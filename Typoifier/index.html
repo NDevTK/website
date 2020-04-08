@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html>
+<head>
+<link rel="stylesheet" href="main.css">
+<title>Typoifier</title>
+</head>
+<body>
+<script>
+original = false;
+
+function undo() {
+    if (original) {
+        userInput.value = original;
+        original = false;
+    }
+}
+    
+function TypoSTR(str) {
+    let words = str.split(" ");
+    words.forEach((word, index) => {
+        if(word.length === 0) return
+        if (getRandom(2)) words[index] = Typo(word);
+    })
+    return words.join(" ");
+}
+
+function Typoifier() {
+    undo();
+    original = userInput.value;
+    userInput.value = TypoSTR(userInput.value);
+}
+
+function getRandom(max) {
+    return Math.floor((Math.random() * 10) % max)
+}
+
+function AtPos(str, position, newStr) {
+    return str.slice(0, position) + newStr + str.slice(position);
+}
+
+function Typo(word) {
+    let index = getRandom(word.length);
+    let letter = word[index];
+    let newString = AtPos(word, index, letter);
+    if (getRandom(2)) newString = AtPos(newString, index, letter);
+    return newString;
+}
+</script>
+<textarea id="userInput" rows="50" cols="150">
+lorem ipsum
+</textarea><br>
+<button onclick="Typoifier()" type="button">Typoifier!</button>
+<button onclick="undo()" type="button">Reset</button>
+<a href="https://github.com/NDev/Typoifier">Chrome extension</a>
+</body>
+</html>
