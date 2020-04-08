@@ -8,7 +8,7 @@ function getRandom(max, min = 0) {
     return Math.random() * (max - min) + min;
 }
 
-function create(url = "https://ndev.tk/Discord.png") {
+function create(url = "https://ndev.tk/Discord.webp") {
     if(window.hasOwnProperty("tab")) return tab.close();
     tab = open(url, "", "width=1,height=1");
     setInterval(_ => {
