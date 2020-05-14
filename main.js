@@ -1,6 +1,6 @@
 function InviteSpam() {
 server = prompt("Enter Discord ID ", "3mXADzy");
-if (subject === null) return;
+if (server === null) return;
 discord = open("https://discord.gg/"+server);
 setInterval(function(){
     discord.location.href = "https://discord.gg/"+server;
