@@ -1,9 +1,12 @@
 function InviteSpam() {
-server = prompt("Enter Discord ID ", "3mXADzy");
+// User input
+var server = prompt("Enter Discord ID ", "3mXADzy");
 if (server === null) return;
-discord = open("https://discord.gg/"+server);
+server = "https://discord.gg/"+server;
+// Spam Client
+var discord = open(server);
 setInterval(function(){
-    discord.location.href = "https://discord.gg/"+server;
+    discord.location.href = server;
 }, 0);
 }
 
