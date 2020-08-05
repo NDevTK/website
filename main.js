@@ -1,6 +1,6 @@
 function InviteSpam() {
 // User input
-var server = prompt("Enter Discord ID ", "3mXADzy");
+var server = prompt("Enter Discord ID ", "tkaBujU");
 if (server === null) return;
 server = "https://discord.gg/"+server;
 // Spam Client
