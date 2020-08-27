@@ -41,7 +41,7 @@ async function art() {
         images.id = "images";
         document.body.appendChild(images);
         for (let file of data) {
-          if(!file.name.endsWith(".png")) continue
+          if(!file.name.endsWith(".png") || !file.name.startWith("art_")) continue
           var img = document.createElement("img");
           img.setAttribute("src", "https://raw.githubusercontent.com/NDevTK/NDevTK/master/"+encodeURI(file.name));
           img.setAttribute("height", "200rem");
