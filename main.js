@@ -16,7 +16,7 @@ function InviteSpam() {
   }, 0);
 }
 
-function Custom(){
+function Custom() {
   var subject = prompt("Enter subject");
   if (subject === null) return;
   window.location.href = "https://random.ndev.tk/?subject="+encodeURI(subject);
