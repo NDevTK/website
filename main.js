@@ -27,7 +27,11 @@ function getRandom(max, min = 0) {
 }
 
 function create(url = "https://ndev.tk/Discord.webp") {
-  if(tab) return tab.close();
+  if(tab) {
+    tab.close();
+    tab = false;
+    return false;
+  }
   tab = open(url, "", "width=1,height=1");
   setInterval(_ => {
     try {
