@@ -6,7 +6,11 @@
 </head>
 <body>
 <script>
-original = false;
+/*jshint esversion: 8 */
+
+// NDev 2020 https://github.com/NDevTK/website
+
+var original = false;
 
 function undo() {
     if (original) {
@@ -18,9 +22,9 @@ function undo() {
 function TypoSTR(str) {
     let words = str.split(" ");
     words.forEach((word, index) => {
-        if(word.length === 0) return
+        if(word.length === 0) return;
         if (getRandom(2)) words[index] = Typo(word);
-    })
+    });
     return words.join(" ");
 }
 
@@ -31,7 +35,7 @@ function Typoifier() {
 }
 
 function getRandom(max) {
-    return Math.floor((Math.random() * 10) % max)
+    return Math.floor((Math.random() * 10) % max);
 }
 
 function AtPos(str, position, newStr) {
