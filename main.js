@@ -42,7 +42,7 @@ function create(url = "https://ndev.tk/Discord.webp") {
   }}, 500);
 }
 
-art();
+//art();
 async function art() {
         var response = await fetch('https://api.github.com/repos/NDevTK/NDevTK/contents/');
         var data = await response.json();
