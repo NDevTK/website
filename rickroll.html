@@ -17,7 +17,7 @@ navigator.serviceWorker.ready.then(async (swReg) => {
   const bgFetch = await swReg.backgroundFetch.fetch(Math.random(), ['/'], {
     title: NGGYU[state]
   });
-  bgFetch.abort();
+  //bgFetch.abort();
   history.back();
 });
 </script>
