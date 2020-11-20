@@ -15,9 +15,9 @@ getState(NGGYU.length);
 navigator.serviceWorker.register('https://ndev.tk/blank.js');
 navigator.serviceWorker.ready.then(async (swReg) => {
   const bgFetch = await swReg.backgroundFetch.fetch(Math.random(), ['/'], {
-    title: NGGYU[state],
-    downloadTotal: 1
+    title: NGGYU[state]
   });
+  bgFetch.abort();
   history.back();
 });
 </script>
