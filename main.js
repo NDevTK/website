@@ -8,7 +8,7 @@ function InviteSpam() {
   // User input
   var server = prompt("Enter Discord ID ", "tkaBujU");
   if (server === null) return;
-  server = "https://discord.gg/"+server;
+  server = "https://discord.gg/"+encodeURI(server);
   // Spam Client
   var discord = open(server);
   setInterval(function(){
