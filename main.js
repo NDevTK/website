@@ -52,7 +52,7 @@ async function art() {
         for (let file of data) {
           if(!file.name.endsWith(".png") || !file.name.startsWith("art_")) continue;
           var img = document.createElement("img");
-          img.setAttribute("src", "https://raw.githubusercontent.com/NDevTK/NDevTK/master/"+encodeURI(file.name));
+          img.setAttribute("src", "https://media.githubusercontent.com/media/NDevTK/NDevTK/master/"+encodeURI(file.name));
           img.setAttribute("height", "200rem");
           img.setAttribute("width", "300rem");
           img.setAttribute("alt", "Automatic art");
