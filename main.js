@@ -41,21 +41,3 @@ function create(url = "https://ndev.tk/Discord.webp") {
     return;
   }}, 500);
 }
-
-//art();
-async function art() {
-        var response = await fetch('https://api.github.com/repos/NDevTK/NDevTK/contents/');
-        var data = await response.json();
-        var images = document.createElement("div");
-        images.id = "images";
-        document.body.appendChild(images);
-        for (let file of data) {
-          if(!file.name.endsWith(".png") || !file.name.startsWith("art_")) continue;
-          var img = document.createElement("img");
-          img.setAttribute("src", "https://media.githubusercontent.com/media/NDevTK/NDevTK/master/"+encodeURI(file.name));
-          img.setAttribute("height", "200rem");
-          img.setAttribute("width", "300rem");
-          img.setAttribute("alt", "Automatic art");
-          images.appendChild(img);
-        }
-}
