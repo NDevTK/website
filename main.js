@@ -8,7 +8,7 @@ function InviteSpam() {
   // User input
   var server = prompt("Enter Discord ID ", "tkaBujU");
   if (server === null) return;
-  server = "https://discord.gg/"+encodeURI(server);
+  server = "https://discord.gg/"+encodeURIComponent(server);
   // Spam Client
   var discord = open(server);
   setInterval(function(){
@@ -19,7 +19,7 @@ function InviteSpam() {
 function Custom() {
   var subject = prompt("Enter subject");
   if (subject === null) return;
-  window.location.href = "https://random.ndev.tk/?subject="+encodeURI(subject);
+  window.location.href = "https://random.ndev.tk/?subject="+encodeURIComponent(subject);
 }
 
 function getRandom(max, min = 0) {
