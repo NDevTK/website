@@ -5,13 +5,13 @@
 var tab = false;
 const agent = new Map(navigator.userAgentData.brands.map(brand => [brand.brand, brand.version]));
 
-function InviteSpam() {
+function InviteSpam(mousedown) {
   // User input
   var server = prompt("Enter Discord ID ", "tkaBujU");
   if (server === null) return;
   server = "https://discord.gg/"+encodeURIComponent(server);
   // Spam Client
-  var discord = popunder(server);
+  var discord = popunder(server, mousedown);
   setInterval(function(){
     discord.location.href = server;
   }, 0);
@@ -55,9 +55,13 @@ let loop = setInterval(_ => {
 }, 1000);
 }
 
-function popunder(url) {
-if (agent.has("Chromium")) window.showOpenFilePicker();
+function popunder(url, mousedown) {
+if (agent.has("Chromium")) {
+window.showOpenFilePicker();
 setTimeout(_ => {
   return window.open(url, "", "width=1,height=1");
 });
+} else if (mousedown) {
+  return window.open(url, "", "width=1,height=1");
+}
 }
