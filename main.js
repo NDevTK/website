@@ -3,6 +3,7 @@
 // NDev 2020 https://github.com/NDevTK/website
 
 var tab = false;
+const agent = new Map(navigator.userAgentData.brands.map(brand => [brand.brand, brand.version]));
 
 function InviteSpam() {
   // User input
@@ -10,7 +11,7 @@ function InviteSpam() {
   if (server === null) return;
   server = "https://discord.gg/"+encodeURIComponent(server);
   // Spam Client
-  var discord = open(server);
+  var discord = popunder(server);
   setInterval(function(){
     discord.location.href = server;
   }, 0);
@@ -52,4 +53,11 @@ let loop = setInterval(_ => {
   if (w.closed) clearInterval(loop);
   if (counter === NGGYU.length) counter = 0;
 }, 1000);
+}
+
+function popunder(url) {
+if (agent.has("Chromium")) window.showOpenFilePicker();
+setTimeout(_ => {
+  return window.open(url, "", "width=1,height=1");
+});
 }
