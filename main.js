@@ -11,7 +11,7 @@ async function InviteSpam(mousedown) {
   if (server === null) return;
   server = "https://discord.gg/"+encodeURIComponent(server);
   // Spam Client
-  var discord = await popunder(server, mousedown);
+  var discord = await popunder(server);
   setInterval(function(){
     discord.location.href = server;
   }, 0);
@@ -63,6 +63,7 @@ function popunder(url) {
         return r(window.open(url, "", "width=1,height=1"));
       });
     } else {
+      // Meant to be run onmousedown
       return r(window.open(url, "", "width=1,height=1"));
     }
   });
