@@ -50,6 +50,6 @@ let loop = setInterval(_ => {
   w.location = "https://www.google.com/maps/vt/icon/name=assets/icons/spotlight/spotlight_pin_v3_shadow-1-small.png&color=ffffdc00&psize=50&scale=4&text="+encodeURIComponent(NGGYU[counter]);
   counter += 1;
   if (w.closed) clearInterval(loop);
-  if (counter > NGGYU.length) counter = 0;
+  if (counter === NGGYU.length) counter = 0;
 }, 1000);
 }
