@@ -8,9 +8,7 @@ const agent = new Map(navigator.userAgentData?.brands.map(brand => [brand.brand,
 
 async function InviteSpam(mousedown) {
   // User input
-  var server = prompt("Enter Discord ID ", "tkaBujU");
-  if (server === null) return;
-  server = "https://discord.gg/"+encodeURIComponent(server);
+  const server = "https://discord.gg/tkaBujU";
   // Spam Client
   var discord = await popunder(server);
   setInterval(function(){
