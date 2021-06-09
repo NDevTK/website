@@ -3,7 +3,8 @@
 // NDev 2020 https://github.com/NDevTK/website
 
 var tab = false;
-const agent = new Map(navigator.userAgentData.brands.map(brand => [brand.brand, brand.version]));
+
+const agent = new Map(navigator.userAgentData?.brands.map(brand => [brand.brand, brand.version]));
 
 async function InviteSpam(mousedown) {
   // User input
