@@ -39,7 +39,7 @@ p { margin: 4px 0 }
 <div id="log"></div>
 </div>
 <script>
-"use strict";
+
 const urls = ["https://ndev.tk/visted/", 'http://notvisited' + ((Math.random()*100000000)|0)+'.foo', 'https://www.facebook.com', 'https://www.google.com', 'https://www.google.co.uk', 'http://www.youtube.com', 'https://www.twitter.com', 'https://www.linkedin.com', 'http://www.craigslist.org', 'http://stackoverflow.com', 'http://www.bing.com', 'http://www.bbc.co.uk', 'http://www.microsoft.com', 'http://www.amazon.com', 'http://www.amazon.co.uk', 'http://www.mozilla.org', 'http://www.contextis.co.uk/', 'http://www.theregister.co.uk', 'http://www.reddit.com', 'http://news.ycombinator.com','http://www.ebay.co.uk','http://www.ebay.com','http://www.ask.com','http://www.msn.com', 'http://www.wordpress.com', 'http://pinterest.com','http://instagram.com','http://www.apple.com','http://www.live.com','http://en.wikipedia.org','http://www.wikileaks.org','http://arstechnica.com'];
 
 requestAnimationFrame = window.requestAnimationFrame || window.mozRequestAnimationFrame ||  
@@ -58,8 +58,6 @@ var stop = true;
 var start;
 var currentUrl = 0;
 var calibIters = 10;
-var textLines;
-var textLen;
 
 function initStats() {
   currentUrl = 0;
@@ -163,15 +161,16 @@ function loop(timestamp) {
               return;
             }
             
-            var threshold = medianNeg + (medianPos - medianNeg)*.75;
+            threshold = medianNeg + (medianPos - medianNeg)*.75;
             document.getElementById('nums').textContent = 'Median Visited: ' + medianPos + 'ms  / Median Unvisited: ' + medianNeg + 'ms / Threshold: ' + threshold + 'ms';
-            var timeStart = Date.now();
+            timeStart = Date.now();
           }
         }
         
         if (currentUrl >= 2) {
             timespans[currentUrl].textContent = diff;
             linkspans[currentUrl].className = (diff >= threshold)? 'visited yes' : 'visited';
+            incUrl = true; 
         }
         
         currentUrl++;
@@ -181,7 +180,7 @@ function loop(timestamp) {
           currentUrl = 0;
          
         if (currentUrl == urls.length) {
-          var timeElapsed = (Date.now() - timeStart) / 1000;
+          timeElapsed = (Date.now() - timeStart) / 1000;
           document.getElementById('nums').innerHTML += "<br>Time elapsed: " + timeElapsed + "s, tested " + (((urls.length -2)/timeElapsed)|0) + " URLs/sec"; 
           stop = true;
           
@@ -225,6 +224,10 @@ function setupLinks() {
   document.getElementById('log').appendChild(table);
 }
 setupLinks();
+
+
+//setTimeout(loop, 2000);
+
 </script>
 </body>
 </html>
