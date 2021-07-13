@@ -44,6 +44,8 @@ function initStats() {
 function updateParams() {
   document.getElementById('nums').innerText = "Loading...";
   out.onclick = e => e.preventDefault();
+  out.oncontextmenu = e => e.preventDefault();
+  out.onselectionchange = e => e.preventDefault();
   out.style.textShadow = document.getElementById('text-shadow').value;
   out.style.opacity = parseFloat(document.getElementById('opacity').value);
   out.style.fontSize = document.getElementById('font-size').value + 'px';
