@@ -172,7 +172,6 @@ function loop(timestamp) {
         if (currentUrl >= 2) {
             timespans[currentUrl].textContent = diff;
             linkspans[currentUrl].className = (diff >= threshold)? 'visited yes' : 'visited';
-            incUrl = true; 
         }
         
         currentUrl++;
