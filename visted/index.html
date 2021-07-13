@@ -177,7 +177,7 @@ function loop(timestamp) {
             
             threshold = medianNeg + (medianPos - medianNeg)*.75;
             document.getElementById('nums').textContent = 'Median Visited: ' + medianPos + 'ms  / Median Unvisited: ' + medianNeg + 'ms / Threshold: ' + threshold + 'ms';
-            timeStart = Date.now();
+            timeStart = performance.now();
           }
         }
         
@@ -194,7 +194,7 @@ function loop(timestamp) {
           currentUrl = 0;
          
         if (currentUrl == urls.length) {
-          timeElapsed = (Date.now() - timeStart) / 1000;
+          timeElapsed = (performance.now() - timeStart) / 1000;
           document.getElementById('nums').innerHTML += "<br>Time elapsed: " + timeElapsed + "s, tested " + (((urls.length -2)/timeElapsed)|0) + " URLs/sec"; 
           stop = true;
           
