@@ -70,6 +70,7 @@ function initStats() {
 }
 
 function updateParams() {
+  document.getElementById('nums').innerText = "Loading...";
   out.style.textShadow = document.getElementById('text-shadow').value;
   out.style.opacity = parseFloat(document.getElementById('opacity').value);
   out.style.fontSize = document.getElementById('font-size').value + 'px';
