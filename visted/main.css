@@ -1,6 +1,10 @@
 #out a { color: blue }
 #out a:visited { color: purple }
 
+html {
+  overflow: hidden;
+}
+
 body {
   font-family: Consolas, monaco, monospace;
   background-color: black;
