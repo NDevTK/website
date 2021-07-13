@@ -90,7 +90,7 @@ function updateParams() {
   out.style.fontSize = document.getElementById('font-size').value + 'px';
   textLines = parseInt(document.getElementById('textlines').value);
   textLen = parseInt(document.getElementById('textlen').value);
-  write();
+  setTimeout(_ => write(), 5);
   resetLinks();
   initStats();
 }
