@@ -1,5 +1,6 @@
 #out a { color: blue }
 #out a:visited { color: purple }
+
 body {
   font-family: Consolas, monaco, monospace;
   background-color: black;
@@ -12,12 +13,14 @@ body {
 ::selection {
   background: white;
 }
+
 #out { 
   font-size: 5px; 
   overflow: hidden; 
   padding: 20px; 
   width:35%;
 }
+
 #stats { position:absolute; right:0; top: 60px; left: 40%}
 p { margin: 4px 0 }
 .linklist span.visited { visibility: hidden; color: white;  background: green; border-radius: 5px;  padding: 2px; font-size: 8pt }
