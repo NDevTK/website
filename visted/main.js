@@ -29,8 +29,6 @@ document.addEventListener("keypress", e => {
     if (e.key === "Enter") updateParams();
 });
 
-out
-
 function initStats() {
   currentUrl = 0;
   start = NaN;
