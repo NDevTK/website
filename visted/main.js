@@ -24,6 +24,10 @@ var textLen;
 var threshold;
 var timeStart;
 
+
+document.addEventListener("keypress", e => {
+    if (e.key === "Enter") updateParams();
+});
 	
 function initStats() {
   currentUrl = 0;
