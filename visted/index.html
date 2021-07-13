@@ -150,6 +150,8 @@ function loop(timestamp) {
   if (stop) return;
   
   var threshold;
+  var timeStart;
+
   var diff = (timestamp - start) | 0;
   start = timestamp;
 
@@ -199,7 +201,7 @@ function loop(timestamp) {
           currentUrl = 0;
          
         if (currentUrl == urls.length) {
-          timeElapsed = (performance.now() - timeStart) / 1000;
+          let timeElapsed = (performance.now() - timeStart) / 1000;
           document.getElementById('nums').innerHTML += "<br>Time elapsed: " + timeElapsed + "s, tested " + (((urls.length -2)/timeElapsed)|0) + " URLs/sec"; 
           stop = true;
           
