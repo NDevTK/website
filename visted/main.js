@@ -150,7 +150,7 @@ function loop(timestamp) {
           let timeElapsed = (performance.now() - timeStart) / 1000;
           document.getElementById('nums').innerHTML += "<br>Time elapsed: " + timeElapsed + "s, tested " + (((urls.length -2)/timeElapsed)|0) + " URLs/sec"; 
           stop = true;
-          
+          out.innerText = "";
        }
           
         currentURLout.textContent = urls[currentUrl];
