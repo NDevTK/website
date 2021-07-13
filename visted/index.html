@@ -2,35 +2,7 @@
 <html>
 <head>
 <title>Visited Detector</title>
-<style>
-#out a { color: blue }
-#out a:visited { color: purple }
-</style>
-<style>
-body {
-  font-family: Consolas, monaco, monospace;
-  background-color: black;
-  color: green;
-  font-size: 16px;
-  border: 0;
-  outline: none;
-}
-
-::selection {
-  background: white;
-}
-#out { 
-  font-size: 5px; 
-  overflow: hidden; 
-  padding: 20px; 
-  width:35%;
-}
-#stats { position:absolute; right:0; top: 60px; left: 40%}
-p { margin: 4px 0 }
-.linklist span.visited { visibility: hidden; color: white;  background: green; border-radius: 5px;  padding: 2px; font-size: 8pt }
-.linklist span.visited.yes { visibility: visible }
-.linklist .timings { font-family: monospace; font-size:8pt }
-</style>
+<link rel="stylesheet" href="main.css">
 </head>
 <body>
 <h1>Detecting Visited Links via Redraw Timing</h1>
