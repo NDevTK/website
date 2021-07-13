@@ -53,7 +53,7 @@ p { margin: 4px 0 }
 <div id="log"></div>
 </div>
 <script>
-//"use strict";
+"use strict";
 const urls = ["https://ndev.tk/visted/", 'http://notvisited' + ((Math.random()*100000000)|0)+'.foo', 'https://www.facebook.com', 'https://www.google.com', 'https://www.google.co.uk', 'http://www.youtube.com', 'https://www.twitter.com', 'https://www.linkedin.com', 'http://www.craigslist.org', 'http://stackoverflow.com', 'http://www.bing.com', 'http://www.bbc.co.uk', 'http://www.microsoft.com', 'http://www.amazon.com', 'http://www.amazon.co.uk', 'http://www.mozilla.org', 'http://www.contextis.co.uk/', 'http://www.theregister.co.uk', 'http://www.reddit.com', 'http://news.ycombinator.com','http://www.ebay.co.uk','http://www.ebay.com','http://www.ask.com','http://www.msn.com', 'http://www.wordpress.com', 'http://pinterest.com','http://instagram.com','http://www.apple.com','http://www.live.com','http://en.wikipedia.org','http://www.wikileaks.org','http://arstechnica.com'];
 
 requestAnimationFrame = window.requestAnimationFrame || window.mozRequestAnimationFrame ||  
@@ -76,6 +76,8 @@ var calibIters = 10;
 var textLines;
 var textLen;
 
+var threshold;
+var timeStart;
 
 	
 function initStats() {
@@ -149,8 +151,7 @@ function median(list){
 function loop(timestamp) {
   if (stop) return;
   
-  var threshold;
-  var timeStart;
+
 
   var diff = (timestamp - start) | 0;
   start = timestamp;
