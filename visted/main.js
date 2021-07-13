@@ -28,7 +28,9 @@ var timeStart;
 document.addEventListener("keypress", e => {
     if (e.key === "Enter") updateParams();
 });
-	
+
+out
+
 function initStats() {
   currentUrl = 0;
   start = NaN;
@@ -43,6 +45,7 @@ function initStats() {
 
 function updateParams() {
   document.getElementById('nums').innerText = "Loading...";
+  out.onclick = e => e.preventDefault();
   out.style.textShadow = document.getElementById('text-shadow').value;
   out.style.opacity = parseFloat(document.getElementById('opacity').value);
   out.style.fontSize = document.getElementById('font-size').value + 'px';
