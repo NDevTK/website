@@ -42,9 +42,11 @@ function create(url = "https://ndev.tk/Discord.webp") {
   }}, 500);
 }
 
+window.onload = e => {
 document.getElementById("rickroll").onclick = e => {
   e.preventDefault();
   googleAnimation();
+}
 }
 
 function googleAnimation() {
