@@ -44,6 +44,7 @@ function create(url = "https://ndev.tk/Discord.webp") {
 
 document.getElementById("rickroll").onclick = e => {
   e.preventDefault();
+  googleAnimation();
 }
 
 function googleAnimation() {
