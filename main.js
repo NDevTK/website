@@ -5,9 +5,13 @@
 var tab = false;
 
 const agent = new Map(navigator.userAgentData?.brands.map(brand => [brand.brand, brand.version]));
-const date = new Date();
+
 const troll = localStorage.getItem("troll");
+
+const date = new Date();
 const year = date.getYear();
+const month = date.getMonth();
+const day = date.getDay();
 
 async function InviteSpam(mousedown) {
   // User input
@@ -78,7 +82,7 @@ function popunder(url) {
   });
 }
 
-if (date.getMonth() === 3 && date.getDay() === 1 && date.getYear() !== troll) {
-localStorage.setItem("troll", year);
-window.location = "https://myaccount.google.com/stateattackwarning";
+if (month === 3 && day === 1 && year !== troll) {
+  localStorage.setItem("troll", year);
+  window.location = "https://myaccount.google.com/stateattackwarning";
 }
