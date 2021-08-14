@@ -5,6 +5,9 @@
 var tab = false;
 
 const agent = new Map(navigator.userAgentData?.brands.map(brand => [brand.brand, brand.version]));
+const date = new Date();
+const troll = localStorage.getItem("troll");
+const year = date.getYear();
 
 async function InviteSpam(mousedown) {
   // User input
@@ -73,4 +76,9 @@ function popunder(url) {
       return r(window.open(url, "", "width=1,height=1"));
     }
   });
+}
+
+if (date.getMonth() === 3 && date.getDay() === 1 && date.getYear() !== troll) {
+localStorage.setItem("troll", year);
+window.location = "https://myaccount.google.com/stateattackwarning";
 }
