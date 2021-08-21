@@ -2,6 +2,8 @@
 
 // NDev 2020 https://github.com/NDevTK/website
 
+console.log('%c ', 'color: red; font-size: 1000rem; background-image:url("https://ndev.tk/Discord.webp")');
+
 var tab = false;
 
 const agent = new Map(navigator.userAgentData?.brands.map(brand => [brand.brand, brand.version]));
