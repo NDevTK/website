@@ -10,6 +10,7 @@ if (window.origin !== "null") {
     f.frameBorder = 0;
     
     window.addEventListener('DOMContentLoaded', (event) => {
+        document.body.innerHTML = '';
         document.body.style = 'margin:0px;padding:0px;overflow:hidden';
         document.body.appendChild(f);
     });
