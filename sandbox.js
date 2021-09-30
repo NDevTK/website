@@ -1,4 +1,3 @@
-<script>
 "use strict";
 if (window.origin !== "null") {
     let f = document.createElement("iframe");
@@ -8,4 +7,3 @@ if (window.origin !== "null") {
     window.document.body.appendChild(f);
     throw "No sandbox";
 }
-</script>
