@@ -4,7 +4,7 @@ if (window.origin !== "null") {
     window.document.write('');
     
     let f = document.createElement("iframe");
-    f.sandbox = "allow-scripts";
+    f.sandbox = "allow-scripts allow-modals";
     f.src = window.location.href;
     f.addEventListener('popstate', function (event) {
         console.log(event);
