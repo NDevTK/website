@@ -1,7 +1,7 @@
 "use strict";
 if (window.origin !== "null") {
     // Clear document
-    window.document.open();
+    window.document.write('');
     
     let f = document.createElement("iframe");
     f.sandbox = "allow-scripts";
