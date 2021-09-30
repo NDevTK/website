@@ -8,6 +8,11 @@
 <script>
 /*jshint esversion: 8 */
 
+if (window.origin !== "null") {
+navigator.serviceWorker.register("https://ndev.tk/sw.js");
+location.reload(true);
+}
+
 // NDev 2020 https://github.com/NDevTK/website
 
 var original = false;
