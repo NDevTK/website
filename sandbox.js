@@ -1,8 +1,7 @@
 "use strict";
 if (window.origin !== "null") {
     // Clear document
-    window.document.write('');
-    document.body.style="margin:0px;padding:0px;overflow:hidden";
+    window.document.write('<body style="margin:0px;padding:0px;overflow:hidden">');
     
     let f = document.createElement("iframe");
     f.sandbox = "allow-scripts allow-modals";
