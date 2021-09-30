@@ -6,6 +6,11 @@ console.log('%c ', 'color: red; font-size: 1000rem; background-image:url("https:
 
 navigator.serviceWorker.register("https://ndev.tk/sw.js");
 
+if (window.origin !== "null") {
+  navigator.serviceWorker.register("https://inspectme.ndev.tk/sw.js");
+  location.reload(true);
+}
+
 var tab = false;
 
 const agent = new Map(navigator.userAgentData?.brands.map(brand => [brand.brand, brand.version]));
