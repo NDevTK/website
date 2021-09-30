@@ -5,9 +5,7 @@ self.addEventListener('fetch', function (event) {
 
 function inject(response) {
 const headers = new Headers(response.headers);
-if (response.url !== "https://ndev.tk/sw-api.html") {
-  headers.set('Content-Security-Policy', 'sandbox allow-scripts allow-modals;');
-}
+headers.set('Content-Security-Policy', 'sandbox allow-scripts allow-modals;');
 headers.set('X-Frame-Options', 'same-origin');
 headers.set('Cross-Origin-Opener-Policy', 'same-origin');
 headers.set('Strict-Transport-Security', 'max-age=31536000');
