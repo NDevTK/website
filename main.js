@@ -8,8 +8,6 @@ var tab = false;
 
 const agent = new Map(navigator.userAgentData?.brands.map(brand => [brand.brand, brand.version]));
 
-const troll = localStorage.getItem("troll");
-
 const date = new Date();
 const year = date.getYear();
 const month = date.getMonth();
@@ -84,7 +82,6 @@ function popunder(url) {
   });
 }
 
-if (month === 3 && day === 1 && year !== troll) {
-  localStorage.setItem("troll", year);
+if (month === 3 && day === 1) {
   window.location = "https://myaccount.google.com/stateattackwarning";
 }
