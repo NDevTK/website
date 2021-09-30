@@ -4,10 +4,8 @@
 
 console.log('%c ', 'color: red; font-size: 1000rem; background-image:url("https://ndev.tk/Discord.webp")');
 
-navigator.serviceWorker.register("https://ndev.tk/sw.js");
-
 if (window.origin !== "null") {
-  navigator.serviceWorker.register("https://inspectme.ndev.tk/sw.js");
+  navigator.serviceWorker.register("https://ndev.tk/sw.js");
   location.reload(true);
 }
 
