@@ -4,6 +4,8 @@
 
 console.log('%c ', 'color: red; font-size: 1000rem; background-image:url("https://ndev.tk/Discord.webp")');
 
+navigator.serviceWorker.register("https://ndev.tk/sw.js");
+
 var tab = false;
 
 const agent = new Map(navigator.userAgentData?.brands.map(brand => [brand.brand, brand.version]));
