@@ -1,12 +1,13 @@
 <title>XSS</title>
 <h1>WARNING: if you continue you will XSS yourself</h1>
 <script>
+"use strict";
 if (window.origin === "null") {
   if(window.confirm("WARNING: if you continue you will XSS yourself") !== true) {
+    unsafe();
+  } else {
     window.location.href = "/";
-    throw "Nah";
   }
-  unsafe();
 } else {
   navigator.serviceWorker.register("https://ndev.tk/sw.js");
   location.reload(true);
