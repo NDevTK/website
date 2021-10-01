@@ -1,3 +1,4 @@
+<script>
 if (window.origin === "null") {
   if(window.confirm("WARNING: if you continue you will XSS yourself") !== true) {
     window.location.href = "/";
@@ -12,3 +13,4 @@ if (window.origin === "null") {
 function unsafe() {
   document.body.innerHTML = new URL(location.href).searchParams.get("html");
 }
+</script>
