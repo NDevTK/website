@@ -3,7 +3,7 @@
 <script>
 "use strict";
 if (window.origin === "null") {
-  if(window.confirm("WARNING: if you continue you will XSS yourself") !== true) {
+  if(window.confirm("WARNING: if you continue you will XSS yourself") === true) {
     unsafe();
   } else {
     window.location.href = "/";
