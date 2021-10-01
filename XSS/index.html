@@ -6,6 +6,8 @@
 if (window.origin === "null") {
   // Clean searchParams
   location.search = "html=" + new URL(location.href).searchParams.get("html");
+  // Clean hash
+  location.hash = "";
   // Require user confirmation
   if(window.confirm("WARNING: if you continue you will XSS yourself") === true) {
     unsafe();
