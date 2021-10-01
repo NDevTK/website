@@ -5,7 +5,7 @@
 // Origin must be sandboxed
 if (window.origin === "null") {
   // Clean searchParams
-  location.search = "html=" + new URL(location.href).searchParams.get("html");
+  window.history.replaceState("", "", "?html=" + new URL(location.href).searchParams.get("html"));
   // Clean hash
   location.hash = "";
   // Require user confirmation
