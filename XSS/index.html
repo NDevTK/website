@@ -2,18 +2,24 @@
 <h1>WARNING: if you continue you will XSS yourself</h1>
 <script>
 "use strict";
+// Origin must be sandboxed
 if (window.origin === "null") {
+  // Clean searchParams
+  location.search = "html=" + new URL(location.href).searchParams.get("html");
+  // Require user confirmation
   if(window.confirm("WARNING: if you continue you will XSS yourself") === true) {
     unsafe();
   } else {
     window.location.href = "/";
   }
 } else {
+  // Used for sandbox
   navigator.serviceWorker.register("https://ndev.tk/sw.js");
   location.reload(true);
 }
 
 function unsafe() {
+  // unsafe code to run code from url
   document.body.innerHTML = new URL(location.href).searchParams.get("html");
 }
 </script>
