@@ -5,8 +5,10 @@
 console.log('%c ', 'color: red; font-size: 1000rem; background-image:url("https://ndev.tk/Discord.webp")');
 
 if (window.origin !== "null") {
-  navigator.serviceWorker.register("https://ndev.tk/sw.js");
-  location.reload(true);
+  navigator.serviceWorker.register("https://ndev.tk/sw.js").then(_ => {
+    location.reload(true);
+  });
+  throw "Added protection"
 }
 
 var tab = false;
