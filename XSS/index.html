@@ -14,8 +14,9 @@ if (window.origin === "null" && window.top === window && window.opener === null 
   }
 } else {
   // Used for sandbox
-  navigator.serviceWorker.register("https://ndev.tk/sw.js");
-  location.reload(true);
+  navigator.serviceWorker.register("https://ndev.tk/sw.js").then(_ => {
+    location.reload(true);
+  });
 }
 
 function unsafe() {
