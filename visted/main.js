@@ -7,7 +7,7 @@ if (window.origin !== "null") {
   });
   throw "Added protection"
 }
-const urls = ["https://ndev.tk/visted/", 'http://notvisited' + ((Math.random()*100000000)|0)+'.foo', 'https://www.facebook.com', 'https://www.google.com', 'https://www.google.co.uk', 'http://www.youtube.com', 'https://www.twitter.com', 'https://www.linkedin.com', 'http://www.craigslist.org', 'http://stackoverflow.com', 'http://www.bing.com', 'http://www.bbc.co.uk', 'http://www.microsoft.com', 'http://www.amazon.com', 'http://www.amazon.co.uk', 'http://www.mozilla.org', 'http://www.contextis.co.uk/', 'http://www.theregister.co.uk', 'http://www.reddit.com', 'http://news.ycombinator.com','http://www.ebay.co.uk','http://www.ebay.com','http://www.ask.com','http://www.msn.com', 'http://www.wordpress.com', 'http://pinterest.com','http://instagram.com','http://www.apple.com','http://www.live.com','http://en.wikipedia.org','http://www.wikileaks.org','http://arstechnica.com'];
+const urls = ["https://ndev.tk/visted/", 'https://notvisited' + ((Math.random()*100000000)|0)+'.foo', 'https://www.facebook.com', 'https://www.google.com', 'https://www.google.co.uk', 'https://www.youtube.com', 'https://www.twitter.com', 'https://www.linkedin.com', 'https://www.craigslist.org', 'https://stackoverflow.com', 'https://www.bing.com', 'https://www.bbc.co.uk', 'https://www.microsoft.com', 'https://www.amazon.com', 'https://www.amazon.co.uk', 'https://www.mozilla.org', 'https://www.contextis.co.uk/', 'https://www.theregister.co.uk', 'https://www.reddit.com', 'https://news.ycombinator.com','https://www.ebay.co.uk','https://www.ebay.com','https://www.ask.com','https://www.msn.com', 'https://www.wordpress.com', 'https://pinterest.com','https://instagram.com','https://www.apple.com','https://www.live.com','https://en.wikipedia.org','https://www.wikileaks.org','https://arstechnica.com'];
 
 requestAnimationFrame = window.requestAnimationFrame || window.mozRequestAnimationFrame ||  
    window.webkitRequestAnimationFrame || window.msRequestAnimationFrame;  
@@ -89,7 +89,7 @@ function updateLinks() {
 
 function resetLinks() {
   for (var i=0; i<out.children.length; i++) {
-    out.children[i].href = 'http://' + Math.random() + '.asd';
+    out.children[i].href = 'https://' + Math.random() + '.asd';
     out.children[i].style.color='red';
     out.children[i].style.color='';
   }
