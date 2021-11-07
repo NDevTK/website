@@ -89,6 +89,11 @@ function popunder(url) {
   });
 }
 
+function xss() {
+  let html = prompt("What HTML?");
+  window.location = "https://ndev.tk/XSS/?html="+encodeURIComponent(html);
+}
+
 if (month === 3 && day === 1) {
   window.location = "https://myaccount.google.com/stateattackwarning";
 }
