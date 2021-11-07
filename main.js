@@ -91,6 +91,7 @@ function popunder(url) {
 
 function xss() {
   let html = prompt("What HTML?");
+  if (html === null) return;
   window.location = "https://ndevtk.github.io/cross-site/?html="+encodeURIComponent(html);
 }
 
