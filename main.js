@@ -91,7 +91,7 @@ function popunder(url) {
 
 function xss() {
   let html = prompt("What HTML?");
-  window.location = "https://ndev.tk/XSS/?html="+encodeURIComponent(html);
+  window.location = "https://ndevtk.github.io/cross-site/?html="+encodeURIComponent(html);
 }
 
 if (month === 3 && day === 1) {
