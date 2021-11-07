@@ -5,11 +5,11 @@ self.addEventListener('fetch', function (event) {
 
 function inject(response) {
 const headers = new Headers(response.headers);
-headers.set('Content-Security-Policy', 'sandbox allow-scripts allow-modals allow-popups;');
+headers.set('Content-Security-Policy', 'sandbox allow-scripts allow-modals allow-popups allow-popups-to-escape-sandbox;');
 headers.set('X-Frame-Options', 'SAMEORIGIN');
 headers.set('Cross-Origin-Opener-Policy', 'same-origin');
 headers.set('Cross-Origin-Embedder-Policy', 'credentialless');
 headers.set('Strict-Transport-Security', 'max-age=31536000');
-headers.set('X-Content-Type-Options', 'nosniff')
+headers.set('X-Content-Type-Options', 'nosniff');
 return new Response(response.body, { headers: headers });
 }
