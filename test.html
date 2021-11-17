@@ -1,0 +1,15 @@
+<!-- Set the Content-Security-Policy to only allow example.org -->
+<meta http-equiv="Content-Security-Policy"
+      content="connect-src https://example.org">
+<script>
+// Listen for a CSP violation event
+document.addEventListener('securitypolicyviolation', () => {
+  console.log("Detected a redirect to somewhere other than example.org");
+});
+// Try to fetch example.org. If it redirects to another cross-site website
+// it will trigger a CSP violation event
+fetch('https://example.org/might_redirect', {
+  mode: 'no-cors',
+  credentials: 'include'
+});
+</script>
