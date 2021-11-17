@@ -8,8 +8,7 @@ document.addEventListener('securitypolicyviolation', e => {
 });
 // Try to fetch example.org. If it redirects to another cross-site website
 // it will trigger a CSP violation event
-fetch('https://example.org/might_redirect', {
-  mode: 'no-cors',
-  credentials: 'include'
-});
+let f = document.createElement("iframe");
+f.src = "https://fb.com";
+document.body.appendChild(f);
 </script>
