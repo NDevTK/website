@@ -1,6 +1,6 @@
 <!-- Set the Content-Security-Policy to only allow example.org -->
 <meta http-equiv="Content-Security-Policy"
-      content="connect-src https://example.org">
+      content="frame-src self">
 <script>
 // Listen for a CSP violation event
 document.addEventListener('securitypolicyviolation', () => {
