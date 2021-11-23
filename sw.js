@@ -10,6 +10,5 @@ headers.set('X-Frame-Options', 'SAMEORIGIN');
 headers.set('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
 headers.set('Cross-Origin-Embedder-Policy', 'credentialless');
 headers.set('Strict-Transport-Security', 'max-age=31536000');
-headers.set('X-Content-Type-Options', 'nosniff');
 return new Response(response.body, { headers: headers });
 }
