@@ -20,16 +20,6 @@ const year = date.getYear();
 const month = date.getMonth();
 const day = date.getDay();
 
-async function InviteSpam(mousedown) {
-  // User input
-  const server = "https://discord.gg/tkaBujU";
-  // Spam Client
-  var discord = await popunder(server);
-  setInterval(function(){
-    discord.location.href = server;
-  }, 0);
-}
-
 function Custom() {
   var subject = prompt("Enter subject");
   if (subject === null) return;
@@ -38,22 +28,6 @@ function Custom() {
 
 function getRandom(max, min = 0) {
   return Math.random() * (max - min) + min;
-}
-
-function create(url = "https://ndev.tk/Discord.webp") {
-  if(tab) {
-    tab.close();
-    tab = false;
-    return false;
-  }
-  tab = open(url, "", "width=1,height=1");
-  setInterval(_ => {
-    try {
-    tab.moveTo(getRandom(window.screen.availHeight), getRandom(window.screen.availWidth));
-    tab.resizeTo(getRandom(1000), getRandom(1000));
-    } catch (err) {
-    return;
-  }}, 500);
 }
 
 window.onload = e => {
