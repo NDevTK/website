@@ -72,3 +72,18 @@ function xss() {
 if (month === 3 && day === 1) {
   window.location = "https://myaccount.google.com/stateattackwarning";
 }
+
+let clicked = new Set();
+
+function snowflake(index) {
+  if (clicked.has(index)) {
+    alert("You clicked snowflake " + index + " again.");
+  } else {
+    alert("You clicked snowflake " + index + ".");
+    clicked.add(index);
+    if (clicked.size === 12) {
+      alert("You clicked all the snowflakes.");
+      clicked.clear();
+    }
+  }
+}
