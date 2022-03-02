@@ -7,6 +7,7 @@ if (window.origin !== "null") {
   });
   throw "Added protection"
 }
+
 const urls = ["https://ndev.tk/visted/", 'https://notvisited' + ((Math.random()*100000000)|0)+'.foo', 'https://www.facebook.com', 'https://www.google.com', 'https://www.google.co.uk', 'https://www.youtube.com', 'https://www.twitter.com', 'https://www.linkedin.com', 'https://www.craigslist.org', 'https://stackoverflow.com', 'https://www.bing.com', 'https://www.bbc.co.uk', 'https://www.microsoft.com', 'https://www.amazon.com', 'https://www.amazon.co.uk', 'https://www.mozilla.org', 'https://www.contextis.co.uk/', 'https://www.theregister.co.uk', 'https://www.reddit.com', 'https://news.ycombinator.com','https://www.ebay.co.uk','https://www.ebay.com','https://www.ask.com','https://www.msn.com', 'https://www.wordpress.com', 'https://pinterest.com','https://instagram.com','https://www.apple.com','https://www.live.com','https://en.wikipedia.org','https://www.wikileaks.org','https://arstechnica.com'];
 
 requestAnimationFrame = window.requestAnimationFrame || window.mozRequestAnimationFrame ||  
