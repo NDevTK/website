@@ -87,3 +87,11 @@ function snowflake(index) {
     }
   }
 }
+
+document.addEventListener('keydown', e => {
+  switch (e.code) {
+    case 'KeyM':
+      background.src = "https://ndev.tk/mc.png";
+      break
+  }
+});
