@@ -6,7 +6,6 @@
     document.body.appendChild(test);
     
     onmessage = e => {
-        if (e.source !== test.contentWindow) return
         test.src = 'about:blank';
         result.innerText = 'No PDF!';
     }
