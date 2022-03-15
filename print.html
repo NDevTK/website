@@ -1,0 +1,29 @@
+<html>
+<head>
+<script>
+function check() {
+    let result = document.getElementById('result');
+    result.innerText = 'Loading';
+    
+    let test = document.createElement('iframe');
+    test.hidden = true;
+    test.src = 'https://ndevtk.github.io/cross-site/PrintDetect/index.html';
+    document.body.appendChild(test);
+
+    onmessage = e => {
+        result.innerText = 'No PDF!';
+    }
+    
+    setTimeout(_ => {
+      onmessage = null;
+      if (result.innerText === 'Loading') result.innerText = 'PDF!';
+      document.body.removeChild(test);
+    }, 2000);
+}
+</script>
+</head>
+<body>
+<button onclick="check()">Click me</button>
+<p1 id="result"></p1>
+</body>
+</html>
