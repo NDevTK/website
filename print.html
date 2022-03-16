@@ -2,7 +2,7 @@
 <body>
 <script>
 let printer = document.createElement('iframe');
-document.body.appendChild(f);
+document.body.appendChild(printer);
 
 function check() {
     result.innerText = 'loading';
@@ -10,7 +10,7 @@ function check() {
         if (result.innerText !== 'loading') return
         result.innerText = 'print';
     }
-    f.src = 'https://ndevtk.github.io/cross-site/PrintDetect/index.html'
+    printer.src = 'https://ndevtk.github.io/cross-site/PrintDetect/index.html'
     setTimeout(_ => {
         if (result.innerText !== 'loading') return
         result.innerText = 'No print';
