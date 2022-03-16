@@ -1,10 +1,10 @@
 <html>
 <body>
 <script>
-let printer = document.createElement('iframe');
-document.body.appendChild(printer);
-
 function check() {
+    let printer = document.createElement('iframe');
+    document.body.appendChild(printer);
+    printer.hidden = true;
     result.innerText = 'loading';
     onmessage = e => {
         if (result.innerText !== 'loading') return
@@ -15,7 +15,8 @@ function check() {
         if (result.innerText !== 'loading') return
         result.innerText = 'No print';
         printer.src = 'about:blank';
-    }, 5000)
+	    setTimeout(_ => { document.body.removeChild(printer); }, 100);
+    }, 100);
 }
 </script>
 <button onclick="check()">Click me</button>
