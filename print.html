@@ -1,9 +1,8 @@
 <html>
 <body>
 <script>
-let f = document.createElement('iframe');
+let printer = document.createElement('iframe');
 document.body.appendChild(f);
-f.hidden = true;
 
 function check() {
     result.innerText = 'loading';
@@ -15,7 +14,7 @@ function check() {
     setTimeout(_ => {
         if (result.innerText !== 'loading') return
         result.innerText = 'No print';
-        f.src = 'about:blank';
+        printer.src = 'about:blank';
     }, 5000)
 }
 </script>
