@@ -15,8 +15,8 @@ function check() {
         if (result.innerText !== 'loading') return
         result.innerText = 'No print';
         printer.src = 'about:blank';
-	    setTimeout(_ => { document.body.removeChild(printer); }, 100);
-    }, 100);
+	    setTimeout(_ => { document.body.removeChild(printer); }, 1000);
+    }, 1000);
 }
 </script>
 <button onclick="check()">Click me</button>
