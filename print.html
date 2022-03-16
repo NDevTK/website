@@ -1,26 +1,22 @@
 <html>
 <body>
 <script>
-    let test = document.createElement('iframe');
-    test.hidden = true;
-    document.body.appendChild(test);
-    
-    onmessage = e => {
-        test.src = 'about:blank';
-        result.innerText = 'No PDF!';
-    }
-        
-    function check() {
-        let result = document.getElementById('result');
-        result.innerText = 'Loading';
-        
-        test.src = 'https://ndevtk.github.io/cross-site/PrintDetect/index.html';
+let f = document.createElement('iframe');
+document.body.appendChild(f);
 
-        setTimeout(_ => {
-            if (result.innerText === 'Loading') result.innerText = 'PDF!';
-            test.src = 'about:blank';
-        }, 1000);
+function check() {
+    result.innerText = 'loading';
+    onmessage = e => {
+        if (result.innerText !== 'loading') return
+        result.innerText = 'print';
     }
+    f.src = 'https://ndevtk.github.io/cross-site/PrintDetect/index.html'
+    setTimeout(_ => {
+        if (result.innerText !== 'loading') return
+        result.innerText = 'No print';
+        f.src = 'about:blank';
+    }, 5000)
+}
 </script>
 <button onclick="check()">Click me</button>
 <p1 id="result"></p1>
