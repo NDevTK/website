@@ -1,28 +1,29 @@
 <html>
 <body>
 <script>
-  "use strict";
-  onload = () => {
-    let result = document.getElementById('result');
-    
+"use strict";
+let result;
+
+onload = () => {
+    result = document.getElementById('result');
     if (sessionStorage.getItem('loading') === '') {
-      result.innerText = 'no print';
-      sessionStorage.removeItem('loading');
+        result.innerText = 'no print';
+        sessionStorage.removeItem('loading');
     }
-    
-    function check() {
-      let printer = document.createElement('iframe');
-      printer.hidden = true;
-      printer.src = 'https://ndevtk.github.io/cross-site/PrintDetect/reload.html';
-      document.body.appendChild(printer);
-      result.innerText = 'loading';
-      sessionStorage.setItem('loading', '');
-      print();
-      document.body.removeChild(printer);
-      result.innerText = 'print';
-      sessionStorage.removeItem('loading');
-    }
-  }
+}
+
+function check() {
+    let printer = document.createElement('iframe');
+    printer.hidden = true;
+    printer.src = 'https://ndevtk.github.io/cross-site/PrintDetect/reload.html';
+    document.body.appendChild(printer);
+    result.innerText = 'loading';
+    sessionStorage.setItem('loading', '');
+    print();
+    document.body.removeChild(printer);
+    result.innerText = 'print';
+    sessionStorage.removeItem('loading');
+}
 </script>
 <button onclick="check()">Click me</button>
 <p1 id="result"></p1>
