@@ -1,6 +1,9 @@
 <html>
 <body>
-<script>  
+<script>
+  "use strict";  
+  let result = document.getElementById('result');
+  
   if (sessionStorage.getItem('loading') === '') {
     result.innerText = 'no print';
     sessionStorage.removeItem('loading');
