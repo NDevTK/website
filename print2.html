@@ -20,9 +20,11 @@ function check() {
     result.innerText = 'loading';
     sessionStorage.setItem('loading', '');
     print();
-    document.body.removeChild(printer);
-    result.innerText = 'print';
-    sessionStorage.removeItem('loading');
+    setTimeout(_ => {
+        document.body.removeChild(printer);
+        result.innerText = 'print';
+        sessionStorage.removeItem('loading');
+    }, 100);
 }
 </script>
 <button onclick="check()">Click me</button>
