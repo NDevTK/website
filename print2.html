@@ -1,7 +1,7 @@
 <html>
 <body>
 <script>  
-  if (sessionStorage.getItem('loading') === true) {
+  if (sessionStorage.getItem('loading') === '') {
     result.innerText = 'no print';
     sessionStorage.removeItem('loading');
   }
@@ -12,7 +12,7 @@
     printer.src = 'https://ndevtk.github.io/cross-site/PrintDetect/reload.html';
     document.body.appendChild(printer);
     result.innerText = 'loading';
-    sessionStorage.setItem('loading', true);
+    sessionStorage.setItem('loading', '');
     setTimeout(_ => {
       print();
       document.body.removeChild(printer);
