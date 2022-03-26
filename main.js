@@ -93,5 +93,12 @@ document.addEventListener('keydown', e => {
     case 'KeyM':
       background.src = "https://ndev.tk/mc.png";
       break
+    case 'KeyD':
+      background.src = "https://random.ndev.tk/?subject=duck";
+      break
+    case 'KeyN':
+      background.src = "https://developer.mozilla.org/en-US/";
+      break
   }
+  // Get it... MDN :)
 });
