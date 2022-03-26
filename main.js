@@ -97,7 +97,7 @@ document.addEventListener('keydown', e => {
       background.src = "https://random.ndev.tk/?subject=duck";
       break
     case 'KeyN':
-      background.src = "https://developer.mozilla.org/en-US/";
+      location = "https://developer.mozilla.org/en-US/";
       break
   }
   // Get it... MDN :)
