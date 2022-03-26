@@ -82,6 +82,7 @@ function snowflake(index) {
     alert("You clicked snowflake " + index + ".");
     clicked.add(index);
     if (clicked.size === 12) {
+      background.src = "https://random.ndev.tk/?subject=duck";
       alert("You clicked all the snowflakes.");
       clicked.clear();
     }
@@ -99,6 +100,8 @@ document.addEventListener('keydown', e => {
     case 'KeyN':
       location = "https://developer.mozilla.org/en-US/";
       break
+    case 'KeyC':
+      [...Array(2**32-1)];
+      break
   }
-  // Get it... MDN :)
 });
