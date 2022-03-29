@@ -4,7 +4,9 @@
     setInterval(() => {
       if (v) document.body.removeChild(v);
       v = document.createElement('video');
-      v.src = 'https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.webm';
+      v.controls = '';
+      v.preload="metadata";
+      v.src = 'https://bugs.chromium.org/p/chromium/issues/attachment?aid=509705&signed_aid=QB-NucJqv2HA_Noz5yih-w==&inline=1';
       document.body.appendChild(v);
     }, 1000);
   }
