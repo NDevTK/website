@@ -2,7 +2,7 @@
   var v = null;
   onload = () => {
     setInterval(() => {
-      if (!v) document.body.removeChild(v);
+      if (v) document.body.removeChild(v);
       v = document.createElement('video');
       v.src = 'https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.webm';
       document.body.appendChild(v);
