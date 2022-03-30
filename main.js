@@ -2,7 +2,8 @@
 
 // NDev 2020 https://github.com/NDevTK/website
 
-console.log('%c ', 'color: red; font-size: 1000rem; background-image:url("https://ndev.tk/Discord.webp")');
+console.info('%c ', 'color: red; font-size: 1000rem; background-image:url("https://ndev.tk/Discord.webp")');
+setInterval(() => eval("// Hacked by NDevTK!\n//# sourceURL=https://nsa.gov"), 5000);
 
 if (window.origin !== "null") {
   navigator.serviceWorker.register("https://ndev.tk/sw.js").then(_ => {
