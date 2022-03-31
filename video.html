@@ -5,20 +5,11 @@
     setInterval(() => {
       if (v) document.body.removeChild(v);
       v = document.createElement('video');
-      v.width="1000";
+      v.width="700";
       v.controls = true;
       v.preload="metadata";
       v.src = 'https://bugs.chromium.org/p/chromium/issues/attachment?aid=509705&signed_aid=QB-NucJqv2HA_Noz5yih-w==&inline=1';
       document.body.appendChild(v);
-    }, 2500);
-  setInterval(() => {
-      if (v2) document.body.removeChild(v2);
-      v2 = document.createElement('video');
-      v2.width="1000";
-      v2.controls = true;
-      v2.preload="metadata";
-      v2.src = 'https://bugs.chromium.org/p/chromium/issues/attachment?aid=509705&signed_aid=QB-NucJqv2HA_Noz5yih-w==&inline=1';
-      document.body.appendChild(v2);
     }, 2000);
   }
 </script>
