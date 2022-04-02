@@ -1,18 +1,16 @@
 <script>
   onload = () => {
-    createVideo();createVideo();createVideo();createVideo();createVideo();createVideo();createVideo();createVideo();createVideo();createVideo();createVideo();createVideo();createVideo();createVideo();createVideo();createVideo();createVideo();createVideo();createVideo();createVideo();createVideo();createVideo();createVideo();createVideo();createVideo();createVideo();createVideo();createVideo();createVideo();createVideo();createVideo();createVideo();
+    createVideo();createVideo();createVideo();createVideo();createVideo();createVideo();createVideo();createVideo();createVideo();createVideo();
   }
   
-function createVideo() {
-  let v = document.createElement('video');
-  document.body.appendChild(v);
-  setInterval(() => {
-      v.src = '';
-      v.width="500";
-      //v.controls = true;
+  function createVideo() {
+      let v = null;
+    setInterval(() => {
+      if (v) document.body.removeChild(v);
+      v = document.createElement('video');
+      v.width="650";
       v.src = 'https://bugs.chromium.org/p/chromium/issues/attachment?aid=509705&signed_aid=QB-NucJqv2HA_Noz5yih-w==&inline=1';
+      document.body.appendChild(v);
     }, 1000);
   }
-  
-  
 </script>
