@@ -71,7 +71,8 @@ function xss() {
 }
 
 if (month === 3 && day === 1) {
-  window.location = "https://myaccount.google.com/stateattackwarning";
+// ITS NOT THE RIGHT DAY M8
+//  window.location = "https://myaccount.google.com/stateattackwarning";
 }
 
 let clicked = new Set();
