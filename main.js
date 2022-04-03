@@ -92,17 +92,17 @@ function snowflake(index) {
 }
 
 document.addEventListener('keydown', e => {
-  switch (e.code) {
-    case 'KeyM':
+  switch (e.key.toLowerCase()) {
+    case 'm':
       background.src = "https://ndev.tk/mc.png";
       break
-    case 'KeyD':
+    case 'd':
       background.src = "https://random.ndev.tk/?subject=duck";
       break
-    case 'KeyN':
+    case 'n':
       location = "https://developer.mozilla.org/en-US/";
       break
-    case 'KeyC':
+    case 'c':
       [...Array(2**32-1)];
       break
   }
