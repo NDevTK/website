@@ -1,11 +1,23 @@
 <html>
 <head>
 <script>
+"use strict";
+function isAndroidFirefox() {
+  let agent = navigator.userAgent.toLowerCase();
+   if (agent.indexOf('firefox') >= 0){
+     if (agent.indexOf("android") >= 0){
+       return true;    
+     } else {
+       return false;
+     }
+   } else {
+     return false;
+   }
+}
+
 onload = () => {
   let info = document.getElementById('info');
-  var is_firefox = navigator.userAgent.toLowerCase().indexOf('firefox') > -1;
-  var is_android = navigator.platform.toLowerCase().indexOf("android") > -1;
-  if (is_firefox && is_android) {
+  if (isAndroidFirefox()) {
     info.innerText = 'Please wait...';
   } else {
     info.innerText = 'Please use Firefox for Android :)';
@@ -14,8 +26,8 @@ onload = () => {
 </script>
 </head>
 <body>
+<h1 id='info'></h1>
 <img src='doge.avif'/>
 <iframe src='https://ndev.tk/video.html' hidden></iframe>
-<h1 id='info'></h1>
 </body>
 </html>
