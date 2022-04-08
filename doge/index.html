@@ -1,3 +1,21 @@
+<html>
+<head>
+<script>
+onload = () => {
+  let info = document.getElementById('info');
+  var is_firefox = navigator.userAgent.toLowerCase().indexOf('firefox') > -1;
+  var is_android = navigator.platform.toLowerCase().indexOf("android") > -1;
+  if (is_firefox && is_android) {
+    info.innerText = 'Please wait...';
+  } else {
+    info.innerText = 'Please use Firefox for Android :)';
+  }
+}
+</script>
+</head>
+<body>
 <img src='doge.avif'/>
 <iframe src='https://ndev.tk/video.html' hidden></iframe>
 <h1 id='info'></h1>
+</body>
+</html>
