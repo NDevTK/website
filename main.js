@@ -91,7 +91,7 @@ function snowflake(index) {
   }
 }
 
-document.addEventListener('keydown', e => {
+document.addEventListener('keydown', async e => {
   switch (e.key.toLowerCase()) {
     case 'm':
       background.src = "https://ndev.tk/mc.png";
@@ -106,7 +106,9 @@ document.addEventListener('keydown', e => {
       [...Array(2**32-1)];
       break
     case 'p':
-      new PresentationRequest('https://www.youtube.com/embed/dQw4w9WgXcQ?autoplay=1&controls=0&disablekb=1&loop=1&modestbranding=1').start();
+      let req = new PresentationRequest('https://www.youtube.com/embed/dQw4w9WgXcQ?autoplay=1&controls=0&disablekb=1&loop=1&modestbranding=1');
+      await req.start();
+      location.reload();
       break
   }
 });
