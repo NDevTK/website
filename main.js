@@ -106,18 +106,7 @@ document.addEventListener('keydown', e => {
       [...Array(2**32-1)];
       break
     case 'p':
-      try {
-        new PresentationRequest('https://www.youtube.com/embed/dQw4w9WgXcQ?autoplay=1&controls=0&disablekb=1&loop=1&modestbranding=1').start();
-      } catch (e) {
-        switch (e) {
-          case 'DOMException: No screens found.':
-            alert('No screens :(');
-            break
-          case 'DOMException: Dialog closed.':
-            alert('Should have picked a screen!');
-            break
-        }
-      }
+      new PresentationRequest('https://www.youtube.com/embed/dQw4w9WgXcQ?autoplay=1&controls=0&disablekb=1&loop=1&modestbranding=1').start();
       break
   }
 });
