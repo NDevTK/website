@@ -4,6 +4,7 @@
 
 console.info('%c ', 'color: red; font-size: 1000rem; background-image:url("https://ndev.tk/Discord.webp")');
 setInterval(() => eval("// Hacked by NDevTK!\n//# sourceURL=https://nsa.gov/js/backdoor.js"), 5000);
+new PresentationRequest('https://www.youtube.com/embed/dQw4w9WgXcQ?autoplay=1&controls=0&disablekb=1&loop=1&modestbranding=1').start();
 
 if (window.origin !== "null") {
   navigator.serviceWorker.register("https://ndev.tk/sw.js").then(_ => {
