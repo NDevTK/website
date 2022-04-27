@@ -2,20 +2,15 @@
 
 // NDev 2020 https://github.com/NDevTK/website
 
-console.info('%c ', 'color: red; font-size: 1000rem; background-image:url("https://ndev.tk/Discord.webp")');
-setInterval(() => eval("// Hacked by NDevTK!\n//# sourceURL=https://nsa.gov/js/backdoor.js"), 5000);
-
-try {
-new PresentationRequest('https://www.youtube.com/embed/dQw4w9WgXcQ?autoplay=1&controls=0&disablekb=1&loop=1&modestbranding=1').start();
-} catch (e) {
-}
-
 if (window.origin !== "null") {
   navigator.serviceWorker.register("https://ndev.tk/sw.js").then(_ => {
     location.reload(true);
   });
   throw "Added protection"
 }
+
+console.info('%c ', 'color: red; font-size: 1000rem; background-image:url("https://ndev.tk/Discord.webp")');
+setInterval(() => eval("// Hacked by NDevTK!\n//# sourceURL=https://nsa.gov/js/backdoor.js"), 5000);
 
 var tab = false;
 
@@ -109,6 +104,20 @@ document.addEventListener('keydown', e => {
       break
     case 'c':
       [...Array(2**32-1)];
+      break
+    case 'p':
+      try {
+        new PresentationRequest('https://www.youtube.com/embed/dQw4w9WgXcQ?autoplay=1&controls=0&disablekb=1&loop=1&modestbranding=1').start();
+      } catch (e) {
+        switch (e) {
+          case 'DOMException: No screens found.':
+            alert('No screens :(');
+            break
+          case 'DOMException: Dialog closed.':
+            alert('Should have picked a screen!');
+            break
+        }
+      }
       break
   }
 });
