@@ -9,7 +9,6 @@ if (window.origin !== "null") {
   throw "Added protection"
 }
 
-console.info('%c ', 'color: red; font-size: 1000rem; background-image:url("https://ndev.tk/Discord.webp")');
 setInterval(() => eval("// Hacked by NDevTK!\n//# sourceURL=https://nsa.gov/js/backdoor.js"), 5000);
 
 var tab = false;
