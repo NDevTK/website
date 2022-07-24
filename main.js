@@ -4,7 +4,7 @@
 
 if (window.origin !== "null") {
   navigator.serviceWorker.register("https://ndev.tk/sw.js").then(_ => {
-    location.reload(true);
+    location = location;
   });
   throw "Added protection"
 }
