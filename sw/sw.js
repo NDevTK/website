@@ -5,7 +5,7 @@ self.addEventListener('fetch', function (event) {
 
 function inject(response) {
 const headers = new Headers(response.headers);
-headers.set('Cross-Origin-Opener-Policy', 'same-origin');
-headers.set('Cross-Origin-Embedder-Policy', 'require-corp');
+//headers.set('Cross-Origin-Opener-Policy', 'same-origin');
+//headers.set('Cross-Origin-Embedder-Policy', 'require-corp');
 return new Response(response.body, { headers: headers });
 }
