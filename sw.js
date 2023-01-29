@@ -14,14 +14,14 @@ headers.set('Strict-Transport-Security', 'max-age=31536000');
 
 try {
   const policyOrigin = new URL(response.url).pathname;
+  switch (policyOrigin) {
+    case '/tabPiP/':
+      headers.set('Content-Security-Policy', '');
+      break
+  }
 } catch {
+  headers.set('Content-Security-Policy', 'sandbox');
   return new Response('policyOrigin error');
-}
-
-switch (policyOrigin) {
-  case '/tabPiP/':
-    headers.set('Content-Security-Policy', '');
-    break
 }
 
 return new Response(response.body, { headers: headers });
