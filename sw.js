@@ -14,7 +14,7 @@ headers.set('Strict-Transport-Security', 'max-age=31536000');
 
 try {
   const policyURL = new URL(response.url);
-  if (policyURL.protocol !== 'https:' || policyURL !== 'https://ndev.tk') throw Untrusted;
+  if (policyURL.protocol !== 'https:' || policyURL.origin !== 'https://ndev.tk') throw Untrusted;
   switch (policyURL.pathname) {
     case '/tabPiP/':
       headers.set('Content-Security-Policy', '');
