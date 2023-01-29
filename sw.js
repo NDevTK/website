@@ -12,7 +12,12 @@ headers.set('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
 //headers.set('Cross-Origin-Embedder-Policy', 'credentialless');
 headers.set('Strict-Transport-Security', 'max-age=31536000');
 
-const policyOrigin = new URL(response.url).pathname;
+try {
+  const policyOrigin = new URL(response.url).pathname;
+} catch {
+  return new Response('policyOrigin error');
+}
+
 switch (policyOrigin) {
   case '/tabPiP/':
     headers.set('Content-Security-Policy', '');
