@@ -13,8 +13,9 @@ headers.set('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
 headers.set('Strict-Transport-Security', 'max-age=31536000');
 
 try {
-  const policyOrigin = new URL(response.url).pathname;
-  switch (policyOrigin) {
+  const policyURL = new URL(response.url);
+  if (policyURL.protocol !== 'https:' || policyURL !== 'https://ndev.tk') throw Untrusted;
+  switch (policyURL.pathname) {
     case '/tabPiP/':
       headers.set('Content-Security-Policy', '');
       break
