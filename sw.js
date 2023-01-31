@@ -21,7 +21,6 @@ try {
       break
   }
 } catch {
-  headers.set('Content-Security-Policy', 'sandbox');
   return new Response('policyOrigin error');
 }
 
