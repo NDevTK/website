@@ -19,13 +19,14 @@ headers.set('Strict-Transport-Security', 'max-age=31536000');
 
 try {
   const policyURL = new URL(response.url);
+  if (policyURL.search === 'secure') throw Untrusted;
   if (policyURL.protocol !== 'https:' || policyURL.origin !== 'https://ndev.tk') throw Untrusted;
   switch (policyURL.pathname) {
     case '/tabPiP/':
       headers.set('Content-Security-Policy', '');
       break
     case '/sandboxAPI/':
-      return new Response('OK', { headers: sandboxAPI });
+      return new Response('', { headers: sandboxAPI, status: 204 });
       break
   }
 } catch {
