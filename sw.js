@@ -26,6 +26,7 @@ try {
       break
     case '/sandboxAPI/':
       return new Response('OK', { headers: sandboxAPI });
+      break
   }
 } catch {
   return new Response('policyOrigin error');
