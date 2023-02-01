@@ -24,9 +24,8 @@ try {
     case '/tabPiP/':
       headers.set('Content-Security-Policy', '');
       break
-    case '/sandboxAPI/'
+    case '/sandboxAPI/':
       return new Response('OK', { headers: sandboxAPI });
-      break
   }
 } catch {
   return new Response('policyOrigin error');
