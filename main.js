@@ -99,17 +99,21 @@ document.addEventListener('keydown', async e => {
   }
 });
 
+async function razerRGB() {
+  razer.createKeyboardEffect('CHROMA_STATIC', 255);
+}
+
 
 // Razer SDK
 function ChromaSDK() {
-    var uri;
-    var timerId;
+    var razerAPI;
+    var razerTimer;
 }
 
-function onTimer() {
+function razerHeartbeat() {
     var request = new XMLHttpRequest();
 
-    request.open("PUT", uri + "/heartbeat", true);
+    request.open("PUT", razerAPI + "/heartbeat", true);
 
     request.setRequestHeader("content-type", "application/json");
 
@@ -117,7 +121,7 @@ function onTimer() {
 
     request.onreadystatechange = function () {
         if ((request.readyState == 4) && (request.status == 200)){
-            console.log(request.responseText);
+            //console.log(request.responseText);
         }
     }
 }
@@ -151,8 +155,8 @@ ChromaSDK.prototype = {
 
         request.onreadystatechange = function () {
             if (request.readyState == 4) {
-                uri = JSON.parse(request.responseText)["uri"];
-                timerId = setInterval(onTimer, 10000);
+                razerAPI = JSON.parse(request.responseText)["uri"];
+                razerTimer = setInterval(razerHeartbeat, 10000);
             }
         }
     },
@@ -171,7 +175,7 @@ ChromaSDK.prototype = {
             }
         }
 
-        clearInterval(timerId);
+        clearInterval(razerTimer);
     },
     createKeyboardEffect: function (effect, data) {
         var jsonObj;
@@ -189,7 +193,7 @@ ChromaSDK.prototype = {
 
         var request = new XMLHttpRequest();
 
-        request.open("PUT", uri + "/keyboard", false);
+        request.open("PUT", razerAPI + "/keyboard", false);
 
         request.setRequestHeader("content-type", "application/json");
 
@@ -211,7 +215,7 @@ ChromaSDK.prototype = {
 
         var request = new XMLHttpRequest();
 
-        request.open("POST", uri + "/keyboard", false);
+        request.open("POST", razerAPI + "/keyboard", false);
 
         request.setRequestHeader("content-type", "application/json");
 
@@ -233,7 +237,7 @@ ChromaSDK.prototype = {
 
         var request = new XMLHttpRequest();
 
-        request.open("PUT", uri + "/mousepad", false);
+        request.open("PUT", razerAPI + "/mousepad", false);
 
         request.setRequestHeader("content-type", "application/json");
 
@@ -251,11 +255,9 @@ ChromaSDK.prototype = {
             jsonObj = JSON.stringify({ "effect": effect, "param": color });
         }
 
-        console.log(jsonObj);
-
         var request = new XMLHttpRequest();
 
-        request.open("POST", uri + "/mousepad", false);
+        request.open("POST", razerAPI + "/mousepad", false);
 
         request.setRequestHeader("content-type", "application/json");
 
@@ -279,7 +281,7 @@ ChromaSDK.prototype = {
 
         var request = new XMLHttpRequest();
 
-        request.open("PUT", uri + "/mouse", false);
+        request.open("PUT", razerAPI + "/mouse", false);
 
         request.setRequestHeader("content-type", "application/json");
 
@@ -297,11 +299,9 @@ ChromaSDK.prototype = {
             jsonObj = JSON.stringify({ "effect": effect, "param": color });
         }
 
-        console.log(jsonObj);
-
         var request = new XMLHttpRequest();
 
-        request.open("POST", uri + "/mouse", false);
+        request.open("POST", razerAPI + "/mouse", false);
 
         request.setRequestHeader("content-type", "application/json");
 
@@ -323,7 +323,7 @@ ChromaSDK.prototype = {
 
         var request = new XMLHttpRequest();
 
-        request.open("PUT", uri + "/headset", false);
+        request.open("PUT", razerAPI + "/headset", false);
 
         request.setRequestHeader("content-type", "application/json");
 
@@ -341,7 +341,7 @@ ChromaSDK.prototype = {
             jsonObj = JSON.stringify({ "effect": effect, "param": color });
         }
         var request = new XMLHttpRequest();
-        request.open("POST", uri + "/headset", false);
+        request.open("POST", razerAPI + "/headset", false);
         request.setRequestHeader("content-type", "application/json");
         request.send(jsonObj);
         return JSON.parse(request.responseText)['id'];
@@ -359,7 +359,7 @@ ChromaSDK.prototype = {
         }
         var request = new XMLHttpRequest();
 
-        request.open("PUT", uri + "/keypad", false);
+        request.open("PUT", razerAPI + "/keypad", false);
 
         request.setRequestHeader("content-type", "application/json");
 
@@ -377,7 +377,7 @@ ChromaSDK.prototype = {
             jsonObj = JSON.stringify({ "effect": effect, "param": color });
         }
         var request = new XMLHttpRequest();
-        request.open("POST", uri + "/keypad", false);
+        request.open("POST", razerAPI + "/keypad", false);
         request.setRequestHeader("content-type", "application/json");
         request.send(jsonObj);
         return JSON.parse(request.responseText)['id'];
@@ -393,7 +393,7 @@ ChromaSDK.prototype = {
             jsonObj = JSON.stringify({ "effect": effect, "param": color });
         }
         var request = new XMLHttpRequest();
-        request.open("PUT", uri + "/chromalink", false);
+        request.open("PUT", razerAPI + "/chromalink", false);
         request.setRequestHeader("content-type", "application/json");
         request.send(jsonObj);
     },
@@ -408,7 +408,7 @@ ChromaSDK.prototype = {
             jsonObj = JSON.stringify({ "effect": effect, "param": color });
         }
         var request = new XMLHttpRequest();
-        request.open("POST", uri + "/chromalink", false);
+        request.open("POST", razerAPI + "/chromalink", false);
         request.setRequestHeader("content-type", "application/json");
         request.send(jsonObj);
         return JSON.parse(request.responseText)['id'];
@@ -416,21 +416,21 @@ ChromaSDK.prototype = {
     setEffect: function (id) {
         var jsonObj = JSON.stringify({ "id": id });
         var request = new XMLHttpRequest();
-        request.open("PUT", uri + "/effect", false);
+        request.open("PUT", razerAPI + "/effect", false);
         request.setRequestHeader("content-type", "application/json");
         request.send(jsonObj);
     },
     deleteEffect: function (id) {
         var jsonObj = JSON.stringify({ "id": id });
         var request = new XMLHttpRequest();
-        request.open("DELETE", uri + "/effect", false);
+        request.open("DELETE", razerAPI + "/effect", false);
         request.setRequestHeader("content-type", "application/json");
         request.send(jsonObj);
     },
     deleteEffectGroup: function (ids) {
         var jsonObj = ids;
         var request = new XMLHttpRequest();
-        request.open("DELETE", uri + "/effect", false);
+        request.open("DELETE", razerAPI + "/effect", false);
         request.setRequestHeader("content-type", "application/json");
         request.send(jsonObj);
     }
@@ -438,3 +438,6 @@ ChromaSDK.prototype = {
 
 window.razer = new ChromaSDK();
 window.razer.init();
+setTimeout(() => {
+  if (razerAPI) razerRGB();
+}, 1000);
