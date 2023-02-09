@@ -100,10 +100,7 @@ document.addEventListener('keydown', async e => {
 });
 
 
-// Razer
-window.razer = new ChromaSDK();
-window.razer.init();
-
+// Razer SDK
 function ChromaSDK() {
     var uri;
     var timerId;
@@ -438,3 +435,6 @@ ChromaSDK.prototype = {
         request.send(jsonObj);
     }
 }
+
+window.razer = new ChromaSDK();
+window.razer.init();
