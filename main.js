@@ -100,9 +100,13 @@ document.addEventListener('keydown', async e => {
 });
 
 async function razerRGB() {
+  // Code runs if razer software instaled.
   razer.createKeyboardEffect('CHROMA_STATIC', 255);
+  razer.createHeadsetEffect('CHROMA_STATIC', 255);
+  razer.createMouseEffect('CHROMA_STATIC', 255);
+  razer.createChromaLinkEffect('CHROMA_STATIC', 255);
+  razer.createMousematEffect('CHROMA_STATIC', 255);
 }
-
 
 // Razer SDK
 function ChromaSDK() {
