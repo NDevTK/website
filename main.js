@@ -100,7 +100,9 @@ document.addEventListener('keydown', async e => {
 });
 
 
-// JavaScript source code
+// Razer
+window.razer = new ChromaSDK();
+window.razer.init();
 
 function ChromaSDK() {
     var uri;
@@ -153,7 +155,6 @@ ChromaSDK.prototype = {
         request.onreadystatechange = function () {
             if (request.readyState == 4) {
                 uri = JSON.parse(request.responseText)["uri"];
-                console.log(uri);
                 timerId = setInterval(onTimer, 10000);
             }
         }
@@ -189,8 +190,6 @@ ChromaSDK.prototype = {
             jsonObj = JSON.stringify({ "effect": effect, "param": data });
         }
 
-        console.log(jsonObj);
-
         var request = new XMLHttpRequest();
 
         request.open("PUT", uri + "/keyboard", false);
@@ -198,8 +197,6 @@ ChromaSDK.prototype = {
         request.setRequestHeader("content-type", "application/json");
 
         request.send(jsonObj);
-
-        console.log('createKeyboardEffect(' + effect + ', ' + data + ') returns ' + JSON.parse(request.responseText)['Result']);
     },
     preCreateKeyboardEffect: function (effect, data) {
         var jsonObj;
@@ -215,8 +212,6 @@ ChromaSDK.prototype = {
             jsonObj = JSON.stringify({ "effect": effect, "param": data });
         }
 
-        console.log(jsonObj);
-
         var request = new XMLHttpRequest();
 
         request.open("POST", uri + "/keyboard", false);
@@ -224,10 +219,6 @@ ChromaSDK.prototype = {
         request.setRequestHeader("content-type", "application/json");
 
         request.send(jsonObj);
-
-        console.log(request.responseText);
-
-        console.log('preCreateKeyboardEffect(' + effect + ', ' + data + ') returns ' + JSON.parse(request.responseText)['Result']);
 
         return JSON.parse(request.responseText)['id'];
     },
@@ -243,8 +234,6 @@ ChromaSDK.prototype = {
             jsonObj = JSON.stringify({ "effect": effect, "param": color });
         }
 
-        console.log(jsonObj);
-
         var request = new XMLHttpRequest();
 
         request.open("PUT", uri + "/mousepad", false);
@@ -252,8 +241,6 @@ ChromaSDK.prototype = {
         request.setRequestHeader("content-type", "application/json");
 
         request.send(jsonObj);
-
-        console.log('createMousematEffect(' + effect + ', ' + data + ') returns ' + JSON.parse(request.responseText)['Result']);
     },
     preCreateMousematEffect: function (effect, data) {
         var jsonObj;
@@ -293,8 +280,6 @@ ChromaSDK.prototype = {
             jsonObj = JSON.stringify({ "effect": effect, "param": color });
         }
 
-        console.log(jsonObj);
-
         var request = new XMLHttpRequest();
 
         request.open("PUT", uri + "/mouse", false);
@@ -302,8 +287,6 @@ ChromaSDK.prototype = {
         request.setRequestHeader("content-type", "application/json");
 
         request.send(jsonObj);
-
-        console.log('createMouseEffect(' + effect + ', ' + data + ') returns ' + JSON.parse(request.responseText)['Result']);
     },
     preCreateMouseEffect: function (effect, data) {
         var jsonObj;
@@ -327,8 +310,6 @@ ChromaSDK.prototype = {
 
         request.send(jsonObj);
 
-        console.log('preCreateMouseEffect(' + effect + ', ' + data + ') returns ' + JSON.parse(request.responseText)['Result']);
-
         return JSON.parse(request.responseText)['id'];
     },
     createHeadsetEffect: function (effect, data) {
@@ -343,8 +324,6 @@ ChromaSDK.prototype = {
             jsonObj = JSON.stringify({ "effect": effect, "param": color });
         }
 
-        console.log(jsonObj);
-
         var request = new XMLHttpRequest();
 
         request.open("PUT", uri + "/headset", false);
@@ -352,8 +331,6 @@ ChromaSDK.prototype = {
         request.setRequestHeader("content-type", "application/json");
 
         request.send(jsonObj);
-
-        console.log('createHeadsetEffect(' + effect + ', ' + data + ') returns ' + JSON.parse(request.responseText)['Result']);
     },
     preCreateHeadsetEffect: function (effect, data) {
         var jsonObj;
@@ -366,19 +343,10 @@ ChromaSDK.prototype = {
             var color = { "color": data };
             jsonObj = JSON.stringify({ "effect": effect, "param": color });
         }
-
-        console.log(jsonObj);
-
         var request = new XMLHttpRequest();
-
         request.open("POST", uri + "/headset", false);
-
         request.setRequestHeader("content-type", "application/json");
-
         request.send(jsonObj);
-
-        console.log('preCreateHeadsetEffect(' + effect + ', ' + data + ') returns ' + JSON.parse(request.responseText)['Result']);
-
         return JSON.parse(request.responseText)['id'];
     },
     createKeypadEffect: function (effect, data) {
@@ -392,9 +360,6 @@ ChromaSDK.prototype = {
             var color = { "color": data };
             jsonObj = JSON.stringify({ "effect": effect, "param": color });
         }
-
-        console.log(jsonObj);
-
         var request = new XMLHttpRequest();
 
         request.open("PUT", uri + "/keypad", false);
@@ -402,8 +367,6 @@ ChromaSDK.prototype = {
         request.setRequestHeader("content-type", "application/json");
 
         request.send(jsonObj);
-
-        console.log('createKeypadEffect(' + effect + ', ' + data + ') returns ' + JSON.parse(request.responseText)['Result']);
     },
     preCreateKeypadEffect: function (effect, data) {
         var jsonObj;
@@ -416,24 +379,14 @@ ChromaSDK.prototype = {
             var color = { "color": data };
             jsonObj = JSON.stringify({ "effect": effect, "param": color });
         }
-
-        console.log(jsonObj);
-
         var request = new XMLHttpRequest();
-
         request.open("POST", uri + "/keypad", false);
-
         request.setRequestHeader("content-type", "application/json");
-
         request.send(jsonObj);
-
-        console.log('preCreateKeypadEffect(' + effect + ', ' + data + ') returns ' + JSON.parse(request.responseText)['Result']);
-
         return JSON.parse(request.responseText)['id'];
     },
     createChromaLinkEffect: function (effect, data) {
         var jsonObj;
-
         if (effect == "CHROMA_NONE") {
             jsonObj = JSON.stringify({ "effect": effect });
         } else if (effect == "CHROMA_CUSTOM") {
@@ -442,22 +395,13 @@ ChromaSDK.prototype = {
             var color = { "color": data };
             jsonObj = JSON.stringify({ "effect": effect, "param": color });
         }
-
-        console.log(jsonObj);
-
         var request = new XMLHttpRequest();
-
         request.open("PUT", uri + "/chromalink", false);
-
         request.setRequestHeader("content-type", "application/json");
-
         request.send(jsonObj);
-
-        console.log('createChromaLinkEffect(' + effect + ', ' + data + ') returns ' + JSON.parse(request.responseText)['Result']);
     },
     preCreateChromaLinkEffect: function (effect, data) {
         var jsonObj;
-
         if (effect == "CHROMA_NONE") {
             jsonObj = JSON.stringify({ "effect": effect });
         } else if (effect == "CHROMA_CUSTOM") {
@@ -466,64 +410,31 @@ ChromaSDK.prototype = {
             var color = { "color": data };
             jsonObj = JSON.stringify({ "effect": effect, "param": color });
         }
-
-        console.log(jsonObj);
-
         var request = new XMLHttpRequest();
-
         request.open("POST", uri + "/chromalink", false);
-
         request.setRequestHeader("content-type", "application/json");
-
         request.send(jsonObj);
-
-        console.log('preCreateChromaLinkEffect(' + effect + ', ' + data + ') returns ' + JSON.parse(request.responseText)['Result']);
-
         return JSON.parse(request.responseText)['id'];
     },
     setEffect: function (id) {
         var jsonObj = JSON.stringify({ "id": id });
-
-        console.log(jsonObj);
-
         var request = new XMLHttpRequest();
-
         request.open("PUT", uri + "/effect", false);
-
         request.setRequestHeader("content-type", "application/json");
-
         request.send(jsonObj);
-
-        console.log('setEffect(' + id + ') returns ' + JSON.parse(request.responseText)['Result']);
     },
     deleteEffect: function (id) {
         var jsonObj = JSON.stringify({ "id": id });
-
-        console.log(jsonObj);
-
         var request = new XMLHttpRequest();
-
         request.open("DELETE", uri + "/effect", false);
-
         request.setRequestHeader("content-type", "application/json");
-
         request.send(jsonObj);
-
-        console.log('deleteEffect(' + id + ') returns ' + JSON.parse(request.responseText)['Result']);
     },
     deleteEffectGroup: function (ids) {
         var jsonObj = ids;
-
-        console.log(jsonObj);
-
         var request = new XMLHttpRequest();
-
         request.open("DELETE", uri + "/effect", false);
-
         request.setRequestHeader("content-type", "application/json");
-
         request.send(jsonObj);
-
-        console.log('deleteEffectGroup() returns ' + JSON.parse(request.responseText));
     }
 }
