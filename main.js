@@ -135,11 +135,11 @@ ChromaSDK.prototype = {
         request.setRequestHeader("content-type", "application/json");
 
         var data = JSON.stringify({
-            "title": "Razer Chroma SDK Sample Application",
-            "description": "Razer Chroma SDK Sample Application",
+            "title": "NDevTK",
+            "description": "NDevTK website",
             "author": {
-                "name": "Chroma Developer",
-                "contact": "www.razerzone.com"
+                "name": "NDevTK",
+                "contact": "ndev.tk"
             },
             "device_supported": [
                 "keyboard",
