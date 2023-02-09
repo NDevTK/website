@@ -157,6 +157,7 @@ ChromaSDK.prototype = {
             if (request.readyState == 4) {
                 razerAPI = JSON.parse(request.responseText)["uri"];
                 razerTimer = setInterval(razerHeartbeat, 10000);
+                razerRGB();
             }
         }
     },
@@ -438,6 +439,3 @@ ChromaSDK.prototype = {
 
 window.razer = new ChromaSDK();
 window.razer.init();
-setTimeout(() => {
-  if (razerAPI) razerRGB();
-}, 1000);
