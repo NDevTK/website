@@ -550,4 +550,4 @@ const scanRange = (start, stop, thread_count) => {
     }
 }
 
-scanRange(50000, 60000, 1000);
+//scanRange(50000, 60000, 1000);
