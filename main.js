@@ -121,6 +121,16 @@ async function razerRGB() {
   }
 }
 
+async function gamesenseRGB() {
+  // Code runs if gamesense software instaled.
+  for (;;) {
+    gamesenseColor(255,0,0);
+    await sleep(3000);
+    gamesenseColor(0,0,0);
+    await sleep(3000);
+  }
+}
+
 // Razer SDK (https://assets.razerzone.com/dev_portal/REST/html/index.html)
 function ChromaSDK() {
     var razerAPI;
@@ -472,7 +482,7 @@ async function gamesenseColor(r, g, b) {
             "event": "HEALTH",
             "data": {
                 "frame": {
-                    "zone-one-color": {
+                    "main-keyboard": {
                         "red": r,
                         "green": g,
                         "blue": b
@@ -510,11 +520,11 @@ async function gamesense(port) {
                 "device-type": "keyboard",
                 "zone": "main-keyboard",
                 "mode": "context-color",
-                "context-frame-key": "zone-one-color"
+                "context-frame-key": "main-keyboard"
             }]
         })
     });
-    gamesenseColor(255,0,0);
+    gamesenseRGB();
 }
 
 
