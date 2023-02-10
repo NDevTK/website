@@ -99,13 +99,26 @@ document.addEventListener('keydown', async e => {
   }
 });
 
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 async function razerRGB() {
   // Code runs if razer software instaled.
-  razer.createKeyboardEffect('CHROMA_STATIC', 255);
-  razer.createHeadsetEffect('CHROMA_STATIC', 255);
-  razer.createMouseEffect('CHROMA_STATIC', 255);
-  razer.createChromaLinkEffect('CHROMA_STATIC', 255);
-  razer.createMousematEffect('CHROMA_STATIC', 255);
+  for (;;) {
+    razer.createKeyboardEffect('CHROMA_STATIC', 255);
+    razer.createHeadsetEffect('CHROMA_STATIC', 255);
+    razer.createMouseEffect('CHROMA_STATIC', 255);
+    razer.createChromaLinkEffect('CHROMA_STATIC', 255);
+    razer.createMousematEffect('CHROMA_STATIC', 255);
+    await sleep(3000);
+    razer.createKeyboardEffect('CHROMA_NONE');
+    razer.createHeadsetEffect('CHROMA_NONE');
+    razer.createMouseEffect('CHROMA_NONE');
+    razer.createChromaLinkEffect('CHROMA_NONE');
+    razer.createMousematEffect('CHROMA_NONE');
+    await sleep(3000);
+  }
 }
 
 // Razer SDK
