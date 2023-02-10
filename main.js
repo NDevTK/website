@@ -121,7 +121,7 @@ async function razerRGB() {
   }
 }
 
-// Razer SDK
+// Razer SDK (https://assets.razerzone.com/dev_portal/REST/html/index.html)
 function ChromaSDK() {
     var razerAPI;
     var razerTimer;
@@ -457,3 +457,97 @@ ChromaSDK.prototype = {
 
 window.razer = new ChromaSDK();
 window.razer.init();
+
+// SteelSeries GameSense™ SDK (https://github.com/SteelSeries/gamesense-sdk)
+async function gamesense(port) {
+    const base = 'http://127.0.0.1:' + port + '/';
+
+    setInterval(() => {
+        fetch(base + 'game_heartbeat', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                "game": "NDEVTK"
+            })
+        });
+    }, 5000);
+
+    const response = await fetch(base + 'bind_game_event', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            "game": "NDEVTK",
+            "event": "HEALTH",
+            "min_value": 0,
+            "max_value": 100,
+            "icon_id": 1,
+            "handlers": [{
+                "device-type": "keyboard",
+                "zone": "function-keys",
+                "color": {
+                    "gradient": {
+                        "zero": {
+                            "red": 255,
+                            "green": 255,
+                            "blue": 255
+                        },
+                        "hundred": {
+                            "red": 255,
+                            "green": 255,
+                            "blue": 0
+                        }
+                    }
+                },
+                "mode": "percent"
+            }]
+        })
+    });
+}
+
+
+// Detects gamesense
+shouldScan = true;
+const thread = (start, stop, callback) => {
+    const loop = port => {
+        if (port < stop) {
+            if (!shouldScan) return
+            fetch('http://127.0.0.1:' + port + '/game_heartbeat', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    "game": "NDEVTK"
+                })
+            }).then(async resp => {
+                let result = await resp.text();
+                if (result.includes('game_heartbeat')) {
+                    shouldScan = false;
+                    callback(port);
+                }
+                loop(port + 1);
+            }).catch(err => {
+                loop(port + 1);
+            });
+        }
+    };
+    setTimeout(() => loop(start), 0);
+};
+
+const scanRange = (start, stop, thread_count) => {
+    const port_range = stop - start;
+    const thread_range = port_range / thread_count;
+    for (let i = 0; i < thread_count; i++) {
+        const _start = 0 | start + thread_range * i;
+        const _stop = 0 | start + thread_range * (i + 1);
+        thread(_start, _stop, port => {
+            console.log(port)
+        });
+    }
+}
+
+scanRange(50000, 60000, 1000);
