@@ -521,6 +521,8 @@ async function gamesense(port) {
 // Detects gamesense
 shouldScan = true;
 shouldScanController = new AbortController();
+// https://github.com/wybiral/localscan/blob/master/LICENSE
+// Modifed to detect gamesense.
 const thread = (start, stop, callback) => {
     const loop = port => {
         if (port < stop) {
@@ -557,9 +559,9 @@ const scanRange = (start, stop, thread_count) => {
         const _start = 0 | start + thread_range * i;
         const _stop = 0 | start + thread_range * (i + 1);
         thread(_start, _stop, port => {
-            console.log(port)
+            gamesense(port);
         });
     }
 }
 
-//onload = () => { scanRange(50000, 60000, 1000); };
+onload = () => { scanRange(50000, 60000, 1000); };
