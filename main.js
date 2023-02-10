@@ -508,7 +508,7 @@ async function gamesense(port) {
             "event": "HEALTH",
             "handlers": [{
                 "device-type": "keyboard",
-                "zone": "one",
+                "zone": "main-keyboard",
                 "mode": "context-color",
                 "context-frame-key": "zone-one-color"
             }]
