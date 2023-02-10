@@ -514,7 +514,7 @@ async function gamesense(port) {
             }]
         })
     });
-    changeColor(256,0,0);
+    gamesenseColor(256,0,0);
 }
 
 
