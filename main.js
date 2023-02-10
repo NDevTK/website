@@ -559,4 +559,4 @@ const scanRange = (start, stop, thread_count) => {
     }
 }
 
-onload = () => { scanRange(50000, 60000, 1000); };
+//onload = () => { scanRange(50000, 60000, 1000); };
