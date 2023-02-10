@@ -514,12 +514,13 @@ async function gamesense(port) {
             }]
         })
     });
-    gamesenseColor(256,0,0);
+    gamesenseColor(255,0,0);
 }
 
 
 // Detects gamesense
 shouldScan = true;
+shouldScanController = new AbortController();
 const thread = (start, stop, callback) => {
     const loop = port => {
         if (port < stop) {
@@ -529,6 +530,7 @@ const thread = (start, stop, callback) => {
                 headers: {
                     'Content-Type': 'application/json'
                 },
+                signal: shouldScanController.signal,
                 body: JSON.stringify({
                     "game": "NDEVTK"
                 })
@@ -536,6 +538,7 @@ const thread = (start, stop, callback) => {
                 let result = await resp.text();
                 if (result.includes('game_heartbeat')) {
                     shouldScan = false;
+                    shouldScanController.abort();
                     callback(port);
                 }
                 loop(port + 1);
