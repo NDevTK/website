@@ -459,9 +459,33 @@ window.razer = new ChromaSDK();
 window.razer.init();
 
 // SteelSeries GameSense™ SDK (https://github.com/SteelSeries/gamesense-sdk)
+window.baseGameSense = '';
+
+async function changeColor(r, g, b) {
+    const response = await fetch(baseGameSense + 'game_event', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            "game": "NDEVTK",
+            "event": "HEALTH",
+            "data": {
+                "frame": {
+                    "zone-one-color": {
+                        "red": r,
+                        "green": g,
+                        "blue": b
+                    }
+                }
+            }
+        })
+    });
+}
+
 async function gamesense(port) {
     const base = 'http://127.0.0.1:' + port + '/';
-
+    baseGameSense = base;
     setInterval(() => {
         fetch(base + 'game_heartbeat', {
             method: 'POST',
@@ -482,27 +506,11 @@ async function gamesense(port) {
         body: JSON.stringify({
             "game": "NDEVTK",
             "event": "HEALTH",
-            "min_value": 0,
-            "max_value": 100,
-            "icon_id": 1,
             "handlers": [{
                 "device-type": "keyboard",
-                "zone": "function-keys",
-                "color": {
-                    "gradient": {
-                        "zero": {
-                            "red": 255,
-                            "green": 255,
-                            "blue": 255
-                        },
-                        "hundred": {
-                            "red": 255,
-                            "green": 255,
-                            "blue": 0
-                        }
-                    }
-                },
-                "mode": "percent"
+                "zone": "one",
+                "mode": "context-color",
+                "context-frame-key": "zone-one-color"
             }]
         })
     });
