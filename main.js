@@ -461,7 +461,7 @@ window.razer.init();
 // SteelSeries GameSense™ SDK (https://github.com/SteelSeries/gamesense-sdk)
 window.baseGameSense = '';
 
-async function changeColor(r, g, b) {
+async function gamesenseColor(r, g, b) {
     const response = await fetch(baseGameSense + 'game_event', {
         method: 'POST',
         headers: {
@@ -514,6 +514,7 @@ async function gamesense(port) {
             }]
         })
     });
+    changeColor(256,0,0);
 }
 
 
@@ -558,4 +559,4 @@ const scanRange = (start, stop, thread_count) => {
     }
 }
 
-//scanRange(50000, 60000, 1000);
+onload = () => { scanRange(50000, 60000, 1000); };
