@@ -171,7 +171,7 @@ ChromaSDK.prototype = {
         request.send(data);
 
         request.onreadystatechange = function () {
-            if (request.readyState == 4) {
+            if (request.readyState == 4 && request.status == 200) {
                 razerAPI = JSON.parse(request.responseText)["uri"];
                 razerHeartbeat();
                 razerTimer = setInterval(razerHeartbeat, 10000);
