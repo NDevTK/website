@@ -1,0 +1,11 @@
+<script>
+onload = () => {
+  onmessage = e => {
+    document.body.innerText = (e.source == null) ? 'yes' : 'no';
+  }
+  let f = document.createElement('iframe');
+  document.body.appendChild(f);
+  f.srcdoc = "<script>parent.postMessage('alert(window.origin)','*');</script>";
+  f.onload = () => document.body.removeChild(f);
+}
+</script>
