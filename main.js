@@ -527,51 +527,65 @@ async function gamesense(port) {
     gamesenseRGB();
 }
 
-
-// Detects gamesense
-shouldScan = true;
-shouldScanController = new AbortController();
-// https://github.com/wybiral/localscan/blob/master/LICENSE
-// Modifed to detect gamesense.
-const thread = (start, stop, callback) => {
+function worker_function() {
+  // Detects gamesense
+  shouldScan = true;
+  shouldScanController = new AbortController();
+  // https://github.com/wybiral/localscan/blob/master/LICENSE
+  // Modifed to detect gamesense.
+  const thread = (start, stop, callback) => {
     const loop = port => {
-        if (port < stop) {
-            if (!shouldScan) return
-            fetch('http://127.0.0.1:' + port + '/game_heartbeat', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                signal: shouldScanController.signal,
-                body: JSON.stringify({
-                    "game": "NDEVTK"
-                })
-            }).then(async resp => {
-                let result = await resp.text();
-                if (result.includes('game_heartbeat')) {
-                    shouldScan = false;
-                    shouldScanController.abort();
-                    callback(port);
-                }
-                loop(port + 1);
-            }).catch(err => {
-                loop(port + 1);
-            });
-        }
+      if (port < stop) {
+        if (!shouldScan) return
+        fetch('http://127.0.0.1:' + port + '/game_heartbeat', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          signal: shouldScanController.signal,
+          body: JSON.stringify({
+            "game": "NDEVTK"
+          })
+        }).then(async resp => {
+          let result = await resp.text();
+          if (result.includes('game_heartbeat')) {
+            shouldScan = false;
+            shouldScanController.abort();
+            callback(port);
+          }
+          loop(port + 1);
+        }).catch(err => {
+          loop(port + 1);
+        });
+      }
     };
     setTimeout(() => loop(start), 0);
-};
-
-const scanRange = (start, stop, thread_count) => {
+  };
+  
+  const scanRange = (start, stop, thread_count) => {
     const port_range = stop - start;
     const thread_range = port_range / thread_count;
     for (let i = 0; i < thread_count; i++) {
-        const _start = 0 | start + thread_range * i;
-        const _stop = 0 | start + thread_range * (i + 1);
-        thread(_start, _stop, port => {
-            gamesense(port);
-        });
+      const _start = 0 | start + thread_range * i;
+      const _stop = 0 | start + thread_range * (i + 1);
+      thread(_start, _stop, port => {
+        self.postMessage(port);
+      });
     }
+  }
+  
+  scanRange(50000, 60000, 1000);
 }
 
-onload = () => { scanRange(50000, 60000, 1000); };
+// Create the WebWorker from the JS function and invoke it
+const worker = new Worker(
+  URL.createObjectURL(
+    new Blob([`(${worker_function})()`], {
+      type: "text/javascript"
+    }))
+);
+
+worker.onmessage = e => {
+  gamesense(e.data);
+  worker.close();
+}
