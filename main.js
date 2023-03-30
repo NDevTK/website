@@ -26,10 +26,6 @@ function Custom() {
   window.location.href = "https://random.ndev.tk/?subject="+encodeURIComponent(subject);
 }
 
-function getRandom(max, min = 0) {
-  return Math.random() * (max - min) + min;
-}
-
 function popunder(url) {
   return new Promise(r => {
     if (agent.has("Chromium")) {
