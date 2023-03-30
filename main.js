@@ -55,7 +55,7 @@ function randomInteger(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
-if (randomInteger(3, 133) === 007) {
+if (randomInteger(3, 133) === 7) {
   // Opt out
   if (window.name === 'notroll') return
   window.name = 'notroll';
