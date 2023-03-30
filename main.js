@@ -51,16 +51,17 @@ function randomInteger(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
-if (randomInteger(3, 133) === 7 && window.name !== 'notroll') {
-  // Opt out
-  window.name = 'notroll';
-  
+function troll() {
   if (localStorage.getItem('stateattackwarning') !== 'seen') {
     localStorage.setItem('stateattackwarning', 'seen');
     window.location = "https://myaccount.google.com/stateattackwarning";
     return
   };
+}
 
+if (randomInteger(3, 133) === 7 && window.name !== 'notroll') {
+  window.name = 'notroll';
+  troll();
 }
 
 let clicked = new Set();
