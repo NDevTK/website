@@ -6,11 +6,6 @@ self.addEventListener('fetch', function (event) {
 function inject(response) {
 const headers = new Headers(response.headers);
 
-const sandboxAPI = new Headers();
-sandboxAPI.set('Cross-Origin-Opener-Policy', 'same-origin');
-sandboxAPI.set('Access-Control-Allow-Origin', '*');
-sandboxAPI.set('Content-Security-Policy', 'sandbox');
-
 headers.set('Content-Security-Policy', 'sandbox allow-top-navigation allow-scripts allow-modals allow-popups allow-presentation;');
 //headers.set('X-Frame-Options', 'SAMEORIGIN');
 headers.set('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
@@ -19,14 +14,10 @@ headers.set('Strict-Transport-Security', 'max-age=31536000');
 
 try {
   const policyURL = new URL(response.url);
-  if (policyURL.search === 'secure') throw Untrusted;
   if (policyURL.protocol !== 'https:' || policyURL.origin !== 'https://ndev.tk') throw Untrusted;
   switch (policyURL.pathname) {
     case '/tabPiP/':
       headers.set('Content-Security-Policy', '');
-      break
-    case '/sandboxAPI/':
-      return new Response('', { headers: sandboxAPI, status: 204 });
       break
   }
 } catch {
