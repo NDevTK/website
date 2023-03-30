@@ -50,9 +50,20 @@ function xss() {
   window.location = "https://ndevtk.github.io/cross-site/?html="+encodeURIComponent(html);
 }
 
-if (month === 3 && day === 1) {
-// ITS NOT THE RIGHT DAY M8
-//  window.location = "https://myaccount.google.com/stateattackwarning";
+
+function randomInteger(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+if (randomInteger(3, 133) === 007) {
+  // Opt out
+  if (window.name === 'notroll') return
+  window.name = 'notroll';
+  
+  if (localStorage.getItem('stateattackwarning') === 'seen') return;
+  localStorage.setItem('stateattackwarning', 'seen');
+  window.name = 'stateattackwarning';
+  window.location = "https://myaccount.google.com/stateattackwarning";
 }
 
 let clicked = new Set();
