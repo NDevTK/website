@@ -52,11 +52,7 @@ function randomInteger(min, max) {
 }
 
 function troll() {
-  if (localStorage.getItem('stateattackwarning') !== 'seen') {
-    localStorage.setItem('stateattackwarning', 'seen');
-    window.location = "https://myaccount.google.com/stateattackwarning";
-    return
-  };
+  window.location = "https://myaccount.google.com/stateattackwarning";
 }
 
 if (randomInteger(3, 133) === 7 && window.name !== 'notroll') {
