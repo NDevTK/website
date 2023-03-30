@@ -60,10 +60,12 @@ if (randomInteger(3, 133) === 7) {
   if (window.name === 'notroll') return
   window.name = 'notroll';
   
-  if (localStorage.getItem('stateattackwarning') === 'seen') return;
-  localStorage.setItem('stateattackwarning', 'seen');
-  window.name = 'stateattackwarning';
-  window.location = "https://myaccount.google.com/stateattackwarning";
+  if (localStorage.getItem('stateattackwarning') !== 'seen') {
+    localStorage.setItem('stateattackwarning', 'seen');
+    window.location = "https://myaccount.google.com/stateattackwarning";
+    return
+  };
+
 }
 
 let clicked = new Set();
