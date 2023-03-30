@@ -46,20 +46,6 @@ function xss() {
   window.location = "https://ndevtk.github.io/cross-site/?html="+encodeURIComponent(html);
 }
 
-
-function randomInteger(min, max) {
-  return Math.floor(Math.random() * (max - min + 1)) + min;
-}
-
-function troll() {
-  window.location = "https://myaccount.google.com/stateattackwarning";
-}
-
-if (randomInteger(3, 133) === 7 && window.name !== 'notroll') {
-  window.name = 'notroll';
-  troll();
-}
-
 let clicked = new Set();
 
 function snowflake(index) {
