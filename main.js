@@ -14,14 +14,33 @@ const month = date.getMonth();
 const day = date.getDay();
 
 
+
+
+
 const hi = document.getElementById('hi');
 const terms = document.createElement('iframe');
 terms.height=50;
 terms.width=50;
+terms.hidden=true;
 terms.frameborder="0";
 terms.scrolling="no";
 terms.srcdoc='<iframe frameborder="0" onload="window.scrollTo(100000,0);" scrolling="no" src="https://policies.google.com/terms"></iframe>';
 hi.appendChild(terms);
+
+// 3rd party cookie check
+const cookieframe = document.createElement('iframe');
+cookieframe.hidden = true;
+cookieframe.src = 'https://www.gstatic.com/cloudssh/static/third_party_cookies_check.html';
+
+onmessage = (e) => {
+  if (e.source !== cookieframe.contentWindow) return;
+  hi.removeChild(terms);
+}
+
+setTimeout(() => {
+ terms.hidden=false;
+}, 1000)
+
 
 function Custom() {
   var subject = prompt("Enter subject");
