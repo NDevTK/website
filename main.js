@@ -101,6 +101,7 @@ function snowflake(index) {
 }
 
 function changeSnowflake(userSnowflake = '🦆') {
+    if (userSnowflake === null) return;
     const snowflakes = document.getElementsByClassName('snowflake');
     for (const snowflake of snowflakes) {
         snowflake.innerText = userSnowflake;
