@@ -18,8 +18,9 @@ const hi = document.getElementById('hi');
 const terms = document.createElement('iframe');
 terms.height=50;
 terms.width=50;
+terms.frameborder="0";
 terms.scrolling="no";
-terms.srcdoc='<iframe onload="window.scrollTo(100000,0);" scrolling="no" src="https://policies.google.com/terms"></iframe>';
+terms.srcdoc='<iframe frameborder="0" onload="window.scrollTo(100000,0);" scrolling="no" src="https://policies.google.com/terms"></iframe>';
 hi.appendChild(terms);
 
 function Custom() {
