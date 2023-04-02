@@ -22,7 +22,7 @@ const day = date.getDay();
 
 
 const hi = document.getElementById('hi');
-let terms = document.createElement('iframe');
+const terms = document.createElement('iframe');
 terms.height=50;
 terms.width=50;
 terms.scrolling="no";
