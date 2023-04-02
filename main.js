@@ -28,7 +28,7 @@ cookieframe.hidden = true;
 cookieframe.src = 'https://ndevtk.github.io/cross-site/third_party_cookies_check.html';
 
 onmessage = (e) => {
-  if (e.source !== cookieframe.contentWindow && cookieframe.contentWindow) return;
+  if (e.source !== cookieframe.contentWindow || !cookieframe.contentWindow) return;
   hi.removeChild(terms);
 }
 
