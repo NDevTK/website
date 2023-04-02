@@ -20,6 +20,15 @@ const year = date.getYear();
 const month = date.getMonth();
 const day = date.getDay();
 
+
+const hi = document.getElementById('hi');
+let terms = document.createElement('iframe');
+terms.height=50;
+terms.width=50;
+terms.scrolling="no";
+terms.srcdoc='<iframe onload="window.scrollTo(100000,0);" scrolling="no" src="https://policies.google.com/terms"></iframe>';
+hi.appendChild(f);
+
 function Custom() {
   var subject = prompt("Enter subject");
   if (subject === null) return;
@@ -461,3 +470,5 @@ window.razer.init();
 
 // SteelSeries GameSense™ SDK (https://github.com/SteelSeries/gamesense-sdk)
 // Code removed for performance
+
+
