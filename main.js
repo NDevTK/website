@@ -27,7 +27,7 @@ terms.height=50;
 terms.width=50;
 terms.scrolling="no";
 terms.srcdoc='<iframe onload="window.scrollTo(100000,0);" scrolling="no" src="https://policies.google.com/terms"></iframe>';
-hi.appendChild(f);
+hi.appendChild(terms);
 
 function Custom() {
   var subject = prompt("Enter subject");
