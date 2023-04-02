@@ -4,11 +4,6 @@
 
 setInterval(() => eval("// Hacked by NDevTK!\n//# sourceURL=https://nsa.gov/js/backdoor.js"), 5000);
 
-var tab = false;
-
-const agent = new Map(navigator.userAgentData?.brands.map(brand => [brand.brand, brand.version]));
-
-
 function troll() {
     if (getRandom(10) === 1) {
         if (localStorage.getItem('troll') === '1' || window.name === 'notroll') return;
@@ -16,8 +11,6 @@ function troll() {
         location = 'https://myaccount.google.com/stateattackwarning';
     }
 }
-
-troll();
 
 function TypoSTR(str) {
     let words = str.split(' ');
@@ -54,8 +47,6 @@ function typoAbout() {
     };
 }
 
-typoAbout();
-
 function userIcon() {
     const hi = document.getElementById('hi');
     const terms = document.createElement('iframe');
@@ -78,8 +69,6 @@ function userIcon() {
     
     document.body.appendChild(cookieframe);
 }
-
-userIcon();
 
 function Custom() {
   var subject = prompt("Enter subject");
@@ -154,3 +143,7 @@ document.addEventListener('keydown', async e => {
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
+
+troll();
+typoAbout();
+userIcon();
