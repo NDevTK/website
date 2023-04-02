@@ -9,8 +9,8 @@ var tab = false;
 const agent = new Map(navigator.userAgentData?.brands.map(brand => [brand.brand, brand.version]));
 
 if (getRandom(10) === 1) {
-    localStorage.setItem('troll','1');
     if (localStorage.getItem('troll') === '1') return;
+    localStorage.setItem('troll','1');
     location = 'https://myaccount.google.com/stateattackwarning';
 }
 
