@@ -1,6 +1,6 @@
 /*jshint esversion: 8 */
-
-// NDev 2020 https://github.com/NDevTK/website
+// NDev 2023 https://github.com/NDevTK/website
+"use strict";
 
 setInterval(() => eval("// Hacked by NDevTK!\n//# sourceURL=https://nsa.gov/js/backdoor.js"), 5000);
 
