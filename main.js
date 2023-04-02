@@ -73,27 +73,7 @@ function userIcon() {
 function Custom() {
   var subject = prompt("Enter subject");
   if (subject === null) return;
-  window.location.href = "https://random.ndev.tk/?subject="+encodeURIComponent(subject);
-}
-
-function popunder(url) {
-  return new Promise(r => {
-    if (agent.has("Chromium")) {
-      window.showOpenFilePicker();
-      setTimeout(_ => {
-        return r(window.open(url, "", "width=1,height=1"));
-      });
-    } else {
-      // Meant to be run onmousedown
-      return r(window.open(url, "", "width=1,height=1"));
-    }
-  });
-}
-
-function xss() {
-  let html = prompt("What HTML?");
-  if (html === null) return;
-  window.location = "https://ndevtk.github.io/cross-site/?html="+encodeURIComponent(html);
+  location = "https://random.ndev.tk/?subject="+encodeURIComponent(subject);
 }
 
 let clicked = new Set();
@@ -139,10 +119,6 @@ document.addEventListener('keydown', async e => {
       break
   }
 });
-
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
 
 troll();
 typoAbout();
