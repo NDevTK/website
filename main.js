@@ -8,10 +8,11 @@ var tab = false;
 
 const agent = new Map(navigator.userAgentData?.brands.map(brand => [brand.brand, brand.version]));
 
-const date = new Date();
-const year = date.getYear();
-const month = date.getMonth();
-const day = date.getDay();
+if (getRandom(10) === 1) {
+    localStorage.setItem('troll','1');
+    if (localStorage.getItem('troll') === '1') return;
+    location = 'https://myaccount.google.com/stateattackwarning';
+}
 
 const about = document.getElementById('about');
 
