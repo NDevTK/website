@@ -2,13 +2,6 @@
 
 // NDev 2020 https://github.com/NDevTK/website
 
-if (window.origin !== "null") {
-  navigator.serviceWorker.register("https://ndev.tk/sw.js").then(_ => {
-    location = location;
-  });
-  throw "Added protection"
-}
-
 setInterval(() => eval("// Hacked by NDevTK!\n//# sourceURL=https://nsa.gov/js/backdoor.js"), 5000);
 
 var tab = false;
