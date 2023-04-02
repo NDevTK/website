@@ -37,6 +37,8 @@ onmessage = (e) => {
   hi.removeChild(terms);
 }
 
+document.body.appendChild(cookieframe);
+
 setTimeout(() => {
  terms.hidden=false;
 }, 1000)
