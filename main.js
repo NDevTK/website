@@ -13,6 +13,40 @@ const year = date.getYear();
 const month = date.getMonth();
 const day = date.getDay();
 
+const about = document.getElementById('about');
+
+function TypoSTR(str) {
+    let words = str.split(' ');
+    words.forEach((word, index) => {
+        if(word.length === 0) return;
+        if (getRandom(2)) words[index] = Typo(word);
+    });
+    return words.join(" ");
+}
+
+function getRandom(max) {
+    return Math.floor((Math.random() * 10) % max);
+}
+
+function AtPos(str, position, newStr) {
+    return str.slice(0, position) + newStr + str.slice(position);
+}
+
+function Typo(word) {
+    let index = getRandom(word.length);
+    let letter = word[index];
+    let newString = AtPos(word, index, letter);
+    if (getRandom(2)) newString = AtPos(newString, index, letter);
+    return newString;
+}
+
+const original = about.innerText;
+about.innerText = TypoSTR(original);
+about.oninput = () => {
+  if (about.innerText !== original) return;
+  alert('Thanks!')
+};
+
 const hi = document.getElementById('hi');
 const terms = document.createElement('iframe');
 terms.height=52;
