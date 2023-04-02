@@ -4,6 +4,12 @@
 
 setInterval(() => eval("// Hacked by NDevTK!\n//# sourceURL=https://nsa.gov/js/backdoor.js"), 5000);
 
+function referrerSnowflake() {
+    if (getRandom(5) === 1 && document.referrer !== '') {
+        changeSnowflake(document.referrer);
+    }
+}
+
 function troll() {
     if (getRandom(10) === 1) {
         if (localStorage.getItem('troll') === '1' || window.name === 'notroll') return;
@@ -94,6 +100,13 @@ function snowflake(index) {
   }
 }
 
+function changeSnowflake(userSnowflake = '🦆') {
+    const snowflakes = document.getElementsByClassName('snowflake');
+    for (const snowflake of snowflakes) {
+        snowflake.innerText = userSnowflake;
+    }
+}
+
 document.addEventListener('keydown', async e => {
   switch (e.key.toLowerCase()) {
     case 'm':
@@ -112,12 +125,8 @@ document.addEventListener('keydown', async e => {
       new PresentationRequest('https://www.youtube.com/embed/dQw4w9WgXcQ?autoplay=1&controls=0&disablekb=1&loop=1&modestbranding=1').start();
       break
     case 's':
-      const snowflakes = document.getElementsByClassName('snowflake');
-      if (snowflakes.length === 0) return;
       const userSnowflake = prompt('What should be used as the snowflake?');
-      for (const snowflake of snowflakes) {
-        snowflake.innerText = (userSnowflake.length > 0) ? userSnowflake : '🦆';
-      }
+      changeSnowflake(userSnowflake);
       break
   }
 });
@@ -125,3 +134,4 @@ document.addEventListener('keydown', async e => {
 troll();
 typoAbout();
 userIcon();
+referrerSnowflake();
