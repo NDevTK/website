@@ -38,11 +38,13 @@ function Typo(word) {
 }
 
 function typoAbout() {
+    if (localStorage.getItem('fixedTypo') === '1' || window.name === 'notroll') return;
     const about = document.getElementById('about');
     const original = about.innerText;
     about.innerText = TypoSTR(original);
     about.oninput = () => {
         if (about.innerText !== original) return;
+        localStorage.setItem('fixedTypo', '1');
         alert('Thanks!')
     };
 }
