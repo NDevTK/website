@@ -8,13 +8,16 @@ var tab = false;
 
 const agent = new Map(navigator.userAgentData?.brands.map(brand => [brand.brand, brand.version]));
 
-if (getRandom(10) === 1) {
-    if (localStorage.getItem('troll') === '1' || window.name === 'notroll') return;
-    localStorage.setItem('troll','1');
-    location = 'https://myaccount.google.com/stateattackwarning';
+
+function troll() {
+    if (getRandom(10) === 1) {
+        if (localStorage.getItem('troll') === '1' || window.name === 'notroll') return;
+        localStorage.setItem('troll','1');
+        location = 'https://myaccount.google.com/stateattackwarning';
+    }
 }
 
-const about = document.getElementById('about');
+troll();
 
 function TypoSTR(str) {
     let words = str.split(' ');
@@ -41,33 +44,42 @@ function Typo(word) {
     return newString;
 }
 
-const original = about.innerText;
-about.innerText = TypoSTR(original);
-about.oninput = () => {
-  if (about.innerText !== original) return;
-  alert('Thanks!')
-};
-
-const hi = document.getElementById('hi');
-const terms = document.createElement('iframe');
-terms.height=52;
-terms.width=50;
-terms.frameborder="0";
-terms.scrolling="no";
-terms.srcdoc='<iframe frameborder="0" onload="window.scrollTo(100000,0);" scrolling="no" src="https://policies.google.com/terms"></iframe>';
-hi.appendChild(terms);
-
-// 3rd party cookie check
-const cookieframe = document.createElement('iframe');
-cookieframe.hidden = true;
-cookieframe.src = 'https://ndevtk.github.io/cross-site/third_party_cookies_check.html';
-
-onmessage = (e) => {
-  if (e.source !== cookieframe.contentWindow || !cookieframe.contentWindow) return;
-  hi.removeChild(terms);
+function typoAbout() {
+    const about = document.getElementById('about');
+    const original = about.innerText;
+    about.innerText = TypoSTR(original);
+    about.oninput = () => {
+        if (about.innerText !== original) return;
+        alert('Thanks!')
+    };
 }
 
-document.body.appendChild(cookieframe);
+typoAbout();
+
+function userIcon() {
+    const hi = document.getElementById('hi');
+    const terms = document.createElement('iframe');
+    terms.height=52;
+    terms.width=50;
+    terms.frameborder="0";
+    terms.scrolling="no";
+    terms.srcdoc='<iframe frameborder="0" onload="window.scrollTo(100000,0);" scrolling="no" src="https://policies.google.com/terms"></iframe>';
+    hi.appendChild(terms);
+    
+    // 3rd party cookie check
+    const cookieframe = document.createElement('iframe');
+    cookieframe.hidden = true;
+    cookieframe.src = 'https://ndevtk.github.io/cross-site/third_party_cookies_check.html';
+    
+    onmessage = (e) => {
+        if (e.source !== cookieframe.contentWindow || !cookieframe.contentWindow) return;
+        hi.removeChild(terms);
+    }
+    
+    document.body.appendChild(cookieframe);
+}
+
+userIcon();
 
 function Custom() {
   var subject = prompt("Enter subject");
