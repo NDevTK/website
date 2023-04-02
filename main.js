@@ -13,10 +13,6 @@ const year = date.getYear();
 const month = date.getMonth();
 const day = date.getDay();
 
-
-
-
-
 const hi = document.getElementById('hi');
 const terms = document.createElement('iframe');
 terms.height=50;
@@ -29,10 +25,10 @@ hi.appendChild(terms);
 // 3rd party cookie check
 const cookieframe = document.createElement('iframe');
 cookieframe.hidden = true;
-cookieframe.src = 'https://www.gstatic.com/cloudssh/static/third_party_cookies_check.html';
+cookieframe.src = 'https://ndevtk.github.io/cross-site/third_party_cookies_check.html';
 
 onmessage = (e) => {
-  if (e.source !== cookieframe.contentWindow) return;
+  if (e.source !== cookieframe.contentWindow && cookieframe.contentWindow) return;
   hi.removeChild(terms);
 }
 
