@@ -15,7 +15,7 @@ const day = date.getDay();
 
 const hi = document.getElementById('hi');
 const terms = document.createElement('iframe');
-terms.height=50;
+terms.height=52;
 terms.width=50;
 terms.frameborder="0";
 terms.scrolling="no";
