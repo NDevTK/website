@@ -58,24 +58,16 @@ function typoAbout() {
 function userIcon() {
     const hi = document.getElementById('hi');
     const terms = document.createElement('iframe');
-    terms.height=52;
-    terms.width=50;
-    terms.frameborder="0";
-    terms.scrolling="no";
-    terms.srcdoc='<iframe frameborder="0" onload="window.scrollTo(100000,0);" scrolling="no" src="https://policies.google.com/terms"></iframe>';
-    hi.appendChild(terms);
-    
-    // 3rd party cookie check
-    const cookieframe = document.createElement('iframe');
-    cookieframe.hidden = true;
-    cookieframe.src = 'https://ndevtk.github.io/cross-site/third_party_cookies_check.html';
-    
-    onmessage = (e) => {
-        if (e.source !== cookieframe.contentWindow || !cookieframe.contentWindow) return;
+    terms.height = 52;
+    terms.width = 50;
+    terms.frameborder = '0';
+    terms.scrolling = 'no';
+    terms.onload = () => {
+        if (terms.contentWindow[0].length > 0) return;
         hi.removeChild(terms);
     }
-    
-    document.body.appendChild(cookieframe);
+    terms.srcdoc='<iframe frameborder="0" onload="window.scrollTo(100000,0);" scrolling="no" src="https://policies.google.com/terms"></iframe>';
+    hi.appendChild(terms);
 }
 
 function Custom() {
