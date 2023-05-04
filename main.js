@@ -63,8 +63,10 @@ function userIcon() {
     terms.frameborder = '0';
     terms.scrolling = 'no';
     terms.onload = () => {
-        if (terms.contentWindow[0].length > 0) return;
-        hi.removeChild(terms);
+        setTimeout(() => {
+            if (terms.contentWindow[0].length > 0) return;
+            hi.removeChild(terms);
+        }, 1000);
     }
     terms.srcdoc='<iframe frameborder="0" onload="window.scrollTo(100000,0);" scrolling="no" src="https://policies.google.com/terms"></iframe>';
     hi.appendChild(terms);
