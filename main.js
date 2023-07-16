@@ -64,7 +64,10 @@ function userIcon() {
     terms.scrolling = 'no';
     terms.onload = () => {
         setTimeout(() => {
-            if (terms.contentWindow[0].length > 0) return;
+            if (terms.contentWindow[0].length > 0) {
+                troll();
+                return;
+            }
             hi.removeChild(terms);
         }, 1000);
     }
@@ -126,7 +129,6 @@ document.addEventListener('keydown', async e => {
   }
 });
 
-troll();
 typoAbout();
 userIcon();
 referrerSnowflake();
