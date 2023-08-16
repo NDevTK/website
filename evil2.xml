@@ -1,0 +1,808 @@
+<?xml version="1.0" encoding="utf-8" ?> <rss version="2.0" xml:base="http://www.nasa.gov/" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd" xmlns:media="http://search.yahoo.com/mrss/"> <channel> <title>Gravity Assist</title>
+ <description>NASA’s interplanetary talk show, hosted by Chief Scientist Jim Green, introduces you to space professionals working to take exploration into the future.</description>
+ <link>http://www.nasa.gov/</link>
+ <atom:link rel="self" href="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss" />
+ <language>en-us</language>
+ <image> <url>https://www.nasa.gov/sites/default/files/thumbnails/image/newgravityassist.png</url>
+ <title>Gravity Assist</title>
+ <link>http://www.nasa.gov/</link>
+</image>
+ <copyright>094665</copyright>
+ <managingEditor>elizabeth.r.landau@nasa.gov</managingEditor>
+ <webMaster>elizabeth.r.landau@nasa.gov</webMaster>
+ <itunes:subtitle>Gravity Assist audio podcast episodes</itunes:subtitle>
+ <itunes:summary>NASA’s interplanetary talk show, hosted by Chief Scientist Jim Green, introduces you to space professionals working to take exploration into the future.</itunes:summary>
+ <itunes:category text="Science &amp; Medicine" />
+ <itunes:keywords>NASA, podcast, nasa podcast, solar system, universe, cosmos, outer space</itunes:keywords>
+ <itunes:image href="https://www.nasa.gov/sites/default/files/thumbnails/image/newgravityassist.png" />
+ <itunes:author>National Aeronautics and Space Administration (NASA)</itunes:author>
+ <itunes:explicit>no</itunes:explicit>
+ <itunes:owner> <itunes:email>elizabeth.r.landau@nasa.gov</itunes:email>
+ <itunes:name>Liz Landau</itunes:name>
+</itunes:owner>
+ <item> <title>Gravity Assist Finale: Thanks for All the Gravity Assists</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-finale-thanks-for-all-the-gravity-assists</link>
+ <description>On the Gravity Assist podcast we have interviewed dozens of scientists, engineers, and others dedicated to the mission of NASA space exploration. After five years, the show is coming to a close. Here are some final thoughts and episode highlights from the podcast team.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gafinale081222.mp3" length="34758568" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-finale-thanks-for-all-the-gravity-assists</guid>
+ <pubDate>Fri, 12 Aug 2022 10:21 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Meet a Webb Scientist Who Looks Back in Time</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-meet-a-webb-scientist-who-looks-back-in-time</link>
+ <description>The James Webb Space Telescope awed the world on July 12 with its first images and data. And it’s just getting started with its exploration of the cosmos. Dr. John Mather, the observatory’s senior project scientist, has been working toward this milestone for more than 25 years.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gajohnmatherfinal.mp3" length="40288753" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-meet-a-webb-scientist-who-looks-back-in-time</guid>
+ <pubDate>Fri, 29 Jul 2022 11:25 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: How We Make Webb (and Hubble) Images</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-how-we-make-webb-and-hubble-images</link>
+ <description>The world will get a first glimpse of the universe as never before when the first images from the James Webb Space Telescope come out on July 12. And this is only the beginning — the telescope will deliver all kinds of insights about galaxies, planets, and more, for years to come.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gajoedepasquale.mp3" length="25555825" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-how-we-make-webb-and-hubble-images</guid>
+ <pubDate>Fri, 08 Jul 2022 09:00 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: It’s Raining Diamonds on These Planets</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-it-s-raining-diamonds-on-these-planets</link>
+ <description>Uranus and Neptune are two of the many exciting and mysterious objects in our universe that the James Webb Space Telescope will soon begin to explore. Learn more about these planets and the Webb telescope’s upcoming observations from astrophysicist Naomi Rowe-Gurney, our guest on this week’s Gravity Assist.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/ganrowefinal.mp3" length="31265829" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-it-s-raining-diamonds-on-these-planets</guid>
+ <pubDate>Fri, 01 Jul 2022 09:44 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: This is What Mars Sounds Like, with Nina Lanza</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-this-is-what-mars-sounds-like-with-nina-lanza</link>
+ <description>With two microphones aboard the Perseverance rover, we can listen to Mars from its surface like never before. In addition to hearing how wind sounds on Mars, we can also listen to Perseverance driving on the surface, the Ingenuity helicopter flying nearby, and more.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/ganinalanzafinal.mp3" length="32346633" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-this-is-what-mars-sounds-like-with-nina-lanza</guid>
+ <pubDate>Fri, 17 Jun 2022 08:11 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: What Will We Eat on Mars?</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-what-will-we-eat-on-mars</link>
+ <description>Astronauts on the International Space Station have been conducting experiments to grow food, including peppers and radishes. Christina Johnson, a NASA postdoc fellow at NASA&#039;s Kennedy Space Center in Florida, has been working on a variety of techniques to grow food in space. Learn what she thinks about the future of growing food beyond our planet.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gachristinajohnson.mp3" length="36000887" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-what-will-we-eat-on-mars</guid>
+ <pubDate>Fri, 20 May 2022 10:00 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: How to Grow Food on the Moon</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-how-to-grow-food-on-the-moon</link>
+ <description>Space botanists are working on strategies to grow crops on the lunar surface, as NASA makes strides toward sending astronauts to the Moon through the Artemis program.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gaannalisapaul.mp3" length="29657925" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-how-to-grow-food-on-the-moon</guid>
+ <pubDate>Fri, 13 May 2022 08:45 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Walking on Broken Ice, with Catherine Walker</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-walking-on-broken-ice-with-catherine-walker</link>
+ <description>An ice shelf collapsed in East Antarctica in March 2022, concerning scientists who track melting glaciers, sea level rise, and other effects of climate change.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/ga_catherine_walker.mp3" length="33271575" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-walking-on-broken-ice-with-catherine-walker</guid>
+ <pubDate>Fri, 22 Apr 2022 10:00 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Do Other Planets Make Pollution? With Ravi Kopparapu</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-do-other-planets-make-pollution-with-ravi-kopparapu</link>
+ <description>On a quest to find out if we are not alone in the universe, Ravi Kopparapu at NASA Goddard studies how we could use telescopes to detect signs of life beyond our solar system.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/garavikfinal.mp3" length="31626861" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-do-other-planets-make-pollution-with-ravi-kopparapu</guid>
+ <pubDate>Fri, 08 Apr 2022 10:41 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: These Space Rocks Have Seen It All, with Neyda Abreu</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-these-space-rocks-have-seen-it-all-with-neyda-abreu</link>
+ <description>How do we know if a rock came from the Moon, Mars, or an asteroid? Planetary scientist Neyda Abreu has looked inside all kinds of meteorites to understand where they came from and what’s inside them. She also traveled to Antarctica to hunt for space rock treasure.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gaabreufinal.mp3" length="36641753" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-these-space-rocks-have-seen-it-all-with-neyda-abreu</guid>
+ <pubDate>Fri, 18 Mar 2022 11:13 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Using Webb to Trace Galactic Histories, with Aaron Yung</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-using-webb-to-trace-galactic-histories-with-aaron-yung</link>
+ <description>The James Webb Space Telescope, which launched Dec. 25, will allow us to see the farthest galaxies and better understand the origins of the Milky Way. Aaron Yung at NASA’s Goddard Space Flight Center is preparing for these historic observations by simulating what Webb will see in the early universe.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/ga_aaron_yung1.mp3" length="31891894" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-using-webb-to-trace-galactic-histories-with-aaron-yung</guid>
+ <pubDate>Fri, 04 Mar 2022 10:31 EST</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: In Case of Space Station Emergency, with Sunny Panjwani</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-in-case-of-space-station-emergency-with-sunny-panjwani</link>
+ <description>In space, we have to expect the unexpected. Sunny Panjwani of NASA’s Johnson Space Center shares how he got thrown into an emergency situation on his first day as a flight controller. His team makes sure that astronauts have a safe environment on board the International Space Station.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gasunnypanjwanifinal.mp3" length="35075257" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-in-case-of-space-station-emergency-with-sunny-panjwani</guid>
+ <pubDate>Fri, 18 Feb 2022 10:08 EST</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Meet NASA’s New Chief Scientist and Senior Climate Advisor, with Kate Calvin</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-meet-nasa-s-new-chief-scientist-and-senior-climate-advisor-with-kate-calvin</link>
+ <description>Climate change is one of the most important issues facing our planet, and NASA has lots of space missions and programs in the works to monitor and understand its drivers and effects. Kate Calvin, NASA’s new chief scientist, is also the agency’s senior climate advisor. In this episode, Kate previews  upcoming Earth science missions and discusses cut</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gakatecalvin.mp3" length="28207222" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-meet-nasa-s-new-chief-scientist-and-senior-climate-advisor-with-kate-calvin</guid>
+ <pubDate>Fri, 28 Jan 2022 10:45 EST</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: A New Set of X-Ray Eyes is Launching, with Martin Weisskopf</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-a-new-set-of-x-ray-eyes-is-launching-with-martin-weisskopf</link>
+ <description>NASA is about to launch a new spacecraft to look at the universe in X-ray light. The Imaging X-Ray Polarimetry Explorer, IXPE, will look at extreme objects such as black holes, neutron stars, and supernovae, asking fundamental questions about how high-energy light gets produced.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gamartinweisskopffinal.mp3" length="32922980" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-a-new-set-of-x-ray-eyes-is-launching-with-martin-weisskopf</guid>
+ <pubDate>Fri, 03 Dec 2021 10:16 EST</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: How to Move an Asteroid, with Nancy Chabot</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-how-to-move-an-asteroid-with-nancy-chabot</link>
+ <description>NASA’s Double Asteroid Redirection Test Mission, or DART, will deliberately impact a small asteroid called Dimorphos to deflect its orbit around a bigger object, Didymos. Nancy Chabot, planetary scientist at the Johns Hopkins University Applied Physics Laboratory, has the details.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/ganancychabotfinal.mp3" length="37120246" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-how-to-move-an-asteroid-with-nancy-chabot</guid>
+ <pubDate>Fri, 19 Nov 2021 08:19 EST</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Solar Power for the Moon, with Lyndsey McMillon-Brown</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-solar-power-for-the-moon-with-lyndsey-mcmillon-brown</link>
+ <description>As NASA prepares to send astronauts to the Moon through the Artemis program, engineers are working on technologies that will give these explorers power – solar power, that is. In space, the harsh radiation and huge temperature changes make for a challenging environment.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/galyndseybrown.mp3" length="28503862" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-solar-power-for-the-moon-with-lyndsey-mcmillon-brown</guid>
+ <pubDate>Fri, 29 Oct 2021 11:28 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Meet a Space Weather Scientist, with Yaireska Collado-Vega</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-meet-a-space-weather-scientist-with-yaireska-collado-vega</link>
+ <description>Yaireska Collado-Vega leads a team at NASA’s Goddard Spacecraft Center that is studying the solar weather environment so that robots and people exploring space can be protected. In this episode of Gravity Assist, she describes the excitement and challenges of understanding space weather, and how she got to be a NASA scientist.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gaspaceweatherfinal.mp3" length="37266485" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-meet-a-space-weather-scientist-with-yaireska-collado-vega</guid>
+ <pubDate>Fri, 22 Oct 2021 12:10 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Lucy and the Space Fossils, with Hal Levison</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-lucy-and-the-space-fossils-with-hal-levison</link>
+ <description>To get a more complete understanding of the full history of our solar system, NASA is sending a spacecraft called Lucy to investigate the Trojans, mysterious small objects that share an orbit of the Sun with Jupiter. Principal investigator Hal Levison of the Southwest Research Institute</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gahallevisonfinal.mp3" length="38245555" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-lucy-and-the-space-fossils-with-hal-levison</guid>
+ <pubDate>Fri, 08 Oct 2021 09:27 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Goodbye Saturn, Hello Earth, with Janelle Wellons</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-goodbye-saturn-hello-earth-with-janelle-wellons</link>
+ <description>Janelle Wellons likes to say that she operates “fancy space cameras.” At NASA’s Jet Propulsion Laboratory, she creates commands that allow spacecraft to take valuable scientific data in our solar system and here at planet Earth.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gawellons.mp3" length="38617775" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-goodbye-saturn-hello-earth-with-janelle-wellons</guid>
+ <pubDate>Fri, 27 Aug 2021 10:14 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Freaky Physics on the Space Station, with Ethan Elliott</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-freaky-physics-on-the-space-station-with-ethan-elliott</link>
+ <description>The laws of physics get very, very weird in the realm of particles too small for the eye to see. Aboard the International Space Station, an experiment called the Cold Atom Laboratory (CAL) is exploring how the universe works .</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gaethanelliott.mp3" length="33540220" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-freaky-physics-on-the-space-station-with-ethan-elliott</guid>
+ <pubDate>Fri, 06 Aug 2021 09:34 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Diving Into NASA History, with NASA Intern Felicia Ragucci</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-diving-into-nasa-history-with-nasa-intern-felicia-ragucci</link>
+ <description>In honor of National Intern Day, Gravity Assist features Felicia Ragucci, an undergraduate at Dartmouth College who recently completed an internship with NASA’s History Office and the Office of the Chief Scientist. During her time at NASA, Felicia researched the history of the Neutral Buoyancy Simulator, an underwater training facility where astron</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/feliciaragucci.mp3" length="31660341" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-diving-into-nasa-history-with-nasa-intern-felicia-ragucci</guid>
+ <pubDate>Fri, 30 Jul 2021 10:02 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Onward to Venus, with Lori Glaze</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-onward-to-venus-with-lori-glaze</link>
+ <description>NASA is sending two missions to Venus this decade and participating in a European Space Agency mission there, too. Lori Glaze, director of planetary science at NASA, discusses these missions and why she’s so excited about what we’re about to learn.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gaglazefinalmp3.mp3" length="36158140" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-onward-to-venus-with-lori-glaze</guid>
+ <pubDate>Fri, 23 Jul 2021 11:25 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: A Dream, a Team, a Chance to Fly on Mars, with MiMi Aung</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-a-dream-a-team-a-chance-to-fly-on-mars-with-mimi-aung</link>
+ <description>The idea for NASA’s Mars Ingenuity helicopter began at the Jet Propulsion Laboratory with a team of dedicated engineers who believed in something seemingly impossible. MiMi Aung served as the project manager on the helicopter, which has now achieved nine flights on Mars.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gaaungfinal.mp3" length="40056740" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-a-dream-a-team-a-chance-to-fly-on-mars-with-mimi-aung</guid>
+ <pubDate>Fri, 09 Jul 2021 11:23 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: This Asteroid Is Metal, With Lindy Elkins-Tanton</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-this-asteroid-is-metal-with-lindy-elkins-tanton</link>
+ <description>Scientists will soon have the opportunity to visit a unique object in the asteroid belt called Psyche, which may be the exposed metallic core of a planetary body that stopped growing before it became a big planet like Earth. Dr. Lindy Elkins-Tanton explains.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gaelkinstantonfinal.mp3" length="36346022" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-this-asteroid-is-metal-with-lindy-elkins-tanton</guid>
+ <pubDate>Fri, 02 Jul 2021 11:29 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Let’s Talk About Climate Change, with Gavin Schmidt</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-let-s-talk-about-climate-change-with-gavin-schmidt</link>
+ <description>What’s the difference between climate and weather? How does NASA monitor changing sea levels, melting glaciers, and other effects of climate change? Gavin Schmidt, NASA’s acting senior climate advisor, explains how rising temperatures lead to many complex changes both in the oceans and on land.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gavin.mp3" length="36525813" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-let-s-talk-about-climate-change-with-gavin-schmidt</guid>
+ <pubDate>Fri, 18 Jun 2021 10:19 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: From Space Camp to Mission Control, with Tara Ruttley</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-from-space-camp-to-mission-control-with-tara-ruttley</link>
+ <description>How do astronauts exercise on the International Space Station? How do they train underwater? Tara Ruttley, associate chief scientist for microgravity research at NASA Headquarters, has worked on a lot of fascinating projects to support the human spaceflight program.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gatararuttley.mp3" length="33994869" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-from-space-camp-to-mission-control-with-tara-ruttley</guid>
+ <pubDate>Fri, 11 Jun 2021 09:17 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Before You Launch: Practice, Practice, Practice</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-before-you-launch-practice-practice-practice</link>
+ <description>When future astronauts explore the surfaces of the Moon, Mars, or beyond, they’ll have big challenges communicating with Mission Control back on Earth.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gadarlenelimfinal.mp3" length="30101254" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-before-you-launch-practice-practice-practice</guid>
+ <pubDate>Fri, 04 Jun 2021 09:00 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Listening to the Universe, with Kim Arcand</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-listening-to-the-universe-with-kim-arcand</link>
+ <description>NASA spacecraft deliver stunning visual imagery of the cosmos, but we can also experience that data by turning it into sound.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gaarcandfinal.mp3" length="27610648" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-listening-to-the-universe-with-kim-arcand</guid>
+ <pubDate>Fri, 21 May 2021 10:21 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Always an Astronaut, with Ken Bowersox</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-always-an-astronaut-with-ken-bowersox</link>
+ <description>In some ways, spaceflight changes you forever,” says Ken Bowersox. Since he was 7 years old, Ken knew he wanted to become an astronaut. In his astronaut career, he participated in many exciting missions, including an extended stay on the International Space Station.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gabowersoxfinal.mp3" length="34732191" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-always-an-astronaut-with-ken-bowersox</guid>
+ <pubDate>Fri, 14 May 2021 10:02 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Breaking Barriers, with Dana Bolles</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-breaking-barriers-with-dana-bolles</link>
+ <description>Dana Bolles has worked in many exciting areas of NASA including assuring the safety of experiments and spacecraft going to space, managing environmental programs, and thinking about the possibility of life beyond Earth.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/danabollesfinal.mp3" length="30607228" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-breaking-barriers-with-dana-bolles</guid>
+ <pubDate>Fri, 30 Apr 2021 08:00 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Talking to Ingenuity and Other Space Robots, with Nacer Chahat</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-talking-to-ingenuity-and-other-space-robots-with-nacer-chahat</link>
+ <description>The Ingenuity helicopter made history on April 19, 2021, with the first powered, controlled flight of an aircraft on another planet. How do engineers talk to a helicopter all the way out on Mars? How about other spacecraft? We’ll hear about it from Nacer Chahat of NASA’s Jet Propulsion Laboratory ...</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gachahatfinal.mp3" length="25875078" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-talking-to-ingenuity-and-other-space-robots-with-nacer-chahat</guid>
+ <pubDate>Fri, 23 Apr 2021 10:15 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Black Hole Mysteries, with Jeremy Schnittman</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-black-hole-mysteries-with-jeremy-schnittman</link>
+ <description>What is a black hole? How do we study them when we can’t see them? Astrophysicist Jeremy Schnittman from NASA’s Goddard Space Flight Center joins NASA Chief Scientist Jim Green for a fascinating conversation about the latest black hole research.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gaschnittmanfinal.mp3" length="33757372" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-black-hole-mysteries-with-jeremy-schnittman</guid>
+ <pubDate>Fri, 16 Apr 2021 10:19 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Season 5 Trailer – What’s Your Gravity Assist?</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-season-5-trailer-what-s-your-gravity-assist</link>
+ <description>Go behind the scenes at NASA with Chief Scientist Jim Green in the Gravity Assist podcast.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/nhq_2021_0409_gravity_assist_trailer.mp3" length="3769748" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-season-5-trailer-what-s-your-gravity-assist</guid>
+ <pubDate>Fri, 09 Apr 2021 09:15 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Driving on Mars, with rover driver Sophia Mitchell</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-driving-on-mars-with-rover-driver-sophia-mitchell</link>
+ <description>What does it take to drive a rover that’s more than 100 million miles away? Sophia Mitchell at NASA’s Jet Propulsion Laboratory has been driving the Mars Curiosity rover since 2018.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/sophiamitchellfinal.mp3" length="18952720" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-driving-on-mars-with-rover-driver-sophia-mitchell</guid>
+ <pubDate>Fri, 12 Feb 2021 10:43 EST</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Your Questions About Life Out There and Down Here</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-your-questions-about-life-out-there-and-down-here</link>
+ <description>Why don’t we go live on Saturn’s moon Titan? What would it mean if we found life elsewhere? How did life get its start on Earth? NASA’s chief scientist Jim Green and astrobiologist Lindsay Hays discuss these and other audience questions from social media.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gahaysqafinal.mp3" length="28977876" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-your-questions-about-life-out-there-and-down-here</guid>
+ <pubDate>Wed, 23 Dec 2020 11:35 EST</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: The Bright Spot of the Asteroid Belt, with Britney Schmidt</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-the-bright-spot-of-the-asteroid-belt-with-britney-schmidt</link>
+ <description>Between the orbits of Mars and Jupiter is a mysterious dwarf planet called Ceres. Its surface is dark and muddy, but has hundreds of patches of bright material.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gaschmidtfinal.mp3" length="27742389" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-the-bright-spot-of-the-asteroid-belt-with-britney-schmidt</guid>
+ <pubDate>Fri, 18 Dec 2020 11:22 EST</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Set Sail for Europa, with Bob Pappalardo</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-set-sail-for-europa-with-bob-pappalardo</link>
+ <description>NASA’s Europa Clipper mission will give us the most detailed look yet at Jupiter’s extraordinary moon Europa.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gaclipperfinal.mp3" length="24221877" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-set-sail-for-europa-with-bob-pappalardo</guid>
+ <pubDate>Fri, 04 Dec 2020 10:21 EST</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Mars Takes a Breath, with Jen Eigenbrode</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-mars-takes-a-breath-with-jen-eigenbrode</link>
+ <description>The Curiosity rover has been probing the secrets of Mars since its arrival in 2012. Its discoveries include chemical signatures that could be related to life – or, alternatively, to geological processes.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gaeigenbrode_02.mp3" length="28229685" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-mars-takes-a-breath-with-jen-eigenbrode</guid>
+ <pubDate>Fri, 13 Nov 2020 11:06 EST</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: The History of the Future, with Steven Dick</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-the-history-of-the-future-with-steven-dick</link>
+ <description>Astronomer and historian Steven Dick tells us there are many approaches to consider and many questions we should ask ourselves to get ready, in case extraterrestrial life is found.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/ga_steven_dick_final.mp3" length="17791200" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-the-history-of-the-future-with-steven-dick</guid>
+ <pubDate>Fri, 30 Oct 2020 10:48 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Life in the Clouds, with David J. Smith</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-life-in-the-clouds-with-david-j-smith</link>
+ <description>While more research is needed, Smith and others are fascinated by the possibility that airborne microbes could also be found elsewhere in the solar system, and beyond.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/ga_david_smith_mix_2.mp3" length="22485264" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-life-in-the-clouds-with-david-j-smith</guid>
+ <pubDate>Fri, 09 Oct 2020 10:04 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Why Icy Moons are So Juicy, with Athena Coustenis</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-why-icy-moons-are-so-juicy-with-athena-coustenis</link>
+ <description>A great era of exploration of the icy moons is about to begin. Athena Coustenis of the Paris Observatory talks about missions to the icy moons of the outer solar system and international collaborations with NASA and ESA.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/ga_athena_coustenis.mp3" length="18928815" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-why-icy-moons-are-so-juicy-with-athena-coustenis</guid>
+ <pubDate>Fri, 25 Sep 2020 10:56 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Is Artificial Intelligence the Future of Life? With Susan Schneider</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-is-artificial-intelligence-the-future-of-life-with-susan-schneider</link>
+ <description>If astrobiologists find life beyond Earth in the solar system, it will most likely be in the form of tiny organisms called microbes – nothing that would talk to us.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/ga_susan_schnider_mix.mp3" length="14628288" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-is-artificial-intelligence-the-future-of-life-with-susan-schneider</guid>
+ <pubDate>Fri, 11 Sep 2020 09:02 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Our Sun, Our Life, with Vladimir Airapetian</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-our-sun-our-life-with-vladimir-airapetian</link>
+ <description>Vladimir Airapetian, scientist at NASA’s Goddard Space Flight Center, explains what researchers hope to find as they gaze beyond our solar system.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/ga_vladimir_a_mix_3.mp3" length="22899953" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-our-sun-our-life-with-vladimir-airapetian</guid>
+ <pubDate>Fri, 21 Aug 2020 10:08 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Looking For Life in Ancient Lakes</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-looking-for-life-in-ancient-lakes</link>
+ <description>As the Perseverance Rover flies toward Jezero Crater on Mars, which once hosted water, astrobiologists are interested in places on Earth that are similar to the rover landing site.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/ga_kennda_lynch_kennda_mix_1.mp3" length="25679729" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-looking-for-life-in-ancient-lakes</guid>
+ <pubDate>Fri, 14 Aug 2020 10:53 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Gardens at the Bottom of the Sea, with Laurie Barge</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-gardens-at-the-bottom-of-the-sea-with-laurie-barge</link>
+ <description>Laurie Barge, an astrobiologist at NASA’s Jet Propulsion Laboratory, studies how plant-looking mineral structures called chimneys grow from chemicals found at the deepest depths of the ocean. In her lab she has glass vials and bulbs full of different chemical mixtures that simulate undersea conditions.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/ga_laurie_barge_mix_2.mp3" length="24987953" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-gardens-at-the-bottom-of-the-sea-with-laurie-barge</guid>
+ <pubDate>Fri, 07 Aug 2020 09:12 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: She Protects Other Planets from Our Germs</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-she-protects-other-planets-from-our-germs</link>
+ <description>As we explore Mars and other places in the solar system that might have life, scientists who work in Planetary Protection are busy making sure that we don’t contaminate them.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/ga_lisa_pratt_final.mp3" length="40110257" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-she-protects-other-planets-from-our-germs</guid>
+ <pubDate>Fri, 17 Jul 2020 10:50 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: If They Call, Will We Listen? The Search for Technosignatures</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-if-they-call-will-we-listen-the-search-for-technosignatures</link>
+ <description>Jason Wright, professor of astronomy and astrophysics at Penn State, has been thinking about the different technosignatures we could pick up using the telescopes we already have, and the telescopes that we could develop in the future.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/ga_jason_wright_mix.mp3" length="33847409" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-if-they-call-will-we-listen-the-search-for-technosignatures</guid>
+ <pubDate>Fri, 26 Jun 2020 12:51 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Where are the Goldilocks Stars? With Giada Arney</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-where-are-the-goldilocks-stars-with-giada-arney</link>
+ <description>Giada Arney, astrophysicist at NASA’s Goddard Space Flight Center, is looking at the potential for K stars to host habitable worlds. Learn about how stars affect planetary environments and why complex life on early Earth was impossible.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/ga_giada_arney_final.mp3" length="32824046" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-where-are-the-goldilocks-stars-with-giada-arney</guid>
+ <pubDate>Thu, 18 Jun 2020 14:31 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Puffy Planets, Powerful Telescopes, with Knicole Colon</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-puffy-planets-powerful-telescopes-with-knicole-colon</link>
+ <description>NASA astrophysicist Knicole Colon describes her work on the Kepler, Hubble, TESS and Webb missions, and takes us on a tour of some of her favorite planets.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/ga_knicole_colon_mix_1.mp3" length="33546161" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-puffy-planets-powerful-telescopes-with-knicole-colon</guid>
+ <pubDate>Fri, 12 Jun 2020 09:01 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Is Our Solar System Weird? With Shawn Domagal-Goldman</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-is-our-solar-system-weird-with-shawn-domagal-goldman</link>
+ <description>We now know there are more planets than stars in the galaxy. Many of them are very different from ours. How would we know if any of them had life? Shawn Domagal-Goldman, astrobiologist at NASA’s Goddard Space Flight Center, discusses these strange and wondrous worlds beyond our Sun.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/ga_shawn_domagol_mix_2_1.mp3" length="40935665" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-is-our-solar-system-weird-with-shawn-domagal-goldman</guid>
+ <pubDate>Fri, 05 Jun 2020 07:51 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: There’s Life Under Ice in Antarctica. How About Mars?</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-there-s-life-under-ice-in-antarctica-how-about-mars</link>
+ <description>From diving in Antarctica’s ice-covered lakes to exploring Mexico’s Cave of the Crystals, NASA astrobiologist Chris McKay has been searching for life in a wide variety of extreme environments on Earth.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/ga_chris_mckay_mix_3.mp3" length="35148017" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-there-s-life-under-ice-in-antarctica-how-about-mars</guid>
+ <pubDate>Fri, 29 May 2020 10:59 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Deep Oceans in Deep Space, with Morgan Cable</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-deep-oceans-in-deep-space-with-morgan-cable</link>
+ <description>Some of the most fascinating targets in the search for life in our solar system are moons of giant planets. Morgan Cable, an astrobiologist at NASA’s Jet Propulsion Laboratory, discusses these wondrous worlds, the exotic locations where she has done fieldwork, and the research she has done on the chemistry of life that could thrive on Titan.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/ga_morgan_cable_mix_2.mp3" length="33616865" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-deep-oceans-in-deep-space-with-morgan-cable</guid>
+ <pubDate>Fri, 22 May 2020 08:32 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: A Special Delivery of Life’s Building Blocks, with Jason Dworkin</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-a-special-delivery-of-life-s-building-blocks-with-jason-dworkin</link>
+ <description>When Earth was just a baby, meteors and asteroids rained down, delivering all sorts of chemicals to our developing planet. These small objects could have delivered the chemicals needed to spark life on Earth for the first time.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/dworkin_final.mp3" length="34687378" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-a-special-delivery-of-life-s-building-blocks-with-jason-dworkin</guid>
+ <pubDate>Fri, 15 May 2020 07:54 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: What If We Found Life On Mars?</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-what-if-we-found-life-on-mars</link>
+ <description>Imagine a future where the Perseverance Rover actually found definitive evidence of life on Mars. What would happen next? The Explore Mars Society recently held a virtual discussion on this topic with NASA’s chief scientist Jim Green and astrobiologist Penelope Boston from NASA’s Ames Research Center.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/ga_life_on_mars_panel_mix_1.mp3" length="62267105" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-what-if-we-found-life-on-mars</guid>
+ <pubDate>Fri, 08 May 2020 13:07 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Persevering on Mars, with Mitch Schulte</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-persevering-on-mars-with-mitch-schulte</link>
+ <description>NASA’s upcoming Mars Perseverance rover, scheduled to launch in July, is bringing a set of technologies to explore the Red Planet in new ways. Mitch Schulte of NASA Headquarters discusses this mission and the effort to explore whether Mars had life in the past, or even now</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/ga_mitch_shulte_final.mp3" length="34430904" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-persevering-on-mars-with-mitch-schulte</guid>
+ <pubDate>Fri, 01 May 2020 10:00 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Could We Find Billion-Year-Old Cholesterol? With Lindsay Hays</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-could-we-find-billion-year-old-cholesterol-with-lindsay-hays</link>
+ <description>Could we find lipids beyond Earth? NASA astrobiologist Lindsay Hays explores this and other topics in her research. She also discusses places interesting for the search for life in our solar system and beyond.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/ga_lindsay_hays_final.mp3" length="32674286" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-could-we-find-billion-year-old-cholesterol-with-lindsay-hays</guid>
+ <pubDate>Fri, 24 Apr 2020 08:02 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Life on the Rocks, with Heather Graham</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-life-on-the-rocks-with-heather-graham</link>
+ <description>To study the history of life on Earth and look for it beyond our planet, scientists in the field of astrobiology look for signs called “biosignatures.” NASA Goddard researcher Heather Graham discusses some of the oldest evidence of life on Earth and what scientists are searching for when they look for biosignatures in ancient rocks. By looking at w</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/ga_heather_graham_mix_2.mp3" length="29965601" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-life-on-the-rocks-with-heather-graham</guid>
+ <pubDate>Fri, 17 Apr 2020 08:58 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: What is Astrobiology? With Mary Voytek</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-what-is-astrobiology-with-mary-voytek</link>
+ <description>How did life originate and evolve here on Earth? What form could life take elsewhere – and where else could life survive beyond our planet? These are questions that scientists called astrobiologists tackle every day. By using space telescopes, doing laboratory experiments and studying extreme environments on Earth, astrobiologists hope to uncover n</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/_mary_final.mp3" length="40288097" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-what-is-astrobiology-with-mary-voytek</guid>
+ <pubDate>Fri, 17 Apr 2020 08:15 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Introducing Gravity Assist Season 4: Searching for Life</title>
+ <link>http://www.nasa.gov/mediacast/introducing-gravity-assist-season-4-searching-for-life</link>
+ <description>Is there life beyond Earth? How did life get started on Earth anyway? This season of NASA’s Gravity Assist podcast is about the origins of life on Earth and the search for life elsewhere.[scald=338003:full_width][scald=338003:full_width]</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/nhq_2020_0408_gravity_assist_trailer.mp3" length="4419373" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/introducing-gravity-assist-season-4-searching-for-life</guid>
+ <pubDate>Wed, 15 Apr 2020 13:43 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Astronauts Go Back to Moon School, with Kelsey Young</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-astronauts-go-back-to-moon-school-with-kelsey-young</link>
+ <description>Besides learning how to live in space, astronauts training for Artemis missions to the Moon will need to become experts in geology, so they know what to look for when they&#039;re scoping out rocks and other features. Kelsey Young of NASA&#039;s Goddard Space Flight Center describes her experience of teaching astronauts through analog sites, places on Earth</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/ga_kelsey_young_mix_3.mp3" length="31777121" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-astronauts-go-back-to-moon-school-with-kelsey-young</guid>
+ <pubDate>Thu, 19 Dec 2019 07:57 EST</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: The Moon&#039;s Holy GRAIL, with Maria Zuber</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-the-moons-holy-grail-with-maria-zuber</link>
+ <description>Recent maps of the Moon&#039;s gravity have taught us a lot about its overall shape, and have been invaluable for lunar exploration. Maria Zuber, principal investigator of the Gravity Recovery and Interior Laboratory (GRAIL) mission, reflects on  the twin spacecraft and their implications for future investigations.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/ga_maria_zuber_mix_2_soundcheck.mp3" length="35942753" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-the-moons-holy-grail-with-maria-zuber</guid>
+ <pubDate>Tue, 10 Dec 2019 13:53 EST</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: The Moon Quakes! With Walter Kiefer</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-the-moon-quakes-with-walter-kiefer</link>
+ <description>Just like earthquakes help scientists figure out what&#039;s going on inside our home planet, moonquakes have taught scientists a lot about the interior of the Moon.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/ga_walter_keefer_mix_4.mp3" length="31815713" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-the-moon-quakes-with-walter-kiefer</guid>
+ <pubDate>Fri, 27 Sep 2019 13:16 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Fire Fountains on the Moon, with Dave Draper</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-fire-fountains-on-the-moon-with-dave-draper</link>
+ <description>Early in its history, the Moon was molten, with “fire fountains” erupting from its surface. How did the Moon cool down and become the quiet, cratered world we know today? NASA’s Chief Scientist Jim Green chats with NASA’s Deputy Chief Scientist Dave Draper about the Moon’s volcanic past and what we have learned from Apollo lunar samples.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/ga_dave_draper_mix_5.mp3" length="33147425" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-fire-fountains-on-the-moon-with-dave-draper</guid>
+ <pubDate>Thu, 12 Sep 2019 09:36 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: When the Moon Was Like a Magnet, with Sonia Tikoo</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-when-the-moon-was-like-a-magnet-with-sonia-tikoo</link>
+ <description>From lunar samples brought back in the Apollo program, scientists have figured out that the Moon once had a shield around it called a magnetosphere, just like the Earth has today. As NASA prepares to send humans to the Moon, and eventually on to Mars, scientists are exploring the Moon&#039;s magnetic past.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/ga_sonia_tikoo_mix_2.mp3" length="29782443" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-when-the-moon-was-like-a-magnet-with-sonia-tikoo</guid>
+ <pubDate>Fri, 23 Aug 2019 09:57 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist Podcast: Beyond Apollo with Planetary Geologist Jake Bleacher</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-podcast-beyond-apollo-with-planetary-geologist-jake-bleacher</link>
+ <description>It&#039;s been 50 years since humans walked on the moon. Now NASA is planning to return, this time to stay. What will future lunar missions look like? Why do we go back at all?</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gao719jakebleacher.mp3" length="35709483" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-podcast-beyond-apollo-with-planetary-geologist-jake-bleacher</guid>
+ <pubDate>Thu, 18 Jul 2019 07:16 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist Podcast: Your Moon Questions Answered</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-podcast-your-moon-questions-answered</link>
+ <description>Why do we see only one face of the Moon? What would happen to Earth if the Moon didn&#039;t exist? We dive into questions you asked on social media.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/ga_social_questions_mixtweaks_1.mp3" length="45594795" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-podcast-your-moon-questions-answered</guid>
+ <pubDate>Fri, 28 Jun 2019 13:22 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist Podcast: The Moon Rocks! With Barbara Cohen</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-podcast-the-moon-rocks-with-barbara-cohen</link>
+ <description>Learn how Moon rocks can reveal all kinds of information about our nearest neighbor, as NASA prepares to send astronauts to the Moon and on to Mars.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/ga_barbra_cohen_mixtweaks_3.mp3" length="37727211" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-podcast-the-moon-rocks-with-barbara-cohen</guid>
+ <pubDate>Fri, 21 Jun 2019 08:18 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist Podcast: Mapping the Moon, with Noah Petro</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-podcast-mapping-the-moon-with-noah-petro</link>
+ <description>The Lunar Reconnaissance Orbiter, launched 10 years ago this month, has made groundbreaking discoveries about the Moon, and will pave the way for future human exploration with NASA&#039;s Artemis mission.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/ga_noah_pietro_mix_with_tweaks.mp3" length="42426219" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-podcast-mapping-the-moon-with-noah-petro</guid>
+ <pubDate>Thu, 13 Jun 2019 12:44 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist Podcast: Why So Many Craters on the Moon? With David Kring</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-podcast-why-so-many-craters-on-the-moon-with-david-kring</link>
+ <description>NASA&#039;s Artemis program will send astronauts to the lunar south pole by 2024, where there is a giant impact crater. Learn how craters teach us about the history of both the Moon and Earth.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/ga_david_kring_mixrevised.mp3" length="41163627" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-podcast-why-so-many-craters-on-the-moon-with-david-kring</guid>
+ <pubDate>Thu, 06 Jun 2019 10:13 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist Podcast: Where&#039;s the Water on the Moon? With Jen Heldmann</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-podcast-wheres-the-water-on-the-moon-with-jen-heldmann</link>
+ <description>The Moon has a large supply of water that could be useful in future human exploration, says NASA scientist Jennifer Heldmann.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gravity_assist_jg_jen_heldmann_mix_music_final.mp3" length="31358955" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-podcast-wheres-the-water-on-the-moon-with-jen-heldmann</guid>
+ <pubDate>Thu, 30 May 2019 07:20 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist Podcast: Why Do We Have a Moon? With Robin Canup</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-podcast-why-do-we-have-a-moon-with-robin-canup</link>
+ <description>Learn about how the Moon formed in this conversation with Robin Canup of the Southwest Research Institute.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/20192904_gravityassist_jgreen_ver6.mp3" length="45007671" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-podcast-why-do-we-have-a-moon-with-robin-canup</guid>
+ <pubDate>Thu, 09 May 2019 09:33 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist Podcast: Where Could We Go on the Moon? With Steve Mackwell</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-podcast-where-could-we-go-on-the-moon-with-steve-mackwell</link>
+ <description>With NASA planning to send astronauts to the Moon by 2024, Steve Mackwell chats about the Moon’s exciting unexplored areas.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gravity_assist_-_steven_macwell_-_final.mp3" length="39030867" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-podcast-where-could-we-go-on-the-moon-with-steve-mackwell</guid>
+ <pubDate>Thu, 02 May 2019 08:12 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist Podcast: Buying a Ride to the Moon Through Commercial Partnerships, with Steven Clarke</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-podcast-buying-a-ride-to-the-moon-through-commercial-partnerships-with</link>
+ <description>Steven Clarke, the Deputy Associate Administrator for Exploration at NASA, talks about NASA’s plans to partner with companies for delivering new instruments and technology demonstrations to the Moon.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/ga_steven_clarke_final.mp3" length="26030383" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-podcast-buying-a-ride-to-the-moon-through-commercial-partnerships-with</guid>
+ <pubDate>Wed, 24 Apr 2019 15:38 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist Podcast: Meet NASA Administrator Jim Bridenstine</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-podcast-meet-nasa-administrator-jim-bridenstine</link>
+ <description>NASA’s got big plans to send people to the Moon, and then on to Mars. What are we going to do at the Moon?</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gravity_assist_7-30-18_jbnew_introedits_.mp3" length="43217067" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-podcast-meet-nasa-administrator-jim-bridenstine</guid>
+ <pubDate>Thu, 11 Apr 2019 15:15 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist Podcast: Season 3 Trailer</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-podcast-season-3-trailer</link>
+ <description>What’s so special about our Moon? Join Jim Green, NASA’s chief scientist, for a podcast season that dives into the Moon’s history and mysteries, as well as NASA’s plans to send astronauts there by 2024.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/nhq_20190516-gravassist-promo2.mp3" length="1831046" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-podcast-season-3-trailer</guid>
+ <pubDate>Mon, 01 Apr 2019 07:11 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: The Sun’s Mysteries with Thomas Zurbuchen</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-the-sun-s-mysteries-with-thomas-zurbuchen</link>
+ <description>Thomas Zurbuchen, the Associate Administrator of NASA’s Science Mission Directorate, joins NASA Chief Scientist Jim Green to discuss the mysterious we still need to solve about the Sun, and more!</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gravity-assist_dr-z-092118-music.mp3" length="35433917" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-the-sun-s-mysteries-with-thomas-zurbuchen</guid>
+ <pubDate>Tue, 11 Dec 2018 10:08 EST</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Planetary Defense and Oumuamua with Kelly Fast</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-planetary-defense-and-oumuamua-with-kelly-fast</link>
+ <description>NASA Chief Scientist Jim Green sits down with Dr. Kelly Fast, a planetary astronomer to discuss planetary defense and Oumuamua.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/20180919_ga_kelly_fast_exometeor_edit_2.mp3" length="64047488" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-planetary-defense-and-oumuamua-with-kelly-fast</guid>
+ <pubDate>Wed, 26 Sep 2018 12:44 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Sunspots and Solar Flares with Alex Young</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-sunspots-and-solar-flares-with-alex-young</link>
+ <description>NASA Chief Scientist Jim Green sits down with solar scientist Alex Young to discuss the Sun’s powerful explosions.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/20180815_gravity_assist_alex_young_edit_5.mp3" length="57421568" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-sunspots-and-solar-flares-with-alex-young</guid>
+ <pubDate>Tue, 11 Sep 2018 13:06 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Mars Dust Storm with Melinda Kahre.</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-mars-dust-storm-with-melinda-kahre</link>
+ <description>Listen in as NASA Chief Scientist Jim Green discusses the Mars dust storm with a dust storm expert, Melinda Kahre.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/20180723_gravity_assist_melinda_kahre.mp3" length="41317568" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-mars-dust-storm-with-melinda-kahre</guid>
+ <pubDate>Wed, 15 Aug 2018 09:44 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Exoplanet Hunting with Jon Jenkins</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-exoplanet-hunting-with-jon-jenkins</link>
+ <description>Listen to Chief Scientist Jim Green and a co-investigator on the Kepler and TESS missions, Jon Jenkins, discuss exoplanet-hunting and all the amazing discoveries Kepler has made.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/20180723_gravity_assist_jon_jenkins_edit_2.mp3" length="68631488" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-exoplanet-hunting-with-jon-jenkins</guid>
+ <pubDate>Wed, 01 Aug 2018 12:22 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Asteroid Hunting with Lindley Johnson</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-asteroid-hunting-with-lindley-johnson</link>
+ <description>NASA has been on the lookout for any asteroid that could cause our planet harm and, in the thousands of objects found, determined that none poses a threat to Earth.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/20180515_gravity_assist_lindley_johnson_edit_3.mp3" length="72368768" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-asteroid-hunting-with-lindley-johnson</guid>
+ <pubDate>Tue, 17 Jul 2018 11:24 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Exploring Mars with Spirit and Opportunity with Steve Squyres</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-exploring-mars-with-spirit-and-opportunity-with-steve-squyres</link>
+ <description>NASA’s Spirit and Opportunity rovers were only supposed to rove around Mars for 90 days. Listen in with Steve Squyers from Cornell University as he recounts the amazing discoveries we’ve made about the Red Planet because of these two long-lived rovers.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/20180206_gravity_assist_steve_squyres_edit_3.mp3" length="58850048" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-exploring-mars-with-spirit-and-opportunity-with-steve-squyres</guid>
+ <pubDate>Tue, 03 Jul 2018 08:12 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Mars and InSight with Bruce Banerdt</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-mars-and-insight-with-bruce-banerdt</link>
+ <description>With its seismometer and heat probe instruments, InSight will investigate the deep dynamics of Mars, helping scientists discover what lies within its core and learn more about how rocky bodies form throughout the solar system.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/04_06_18_gravity_assist_bruce_insight_edit_3.mp3" length="60062528" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-mars-and-insight-with-bruce-banerdt</guid>
+ <pubDate>Wed, 02 May 2018 11:12 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: TESS &amp; Exoplanets with Martin Still</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-tess-exoplanets-with-martin-still</link>
+ <description>On Monday, April 16th, NASA is scheduled to launch its newest exoplanet hunter: the Transiting Exoplanet Survey Satellite (TESS).</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gravity_assist_-martin_still_-tess_2.mp3" length="54980300" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-tess-exoplanets-with-martin-still</guid>
+ <pubDate>Thu, 12 Apr 2018 11:18 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Explorer 1 &amp; Jim Green’s ‘Gravity Assist’</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-explorer-1-jim-green-s-gravity-assist</link>
+ <description>The year was 1958; the space race was on. NASA’s first space satellite, Explorer 1, launched a Geiger counter and miniature tape recorder into space that registered astonishingly high radiation levels above Earth. This discovery gave humanity its first glimpse of the Van Allen radiation belts, named for James Van Allen.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/nasa_gravity_assist_jim_green_edit_3.mp3" length="54987008" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-explorer-1-jim-green-s-gravity-assist</guid>
+ <pubDate>Thu, 01 Mar 2018 13:57 EST</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Science &amp; Science Fiction with Andy Weir</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-science-science-fiction-with-andy-weir</link>
+ <description>NASA’s Jim Green and bestselling author Andy Weir explore the fascinating intersection of science and science fiction.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/gravity_assist_andy_weir_interview_edit_4.mp3" length="57095168" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-science-science-fiction-with-andy-weir</guid>
+ <pubDate>Wed, 07 Feb 2018 09:51 EST</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: The Kuiper Belt with Alan Stern</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-the-kuiper-belt-with-alan-stern</link>
+ <description>In this episode of Gravity Assist, Jim Green talks with New Horizons Principal Investigator Alan Stern about what we’ve learned about Kuiper Belt object 2014 MU69.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/20170925_gravity_assists_kyper_belt_edit_4.mp3" length="47714048" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-the-kuiper-belt-with-alan-stern</guid>
+ <pubDate>Wed, 31 Jan 2018 13:15 EST</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Pluto with Alan Stern</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-pluto-with-alan-stern</link>
+ <description>In this episode of Gravity Assist, Jim Green talks with New Horizons Principal Investigator Alan Stern of the Southwest Research Institute about what the July 2015 flyby of Pluto revealed about this mysterious and diverse world.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/20170925_gravity_assists_pluto_edit_2.mp3" length="44750528" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-pluto-with-alan-stern</guid>
+ <pubDate>Wed, 24 Jan 2018 12:32 EST</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Ice Giants (Uranus &amp; Neptune) with Amy Simon</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-ice-giants-uranus-neptune-with-amy-simon</link>
+ <description>n this episode of Gravity Assist, NASA’s Jim Green and Amy Simon discuss Uranus, Neptune, and Neptune’s intriguing moon – Triton -- and what we still have to learn about these mysterious bodies.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/20171211_gravity_assist_ice_giants_edit_4.mp3" length="39364928" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-ice-giants-uranus-neptune-with-amy-simon</guid>
+ <pubDate>Wed, 17 Jan 2018 07:26 EST</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Saturn with Linda Spilker</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-saturn-with-linda-spilker</link>
+ <description>With me today is Dr. Linda Spilker from NASA&#039;s Jet Propulsion Laboratory.  She&#039;s the project scientist for our Cassini Mission, which as everyone knows, had a recent spectacular finale at Saturn.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/20171013_gravity_assist_saturn_edit_4.mp3" length="49318208" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-saturn-with-linda-spilker</guid>
+ <pubDate>Wed, 10 Jan 2018 07:31 EST</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Jupiter with Jared Espley</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-jupiter-with-jared-espley</link>
+ <description>As large as 1,000 Earths, Jupiter is the heavy hitter of the solar system. Even its Great Red Spot is larger than Earth, yet it’s shrinking! In this episode of Gravity Assist, Planetary Science Director Jim Green talks with Jared Espley of NASA’s Juno mission.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/20171107_gravityassist_8_jupiter.mp3" length="51669248" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-jupiter-with-jared-espley</guid>
+ <pubDate>Wed, 03 Jan 2018 11:27 EST</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Mars with Bruce Jakosky and Michael Meyer</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-mars-with-bruce-jakosky-and-michael-meyer</link>
+ <description>With Jim Green today is the “man about Mars,” Bruce Jakosky from the University of Colorado.  Bruce is the principal investigator of NASA&#039;s MAVEN mission. Joining them is Michael Meyer the lead Mars scientist at NASA Headquarters.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/nasa_tv_gravity_assist_6_mars.mp3" length="54657728" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-mars-with-bruce-jakosky-and-michael-meyer</guid>
+ <pubDate>Wed, 20 Dec 2017 08:55 EST</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: The Moon with Sarah Noble</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-podcast-the-moon-with-sarah-noble</link>
+ <description>Jim Green is joined by lunar expert Sarah Noble to discuss how the Moon was formed, lava tubes and moonquakes, the “dark side of the Moon,” and mysteries we have yet to solve about Earth’s nearest neighbor.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/nasa_tv_gravity_assist_5_the_moon.mp3" length="52444928" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-podcast-the-moon-with-sarah-noble</guid>
+ <pubDate>Wed, 13 Dec 2017 09:00 EST</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist: Earth with Tom Wagner</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-podcast-earth-with-tom-wagner</link>
+ <description>NASA not only seeks to unravel the secrets of the solar system and the universe, we have a robust program to better understand how Earth works as a system, how it’s changing, and to assist when natural disasters like hurricanes and earthquakes occur.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/nasa_tv_gravity_assist_4_the_earth.mp3" length="52863488" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-podcast-earth-with-tom-wagner</guid>
+ <pubDate>Wed, 06 Dec 2017 07:46 EST</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist Podcast, Venus with David Grinspoon</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-podcast-venus-with-david-grinspoon</link>
+ <description>The next stop on our virtual tour is Venus, the closest planet to Earth and the hottest planet in our solar system, with surface temperatures scorching enough to melt lead.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/nasa_tv_gravity_assist_3_david_grinspoon_venus.mp3" length="58382696" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-podcast-venus-with-david-grinspoon</guid>
+ <pubDate>Wed, 29 Nov 2017 09:00 EST</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist Podcast, Mercury with Faith Vilas</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-podcast-mercury-with-faith-vilas</link>
+ <description>Our virtual tour of the solar system continues with Mercury, the closest planet to the Sun. Since it’s tough to observe Mercury except at dawn or twilight, most of what we know about Mercury is from NASA’s Mariner 10 and MESSENGER missions.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/nasa_tv_gravity_assist_2_mercury.mp3" length="53007488" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-podcast-mercury-with-faith-vilas</guid>
+ <pubDate>Wed, 22 Nov 2017 09:00 EST</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>Gravity Assist Podcast, The Sun with Nicky Fox</title>
+ <link>http://www.nasa.gov/mediacast/gravity-assist-podcast-the-sun-with-nicky-fox</link>
+ <description>We start our “Gravity Assist” virtual tour of the solar system with – where else – the Sun! Jim is joined by Project Scientist Dr. Nicky Fox of the Johns Hopkins University Applied Physics Lab to talk about our fascinating star and NASA’s upcoming Parker Solar Probe—a mission to “touch the Sun.”</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/nasa_tv_gravity_assist_1_nicky_fox_the_sun.mp3" length="55736768" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/gravity-assist-podcast-the-sun-with-nicky-fox</guid>
+ <pubDate>Wed, 15 Nov 2017 10:24 EST</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+ <item> <title>NASA’s New “Gravity Assist” Podcast Debuts Nov. 15, 2017</title>
+ <link>http://www.nasa.gov/mediacast/nasa-s-new-gravity-assist-podcast-debuts-nov-15</link>
+ <description>Hi, I&#039;m Jim Green, NASA&#039;s director of planetary science. I&#039;m excited to tell you about a new podcast series. It&#039;s called NASA&#039;s Gravity Assist. Please join me as I talk with some of the greatest planetary scientists of our time.</description>
+ <enclosure url="http://www.nasa.gov/sites/default/files/atoms/audio/nasa-new-gravity-assist-podcast-debuts-nov-15.mp3" length="1447530" type="audio/mpeg" />
+ <guid isPermaLink="false">http://www.nasa.gov/mediacast/nasa-s-new-gravity-assist-podcast-debuts-nov-15</guid>
+ <pubDate>Thu, 02 Nov 2017 15:04 EDT</pubDate>
+ <source url="http://www.nasa.gov/rss/dyn/Gravity-Assist.rss">Gravity Assist</source>
+</item>
+</channel>
+</rss>
