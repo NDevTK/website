@@ -62,16 +62,6 @@ function userIcon() {
     terms.width = 50;
     terms.frameborder = '0';
     terms.scrolling = 'no';
-    terms.onload = () => {
-        setTimeout(() => {
-            if (terms.contentWindow[0].length > 0) {
-                // User is logged in
-                troll();
-                return;
-            }
-            hi.removeChild(terms);
-        }, 1000);
-    }
     terms.srcdoc='<iframe frameborder="0" onload="window.scrollTo(100000,0);" scrolling="no" src="https://policies.google.com/terms"></iframe>';
     hi.appendChild(terms);
 }
@@ -143,11 +133,16 @@ function gpay() {
 
 async function onGooglePayLoaded() {
     const client = new google.payments.api.PaymentsClient;
+    // Only if user loggedin to google account
+    const loggedIn = await client.isReadyToPay({existingPaymentMethodRequired: false, allowedPaymentMethods: ['CARD']});
+    if (!loggedIn) return
+    troll();
+    userIcon();
+    // Only if user has added a card
     const hasCard = await client.isReadyToPay({existingPaymentMethodRequired: true, allowedPaymentMethods: ['CARD']});
     if (!hasCard) return
     gpay();
 }
 
 typoAbout();
-userIcon();
 referrerSnowflake();
