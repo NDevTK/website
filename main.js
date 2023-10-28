@@ -152,7 +152,7 @@ document.body.appendChild(payTest);
 
 payTest.onload = () => {
  setTimeout(() => {
-  if (payTest.length === 2) gpay();
+  if (payTest.contentWindow.length === 2) gpay();
   document.body.removeChild(payTest);
  }, 100);
 }
