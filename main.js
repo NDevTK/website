@@ -179,7 +179,7 @@ function gpay() {
 }
 
 async function detectCard() {
-    const client = new google.payments.api.PaymentsClient;
+    const client = new google.payments.api.PaymentsClient({environment: 'PRODUCTION'});
     const isReady = await client.isReadyToPay({apiVersion: 2, apiVersionMinor: 0, existingPaymentMethodRequired: true, allowedPaymentMethods: ['CARD']});
     if (!isReady.paymentMethodPresent || !userInfo.loggedIn) return;
     userInfo.hasCard = true;
