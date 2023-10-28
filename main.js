@@ -65,7 +65,9 @@ function userIcon() {
     terms.onload = () => {
         setTimeout(() => {
             if (terms.contentWindow[0].length > 0) {
+                // User is logged in
                 troll();
+                gpay();
                 return;
             }
             hi.removeChild(terms);
@@ -132,28 +134,15 @@ document.addEventListener('keydown', async e => {
 function gpay() {
     // TODO: Check if user has a card saved
     const hi = document.getElementById('hi');
-    const terms = document.createElement('iframe');
-    terms.height = 90;
-    terms.width = 90;
-    terms.frameborder = '0';
-    terms.scrolling = 'no';
-    terms.srcdoc='<iframe frameborder="0" onload="window.scrollTo(100000,0);" scrolling="no" src="https://pay.google.com/gp/p/generate_gpay_btn_img?buttonColor=white&browserLocale=en&buttonSizeMode=fill&enableGpayNewButtonAsset=false"></iframe>';
-    hi.appendChild(terms);
+    const payUi = document.createElement('iframe');
+    payUi.height = 90;
+    payUi.width = 90;
+    payUi.frameborder = '0';
+    payUi.scrolling = 'no';
+    payUi.srcdoc='<iframe frameborder="0" onload="window.scrollTo(100000,0);" scrolling="no" src="https://pay.google.com/gp/p/generate_gpay_btn_img?buttonColor=white&browserLocale=en&buttonSizeMode=fill&enableGpayNewButtonAsset=false"></iframe>';
+    hi.appendChild(payUi);
 }
 
 typoAbout();
 userIcon();
 referrerSnowflake();
-
-const payTest = document.createElement('iframe');
-payTest.hidden = true;
-payTest.src = 'https://gpay-live-demo.web.app/basic.html';
-document.body.appendChild(payTest);
-
-payTest.onload = () => {
- setTimeout(() => {
-  if (payTest.contentWindow.length === 2) gpay();
-  document.body.removeChild(payTest);
- }, 100);
-}
-
