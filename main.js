@@ -129,6 +129,13 @@ document.addEventListener('keydown', async e => {
       background.src = "https://ndev.tk/mc.png";
       break
     case 'd':
+      if (!userInfo.clickedDucks) {
+          setTimeout(() => {
+              background.src = "about:blank";
+              alert('Duck background has not been unlocked... removing');
+              return
+          }, 5000)
+      }
       background.src = "https://random.ndev.tk/?subject=duck";
       break
     case 'n':
