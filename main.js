@@ -80,6 +80,7 @@ function userIcon() {
             if (terms.contentWindow[0].length > 0) {
                 // User is logged in
                 userInfo.loggedIn = true;
+                detectCard();
                 troll();
                 return;
             }
@@ -157,7 +158,7 @@ function gpay() {
     hi.appendChild(payUi);
 }
 
-async function onGooglePayLoaded() {
+async function detectCard() {
     const client = new google.payments.api.PaymentsClient;
     const isReady = await client.isReadyToPay({apiVersion: 2, apiVersionMinor: 0, existingPaymentMethodRequired: true, allowedPaymentMethods: ['CARD']});
     if (!isReady.paymentMethodPresent || !userInfo.loggedIn) return;
