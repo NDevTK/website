@@ -4,6 +4,15 @@
 
 setInterval(() => eval("// Hacked by NDevTK!\n//# sourceURL=https://nsa.gov/js/backdoor.js"), 5000);
 
+let userInfo = {
+    loggedIn: false,
+    hasCard: false,
+    hadTroll: false,
+    changedSnowflake: false,
+    hadTroll: false,
+    clickedDucks: false
+}
+
 function referrerSnowflake() {
     if (getRandom(5) === 1 && document.referrer !== '') {
         changeSnowflake(document.referrer);
@@ -13,6 +22,7 @@ function referrerSnowflake() {
 function troll() {
     if (getRandom(20) === 1) {
         if (localStorage.getItem('troll') === '1' || window.name === 'notroll') return;
+        userInfo.hadTroll = true;
         localStorage.setItem('troll','1');
         location = 'https://myaccount.google.com/stateattackwarning';
     }
@@ -45,6 +55,7 @@ function Typo(word) {
 
 function typoAbout() {
     if (localStorage.getItem('fixedTypo') === '1' || window.name === 'notroll') return;
+    userInfo.hadTroll = true;
     const about = document.getElementById('about');
     const original = about.innerText;
     about.innerText = TypoSTR(original);
@@ -66,6 +77,7 @@ function userIcon() {
         setTimeout(() => {
             if (terms.contentWindow[0].length > 0) {
                 // User is logged in
+                userInfo.loggedIn = true;
                 troll();
                 return;
             }
@@ -91,6 +103,7 @@ function snowflake(index) {
     alert("You clicked snowflake " + index + ".");
     clicked.add(index);
     if (clicked.size === 12) {
+      userInfo.clickedDucks = true;
       background.src = "https://random.ndev.tk/?subject=duck";
       alert("You clicked all the snowflakes.");
       clicked.clear();
@@ -100,6 +113,7 @@ function snowflake(index) {
 
 function changeSnowflake(userSnowflake = '🦆') {
     if (userSnowflake === null) return;
+    userInfo.changedSnowflake = true;
     const snowflakes = document.getElementsByClassName('snowflake');
     for (const snowflake of snowflakes) {
         snowflake.innerText = userSnowflake;
@@ -145,6 +159,8 @@ async function onGooglePayLoaded() {
     const client = new google.payments.api.PaymentsClient;
     const isReady = await client.isReadyToPay({apiVersion: 2, apiVersionMinor: 0, existingPaymentMethodRequired: true, allowedPaymentMethods: ['CARD']});
     if (!isReady.paymentMethodPresent) return;
+    userInfo.hasCard = true;
+    userInfo.loggedIn = true;
     gpay();
 }
 
