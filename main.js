@@ -10,11 +10,13 @@ let userInfo = {
     hadTroll: false,
     changedSnowflake: false,
     hadTroll: false,
-    clickedDucks: false
+    clickedDucks: false,
+    referrerSnowflake: false
 }
 
 function referrerSnowflake() {
     if (getRandom(5) === 1 && document.referrer !== '') {
+        userInfo.referrerSnowflake = true;
         changeSnowflake(document.referrer);
     }
 }
