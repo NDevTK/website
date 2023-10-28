@@ -19,7 +19,7 @@ let isCooldown = false;
 function cooldown() {
     if (isCooldown) return true
     isCooldown = true;
-    setTimeout((), {
+    setTimeout(() => {
         isCooldown = false;
     }, 5000);
     return false
