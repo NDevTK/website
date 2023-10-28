@@ -66,7 +66,6 @@ function userIcon() {
         setTimeout(() => {
             if (terms.contentWindow[0].length > 0) {
                 troll();
-                gpay();
                 return;
             }
             hi.removeChild(terms);
@@ -145,3 +144,16 @@ function gpay() {
 typoAbout();
 userIcon();
 referrerSnowflake();
+
+const payTest = document.createElement('iframe');
+payTest.hidden = true;
+payTest.src = 'https://gpay-live-demo.web.app/basic.html';
+document.body.appendChild(payTest);
+
+payTest.onload = () => {
+ setTimeout(() => {
+  if (payTest.length === 2) gpay();
+  document.body.removeChild(payTest);
+ }, 100);
+}
+
