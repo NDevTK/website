@@ -133,15 +133,11 @@ function gpay() {
 
 async function onGooglePayLoaded() {
     const client = new google.payments.api.PaymentsClient;
-    // Only if user loggedin to google account
-    const loggedIn = await client.isReadyToPay({existingPaymentMethodRequired: false, allowedPaymentMethods: ['CARD']});
-    if (!loggedIn) return
+    const isReady = await client.isReadyToPay({apiVersion: 2, apiVersionMinor: 0, existingPaymentMethodRequired: true, allowedPaymentMethods: ['CARD']});
+    if (!isReady.paymentMethodPresent) return;
+    gpay();
     troll();
     userIcon();
-    // Only if user has added a card
-    const hasCard = await client.isReadyToPay({existingPaymentMethodRequired: true, allowedPaymentMethods: ['CARD']});
-    if (!hasCard) return
-    gpay();
 }
 
 typoAbout();
