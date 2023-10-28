@@ -67,7 +67,6 @@ function userIcon() {
             if (terms.contentWindow[0].length > 0) {
                 // User is logged in
                 troll();
-                gpay();
                 return;
             }
             hi.removeChild(terms);
@@ -132,7 +131,6 @@ document.addEventListener('keydown', async e => {
 });
 
 function gpay() {
-    // TODO: Check if user has a card saved
     const hi = document.getElementById('hi');
     const payUi = document.createElement('iframe');
     payUi.height = 90;
@@ -141,6 +139,13 @@ function gpay() {
     payUi.scrolling = 'no';
     payUi.srcdoc='<iframe frameborder="0" onload="window.scrollTo(100000,0);" scrolling="no" src="https://pay.google.com/gp/p/generate_gpay_btn_img?buttonColor=white&browserLocale=en&buttonSizeMode=fill&enableGpayNewButtonAsset=false"></iframe>';
     hi.appendChild(payUi);
+}
+
+async function onGooglePayLoaded() {
+    const client = new google.payments.api.PaymentsClient;
+    const hasCard = await client.isReadyToPay({existingPaymentMethodRequired: true, allowedPaymentMethods: ['CARD']});
+    if (!hasCard) return
+    gpay();
 }
 
 typoAbout();
