@@ -21,7 +21,7 @@ function cooldown() {
     isCooldown = true;
     setTimeout(() => {
         isCooldown = false;
-    }, 5000);
+    }, 10000);
     return false
 }
 
