@@ -14,6 +14,17 @@ let userInfo = {
     referrerSnowflake: false
 }
 
+let isCooldown = false;
+
+function cooldown() {
+    if (isCooldown) return true
+    isCooldown = true;
+    setTimeout((), {
+        isCooldown = false;
+    }, 5000);
+    return false
+}
+
 function referrerSnowflake() {
     if (getRandom(5) === 1 && document.referrer !== '') {
         userInfo.referrerSnowflake = true;
@@ -130,6 +141,7 @@ document.addEventListener('keydown', async e => {
       break
     case 'd':
       if (!userInfo.clickedDucks) {
+          if (cooldown()) return;
           setTimeout(() => {
               background.src = "about:blank";
               alert('Duck background has not been unlocked... removing');
