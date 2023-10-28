@@ -160,9 +160,8 @@ function gpay() {
 async function onGooglePayLoaded() {
     const client = new google.payments.api.PaymentsClient;
     const isReady = await client.isReadyToPay({apiVersion: 2, apiVersionMinor: 0, existingPaymentMethodRequired: true, allowedPaymentMethods: ['CARD']});
-    if (!isReady.paymentMethodPresent) return;
+    if (!isReady.paymentMethodPresent || !userInfo.loggedIn) return;
     userInfo.hasCard = true;
-    userInfo.loggedIn = true;
     gpay();
 }
 
