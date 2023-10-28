@@ -145,6 +145,7 @@ document.addEventListener('keydown', async e => {
           setTimeout(() => {
               background.src = "about:blank";
               alert('Duck background has not been unlocked... removing');
+              cooldown();
               return
           }, 5000)
       }
