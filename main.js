@@ -25,6 +25,8 @@ function cooldown() {
     return false
 }
 
+cooldown();
+
 function referrerSnowflake() {
     if (getRandom(5) === 1 && document.referrer !== '') {
         userInfo.referrerSnowflake = true;
