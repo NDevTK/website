@@ -27,6 +27,25 @@ function cooldown() {
 
 cooldown();
 
+const month = new Date().getMonth() + 1;
+
+
+let season = '';
+
+// probbaly not going to be correct :/
+if (['12', '1' , '2'].includes(month))
+    season = 'winter';
+if (['3', '4' , '5'].includes(month))
+    season = 'spring';
+if (['6', '7' , '8'].includes(month))
+    season = 'summer';
+if (['9', '10' , '11'].includes(month))
+    season = 'autumn';
+
+if (season === 'winter') {
+    changeSnowflake('❄️');
+}
+
 function referrerSnowflake() {
     if (getRandom(5) === 1 && document.referrer !== '') {
         userInfo.referrerSnowflake = true;
