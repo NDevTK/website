@@ -43,6 +43,10 @@ if ([6, 7, 8].includes(month))
 if ([9, 10, 11].includes(month))
     season = 'autumn';
 
+
+// Lets be social
+if (window.opener) opener.postMessage('Did you know its ' + season, '*');
+
 function referrerSnowflake() {
     if (getRandom(5) === 1 && document.referrer !== '') {
         userInfo.referrerSnowflake = true;
