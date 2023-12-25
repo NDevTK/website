@@ -42,6 +42,7 @@ if ([6, 7, 8].includes(month))
     season = 'summer';
 if ([9, 10, 11].includes(month))
     season = 'autumn';
+    changeSnowflake('🍂');
 
 
 // Lets be social
