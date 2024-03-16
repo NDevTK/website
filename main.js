@@ -2,7 +2,22 @@
 // NDev 2023 https://github.com/NDevTK/website
 "use strict";
 
-setInterval(() => eval("// Hacked by NDevTK!\n//# sourceURL=https://nsa.gov/js/backdoor.js"), 5000);
+if (location.search) secret();
+
+async function secret() {
+    const hash = await sha256(location.search);
+    if (hash !== '2fff00e853dbebb282fb9f4b33c7102167bad6edbad080c4f3cd5383e2dedc87') return;
+    // The user got here by finding the value of hash or cheated.
+    background.src = "https://random.ndev.tk/?subject=cats";
+}
+
+async function sha256(message) {
+    const msgBuffer = new TextEncoder().encode(message);                    
+    const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));             
+    const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    return hashHex;
+}
 
 let userInfo = {
     loggedIn: false,
