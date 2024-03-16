@@ -2,13 +2,29 @@
 // NDev 2023 https://github.com/NDevTK/website
 "use strict";
 
-if (location.search) secret();
+let userInfo = {
+    loggedIn: false,
+    hasCard: false,
+    hadTroll: false,
+    changedSnowflake: false,
+    hadTroll: false,
+    clickedDucks: false,
+    referrerSnowflake: false,
+    didCheat: false
+}
 
-async function secret() {
+if (location.search) secret('url');
+
+async function secret(initiator = 'cheating') {
     const hash = await sha256(location.search);
     if (hash !== '2fff00e853dbebb282fb9f4b33c7102167bad6edbad080c4f3cd5383e2dedc87') return;
+    
     // The user got here by finding the value of hash or cheated.
     background.src = "https://random.ndev.tk/?subject=cats";
+    changeSnowflake('🐈');
+    
+    // By these words guarded please be honest it wont affect the cat background.
+    userInfo.didCheat = initiator;
 }
 
 async function sha256(message) {
@@ -19,15 +35,7 @@ async function sha256(message) {
     return hashHex;
 }
 
-let userInfo = {
-    loggedIn: false,
-    hasCard: false,
-    hadTroll: false,
-    changedSnowflake: false,
-    hadTroll: false,
-    clickedDucks: false,
-    referrerSnowflake: false
-}
+
 
 let isCooldown = false;
 
