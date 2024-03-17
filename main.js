@@ -7,7 +7,6 @@ let userInfo = {
     hasCard: false,
     hadTroll: false,
     changedSnowflake: false,
-    hadTroll: false,
     clickedDucks: false,
     referrerSnowflake: false,
     secretMode: false
