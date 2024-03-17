@@ -15,6 +15,7 @@ let userInfo = {
 secret(location.search);
 
 const icon = document.getElementById('icon');
+const about = document.getElementById('about');
 
 async function secret(key) {
     const hash = await sha256(key);
@@ -23,8 +24,8 @@ async function secret(key) {
     
     // The user got here by finding the value of hash or cheated.
     changeSnowflake('🐈');
-    
     icon.src = 'https://ndev.tk/icon.png';
+    about.innerText = 'Still ' + about.innerText;
 }
 
 async function sha256(message) {
