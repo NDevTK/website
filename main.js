@@ -9,7 +9,8 @@ let userInfo = {
     changedSnowflake: false,
     hadTroll: false,
     clickedDucks: false,
-    referrerSnowflake: false
+    referrerSnowflake: false,
+    secretMode: false
 }
 
 secret(location.search);
@@ -21,6 +22,7 @@ async function secret(key) {
     const hash = await sha256(key);
     if (hash !== '2fff00e853dbebb282fb9f4b33c7102167bad6edbad080c4f3cd5383e2dedc87') return;
     history.replaceState({}, '', location.origin);
+    userInfo.secretMode = true;
     
     // The user got here by finding the value of hash or cheated.
     changeSnowflake('🐈');
