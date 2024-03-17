@@ -9,22 +9,22 @@ let userInfo = {
     changedSnowflake: false,
     hadTroll: false,
     clickedDucks: false,
-    referrerSnowflake: false,
-    didCheat: false
+    referrerSnowflake: false
 }
 
-if (location.search) secret('url');
+secret(location.search);
 
-async function secret(initiator = 'cheating') {
-    const hash = await sha256(location.search);
+const icon = document.getElementById('icon');
+
+async function secret(key) {
+    const hash = await sha256(key);
     if (hash !== '2fff00e853dbebb282fb9f4b33c7102167bad6edbad080c4f3cd5383e2dedc87') return;
+    history.replaceState({}, '', location.origin);
     
     // The user got here by finding the value of hash or cheated.
-    background.src = "https://random.ndev.tk/?subject=cats";
     changeSnowflake('🐈');
     
-    // By these words guarded please be honest it wont affect the cat background.
-    userInfo.didCheat = initiator;
+    icon.src = 'https://ndev.tk/icon.png';
 }
 
 async function sha256(message) {
