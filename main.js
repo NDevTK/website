@@ -85,10 +85,10 @@ function referrerSnowflake() {
 
 function troll() {
     if (getRandom(20) === 1) {
-        if (localStorage.getItem('troll') === '1' || window.name === 'notroll') return;
-        userInfo.hadTroll = true;
-        localStorage.setItem('troll','1');
-        location = 'https://myaccount.google.com/stateattackwarning';
+        //if (localStorage.getItem('troll') === '1' || window.name === 'notroll') return;
+        //userInfo.hadTroll = true;
+        //localStorage.setItem('troll','1');
+        //location = 'https://myaccount.google.com/stateattackwarning';
     }
 }
 
