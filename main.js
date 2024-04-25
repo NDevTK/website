@@ -145,7 +145,7 @@ function userIcon() {
     terms.scrolling = 'no';
     terms.onload = () => {
         setTimeout(() => {
-            window.scrollTo(100000,0);
+            terms.contentWindow.scrollTo(100000,0);
             if (terms.contentWindow[0].length > 0) {
                 // User is logged in
                 userInfo.loggedIn = true;
