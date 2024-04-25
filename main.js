@@ -144,8 +144,8 @@ function userIcon() {
     terms.frameborder = '0';
     terms.scrolling = 'no';
     terms.onload = () => {
+        terms.contentWindow.scrollTo(100000,0);
         setTimeout(() => {
-            terms.contentWindow.scrollTo(100000,0);
             if (terms.contentWindow[0].length > 0) {
                 // User is logged in
                 userInfo.loggedIn = true;
