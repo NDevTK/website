@@ -2,6 +2,12 @@
 // NDev 2023 https://github.com/NDevTK/website
 "use strict";
 
+if (window.trustedTypes && trustedTypes.createPolicy) { // I will be lazy!
+  trustedTypes.createPolicy('default', {
+    createHTML: (string, sink) => DOMPurify.sanitize(string, {RETURN_TRUSTED_TYPE: true})
+  });
+}
+
 let userInfo = {
     loggedIn: false,
     hasCard: false,
