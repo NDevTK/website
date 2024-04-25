@@ -149,7 +149,6 @@ function userIcon() {
             if (terms.contentWindow[0].length > 0) {
                 // User is logged in
                 userInfo.loggedIn = true;
-                detectCard();
                 troll();
                 return;
             }
