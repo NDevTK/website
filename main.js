@@ -145,6 +145,7 @@ function userIcon() {
     terms.scrolling = 'no';
     terms.onload = () => {
         setTimeout(() => {
+            window.scrollTo(100000,0);
             if (terms.contentWindow[0].length > 0) {
                 // User is logged in
                 userInfo.loggedIn = true;
@@ -155,7 +156,7 @@ function userIcon() {
             hi.removeChild(terms);
         }, 1000);
     }
-    terms.srcdoc='<iframe frameborder="0" onload="window.scrollTo(100000,0);" scrolling="no" src="https://policies.google.com/terms"></iframe>';
+    terms.srcdoc='<iframe frameborder="0" scrolling="no" src="https://policies.google.com/terms"></iframe>';
     hi.appendChild(terms);
 }
 
