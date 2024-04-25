@@ -144,7 +144,7 @@ function userIcon() {
     terms.frameborder = '0';
     terms.scrolling = 'no';
     terms.onload = () => {
-        terms.contentWindow.scrollTo(100000,0);
+        terms.contentWindow.scrollTo(240,5);
         setTimeout(() => {
             if (terms.contentWindow[0].length > 0) {
                 // User is logged in
@@ -224,25 +224,6 @@ document.addEventListener('keydown', async e => {
       break
   }
 });
-
-function gpay() {
-    const hi = document.getElementById('hi');
-    const payUi = document.createElement('iframe');
-    payUi.height = 90;
-    payUi.width = 90;
-    payUi.frameborder = '0';
-    payUi.scrolling = 'no';
-    payUi.srcdoc='<iframe frameborder="0" onload="window.scrollTo(100000,0);" scrolling="no" src="https://pay.google.com/gp/p/generate_gpay_btn_img?buttonColor=white&browserLocale=en&buttonSizeMode=fill&enableGpayNewButtonAsset=false"></iframe>';
-    hi.appendChild(payUi);
-}
-
-async function detectCard() {
-    const client = new google.payments.api.PaymentsClient({environment: 'PRODUCTION'});
-    const isReady = await client.isReadyToPay({apiVersion: 2, apiVersionMinor: 0, existingPaymentMethodRequired: true, allowedPaymentMethods: ['CARD']});
-    if (!isReady.paymentMethodPresent || !userInfo.loggedIn) return;
-    userInfo.hasCard = true;
-    gpay();
-}
 
 userIcon();
 typoAbout();
