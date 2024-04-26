@@ -2,7 +2,7 @@
 
 if (window.trustedTypes && trustedTypes.createPolicy) { // I will be lazy!
   trustedTypes.createPolicy('default', {
-    createHTML: (string, sink) => DOMPurify.sanitize(string, {RETURN_TRUSTED_TYPE: true})
+    createHTML: (string, sink) => DOMPurify.sanitize(string, {RETURN_TRUSTED_TYPE: false})
   });
 }
 
