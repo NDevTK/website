@@ -2,14 +2,7 @@
 // NDev 2023 https://github.com/NDevTK/website
 "use strict";
 
-if (window.trustedTypes && trustedTypes.createPolicy) { // I will be lazy!
-  trustedTypes.createPolicy('default', {
-    createHTML: (string, sink) => DOMPurify.sanitize(string, {RETURN_TRUSTED_TYPE: false, ALLOWED_TAGS: ["iframe"]})
-  });
-}
-
 let userInfo = {
-    loggedIn: false,
     hasCard: false,
     hadTroll: false,
     changedSnowflake: false,
@@ -136,29 +129,6 @@ function typoAbout() {
     };
 }
 
-function userIcon() {
-    const hi = document.getElementById('hi');
-    const terms = document.createElement('iframe');
-    terms.height = 52;
-    terms.width = 50;
-    terms.frameborder = '0';
-    terms.scrolling = 'no';
-    terms.onload = () => {
-        terms.contentWindow.scrollTo(240,5);
-        setTimeout(() => {
-            if (terms.contentWindow[0].length > 0) {
-                // User is logged in
-                userInfo.loggedIn = true;
-                troll();
-                return;
-            }
-            hi.removeChild(terms);
-        }, 1000);
-    }
-    terms.srcdoc='<iframe frameborder="0" scrolling="no" src="https://policies.google.com/terms"></iframe>';
-    hi.appendChild(terms);
-}
-
 function Custom() {
   var subject = prompt("Enter subject");
   if (subject === null) return;
@@ -224,6 +194,5 @@ document.addEventListener('keydown', async e => {
   }
 });
 
-userIcon();
 typoAbout();
 referrerSnowflake();
