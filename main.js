@@ -3,7 +3,6 @@
 "use strict";
 
 let userInfo = {
-    hasCard: false,
     hadTroll: false,
     changedSnowflake: false,
     clickedDucks: false,
