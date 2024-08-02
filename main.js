@@ -35,21 +35,6 @@ async function sha256(message) {
     return hashHex;
 }
 
-
-
-let isCooldown = false;
-
-function cooldown() {
-    if (isCooldown) return true
-    isCooldown = true;
-    setTimeout(() => {
-        isCooldown = false;
-    }, 30000);
-    return false
-}
-
-cooldown();
-
 const month = new Date().getMonth() + 1;
 
 
@@ -144,7 +129,6 @@ function snowflake(index) {
     clicked.add(index);
     if (clicked.size === 12) {
       userInfo.clickedDucks = true;
-      background.src = "https://random.ndev.tk/?subject=duck";
       alert("You clicked all the snowflakes.");
       clicked.clear();
     }
@@ -164,18 +148,6 @@ document.addEventListener('keydown', async e => {
   switch (e.key.toLowerCase()) {
     case 'm':
       background.src = "https://ndev.tk/mc.png";
-      break
-    case 'd':
-      if (!userInfo.clickedDucks) {
-          if (cooldown()) return;
-          setTimeout(() => {
-              background.src = "about:blank";
-              alert('Duck background has not been unlocked... removing');
-              cooldown();
-              return
-          }, 5000)
-      }
-      background.src = "https://random.ndev.tk/?subject=duck";
       break
     case 'n':
       location = "https://developer.mozilla.org/en-US/";
