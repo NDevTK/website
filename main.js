@@ -66,15 +66,6 @@ function referrerSnowflake() {
     }
 }
 
-function troll() {
-    if (getRandom(20) === 1) {
-        //if (localStorage.getItem('troll') === '1' || window.name === 'notroll') return;
-        //userInfo.hadTroll = true;
-        //localStorage.setItem('troll','1');
-        //location = 'https://myaccount.google.com/stateattackwarning';
-    }
-}
-
 function TypoSTR(str) {
     let words = str.split(' ');
     words.forEach((word, index) => {
@@ -108,7 +99,7 @@ function typoAbout() {
     about.innerText = TypoSTR(original);
     about.oninput = () => {
         if (about.innerText !== original) return;
-        localStorage.setItem('fixedTypo', '1');
+        if (confirm('Allow this fix to be saved to localStorage?')) localStorage.setItem('fixedTypo', '1');
         alert('Thanks!')
     };
 }
