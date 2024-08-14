@@ -23,7 +23,7 @@ async function secret(key) {
     
     // The user got here by finding the value of hash or cheated.
     changeSnowflake('🐈');
-    icon.src = 'https://ndev.tk/icon.png';
+    icon.src = 'https://ndev.tk/Discord-penguin.png';
     about.innerText = 'Still ' + about.innerText;
 }
 
