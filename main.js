@@ -160,7 +160,7 @@ typoAbout();
 referrerSnowflake();
 
 icon.onclick = () => {
-    if (icon.src === '/icon-qr.png') {
+    if (icon.src.endsWith('/icon-qr.png')) {
         icon.src = '/icon.webp';
     } else {
         icon.src = '/icon-qr.png';
