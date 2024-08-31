@@ -160,5 +160,9 @@ typoAbout();
 referrerSnowflake();
 
 icon.onclick = () => {
-    icon.src = '/icon-qr.png';
+    if (icon.src === '/icon-qr.png') {
+        icon.src = '/icon.webp';
+    } else {
+        icon.src = '/icon-qr.png';
+    }
 }
