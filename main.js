@@ -158,3 +158,8 @@ document.addEventListener('keydown', async e => {
 
 typoAbout();
 referrerSnowflake();
+
+const icon = document.getElementById('icon');
+icon.onclick = () => {
+    icon.src = '/icon-qr.png';
+}
