@@ -138,7 +138,7 @@ function changeSnowflake(userSnowflake = '🦆') {
 document.addEventListener('keydown', async e => {
   switch (e.key.toLowerCase()) {
     case 'm':
-      background.src = "https://ndev.tk/mc.png";
+      background.src = "https://ndev.tk/mc.webp";
       break
     case 'n':
       location = "https://developer.mozilla.org/en-US/";
