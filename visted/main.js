@@ -198,4 +198,10 @@ function setupLinks() {
   }
   document.getElementById('log').appendChild(table);
 }
+
 setupLinks();
+
+document.getElementById('startButton').onclick = updateParams;
+document.getElementById('stopButton').onclick = () => {
+  stop = true;
+}
