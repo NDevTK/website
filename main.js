@@ -160,3 +160,9 @@ icon.onclick = () => {
         icon.src = '/icon-qr.webp';
     }
 }
+
+onkeyup = (e) => {
+  if (e.key === '.') {
+    location.href = 'https://ndevtk.github.io/writeups/';
+  }
+};
