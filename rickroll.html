@@ -1,37 +1,18 @@
 <html>
   <!–– Please start using https://rickroll.ndev.tk ––>
-  <meta http-equiv="Content-Security-Policy" content="object-src 'none'; base-uri 'none'; require-trusted-types-for 'script';" />
 <head>
 <title>RickRoll</title>
 <link rel="prerender" href="https://ndev.tk/rickroll.html" />
 </head>
 <body>
 <b><h1>RickRoll :D</h1></b>
-<p2>This is a legacy page.</p2>
+<p1>This is a legacy page.</p1>
 </body>
 <script src="https://rickroll.ndev.tk/utils.js"></script>
 <script>
-if (window.trustedTypes && window.trustedTypes.createPolicy) {
-  window.trustedTypes.createPolicy('default', {
-    createScriptURL: (urlStr) => {
-      if (urlStr !== 'https://ndev.tk/blank.js') {
-        throw new TypeError('Untrusted URL');
-      }
-      return urlStr;
-    },
-  });
-}
-
-  
 const NGGYU = "We're no strangers to love You know the rules and so do I A full commitment's what I'm thinking of You wouldn't get this from any other guy I just wanna tell you how I'm feeling Gotta make you understand Never gonna give you up Never gonna let you down Never gonna run around and desert you Never gonna make you cry Never gonna say goodbye Never gonna tell a lie and hurt you We've known each other for so long Your heart's been aching but you're too shy to say it Inside we both know what's been going on We know the game and we're gonna play it And if you ask me how I'm feeling Don't tell me you're too blind to see Never gonna give you up Never gonna let you down Never gonna run around and desert you Never gonna make you cry Never gonna say goodbye Never gonna tell a lie and hurt you Never gonna give you up Never gonna let you down Never gonna run around and desert you Never gonna make you cry Never gonna say goodbye Never gonna tell a lie and hurt you Never gonna give, never gonna give (Give you up) (Ooh) Never gonna give, never gonna give (Give you up) We've known each other for so long Your heart's been aching but you're too shy to say it Inside we both know what's been going on We know the game and we're gonna play it I just wanna tell you how I'm feeling Gotta make you understand Never gonna give you up Never gonna let you down Never gonna run around and desert you Never gonna make you cry Never gonna say goodbye Never gonna tell a lie and hurt you Never gonna give you up Never gonna let you down Never gonna run around and desert you Never gonna make you cry Never gonna say goodbye Never gonna tell a lie and hurt you Never gonna give you up Never gonna let you down Never gonna run around and desert you Never gonna make you cry".split(" ");
 getState(NGGYU.length);
-navigator.serviceWorker.register('https://ndev.tk/blank.js');
-navigator.serviceWorker.ready.then(async (swReg) => {
-  const bgFetch = await swReg.backgroundFetch.fetch(Math.random(), ['/'], {
-    title: NGGYU[state]
-  });
-  //bgFetch.abort();
-  history.back();
-});
+download("data:text/html,RickRoll :D", NGGYU[state]+".rick"+suffix);
+history.back();
 </script>
 </html>
