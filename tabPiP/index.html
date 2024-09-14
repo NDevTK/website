@@ -78,14 +78,8 @@ const displayMediaOptions = {
 };
 
 // Set event listeners for the start and stop buttons
-startElem.addEventListener("click", (evt) => {
-  startCapture();
-}, false);
-
-stopElem.addEventListener("click", (evt) => {
-  stopCapture();
-  location.reload();
-}, false);
+startElem.addEventListener("click", startCapture, false);
+stopElem.addEventListener("click", stopCapture, false);
 
 open.addEventListener("click", (evt) => {
   videoElem.requestPictureInPicture();
@@ -107,6 +101,7 @@ function stopCapture(evt) {
 
   tracks.forEach((track) => track.stop());
   videoElem.srcObject = null;
+  location.reload();
 }
 </script>      
     </body>
