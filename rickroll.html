@@ -13,7 +13,7 @@
 <script>
 if (window.trustedTypes && window.trustedTypes.createPolicy) {
   window.trustedTypes.createPolicy('default', {
-    createScriptURL: (urlStr: string) => {
+    createScriptURL: (urlStr) => {
       if (urlStr !== 'https://ndev.tk/blank.js') {
         throw new TypeError('Untrusted URL');
       }
