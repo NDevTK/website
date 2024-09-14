@@ -84,6 +84,7 @@ startElem.addEventListener("click", (evt) => {
 
 stopElem.addEventListener("click", (evt) => {
   stopCapture();
+  location.reload();
 }, false);
 
 open.addEventListener("click", (evt) => {
@@ -97,6 +98,8 @@ async function startCapture() {
   } catch (err) {
     console.error(`Error: ${err}`);
   }
+    stopElem.disabled = false;
+    open.disabled = false;
 }
 
 function stopCapture(evt) {
