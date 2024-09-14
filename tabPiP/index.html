@@ -95,11 +95,11 @@ open.addEventListener("click", (evt) => {
 async function startCapture() {
   try {
     videoElem.srcObject = await navigator.mediaDevices.getDisplayMedia(displayMediaOptions);
+    stopElem.disabled = false;
+    open.disabled = false;
   } catch (err) {
     console.error(`Error: ${err}`);
   }
-    stopElem.disabled = false;
-    open.disabled = false;
 }
 
 function stopCapture(evt) {
