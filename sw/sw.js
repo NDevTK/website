@@ -1,4 +1,8 @@
 "use strict";
-//self.addEventListener('fetch', function (event) {
-//  event.respondWith(fetch(event.request).then(inject));
-//});
+self.addEventListener('fetch', function (event) {
+  event.respondWith(hook);
+});
+
+async function hook(event) {
+  console.log(event);
+}
