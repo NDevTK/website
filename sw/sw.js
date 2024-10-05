@@ -5,4 +5,5 @@ self.addEventListener('fetch', function (event) {
 
 async function hook(event) {
   console.log(event);
+  return new Response('Hello from SW.');
 }
