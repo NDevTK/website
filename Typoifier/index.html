@@ -55,8 +55,8 @@ function getRandomIntInclusive(min, max) {
 
   let randomNumber = randomBuffer[0] / (0xffffffff + 1);
 
-  let min = Math.ceil(min);
-  let max = Math.floor(max);
+  min = Math.ceil(min);
+  max = Math.floor(max);
   return Math.floor(randomNumber * (max - min + 1)) + min;
 }
 
