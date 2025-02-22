@@ -3,6 +3,7 @@
 <h1>Please embed me in iframe then call check()</h1>
 <meta http-equiv="Content-Security-Policy" content="object-src 'none'; base-uri 'none'; require-trusted-types-for 'script';" />
 <script>
+"use strict";
 function check() {
     let printer = document.createElement('iframe');
     document.body.appendChild(printer);
