@@ -10,7 +10,7 @@
 /*jshint esversion: 8 */
 
 // NDev 2020 https://github.com/NDevTK/website
-
+"use strict";
 var original = false;
 
 function undo() {
@@ -55,8 +55,8 @@ function getRandomIntInclusive(min, max) {
 
   let randomNumber = randomBuffer[0] / (0xffffffff + 1);
 
-  min = Math.ceil(min);
-  max = Math.floor(max);
+  let min = Math.ceil(min);
+  let max = Math.floor(max);
   return Math.floor(randomNumber * (max - min + 1)) + min;
 }
 
