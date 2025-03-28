@@ -169,9 +169,6 @@ icon.onclick = () => {
 
 onkeyup = (e) => {
   if (e.key === '.') {
-    if (document.referrer === 'https://ndevtk.github.io/') {
-        return history.back();
-    }
     location.href = 'https://ndevtk.github.io/writeups/';
   }
 };
