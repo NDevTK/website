@@ -1,5 +1,5 @@
 /*jshint esversion: 8 */
-// NDev 2023 https://github.com/NDevTK/website
+// NDevTK 2025 https://github.com/NDevTK/website
 "use strict";
 
 let userInfo = {
