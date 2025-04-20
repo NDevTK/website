@@ -47,9 +47,11 @@ if ([12, 1, 2].includes(month)) {
 }
 if ([3, 4, 5].includes(month)) {
     season = 'spring';
+    changeSnowflake('🌷');
 }
 if ([6, 7, 8].includes(month)) {
     season = 'summer';
+    changeSnowflake('☀️');
 }
 if ([9, 10, 11].includes(month)) {
     season = 'autumn';
