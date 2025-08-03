@@ -14,6 +14,9 @@ secret(location.search);
 
 const icon = document.getElementById('icon');
 const about = document.getElementById('about');
+const hi = document.getElementById('hi');
+
+if (window.top !== window) hi.innerText += ' ' + document.referrer;
 
 async function secret(key) {
     const hash = await sha256(key);
