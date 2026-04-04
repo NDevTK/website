@@ -21,7 +21,7 @@ pre { white-space: pre-wrap; }
 </head>
 <body>
 <h1>HTML &rarr; DOM API Converter</h1>
-<p class="hint">Paste HTML (or a snippet like <code>document.body.innerHTML+='&lt;iframe ...&gt;'</code>). Outputs non-inline equivalent using <code>createElement</code> / <code>setAttribute</code>.</p>
+<p class="hint">Paste HTML or a JS snippet. Supports raw HTML, <code>innerHTML=</code> assignments, string concatenation (<code>"&lt;a href='" + url + "'&gt;" + name + "&lt;/a&gt;"</code>), and template literals (<code>`&lt;a href="${url}"&gt;${name}&lt;/a&gt;`</code>). Embedded JS expressions are auto-substituted as variable references — so what was an XSS sink becomes a safe DOM build.</p>
 
 <label for="in">Input</label>
 <textarea id="in" rows="8" spellcheck="false">document.body.innerHTML+='&lt;iframe credentialless loading="lazy" id="background" title="background" sandbox="allow-scripts" frameborder="0" height="100%" width="100%" src="https://random.ndev.tk/"&gt;'</textarea>

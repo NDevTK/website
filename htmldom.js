@@ -79,26 +79,243 @@
 
   function $(id) { return document.getElementById(id); }
 
-  // Extract HTML from input. If input looks like raw HTML, use it directly.
-  // Otherwise, pull out string literals and concatenate those that look like
-  // HTML (contain `<` or `&`). Fallback: all string literals joined in order.
+  // Extract HTML from input. Returns { html, autoSubs } where autoSubs is a list
+  // of [placeholder, originalExpression] pairs for JS expressions embedded via
+  // string concatenation or template-literal interpolation.
   function extractHTML(input) {
     const trimmed = input.trim();
-    if (!trimmed) return '';
-    if (trimmed.startsWith('<')) return trimmed;
+    if (!trimmed) return { html: '', autoSubs: [] };
+    if (trimmed.startsWith('<')) return { html: trimmed, autoSubs: [] };
 
-    const re = /(['"`])((?:\\[\s\S]|(?!\1)[\s\S])*)\1/g;
-    const htmlLike = [];
-    const all = [];
-    let m;
-    while ((m = re.exec(trimmed)) !== null) {
-      const decoded = decodeJsString(m[2], m[1]);
-      all.push(decoded);
-      if (/[<&]/.test(decoded)) htmlLike.push(decoded);
+    const tokens = tokenize(trimmed);
+    const chain = findBestConcatChain(tokens);
+    if (chain) return chain;
+
+    // Fallback: pick the single string/template literal with the most HTML-ish
+    // content.
+    let best = null;
+    for (const t of tokens) {
+      if (t.type === 'str' || t.type === 'tmpl') {
+        const { html, autoSubs } = materializeStringToken(t, 0);
+        if (/</.test(html) && (!best || html.length > best.html.length)) {
+          best = { html, autoSubs };
+        }
+      }
     }
-    if (htmlLike.length) return htmlLike.join('');
-    if (all.length) return all.join('');
-    return trimmed;
+    if (best) return best;
+    return { html: trimmed, autoSubs: [] };
+  }
+
+  const EXPR_PREFIX = '__HDX';
+  const EXPR_SUFFIX = '__';
+  function makePlaceholder(n) { return EXPR_PREFIX + n + EXPR_SUFFIX; }
+
+  // Build html/autoSubs from a single string or template literal token.
+  // `startIdx` is the next placeholder index to use.
+  function materializeStringToken(tok, startIdx) {
+    const autoSubs = [];
+    let idx = startIdx;
+    if (tok.type === 'str') {
+      return { html: tok.text, autoSubs, nextIdx: idx };
+    }
+    // template literal
+    let html = '';
+    for (const p of tok.parts) {
+      if (p.kind === 'text') html += decodeJsString(p.raw, '`');
+      else {
+        const ph = makePlaceholder(idx++);
+        autoSubs.push([ph, p.expr.trim()]);
+        html += ph;
+      }
+    }
+    return { html, autoSubs, nextIdx: idx };
+  }
+
+  // Walk tokens, maintaining a stack of bracket levels. At each level, split
+  // the range into operand sub-ranges at every `+` at that level. Collect all
+  // chains (operand-arrays) of length >= 2. Returns the chain producing the
+  // most HTML-like output, or null.
+  function findBestConcatChain(tokens) {
+    const chains = [];
+    const stack = [{ opStart: 0, operands: [] }];
+    const addOperand = (ctx, fromIdx, toIdx) => {
+      if (fromIdx > toIdx) return;
+      // Trim whitespace (we don't emit whitespace tokens, so nothing to do).
+      ctx.operands.push({ toks: tokens.slice(fromIdx, toIdx + 1) });
+    };
+    for (let i = 0; i < tokens.length; i++) {
+      const t = tokens[i];
+      if (t.type === 'open') {
+        stack.push({ opStart: i + 1, operands: [] });
+        continue;
+      }
+      if (t.type === 'close') {
+        const top = stack.pop();
+        addOperand(top, top.opStart, i - 1);
+        if (top.operands.length > 1) chains.push(top.operands);
+        continue;
+      }
+      if (t.type === 'plus') {
+        const top = stack[stack.length - 1];
+        addOperand(top, top.opStart, i - 1);
+        top.opStart = i + 1;
+        continue;
+      }
+      if (t.type === 'sep') {
+        // Terminate and flush the current chain at this depth; start a fresh one.
+        const top = stack[stack.length - 1];
+        addOperand(top, top.opStart, i - 1);
+        if (top.operands.length > 1) chains.push(top.operands);
+        top.operands = [];
+        top.opStart = i + 1;
+      }
+    }
+    while (stack.length) {
+      const top = stack.pop();
+      addOperand(top, top.opStart, tokens.length - 1);
+      if (top.operands.length > 1) chains.push(top.operands);
+    }
+
+    let best = null;
+    let bestScore = -1;
+    for (const chain of chains) {
+      const m = materializeChain(chain);
+      if (!m) continue;
+      if (!/</.test(m.html)) continue;
+      const score = m.html.length + m.autoSubs.length * 50;
+      if (score > bestScore) { bestScore = score; best = m; }
+    }
+    return best;
+  }
+
+  function materializeChain(operands) {
+    let html = '';
+    const autoSubs = [];
+    let idx = 0;
+    let hasString = false;
+    for (const op of operands) {
+      // operand has { toks, start, end }
+      if (op.toks.length === 1 && (op.toks[0].type === 'str' || op.toks[0].type === 'tmpl')) {
+        const m = materializeStringToken(op.toks[0], idx);
+        html += m.html;
+        for (const s of m.autoSubs) autoSubs.push(s);
+        idx = m.nextIdx;
+        hasString = true;
+      } else {
+        const first = op.toks[0];
+        const last = op.toks[op.toks.length - 1];
+        const expr = first._src.slice(first.start, last.end).trim();
+        const ph = makePlaceholder(idx++);
+        autoSubs.push([ph, expr]);
+        html += ph;
+      }
+    }
+    if (!hasString) return null;
+    return { html, autoSubs };
+  }
+
+  // --- Tokenizer ---
+  function tokenize(src) {
+    const tokens = [];
+    let i = 0;
+    const n = src.length;
+    function push(tok) { tok._src = src; tokens.push(tok); }
+    while (i < n) {
+      const c = src[i];
+      if (c === ' ' || c === '\t' || c === '\n' || c === '\r') { i++; continue; }
+      if (c === '/' && src[i + 1] === '/') { while (i < n && src[i] !== '\n') i++; continue; }
+      if (c === '/' && src[i + 1] === '*') { i += 2; while (i < n && !(src[i] === '*' && src[i + 1] === '/')) i++; i += 2; continue; }
+      if (c === "'" || c === '"') {
+        const start = i; const quote = c; i++;
+        let raw = '';
+        while (i < n && src[i] !== quote) {
+          if (src[i] === '\\' && i + 1 < n) { raw += src[i] + src[i + 1]; i += 2; }
+          else { raw += src[i]; i++; }
+        }
+        i++;
+        push({ type: 'str', quote, raw, text: decodeJsString(raw, quote), start, end: i });
+        continue;
+      }
+      if (c === '`') {
+        const start = i; i++;
+        const parts = [];
+        let cur = '';
+        while (i < n && src[i] !== '`') {
+          if (src[i] === '\\' && i + 1 < n) { cur += src[i] + src[i + 1]; i += 2; }
+          else if (src[i] === '$' && src[i + 1] === '{') {
+            parts.push({ kind: 'text', raw: cur }); cur = '';
+            i += 2;
+            let depth = 1; const exprStart = i;
+            while (i < n && depth > 0) {
+              const ch = src[i];
+              if (ch === "'" || ch === '"') {
+                const q = ch; i++;
+                while (i < n && src[i] !== q) { if (src[i] === '\\') i += 2; else i++; }
+                i++;
+              } else if (ch === '`') {
+                i++;
+                while (i < n && src[i] !== '`') {
+                  if (src[i] === '\\') { i += 2; }
+                  else if (src[i] === '$' && src[i + 1] === '{') { i += 2; let d = 1; while (i < n && d > 0) { if (src[i] === '{') d++; else if (src[i] === '}') d--; i++; } }
+                  else i++;
+                }
+                i++;
+              } else if (ch === '{') { depth++; i++; }
+              else if (ch === '}') { depth--; if (depth === 0) break; i++; }
+              else i++;
+            }
+            parts.push({ kind: 'expr', expr: src.slice(exprStart, i) });
+            i++;
+          } else { cur += src[i]; i++; }
+        }
+        parts.push({ kind: 'text', raw: cur });
+        i++;
+        push({ type: 'tmpl', parts, start, end: i });
+        continue;
+      }
+      if (c === '+' && src[i + 1] !== '+' && src[i + 1] !== '=') { push({ type: 'plus', start: i, end: i + 1 }); i++; continue; }
+      if (c === ',' || c === ';') { push({ type: 'sep', char: c, start: i, end: i + 1 }); i++; continue; }
+      // Assignment operators (including compound) act as chain terminators.
+      {
+        const assigns = ['**=', '<<=', '>>>=', '>>=', '&&=', '||=', '??=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^='];
+        let matched = false;
+        for (const op of assigns) {
+          if (src.startsWith(op, i)) { push({ type: 'sep', char: op, start: i, end: i + op.length }); i += op.length; matched = true; break; }
+        }
+        if (matched) continue;
+        if (c === '=' && src[i + 1] !== '=' && src[i + 1] !== '>') {
+          push({ type: 'sep', char: '=', start: i, end: i + 1 });
+          i++;
+          continue;
+        }
+      }
+      // Comparison/equality operators starting with '=' — keep as opaque other.
+      if (c === '=' && src[i + 1] === '=') {
+        const len = src[i + 2] === '=' ? 3 : 2;
+        push({ type: 'other', text: src.slice(i, i + len), start: i, end: i + len });
+        i += len;
+        continue;
+      }
+      if (c === '=' && src[i + 1] === '>') { push({ type: 'other', text: '=>', start: i, end: i + 2 }); i += 2; continue; }
+      if (c === '(' || c === '[' || c === '{') { push({ type: 'open', char: c, start: i, end: i + 1 }); i++; continue; }
+      if (c === ')' || c === ']' || c === '}') { push({ type: 'close', char: c, start: i, end: i + 1 }); i++; continue; }
+      // Identifier/number/punctuation run — consumed until we hit a special char.
+      const start = i;
+      while (i < n) {
+        const ch = src[i];
+        if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r') break;
+        if (ch === "'" || ch === '"' || ch === '`') break;
+        if (ch === '+' && src[i + 1] !== '+' && src[i + 1] !== '=') break;
+        if (ch === ',' || ch === ';') break;
+        if (ch === '=') break;
+        if (ch === '(' || ch === ')' || ch === '[' || ch === ']' || ch === '{' || ch === '}') break;
+        if (ch === '/' && (src[i + 1] === '/' || src[i + 1] === '*')) break;
+        i++;
+      }
+      if (i > start) push({ type: 'other', text: src.slice(start, i), start, end: i });
+      else i++;
+    }
+    return tokens;
   }
 
   function decodeJsString(raw, quote) {
@@ -338,13 +555,16 @@
 
   function convert() {
     const raw = $('in').value;
-    const html = extractHTML(raw);
+    const { html, autoSubs } = extractHTML(raw);
     const subStr = $('subStr').value;
     const subVar = $('subVar').value.trim();
     const subs = [];
+    // Manual substitution first (so it wins on exact matches).
     if (subStr && subVar && isValidIdent(subVar)) {
       subs.push([subStr, subVar]);
     }
+    // Auto subs extracted from JS concatenation / template interpolation.
+    for (const s of autoSubs) subs.push(s);
 
     let parent = 'document.body';
     if ($('parentVar').checked) {
@@ -376,8 +596,23 @@
     const lines = [];
     const used = new Set();
 
-    if (subs.length) {
+    // Reserve identifiers that appear in the user's substitution expressions
+    // so we don't shadow them with element variable names.
+    const idRe = /[A-Za-z_$][A-Za-z0-9_$]*/g;
+    for (const [, expr] of subs) {
+      let m;
+      while ((m = idRe.exec(expr)) !== null) used.add(m[0]);
+    }
+    // Also reserve the parent target identifier root.
+    const parentRoot = parent.match(/^[A-Za-z_$][A-Za-z0-9_$]*/);
+    if (parentRoot) used.add(parentRoot[0]);
+
+    if (subStr && subVar && isValidIdent(subVar)) {
       lines.push('// Assumes: const ' + subVar + ' = ' + JSON.stringify(subStr) + ';');
+    }
+    if (autoSubs.length) {
+      lines.push('// Auto-detected JS expressions from input:');
+      for (const [ph, expr] of autoSubs) lines.push('//   ' + ph + ' -> ' + expr);
     }
 
     if (useRoots.length === 0) {
