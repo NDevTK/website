@@ -585,8 +585,15 @@
 
     const doc = new DOMParser().parseFromString(html, 'text/html');
     const roots = [];
-    for (const n of doc.head.childNodes) roots.push(n);
-    for (const n of doc.body.childNodes) roots.push(n);
+    if (doc.head) for (const n of doc.head.childNodes) roots.push(n);
+    if (doc.body) {
+      for (const n of doc.body.childNodes) roots.push(n);
+    } else if (doc.documentElement) {
+      // e.g. <frameset> replaces body in HTML5 parser output.
+      for (const n of doc.documentElement.childNodes) {
+        if (n !== doc.head) roots.push(n);
+      }
+    }
 
     // Filter whitespace-only text at the root level when requested.
     const useRoots = opts.skipWhitespaceText
