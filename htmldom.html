@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>HTML to DOM API Converter</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="script-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'none';">
+<style>
+body { font-family: system-ui, sans-serif; margin: 1rem; max-width: 960px; background: #212529; color: #eee; }
+h1 { font-size: 1.4rem; }
+label { display: block; margin-top: 0.75rem; font-weight: bold; }
+textarea { width: 100%; box-sizing: border-box; font-family: ui-monospace, Consolas, monospace; font-size: 0.9rem; background: #111; color: #eee; border: 1px solid #444; padding: 0.5rem; }
+input[type=text] { width: 100%; box-sizing: border-box; font-family: ui-monospace, Consolas, monospace; background: #111; color: #eee; border: 1px solid #444; padding: 0.35rem; }
+button { margin-top: 0.75rem; padding: 0.4rem 0.9rem; background: #317EFB; color: #fff; border: 0; border-radius: 4px; cursor: pointer; }
+button:hover { background: #2568d4; }
+.hint { color: #aaa; font-size: 0.85rem; }
+.row { display: flex; gap: 0.5rem; align-items: center; }
+.row input[type=text] { flex: 1; }
+pre { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>HTML &rarr; DOM API Converter</h1>
+<p class="hint">Paste HTML or a JS snippet. Supports raw HTML, <code>innerHTML=</code> assignments, string concatenation (<code>"&lt;a href='" + url + "'&gt;" + name + "&lt;/a&gt;"</code>), and template literals (<code>`&lt;a href="${url}"&gt;${name}&lt;/a&gt;`</code>). Embedded JS expressions are auto-substituted as variable references — so what was an XSS sink becomes a safe DOM build.</p>
+
+<label for="in">Input</label>
+<textarea id="in" rows="8" spellcheck="false">document.body.innerHTML+='&lt;iframe credentialless loading="lazy" id="background" title="background" sandbox="allow-scripts" frameborder="0" height="100%" width="100%" src="https://random.ndev.tk/"&gt;'</textarea>
+
+<label for="sub">Replace string with variable reference (optional)</label>
+<div class="row">
+  <input type="text" id="subStr" placeholder="string to replace, e.g. https://random.ndev.tk/">
+  <input type="text" id="subVar" placeholder="variable name, e.g. BG_URL" style="max-width:220px">
+</div>
+
+<fieldset style="margin-top:0.75rem; border:1px solid #444; padding:0.5rem 0.75rem;">
+  <legend style="padding:0 0.4rem; color:#aaa;">Options</legend>
+  <label><input type="checkbox" id="useProps" checked> Prefer IDL properties (e.g. <code>el.src=</code>) over <code>setAttribute</code></label>
+  <label><input type="checkbox" id="splitStyle" checked> Split <code>style=""</code> into <code>style.setProperty()</code> calls</label>
+  <label><input type="checkbox" id="eventsAsListeners" checked> Convert <code>onclick=""</code> to <code>addEventListener()</code></label>
+  <label><input type="checkbox" id="textShortcut" checked> Use <code>textContent</code> for single text-only children</label>
+  <label><input type="checkbox" id="useClassList" checked> Use <code>classList.add()</code> for multiple classes</label>
+  <label><input type="checkbox" id="skipWS"> Skip whitespace-only text nodes</label>
+  <label><input type="checkbox" id="useFragment"> Wrap multiple roots in <code>DocumentFragment</code></label>
+</fieldset>
+
+<label><input type="checkbox" id="parentVar"> Parent is a variable other than <code>document.body</code></label>
+<div class="row"><input type="text" id="parentName" placeholder="parent variable (default: document.body)"></div>
+
+<button id="go">Convert</button>
+<button id="copy">Copy output</button>
+
+<label for="out">Output</label>
+<textarea id="out" rows="16" spellcheck="false" readonly></textarea>
+
+<p class="hint"><a href="/" style="color:#6ea8fe">&larr; Home</a></p>
+
+<script src="htmldom.js"></script>
+</body>
+</html>
