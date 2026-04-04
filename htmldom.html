@@ -32,7 +32,17 @@ pre { white-space: pre-wrap; }
   <input type="text" id="subVar" placeholder="variable name, e.g. BG_URL" style="max-width:220px">
 </div>
 
-<label><input type="checkbox" id="useProps" checked> Prefer IDL properties (e.g. <code>el.src=</code>) over <code>setAttribute</code> when available</label>
+<fieldset style="margin-top:0.75rem; border:1px solid #444; padding:0.5rem 0.75rem;">
+  <legend style="padding:0 0.4rem; color:#aaa;">Options</legend>
+  <label><input type="checkbox" id="useProps" checked> Prefer IDL properties (e.g. <code>el.src=</code>) over <code>setAttribute</code></label>
+  <label><input type="checkbox" id="splitStyle" checked> Split <code>style=""</code> into <code>style.setProperty()</code> calls</label>
+  <label><input type="checkbox" id="eventsAsListeners" checked> Convert <code>onclick=""</code> to <code>addEventListener()</code></label>
+  <label><input type="checkbox" id="textShortcut" checked> Use <code>textContent</code> for single text-only children</label>
+  <label><input type="checkbox" id="useClassList" checked> Use <code>classList.add()</code> for multiple classes</label>
+  <label><input type="checkbox" id="skipWS"> Skip whitespace-only text nodes</label>
+  <label><input type="checkbox" id="useFragment"> Wrap multiple roots in <code>DocumentFragment</code></label>
+</fieldset>
+
 <label><input type="checkbox" id="parentVar"> Parent is a variable other than <code>document.body</code></label>
 <div class="row"><input type="text" id="parentName" placeholder="parent variable (default: document.body)"></div>
 
