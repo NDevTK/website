@@ -94,10 +94,10 @@ segment.
 
 ## Testing
 
-A Node.js test harness lives in `tests/htmldom.test.js`:
+A Node.js test harness lives in `htmldom.test.js`:
 
 ```
-node tests/htmldom.test.js
+node htmldom/htmldom.test.js
 ```
 
 The harness loads `htmldom.js` with minimal DOM stubs, exposes the

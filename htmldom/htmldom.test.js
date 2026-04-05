@@ -1,6 +1,6 @@
 // Advanced tests for htmldom.js's extractHTML resolver.
 //
-// Run with: node tests/htmldom.test.js
+// Run with: node htmldom/htmldom.test.js
 //
 // This test file loads htmldom.js under Node by stubbing the browser globals
 // it touches at init time, then exercises extractHTML across a range of
@@ -23,7 +23,7 @@ global.DOMParser = class {
 
 // Load htmldom.js and expose its internal extractHTML via globalThis by
 // splicing export lines into the source before eval.
-const src = fs.readFileSync(path.join(__dirname, '..', 'htmldom', 'htmldom.js'), 'utf8');
+const src = fs.readFileSync(path.join(__dirname, 'htmldom.js'), 'utf8');
 const patched = src.replace(
   'function extractHTML(input) {',
   'globalThis.__extractHTML = extractHTML;\n  globalThis.__extractAllHTML = extractAllHTML;\n  globalThis.__extractAllDOM = extractAllDOM;\n  function extractHTML(input) {'
