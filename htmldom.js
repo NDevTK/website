@@ -229,30 +229,24 @@
     const assignOp = assign.op;
     const r = resolveIdentifiers(tokens, assign.rhsStart, assign.rhsEnd);
     if (r.parsed) {
-      // Unroll loopVar references so the main html carries the loop's
-      // per-iteration content. When a loop exits the walker replaces the
-      // loop-built variable's binding with a single reference token; this
-      // post-pass expands that reference back to the loopVar's chain
-      // wrapped in the appropriate loop tags, so the downstream materializer
-      // produces matching loop markers. Runs iteratively for chained loops.
-      // Unroll ONE level only: references to loop-built variables in the
-      // main chain get expanded to their loopVars' chains (preserving the
-      // original loop-body tags so the materializer emits matching loop
-      // markers). References inside those expanded chains to OTHER
-      // loop-built variables stay as autoSubs placeholders — the caller
-      // can emit their pre-computation loops separately via loopVars.
-      let mainTokens = r.tokens;
+      // Unroll ONE level of loopVar references: the walker replaces each
+      // loop-built variable's binding with a single name-reference token
+      // on loop exit, and here the main chain's references to those vars
+      // get expanded back to their loopVar chains (which keep their
+      // loop-body tags) so the materializer emits matching loop markers.
+      // References to OTHER loop-built vars inside those expanded chains
+      // stay as autoSubs placeholders; the caller can emit their
+      // pre-computation loops separately via the loopVars output.
       const lvMap = Object.create(null);
       if (r.loopVars) for (const lv of r.loopVars) lvMap[lv.name] = lv;
-      const expanded = [];
-      for (const t of mainTokens) {
-        if (t.type === 'other' && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(t.text) && lvMap[t.text]) {
-          for (const vt of lvMap[t.text].chain) expanded.push(vt);
+      const mainTokens = [];
+      for (const t of r.tokens) {
+        if (t.type === 'other' && IDENT_RE.test(t.text) && lvMap[t.text]) {
+          for (const vt of lvMap[t.text].chain) mainTokens.push(vt);
         } else {
-          expanded.push(t);
+          mainTokens.push(t);
         }
       }
-      mainTokens = expanded;
       const m = materializeFlatChain(mainTokens, r.loopInfo);
       if (r.loopVars && r.loopVars.length && r.inScope) {
         const kept = r.loopVars.filter((lv) => r.inScope(lv.name));
@@ -770,7 +764,7 @@
     // stale initial value.
     const asRef = (name, value) => {
       if (externallyMutable && externallyMutable.has(name)) {
-        return chainBinding([{ type: 'other', text: name, start: 0, end: name.length, _src: name }]);
+        return chainBinding([exprRef(name)]);
       }
       return value;
     };
@@ -1217,7 +1211,7 @@
       if (arith && arith.bind) {
         const nt = tks[arith.next];
         if (nt && nt.type === 'plus') {
-          const r = readChainFromHere(k, stop, terms);
+          const r = readConcatExpr(k, stop, terms);
           if (r) return { binding: chainBinding(r.toks), next: r.next };
         }
         return { binding: arith.bind, next: arith.next };
@@ -1230,14 +1224,14 @@
         if (s.bind) {
           const nt = tks[s.next];
           if (nt && nt.type === 'plus') {
-            const r = readChainFromHere(k, stop, terms);
+            const r = readConcatExpr(k, stop, terms);
             if (r) return { binding: chainBinding(r.toks), next: r.next };
           }
           return { binding: s.bind, next: s.next };
         }
       }
       // Fall through: chain parsing (with opaque-capture for unresolved).
-      const r = readChainFromHere(k, stop, terms);
+      const r = readConcatExpr(k, stop, terms);
       if (r) return { binding: chainBinding(r.toks), next: r.next };
       return null;
     };
@@ -1339,7 +1333,7 @@
           if (isMethodCall) {
             const r = applyMethod(cur, lastSeg, next + 1, stop);
             if (!r) break;
-            bind = r.binding ? r.binding : chainBinding(r.toks);
+            bind = r.bind;
             next = r.next;
             continue;
           }
@@ -1360,7 +1354,7 @@
         if (!args) return null;
         const toks = bind.toks.slice();
         for (const a of args.args) { toks.push(SYNTH_PLUS); for (const v of a) toks.push(v); }
-        return { toks, next: args.next };
+        return { bind: chainBinding(toks), next: args.next };
       }
       if (method === 'join') {
         if (!bind || bind.kind !== 'array') return null;
@@ -1371,7 +1365,7 @@
         const rp = tks[parenIdx + 2];
         if (!rp || rp.type !== 'close' || rp.char !== ')') return null;
         const elems = bind.elems;
-        if (elems.length === 0) return { toks: [makeSynthStr('')], next: parenIdx + 3 };
+        if (elems.length === 0) return { bind: chainBinding([makeSynthStr('')]), next: parenIdx + 3 };
         const out = [];
         for (let e = 0; e < elems.length; e++) {
           const eb = elems[e];
@@ -1379,7 +1373,7 @@
           if (e > 0) { out.push(SYNTH_PLUS); out.push(rewriteTemplate(sepTok)); out.push(SYNTH_PLUS); }
           for (const vt of eb.toks) out.push(vt);
         }
-        return { toks: out, next: parenIdx + 3 };
+        return { bind: chainBinding(out), next: parenIdx + 3 };
       }
       // Pure string methods on a known chain string: evaluate when all args
       // are concrete literals. Non-evaluatable cases return null.
@@ -1423,14 +1417,14 @@
               case 'split': {
                 if (argVals.length === 1) {
                   const parts = s.split(argVals[0]);
-                  return { toks: null, binding: arrayBinding(parts.map((p) => chainBinding([makeSynthStr(p)]))), next: args.next };
+                  return { bind: arrayBinding(parts.map((p) => chainBinding([makeSynthStr(p)]))), next: args.next };
                 }
                 break;
               }
             }
           } catch (_) { return null; }
           if (result === undefined) return null;
-          return { toks: [makeSynthStr(result)], next: args.next };
+          return { bind: chainBinding([makeSynthStr(result)]), next: args.next };
         }
       }
       // Array methods on known array bindings.
@@ -1449,7 +1443,7 @@
         }
         if (!allConcrete) return null;
         if (method === 'slice' && argVals.length <= 2) {
-          return { toks: null, binding: arrayBinding(bind.elems.slice(...argVals)), next: args.next };
+          return { bind: arrayBinding(bind.elems.slice(...argVals)), next: args.next };
         }
         if (method === 'indexOf' && argVals.length === 1) {
           const target = argVals[0];
@@ -1458,7 +1452,7 @@
             const es = bind.elems[i] && bind.elems[i].kind === 'chain' ? chainAsKnownString(bind.elems[i]) : null;
             if (es === target || (typeof target === 'number' && Number(es) === target)) { idx = i; break; }
           }
-          return { toks: [makeSynthStr(String(idx))], next: args.next };
+          return { bind: chainBinding([makeSynthStr(String(idx))]), next: args.next };
         }
         if (method === 'includes' && argVals.length === 1) {
           const target = argVals[0];
@@ -1467,10 +1461,10 @@
             const es = el && el.kind === 'chain' ? chainAsKnownString(el) : null;
             if (es === target || (typeof target === 'number' && Number(es) === target)) { has = true; break; }
           }
-          return { toks: [makeSynthStr(String(has))], next: args.next };
+          return { bind: chainBinding([makeSynthStr(String(has))]), next: args.next };
         }
         if (method === 'reverse' && argVals.length === 0) {
-          return { toks: null, binding: arrayBinding(bind.elems.slice().reverse()), next: args.next };
+          return { bind: arrayBinding(bind.elems.slice().reverse()), next: args.next };
         }
       }
       return null;
@@ -1587,7 +1581,7 @@
               const prefBind = resolvePath(prefix);
               if (prefBind) {
                 const r = applyMethod(prefBind, method, k + 1, stop);
-                if (r) return { bind: r.binding ? r.binding : chainBinding(r.toks), next: r.next };
+                if (r) return { bind: r.bind, next: r.next };
               }
             }
             // Fall through to the opaque-ident handling below for unknown
@@ -1626,8 +1620,7 @@
           }
           const first = tks[k];
           const last = tks[end - 1];
-          const text = first._src.slice(first.start, last.end);
-          return { bind: chainBinding([{ type: 'other', text, start: first.start, end: last.end, _src: first._src }]), next: end };
+          return { bind: chainBinding([exprRef(first._src.slice(first.start, last.end))]), next: end };
         }
         if (b) {
           // Call syntax: `name(args)` where name resolves to a function binding.
@@ -1728,9 +1721,8 @@
       if (end === k) return null;
       const first = tks[k];
       const last = tks[end - 1];
-      const src = first._src.slice(first.start, last.end);
       return {
-        toks: [{ type: 'other', text: src, start: first.start, end: last.end, _src: first._src }],
+        toks: [exprRef(first._src.slice(first.start, last.end))],
         next: end,
       };
     };
@@ -1814,7 +1806,7 @@
       const ft = chainAsExprText(ifF);
       if (ct === null || tt === null || ft === null) return null;
       const text = '(' + ct + ' ? ' + tt + ' : ' + ft + ')';
-      return chainBinding([{ type: 'other', text, start: 0, end: text.length, _src: text }]);
+      return chainBinding([exprRef(text)]);
     };
 
     // Combine two chain bindings via a binary operator. If both sides are
@@ -1869,7 +1861,7 @@
       const rt = chainAsExprText(right);
       if (lt === null || rt === null) return null;
       const text = '(' + lt + ' ' + op + ' ' + rt + ')';
-      return chainBinding([{ type: 'other', text, start: 0, end: text.length, _src: text }]);
+      return chainBinding([exprRef(text)]);
     };
 
     // Apply a unary prefix operator to a chain binding. Folds to a literal
@@ -1892,7 +1884,7 @@
       const et = chainAsExprText(operand);
       if (et === null) return null;
       const text = op + et;
-      return chainBinding([{ type: 'other', text, start: 0, end: text.length, _src: text }]);
+      return chainBinding([exprRef(text)]);
     };
 
     const chainAsNumber = (chain) => {
@@ -1952,7 +1944,7 @@
       const maybeRp = tks[i];
       if (maybeRp && maybeRp.type === 'close' && maybeRp.char === ')') return { args, next: i + 1 };
       while (i < stop) {
-        const arg = readChainFromHere(i, stop, TERMS_ARG);
+        const arg = readConcatExpr(i, stop, TERMS_ARG);
         if (!arg) return null;
         args.push(arg.toks);
         i = arg.next;
@@ -1964,10 +1956,6 @@
       if (!rp || rp.type !== 'close' || rp.char !== ')') return null;
       return { args, next: i + 1 };
     };
-
-    // Internal helper: same as readConcatExpr but always called with a fresh
-    // starting point. (Separate name used to avoid confusion with exports.)
-    const readChainFromHere = (k, stop, terms) => readConcatExpr(k, stop, terms);
 
     // Read a concat chain (operand [+ operand]*) starting at `k`, stopping at
     // the first top-level token matching any terminator in `terms`
@@ -2029,9 +2017,7 @@
               loop: { id: entry.id, kind: entry.kind, headerSrc: entry.headerSrc },
               chain: b.toks,
             });
-            assignName(name, chainBinding([{
-              type: 'other', text: name, start: 0, end: name.length, _src: name,
-            }]));
+            assignName(name, chainBinding([exprRef(name)]));
           }
         }
       }
