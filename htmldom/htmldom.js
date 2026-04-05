@@ -439,7 +439,7 @@
     'toUpperCase', 'toLowerCase', 'trim', 'trimStart', 'trimEnd', 'trimLeft', 'trimRight',
     'repeat', 'slice', 'substring', 'substr', 'charAt', 'indexOf', 'lastIndexOf',
     'includes', 'startsWith', 'endsWith', 'padStart', 'padEnd', 'toString',
-    'split', 'reverse',
+    'split', 'reverse', 'map', 'filter', 'forEach',
   ]);
 
   const MATH_CONSTANTS = {
@@ -1508,6 +1508,44 @@
       }
       // Array methods on known array bindings.
       if (bind && bind.kind === 'array') {
+        // `.map(fn)`, `.filter(fn)`, `.forEach(fn)`: the argument is a
+        // callback function rather than a concat-chain value. Parse the
+        // arrow, invoke it once per element with the element bound to
+        // the single parameter, and collect/filter the results.
+        if (method === 'map' || method === 'filter' || method === 'forEach') {
+          const lp = tks[parenIdx];
+          if (!lp || lp.type !== 'open' || lp.char !== '(') return null;
+          const arrow = peekArrow(parenIdx + 1, stop);
+          if (!arrow) return null;
+          const body = readArrowBody(arrow.arrowNext, stop);
+          if (!body) return null;
+          const rp = tks[body.next];
+          if (!rp || rp.type !== 'close' || rp.char !== ')') return null;
+          const fn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock);
+          if (method === 'forEach') {
+            return { bind: chainBinding([makeSynthStr('undefined')]), next: body.next + 1 };
+          }
+          const results = [];
+          for (const el of bind.elems) {
+            if (!el || el.kind !== 'chain') return null;
+            const toks = instantiateFunction(fn, [el.toks]);
+            if (!toks) return null;
+            if (method === 'map') {
+              results.push(chainBinding(toks));
+              continue;
+            }
+            // method === 'filter': keep element when the callback's
+            // return value is truthy (concrete only; unknowns bail).
+            const resChain = chainBinding(toks);
+            const n = chainAsNumber(resChain);
+            const s = n === null ? chainAsKnownString(resChain) : null;
+            const truthy = (n !== null && n !== 0) || (s !== null && s !== '' && s !== 'false' && s !== 'null' && s !== 'undefined' && s !== '0' && s !== 'NaN');
+            const falsy = n === 0 || s === '' || s === 'false' || s === 'null' || s === 'undefined' || s === '0' || s === 'NaN';
+            if (truthy) results.push(el);
+            else if (!falsy) return null;
+          }
+          return { bind: arrayBinding(results), next: body.next + 1 };
+        }
         const args = readConcatArgs(parenIdx, stop);
         if (!args) return null;
         const argVals = [];
