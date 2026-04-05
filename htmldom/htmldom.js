@@ -639,6 +639,33 @@
         const next = tokens[i + 1];
         if (next && next.type === 'sep' && /^[-+*/%]?=$/.test(next.char)) noteMut(t.text);
         if (next && next.type === 'op' && (next.text === '++' || next.text === '--')) noteMut(t.text);
+        // `arr[i] = ...` / `obj[k] = ...` mutates arr/obj.
+        if (next && next.type === 'open' && next.char === '[') {
+          let d = 1; let j = i + 2;
+          while (j < tokens.length && d > 0) {
+            const tk = tokens[j];
+            if (tk.type === 'open' && tk.char === '[') d++;
+            else if (tk.type === 'close' && tk.char === ']') d--;
+            if (d > 0) j++;
+          }
+          const eq = tokens[j + 1];
+          if (eq && eq.type === 'sep' && eq.char === '=') noteMut(t.text);
+        }
+      }
+      // `arr.push(...)` / `obj.foo = ...` — the path token carries the base
+      // name as its prefix. Flag mutation if followed by a mutating method or `=`.
+      if (t.type === 'other' && PATH_RE.test(t.text)) {
+        const dot = t.text.indexOf('.');
+        const base = t.text.slice(0, dot);
+        const rest = t.text.slice(dot + 1);
+        const next = tokens[i + 1];
+        if (next && next.type === 'sep' && /^[-+*/%]?=$/.test(next.char)) noteMut(base);
+        if (next && next.type === 'open' && next.char === '(') {
+          // Last segment is the method name.
+          const lastDot = rest.lastIndexOf('.');
+          const method = lastDot >= 0 ? rest.slice(lastDot + 1) : rest;
+          if (method === 'push' || method === 'pop' || method === 'shift' || method === 'unshift' || method === 'splice' || method === 'sort' || method === 'reverse' || method === 'fill' || method === 'copyWithin') noteMut(base);
+        }
       }
     }
     const externallyMutable = new Set();
@@ -1864,6 +1891,30 @@
       if (t.type === 'other' && (t.text === 'await' || t.text === 'yield' || t.text === 'typeof' || t.text === 'void' || t.text === 'delete')) {
         const inner = readBase(k + 1, stop);
         if (!inner) return null;
+        // `typeof` folds to a concrete string when the operand has a known
+        // binding kind or a concrete scalar value.
+        if (t.text === 'typeof') {
+          const b = inner.bind;
+          if (b && b.kind === 'object') return { bind: chainBinding([makeSynthStr('object')]), next: inner.next };
+          if (b && b.kind === 'array') return { bind: chainBinding([makeSynthStr('object')]), next: inner.next };
+          if (b && b.kind === 'function') return { bind: chainBinding([makeSynthStr('function')]), next: inner.next };
+          if (b && b.kind === 'element') return { bind: chainBinding([makeSynthStr('object')]), next: inner.next };
+          if (b && b.kind === 'chain') {
+            const n = chainAsNumber(b);
+            if (n !== null) return { bind: chainBinding([makeSynthStr('number')]), next: inner.next };
+            const s = chainAsKnownString(b);
+            if (s !== null) {
+              if (s === 'undefined') return { bind: chainBinding([makeSynthStr('undefined')]), next: inner.next };
+              if (s === 'true' || s === 'false') return { bind: chainBinding([makeSynthStr('boolean')]), next: inner.next };
+              if (s === 'null') return { bind: chainBinding([makeSynthStr('object')]), next: inner.next };
+              return { bind: chainBinding([makeSynthStr('string')]), next: inner.next };
+            }
+          }
+        }
+        // `void expr` is always `undefined`.
+        if (t.text === 'void') {
+          return { bind: chainBinding([makeSynthStr('undefined')]), next: inner.next };
+        }
         const et = chainAsExprText(inner.bind);
         if (et === null) return null;
         const text = t.text + ' ' + et;
@@ -2236,6 +2287,9 @@
         let opText, prec;
         if (opTok && opTok.type === 'op' && BINOP_PREC[opTok.text] !== undefined) {
           opText = opTok.text; prec = BINOP_PREC[opText];
+        } else if (opTok && opTok.type === 'other' && (opTok.text === '==' || opTok.text === '!=' || opTok.text === '===' || opTok.text === '!==')) {
+          // Equality operators are emitted with type 'other' by the tokenizer.
+          opText = opTok.text; prec = BINOP_PREC[opText];
         } else if (opTok && opTok.type === 'plus') {
           // Treat `+` at precedence 12: numeric add when both operands are
           // number literals, otherwise leave it to the concat-chain parser.
@@ -2339,6 +2393,27 @@
           default: return null;
         }
         return chainBinding([makeSynthStr(String(v))]);
+      }
+      // String comparison folding: when both operands are known strings,
+      // fold `== != === !== < > <= >=` to a boolean literal.
+      if (op === '==' || op === '!=' || op === '===' || op === '!==' ||
+          op === '<' || op === '>' || op === '<=' || op === '>=') {
+        const lS = chainAsKnownString(left);
+        const rS = chainAsKnownString(right);
+        if (lS !== null && rS !== null) {
+          let v;
+          switch (op) {
+            case '==': v = lS == rS; break;
+            case '!=': v = lS != rS; break;
+            case '===': v = lS === rS; break;
+            case '!==': v = lS !== rS; break;
+            case '<': v = lS < rS; break;
+            case '>': v = lS > rS; break;
+            case '<=': v = lS <= rS; break;
+            case '>=': v = lS >= rS; break;
+          }
+          return chainBinding([makeSynthStr(String(v))]);
+        }
       }
       // `+` is overloaded in JS. When both operands aren't concrete numbers
       // we decline here and let the caller (concat-chain parser) handle it
@@ -2820,6 +2895,23 @@
             i = skipExpr(i + 2, stop) - 1;
             continue;
           }
+          // Object-path assignment: `obj.a = v`, `obj.a.b = v`. Walks into
+          // the known object binding and installs the new value at the
+          // terminal key. Bails if any intermediate step isn't an object.
+          if (baseBind && baseBind.kind === 'object' && parts.length >= 2) {
+            const r = readValue(i + 2, stop, TERMS_TOP);
+            const val = r ? r.binding : null;
+            let cur = baseBind;
+            let ok = true;
+            for (let p = 1; p < parts.length - 1; p++) {
+              const nxt = cur.props[parts[p]];
+              if (!nxt || nxt.kind !== 'object') { ok = false; break; }
+              cur = nxt;
+            }
+            if (ok) cur.props[parts[parts.length - 1]] = val;
+            i = skipExpr(i + 2, stop) - 1;
+            continue;
+          }
         }
         // Path method call: `el.appendChild(child)`, `el.setAttribute(...)`.
         const parenTok = tokens[i + 1];
@@ -2836,6 +2928,60 @@
                 i = argResult.next - 1;
                 continue;
               }
+            }
+            // Array mutation methods on a known array binding.
+            // `arr.push(v)`, `arr.pop()`, `arr.shift()`, `arr.unshift(v,...)`.
+            if (baseBind && baseBind.kind === 'array' && (method === 'push' || method === 'pop' || method === 'shift' || method === 'unshift')) {
+              const argResult = readCallArgBindings(i + 1, stop);
+              if (argResult) {
+                if (method === 'push') {
+                  for (const b of argResult.bindings) baseBind.elems.push(b);
+                } else if (method === 'pop') {
+                  baseBind.elems.pop();
+                } else if (method === 'shift') {
+                  baseBind.elems.shift();
+                } else if (method === 'unshift') {
+                  baseBind.elems.unshift(...argResult.bindings);
+                }
+                i = argResult.next - 1;
+                continue;
+              }
+            }
+          }
+        }
+      }
+
+      // Bracket-indexed assignment: `arr[i] = v`, `obj['key'] = v`.
+      // Walks into the array/object binding and sets the slot when the
+      // key is a concrete number/string.
+      if (t.type === 'other' && IDENT_RE.test(t.text)) {
+        const openTok = tokens[i + 1];
+        if (openTok && openTok.type === 'open' && openTok.char === '[') {
+          // Scan to matching `]`.
+          let d = 1; let j = i + 2;
+          while (j < stop && d > 0) {
+            const tk = tokens[j];
+            if (tk.type === 'open' && tk.char === '[') d++;
+            else if (tk.type === 'close' && tk.char === ']') d--;
+            if (d > 0) j++;
+          }
+          const eqTok = tokens[j + 1];
+          if (j < stop && eqTok && eqTok.type === 'sep' && eqTok.char === '=') {
+            const keyRes = readValue(i + 2, j, null);
+            const valRes = readValue(j + 2, stop, TERMS_TOP);
+            const baseBind = resolve(t.text);
+            const keyN = keyRes ? chainAsNumber(keyRes.binding) : null;
+            const keyS = keyRes && keyN === null ? chainAsKnownString(keyRes.binding) : null;
+            if (baseBind && baseBind.kind === 'array' && keyN !== null && Number.isInteger(keyN) && keyN >= 0) {
+              while (baseBind.elems.length <= keyN) baseBind.elems.push(null);
+              baseBind.elems[keyN] = valRes ? valRes.binding : null;
+              i = skipExpr(j + 2, stop) - 1;
+              continue;
+            }
+            if (baseBind && baseBind.kind === 'object' && keyS !== null) {
+              baseBind.props[keyS] = valRes ? valRes.binding : null;
+              i = skipExpr(j + 2, stop) - 1;
+              continue;
             }
           }
         }

@@ -285,6 +285,59 @@ group('modules', () => {
 });
 
 // -----------------------------------------------------------------------
+// typeof folding
+// -----------------------------------------------------------------------
+group('typeof folding', () => {
+  check('typeof string',
+    `var a = 'hi'; document.body.innerHTML = typeof a;`, 'string');
+  check('typeof number',
+    `var a = 5; document.body.innerHTML = typeof a;`, 'number');
+  check('typeof boolean',
+    `var a = true; document.body.innerHTML = typeof a;`, 'boolean');
+  check('typeof array/object/function',
+    `var a = [1]; var o = {x:1}; var f = () => 1; document.body.innerHTML = typeof a + '-' + typeof o + '-' + typeof f;`,
+    'object-object-function');
+  check('typeof + equality',
+    `var a = 5; document.body.innerHTML = (typeof a === 'number') ? 'Y' : 'N';`, 'Y');
+  check('void is undefined',
+    `document.body.innerHTML = 'v:' + (void 0);`, 'v:undefined');
+});
+
+// -----------------------------------------------------------------------
+// String equality folding
+// -----------------------------------------------------------------------
+group('string comparison', () => {
+  check('=== on strings',
+    `document.body.innerHTML = ('abc' === 'abc' ? 'A' : 'B');`, 'A');
+  check('!== on strings',
+    `document.body.innerHTML = ('a' !== 'b' ? 'A' : 'B');`, 'A');
+  check('< on strings',
+    `document.body.innerHTML = ('a' < 'b' ? 'lt' : 'ge');`, 'lt');
+});
+
+// -----------------------------------------------------------------------
+// Mutation tracking on bindings
+// -----------------------------------------------------------------------
+group('mutations', () => {
+  check('arr.push appends',
+    `var a = ['x']; a.push('y','z'); document.body.innerHTML = a.join(',');`, 'x,y,z');
+  check('arr.pop removes last',
+    `var a = ['x','y','z']; a.pop(); document.body.innerHTML = a.join(',');`, 'x,y');
+  check('arr.shift removes first',
+    `var a = ['x','y','z']; a.shift(); document.body.innerHTML = a.join(',');`, 'y,z');
+  check('arr.unshift prepends',
+    `var a = ['b','c']; a.unshift('a'); document.body.innerHTML = a.join(',');`, 'a,b,c');
+  check('indexed write arr[i]=v',
+    `var a = [1,2,3]; a[0] = 9; document.body.innerHTML = a.join(',');`, '9,2,3');
+  check('member write obj.x=v',
+    `var o = {a:1}; o.b = 2; document.body.innerHTML = o.a + ',' + o.b;`, '1,2');
+  check('keyed write obj[k]=v',
+    `var o = {a:1}; o['c'] = 3; document.body.innerHTML = o.c;`, '3');
+  check('nested member write',
+    `var o = {n:{x:1}}; o.n.x = 5; document.body.innerHTML = o.n.x;`, '5');
+});
+
+// -----------------------------------------------------------------------
 // Array.* builtins
 // -----------------------------------------------------------------------
 group('Array builtins', () => {
