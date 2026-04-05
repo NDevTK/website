@@ -502,6 +502,34 @@ group('number/string distinction', () => {
 });
 
 // -----------------------------------------------------------------------
+// Shadowed builtins respected
+// -----------------------------------------------------------------------
+group('builtin shadowing', () => {
+  check('unshadowed Math.floor works',
+    `document.body.innerHTML = Math.floor(3.7);`, '3');
+  check('shadowed Math uses user object',
+    `var Math = {floor:99}; document.body.innerHTML = Math.floor;`, '99');
+  check('shadowed parseInt uses user function',
+    `function parseInt(x){return x+'!';} document.body.innerHTML = parseInt('5');`, '5!');
+  check('unshadowed parseInt folds string arg',
+    `document.body.innerHTML = parseInt('42');`, '42');
+  check('unshadowed parseFloat folds string arg',
+    `document.body.innerHTML = parseFloat('3.14');`, '3.14');
+  check('unshadowed Number coerces string',
+    `document.body.innerHTML = Number('99');`, '99');
+  check('unshadowed Boolean coerces number',
+    `document.body.innerHTML = Boolean(1);`, 'true');
+  check('shadowed Object.keys uses user function',
+    `var Object = {keys:()=>'fake'}; document.body.innerHTML = Object.keys();`, 'fake');
+  check('user method on object via property lookup',
+    `var obj = {greet:()=>'hello'}; document.body.innerHTML = obj.greet();`, 'hello');
+  check('.length on plain object uses property',
+    `var obj = {length:'custom'}; document.body.innerHTML = obj.length;`, 'custom');
+  check('.length on array gives count',
+    `var a=[1,2,3]; document.body.innerHTML = a.length;`, '3');
+});
+
+// -----------------------------------------------------------------------
 // Template literal interpolation resolution
 // -----------------------------------------------------------------------
 group('template interpolation', () => {

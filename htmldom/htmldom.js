@@ -861,6 +861,14 @@
       }
       return null;
     };
+    // Check if a global builtin name (possibly dotted like 'Math.floor')
+    // has been shadowed by a user-declared binding. Returns true when the
+    // root identifier appears in ANY scope frame, meaning the user
+    // redefined it and we must NOT apply builtin semantics.
+    const isShadowed = (dottedName) => {
+      const root = dottedName.includes('.') ? dottedName.slice(0, dottedName.indexOf('.')) : dottedName;
+      return resolve(root) !== null;
+    };
     // Walk a dotted path ('obj.a.b') resolving into object/array/chain
     // bindings. Handles `.length` specially on arrays and on chains whose
     // operands are all known string/template literals.
@@ -2102,29 +2110,46 @@
         const paren = tks[k + 1];
         const isCall = paren && paren.type === 'open' && paren.char === '(';
         // Known math/numeric constants like `Math.PI`.
-        if (!isCall && MATH_CONSTANTS[t.text] !== undefined) {
+        if (!isCall && MATH_CONSTANTS[t.text] !== undefined && !isShadowed(t.text)) {
           return { bind: chainBinding([makeSynthNum(MATH_CONSTANTS[t.text])]), next: k + 1 };
         }
         // Known global builtin function call (numeric Math.*, parseInt...).
-        if (isCall && BUILTINS[t.text]) {
+        if (isCall && BUILTINS[t.text] && !isShadowed(t.text)) {
           const args = readConcatArgs(k + 1, stop);
           if (args) {
+            // Collect args as numbers. parseInt/parseFloat/Number/Boolean
+            // also accept string arguments, so try chainAsKnownString as
+            // a fallback and coerce via Number() / parseInt() / parseFloat().
             const nums = [];
-            let allNum = true;
+            let allResolved = true;
+            const coerceFns = { 'parseInt': true, 'parseFloat': true, 'Number': true, 'Boolean': true, 'isNaN': true, 'isFinite': true };
+            const acceptsStrings = coerceFns[t.text] || false;
             for (const a of args.args) {
               const ch = chainBinding(a);
               const n = chainAsNumber(ch);
-              if (n === null) { allNum = false; break; }
-              nums.push(n);
+              if (n !== null) { nums.push(n); continue; }
+              if (acceptsStrings) {
+                const s = chainAsKnownString(ch);
+                if (s !== null) { nums.push(s); continue; }
+              }
+              allResolved = false; break;
             }
-            if (allNum) {
+            if (allResolved) {
               const v = BUILTINS[t.text](...nums);
-              return { bind: chainBinding([typeof v === 'number' ? makeSynthNum(v) : makeSynthStr(String(v))]), next: args.next };
+              if (typeof v === 'number' && !Number.isNaN(v)) {
+                return { bind: chainBinding([makeSynthNum(v)]), next: args.next };
+              }
+              if (typeof v === 'boolean') {
+                return { bind: chainBinding([makeSynthBool(v)]), next: args.next };
+              }
+              if (typeof v === 'number') {
+                return { bind: chainBinding([makeSynthNum(v)]), next: args.next };
+              }
             }
           }
         }
         // Object.keys/values/entries on known object bindings.
-        if (isCall && (t.text === 'Object.keys' || t.text === 'Object.values' || t.text === 'Object.entries')) {
+        if (isCall && (t.text === 'Object.keys' || t.text === 'Object.values' || t.text === 'Object.entries') && !isShadowed(t.text)) {
           const argRes = readCallArgBindings(k + 1, stop);
           if (argRes && argRes.bindings.length === 1) {
             const ob = argRes.bindings[0];
@@ -2146,7 +2171,7 @@
           }
         }
         // Object.assign / Object.fromEntries on known bindings.
-        if (isCall && t.text === 'Object.assign') {
+        if (isCall && t.text === 'Object.assign' && !isShadowed(t.text)) {
           const argRes = readCallArgBindings(k + 1, stop);
           if (argRes && argRes.bindings.length >= 1) {
             const target = argRes.bindings[0];
@@ -2161,7 +2186,7 @@
             }
           }
         }
-        if (isCall && t.text === 'Object.fromEntries') {
+        if (isCall && t.text === 'Object.fromEntries' && !isShadowed(t.text)) {
           const argRes = readCallArgBindings(k + 1, stop);
           if (argRes && argRes.bindings.length === 1) {
             const src = argRes.bindings[0];
@@ -2179,7 +2204,7 @@
           }
         }
         // Array.isArray / Array.from / Array.of on known bindings.
-        if (isCall && t.text === 'Array.isArray') {
+        if (isCall && t.text === 'Array.isArray' && !isShadowed(t.text)) {
           const argRes = readCallArgBindings(k + 1, stop);
           if (argRes && argRes.bindings.length === 1) {
             const ob = argRes.bindings[0];
@@ -2187,11 +2212,11 @@
             if (v !== null) return { bind: chainBinding([makeSynthStr(v)]), next: argRes.next };
           }
         }
-        if (isCall && t.text === 'Array.of') {
+        if (isCall && t.text === 'Array.of' && !isShadowed(t.text)) {
           const argRes = readCallArgBindings(k + 1, stop);
           if (argRes) return { bind: arrayBinding(argRes.bindings.slice()), next: argRes.next };
         }
-        if (isCall && t.text === 'Array.from') {
+        if (isCall && t.text === 'Array.from' && !isShadowed(t.text)) {
           const argRes = readCallArgBindings(k + 1, stop);
           if (argRes && argRes.bindings.length >= 1) {
             const src = argRes.bindings[0];
@@ -2235,7 +2260,7 @@
           }
         }
         // JSON.stringify on known scalar / object / array bindings.
-        if (isCall && (t.text === 'JSON.stringify' || t.text === 'JSON.parse')) {
+        if (isCall && (t.text === 'JSON.stringify' || t.text === 'JSON.parse') && !isShadowed(t.text)) {
           const argRes = readCallArgBindings(k + 1, stop);
           if (argRes && argRes.bindings.length >= 1) {
             const val = bindingToJson(argRes.bindings[0]);
@@ -2262,7 +2287,7 @@
           }
         }
         // `String(x)` coerces any literal to its string form.
-        if (isCall && t.text === 'String') {
+        if (isCall && t.text === 'String' && !isShadowed(t.text)) {
           const args = readConcatArgs(k + 1, stop);
           if (args && args.args.length === 1) {
             const ch = chainBinding(args.args[0]);
