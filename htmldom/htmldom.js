@@ -496,7 +496,20 @@
   // Like makeSynthStr but for numeric values — no quote wrapper, so
   // chainAsNumber recognises them as numeric rather than string.
   const makeSynthNum = (n) => ({
-    type: 'str', quote: '', raw: String(n), text: String(n), start: 0, end: 0, _src: '',
+    type: 'str', quote: '', raw: String(n), text: String(n), start: 0, end: 0, _src: '', jsType: 'number',
+  });
+  // Boolean token — `jsType: 'boolean'` lets typeof fold correctly and
+  // allows truthiness checks to work reliably.  JS coerces true→1,
+  // false→0 in arithmetic, so chainAsNumber can fold these.
+  const makeSynthBool = (v) => ({
+    type: 'str', quote: '', raw: String(v), text: String(v), start: 0, end: 0, _src: '', jsType: 'boolean',
+  });
+  // null / undefined tokens.
+  const makeSynthNull = () => ({
+    type: 'str', quote: '', raw: 'null', text: 'null', start: 0, end: 0, _src: '', jsType: 'null',
+  });
+  const makeSynthUndef = () => ({
+    type: 'str', quote: '', raw: 'undefined', text: 'undefined', start: 0, end: 0, _src: '', jsType: 'undefined',
   });
 
   // Clone operand tokens, applying a `loopId` tag to operands that don't
@@ -2022,21 +2035,21 @@
           if (b && b.kind === 'array') return { bind: chainBinding([makeSynthStr('object')]), next: inner.next };
           if (b && b.kind === 'function') return { bind: chainBinding([makeSynthStr('function')]), next: inner.next };
           if (b && b.kind === 'element') return { bind: chainBinding([makeSynthStr('object')]), next: inner.next };
+          if (b && b.kind === 'chain' && b.toks.length === 1 && b.toks[0].jsType) {
+            const jt = b.toks[0].jsType;
+            const mapped = jt === 'null' ? 'object' : jt;
+            return { bind: chainBinding([makeSynthStr(mapped)]), next: inner.next };
+          }
           if (b && b.kind === 'chain') {
             const n = chainAsNumber(b);
             if (n !== null) return { bind: chainBinding([makeSynthStr('number')]), next: inner.next };
             const s = chainAsKnownString(b);
-            if (s !== null) {
-              if (s === 'undefined') return { bind: chainBinding([makeSynthStr('undefined')]), next: inner.next };
-              if (s === 'true' || s === 'false') return { bind: chainBinding([makeSynthStr('boolean')]), next: inner.next };
-              if (s === 'null') return { bind: chainBinding([makeSynthStr('object')]), next: inner.next };
-              return { bind: chainBinding([makeSynthStr('string')]), next: inner.next };
-            }
+            if (s !== null) return { bind: chainBinding([makeSynthStr('string')]), next: inner.next };
           }
         }
         // `void expr` is always `undefined`.
         if (t.text === 'void') {
-          return { bind: chainBinding([makeSynthStr('undefined')]), next: inner.next };
+          return { bind: chainBinding([makeSynthUndef()]), next: inner.next };
         }
         const et = chainAsExprText(inner.bind);
         if (et === null) return null;
@@ -2078,8 +2091,12 @@
       }
       if (t.type !== 'other') return null;
       // Primitive literal.
+      if (t.text === 'true') return { bind: chainBinding([makeSynthBool(true)]), next: k + 1 };
+      if (t.text === 'false') return { bind: chainBinding([makeSynthBool(false)]), next: k + 1 };
+      if (t.text === 'null') return { bind: chainBinding([makeSynthNull()]), next: k + 1 };
+      if (t.text === 'undefined') return { bind: chainBinding([makeSynthUndef()]), next: k + 1 };
       const lit = primitiveAsString(t.text);
-      if (lit !== null) return { bind: chainBinding([makeSynthStr(lit)]), next: k + 1 };
+      if (lit !== null) return { bind: chainBinding([makeSynthNum(Number(lit))]), next: k + 1 };
       // Identifier/path, possibly with attached .concat/.join method call.
       if (IDENT_OR_PATH_RE.test(t.text)) {
         const paren = tks[k + 1];
@@ -2604,6 +2621,7 @@
           case '??': v = (lNum === null || lNum === undefined) ? rNum : lNum; break;
           default: return null;
         }
+        if (typeof v === 'boolean') return chainBinding([makeSynthBool(v)]);
         return chainBinding([typeof v === 'number' ? makeSynthNum(v) : makeSynthStr(String(v))]);
       }
       // String comparison folding: when both operands are known strings,
@@ -2624,7 +2642,7 @@
             case '<=': v = lS <= rS; break;
             case '>=': v = lS >= rS; break;
           }
-          return chainBinding([makeSynthStr(String(v))]);
+          return chainBinding([makeSynthBool(v)]);
         }
       }
       // `+` is overloaded in JS. When both operands aren't concrete numbers
@@ -2633,10 +2651,11 @@
       if (op === '+') return null;
       // Short-circuit logical/nullish operators using whichever concrete
       // value (number or string) the left-hand side has.
+      const lJsType = left.toks.length === 1 ? left.toks[0].jsType : null;
       const lStr = lNum === null ? chainAsKnownString(left) : null;
-      const lTruthy = (lNum !== null && lNum !== 0) || (lStr !== null && lStr !== '' && lStr !== 'false' && lStr !== 'null' && lStr !== 'undefined' && lStr !== '0' && lStr !== 'NaN');
-      const lFalsy = lNum === 0 || lStr === '' || lStr === 'false' || lStr === 'null' || lStr === 'undefined' || lStr === '0' || lStr === 'NaN';
-      const lNullish = lStr === 'null' || lStr === 'undefined';
+      const lTruthy = (lNum !== null && lNum !== 0) || (lStr !== null && lStr !== '' && lStr !== '0' && lStr !== 'NaN') || lJsType === 'boolean' && lNum === 1;
+      const lFalsy = lNum === 0 || lStr === '' || lStr === '0' || lStr === 'NaN' || lJsType === 'null' || lJsType === 'undefined';
+      const lNullish = lJsType === 'null' || lJsType === 'undefined';
       if (op === '&&') { if (lFalsy) return left; if (lTruthy) return right; }
       else if (op === '||') { if (lTruthy) return left; if (lFalsy) return right; }
       else if (op === '??') { if (lNullish) return right; if (lStr !== null || lNum !== null) return left; }
@@ -2663,6 +2682,7 @@
           case '~': v = ~n; break;
           default: return null;
         }
+        if (typeof v === 'boolean') return chainBinding([makeSynthBool(v)]);
         return chainBinding([typeof v === 'number' ? makeSynthNum(v) : makeSynthStr(String(v))]);
       }
       const et = chainAsExprText(operand);
@@ -2680,6 +2700,11 @@
       // or arithmetic results) fold to numbers.
       if (t.type === 'str' && t.quote && t.quote !== '') return null;
       if (t.type !== 'str' && t.type !== 'other') return null;
+      // Booleans coerce: true→1, false→0 (JS semantics).
+      if (t.jsType === 'boolean') return t.text === 'true' ? 1 : 0;
+      // null coerces to 0; undefined to NaN (not numeric).
+      if (t.jsType === 'null') return 0;
+      if (t.jsType === 'undefined') return null;
       const n = Number(t.text);
       if (Number.isNaN(n)) return null;
       if (String(n) !== t.text) return null;

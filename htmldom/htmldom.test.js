@@ -301,6 +301,36 @@ group('typeof folding', () => {
     `var a = 5; document.body.innerHTML = (typeof a === 'number') ? 'Y' : 'N';`, 'Y');
   check('void is undefined',
     `document.body.innerHTML = 'v:' + (void 0);`, 'v:undefined');
+  check('typeof null',
+    `document.body.innerHTML = typeof null;`, 'object');
+  check('typeof undefined',
+    `document.body.innerHTML = typeof undefined;`, 'undefined');
+  check('typeof computed boolean',
+    `var x = 3 > 2; document.body.innerHTML = typeof x;`, 'boolean');
+  check('typeof void',
+    `document.body.innerHTML = typeof (void 0);`, 'undefined');
+});
+
+// -----------------------------------------------------------------------
+// Boolean / null / undefined type tracking
+// -----------------------------------------------------------------------
+group('primitive type tracking', () => {
+  check('true + 1 = 2 (boolean coerces to number)',
+    `document.body.innerHTML = true + 1;`, '2');
+  check('false + 1 = 1',
+    `document.body.innerHTML = false + 1;`, '1');
+  check('comparison result in arithmetic',
+    `document.body.innerHTML = (3>2) + 1;`, '2');
+  check('ternary with boolean condition',
+    `document.body.innerHTML = (3>2) ? 'yes' : 'no';`, 'yes');
+  check('ternary with false condition',
+    `document.body.innerHTML = (1>2) ? 'yes' : 'no';`, 'no');
+  check('null ?? default',
+    `var x = null; document.body.innerHTML = x ?? 'default';`, 'default');
+  check('undefined ?? default',
+    `var x = undefined; document.body.innerHTML = x ?? 'default';`, 'default');
+  check('value ?? default',
+    `var x = 'value'; document.body.innerHTML = x ?? 'default';`, 'value');
 });
 
 // -----------------------------------------------------------------------
