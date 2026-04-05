@@ -253,6 +253,49 @@ group('destructuring', () => {
     `var { html: h } = { html: '<a>' }; document.body.innerHTML = h;`, '<a>');
   check('array destructuring',
     `var [a, b] = ['<a>', '<b>']; document.body.innerHTML = a + b;`, '<a><b>');
+  check('object destructuring with default',
+    `var { a = 'dflt' } = {}; document.body.innerHTML = a;`, 'dflt');
+  check('object destructuring default when value present',
+    `var { a = 'dflt' } = { a: 'here' }; document.body.innerHTML = a;`, 'here');
+  check('object destructuring rename with default',
+    `var { a: x = 'd' } = {}; document.body.innerHTML = x;`, 'd');
+  check('object destructuring with rest',
+    `var { a, ...rest } = { a: 'x', b: 'y', c: 'z' }; document.body.innerHTML = JSON.stringify(rest);`,
+    '{"b":"y","c":"z"}');
+  check('array destructuring with defaults',
+    `var [a = 'x', b = 'y'] = ['1']; document.body.innerHTML = a + b;`, '1y');
+  check('array destructuring with rest',
+    `var [a, ...r] = ['x','y','z']; document.body.innerHTML = r.join(',');`, 'y,z');
+});
+
+// -----------------------------------------------------------------------
+// Modules: import/export must not derail the walker
+// -----------------------------------------------------------------------
+group('modules', () => {
+  check('import default skipped',
+    `import foo from 'bar'; var a='<x>'; document.body.innerHTML = a;`, '<x>');
+  check('import named skipped',
+    `import { foo, bar } from 'baz'; var a='hi'; document.body.innerHTML = a;`, 'hi');
+  check('export const stripped',
+    `export const a = '<z>'; document.body.innerHTML = a;`, '<z>');
+  check('export default expression skipped',
+    `export default 42; var a='ok'; document.body.innerHTML = a;`, 'ok');
+  check('export { list } skipped',
+    `var x='hi'; export { x }; document.body.innerHTML = x;`, 'hi');
+});
+
+// -----------------------------------------------------------------------
+// Array.* builtins
+// -----------------------------------------------------------------------
+group('Array builtins', () => {
+  check('Array.isArray on array',
+    `var a=['x','y']; document.body.innerHTML = Array.isArray(a) ? 'A' : 'O';`, 'A');
+  check('Array.of literal list',
+    `var b = Array.of('a','b','c'); document.body.innerHTML = b.join(',');`, 'a,b,c');
+  check('Array.from over array with mapFn',
+    `var a=['x','y']; var b = Array.from(a, (x,i) => i+':'+x); document.body.innerHTML = b.join(',');`, '0:x,1:y');
+  check('Array.from length spec with mapFn',
+    `var b = Array.from({length:3}, (_,i) => i); document.body.innerHTML = b.join('-');`, '0-1-2');
 });
 
 // -----------------------------------------------------------------------
@@ -788,6 +831,83 @@ group('class methods', () => {
   check('method with param',
     `class W { render(msg) { this.el.innerHTML = '<p>'+msg+'</p>'; } }`,
     { html: '<p>__HDX0__</p>', target: 'this.el', autoSubs: [['__HDX0__', 'msg']] });
+});
+
+// -----------------------------------------------------------------------
+// Object literal extensions (getters, method shorthand, shorthand props, computed keys)
+// -----------------------------------------------------------------------
+group('object extensions', () => {
+  check('getter method does not break object',
+    `const o={get html(){return 'x';}, msg:'ok'}; document.body.innerHTML=o.msg;`, 'ok');
+  check('method shorthand does not break object',
+    `const o={render(){return 'x';}, title:'T'}; document.body.innerHTML=o.title;`, 'T');
+  check('shorthand property',
+    `const title='Hello'; const o={title}; document.body.innerHTML=o.title;`, 'Hello');
+  check('computed key',
+    `const k='foo'; const o={[k]:'<p>'}; document.body.innerHTML=o.foo;`, '<p>');
+});
+
+// -----------------------------------------------------------------------
+// new / typeof / void / delete / await / yield
+// -----------------------------------------------------------------------
+group('keyword prefixes', () => {
+  check('new Constructor(args)',
+    `document.body.innerHTML = '<p>' + new Date().toString() + '</p>';`,
+    { html: '<p>__HDX0__</p>', autoSubs: [['__HDX0__', 'new Date().toString()']] });
+  check('typeof',
+    `document.body.innerHTML = '<p>' + typeof x + '</p>';`,
+    { html: '<p>__HDX0__</p>', autoSubs: [['__HDX0__', 'typeof x']] });
+  check('await fetch',
+    `async function f() { const x = await fetch('/a'); document.body.innerHTML = '<p>'+x+'</p>'; }`,
+    { html: '<p>__HDX0__</p>' });
+});
+
+// -----------------------------------------------------------------------
+// Object.keys/values/entries, JSON.stringify/parse
+// -----------------------------------------------------------------------
+group('Object/JSON builtins', () => {
+  check('Object.keys',
+    `const o={a:'x',b:'y'}; document.body.innerHTML = Object.keys(o).join(',');`, 'a,b');
+  check('Object.values',
+    `const o={a:1,b:2}; document.body.innerHTML = Object.values(o).join(',');`, '1,2');
+  check('Object.entries',
+    `const o={a:'1'}; document.body.innerHTML = Object.entries(o).map(e=>e[0]+'='+e[1]).join(',');`, 'a=1');
+  check('JSON.stringify object',
+    `const o={a:'x'}; document.body.innerHTML = JSON.stringify(o);`, '{"a":"x"}');
+  check('JSON.stringify array',
+    `document.body.innerHTML = JSON.stringify([1,2,3]);`, '[1,2,3]');
+  check('JSON.parse round-trip',
+    `const s='{"k":42}'; document.body.innerHTML = 'v=' + JSON.parse(s).k;`, 'v=42');
+});
+
+// -----------------------------------------------------------------------
+// Array.reduce
+// -----------------------------------------------------------------------
+group('array.reduce', () => {
+  check('sum',
+    `const a=[1,2,3,4]; document.body.innerHTML = a.reduce((acc,n)=>acc+n, 0) + '';`, '10');
+  check('concat strings',
+    `const a=['x','y','z']; document.body.innerHTML = a.reduce((acc,s)=>acc+s, '');`, 'xyz');
+});
+
+// -----------------------------------------------------------------------
+// Regex literals don't break tokenization
+// -----------------------------------------------------------------------
+group('regex literals', () => {
+  check('regex in replace call',
+    `var s='abc'; document.body.innerHTML = s.replace(/b/g,'X');`,
+    { html: '__HDX0__', autoSubs: [['__HDX0__', "s.replace(/b/g,'X')"]] });
+  check('regex variable does not crash',
+    `var re=/abc/i; document.body.innerHTML = '<p>ok</p>';`, '<p>ok</p>');
+});
+
+// -----------------------------------------------------------------------
+// Tagged template literals captured as opaque
+// -----------------------------------------------------------------------
+group('tagged template', () => {
+  check('tag`...` captured as opaque',
+    'document.body.innerHTML = html`<p>hi</p>`;',
+    { html: '__HDX0__', autoSubs: [['__HDX0__', 'html`<p>hi</p>`']] });
 });
 
 // -----------------------------------------------------------------------
