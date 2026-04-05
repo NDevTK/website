@@ -2680,19 +2680,27 @@
       for (const [needle, varName] of substitutions) {
         if (needle && s === needle) return { code: varName, isVar: true };
       }
-      for (const [needle, varName] of substitutions) {
-        if (needle && s.includes(needle)) {
-          const parts = s.split(needle);
-          const pieces = [];
-          for (let i = 0; i < parts.length; i++) {
-            if (i > 0) pieces.push('${' + varName + '}');
-            pieces.push(parts[i]
-              .replace(/\\/g, '\\\\')
-              .replace(/`/g, '\\`')
-              .replace(/\$\{/g, '\\${'));
-          }
-          return { code: '`' + pieces.join('') + '`', isVar: true };
+      // Check if ANY needle appears in s.
+      const needles = substitutions.filter(([n]) => n).map(([n, v]) => ({ n, v }));
+      const present = needles.filter((x) => s.includes(x.n));
+      if (present.length) {
+        // Sort by length descending so longer needles win over substring
+        // overlap in the regex alternation.
+        present.sort((a, b) => b.n.length - a.n.length);
+        const esc = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const re = new RegExp(present.map((x) => esc(x.n)).join('|'), 'g');
+        const encode = (t) => t.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$\{/g, '\\${');
+        let out = '';
+        let last = 0;
+        let match;
+        while ((match = re.exec(s)) !== null) {
+          out += encode(s.slice(last, match.index));
+          const hit = present.find((x) => x.n === match[0]);
+          out += '${' + hit.v + '}';
+          last = match.index + match[0].length;
         }
+        out += encode(s.slice(last));
+        return { code: '`' + out + '`', isVar: true };
       }
     }
     const esc = s
