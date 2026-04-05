@@ -393,6 +393,58 @@ group('scope+binding interactions', () => {
 });
 
 // -----------------------------------------------------------------------
+// Function calls (arrow and function declarations)
+// -----------------------------------------------------------------------
+group('function calls', () => {
+  check('single-param arrow',
+    `const f = x => '<a>' + x + '</a>';
+     document.body.innerHTML = f('hi');`, '<a>hi</a>');
+  check('multi-param arrow',
+    `const wrap = (tag, text) => '<' + tag + '>' + text + '</' + tag + '>';
+     document.body.innerHTML = wrap('p', 'hi');`, '<p>hi</p>');
+  check('no-param arrow',
+    `const greet = () => '<p>hello</p>';
+     document.body.innerHTML = greet();`, '<p>hello</p>');
+  check('arrow with block body and return',
+    `const f = (x) => { return '<a>' + x + '</a>'; };
+     document.body.innerHTML = f('hi');`, '<a>hi</a>');
+  check('function declaration with return',
+    `function link(url, text) { return '<a href="' + url + '">' + text + '</a>'; }
+     document.body.innerHTML = link('/a', 'click');`, '<a href="/a">click</a>');
+  check('nested function call',
+    `const em = (t) => '<em>' + t + '</em>';
+     const p = (t) => '<p>' + t + '</p>';
+     document.body.innerHTML = p(em('hi'));`, '<p><em>hi</em></p>');
+  check('function used in template',
+    `const url = (path) => '/api' + path;
+     document.body.innerHTML = \`<a href="\${url('/x')}">go</a>\`;`, '<a href="/api/x">go</a>');
+});
+
+// -----------------------------------------------------------------------
+// Function edge cases
+// -----------------------------------------------------------------------
+group('function edge cases', () => {
+  check('function with unknown arg (unsupported, returns empty)',
+    `const f = x => '<a>' + x + '</a>';
+     document.body.innerHTML = f(unknown);`, '');
+  check('recursion is capped (no infinite loop)',
+    `function f(x) { return '<p>' + x + '</p>'; }
+     document.body.innerHTML = f(f('hi'));`, '<p><p>hi</p></p>');
+  check('function uses outer binding',
+    `const wrap = '<b>';
+     const tag = (x) => wrap + x + '</b>';
+     document.body.innerHTML = tag('hi');`, '<b>hi</b>');
+  check('arrow with concat in body',
+    `const html = (a, b) => [a, b].join('-');
+     document.body.innerHTML = html('<x>', '<y>');`, '<x>-<y>');
+  check('function in object',
+    `var O = { build: (x) => '<a>' + x + '</a>' };
+     document.body.innerHTML = O.build('hi');`, '<a>hi</a>');
+  check('function called with missing arg (unsupported)',
+    `function f(x) { return '<a>'+x+'</a>'; } document.body.innerHTML = f();`, '');
+});
+
+// -----------------------------------------------------------------------
 // Original iframe case from the feature request
 // -----------------------------------------------------------------------
 group('feature-request case', () => {
