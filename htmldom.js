@@ -95,10 +95,15 @@
 
     const tokens = tokenize(trimmed);
 
+    // Collect top-level `IDENT = STRING/TEMPLATE` assignments so a later
+    // `.innerHTML = someVar` can resolve the variable back to its literal.
+    const vars = collectStringVars(tokens);
+
     // If there's an `X.innerHTML = ...` / `X.outerHTML = ...` assignment,
     // restrict HTML extraction to the right-hand side and surface the target.
     const assign = findHtmlAssignment(tokens);
-    const searchTokens = assign ? tokens.slice(assign.rhsStart, assign.rhsEnd) : tokens;
+    let searchTokens = assign ? tokens.slice(assign.rhsStart, assign.rhsEnd) : tokens;
+    searchTokens = substituteVars(searchTokens, vars);
     const target = assign ? assign.target : null;
     const assignProp = assign ? assign.prop : null;
     const assignOp = assign ? assign.op : null;
@@ -154,6 +159,44 @@
       return { target: m[1], prop: m[2], op: t.char, rhsStart: i + 1, rhsEnd };
     }
     return null;
+  }
+
+  // Collect variables whose value is a single string or template literal:
+  // `x = '...'`, `var x = '...'`, `let x = \`...\``, `const x = '...'`.
+  // Only records the first assignment seen for each name.
+  function collectStringVars(tokens) {
+    const vars = Object.create(null);
+    const identRe = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+    for (let i = 0; i < tokens.length; i++) {
+      const t = tokens[i];
+      if (t.type !== 'other' || !identRe.test(t.text)) continue;
+      const sep = tokens[i + 1];
+      if (!sep || sep.type !== 'sep' || sep.char !== '=') continue;
+      const val = tokens[i + 2];
+      if (!val || (val.type !== 'str' && val.type !== 'tmpl')) continue;
+      // Ensure the statement ends here (next is EOF, ; or ,), so we don't
+      // pick up `x = 'a' + foo` assignments where the whole RHS matters.
+      const after = tokens[i + 3];
+      if (after && !(after.type === 'sep' && (after.char === ';' || after.char === ','))) continue;
+      if (!(t.text in vars)) vars[t.text] = val;
+    }
+    return vars;
+  }
+
+  // Replace bare identifier tokens with their known string/template tokens,
+  // except when the identifier is itself the target of an assignment.
+  function substituteVars(toks, vars) {
+    const out = [];
+    for (let i = 0; i < toks.length; i++) {
+      const t = toks[i];
+      if (t.type === 'other' && vars[t.text]) {
+        const next = toks[i + 1];
+        const isLhs = next && next.type === 'sep' && next.char === '=';
+        if (!isLhs) { out.push(vars[t.text]); continue; }
+      }
+      out.push(t);
+    }
+    return out;
   }
 
   const EXPR_PREFIX = '__HDX';
