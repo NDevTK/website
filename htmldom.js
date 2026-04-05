@@ -2872,9 +2872,47 @@
     lines.push(parentVar + '.appendChild(' + v + ');');
   }
 
+  // Split an HTML string containing `__HDLOOP#S__` / `__HDLOOP#E__` markers
+  // into segments: `{ kind: 'static'|'loop', html, id? }`. Only top-level
+  // (non-nested) loop markers create segment boundaries — nested loops stay
+  // as markers inside the segment html.
+  function splitLoopSegments(html) {
+    const segments = [];
+    const re = /__HDLOOP(\d+)([SE])__/g;
+    let depth = 0;
+    let segStart = 0;
+    let loopId = null;
+    let loopInnerStart = 0;
+    let match;
+    while ((match = re.exec(html)) !== null) {
+      const id = Number(match[1]);
+      const isStart = match[2] === 'S';
+      if (isStart) {
+        if (depth === 0) {
+          if (match.index > segStart) {
+            segments.push({ kind: 'static', html: html.slice(segStart, match.index) });
+          }
+          loopId = id;
+          loopInnerStart = re.lastIndex;
+        }
+        depth++;
+      } else {
+        depth--;
+        if (depth === 0) {
+          segments.push({ kind: 'loop', id: loopId, html: html.slice(loopInnerStart, match.index) });
+          segStart = re.lastIndex;
+        }
+      }
+    }
+    if (segStart < html.length) segments.push({ kind: 'static', html: html.slice(segStart) });
+    return segments;
+  }
+
   function convert() {
     const raw = $('in').value;
-    const { html, autoSubs, target, assignProp, assignOp } = extractHTML(raw);
+    const result = extractHTML(raw);
+    const { html, autoSubs, target, assignProp, assignOp } = result;
+    const loops = result.loops || [];
     const subStr = $('subStr').value;
     const subVar = $('subVar').value.trim();
     const subs = [];
@@ -2970,8 +3008,37 @@
       attachTarget = fragVar;
     }
 
-    for (const n of useRoots) {
-      convertNode(n, attachTarget, lines, used, opts, null);
+    // If the extracted html contains loop markers, emit each segment with
+    // a matching for-loop wrapper so the generated DOM code mirrors the
+    // source's iteration structure.
+    const segments = loops.length ? splitLoopSegments(html) : null;
+    if (segments && segments.length) {
+      for (const seg of segments) {
+        const segDoc = new DOMParser().parseFromString(seg.html, 'text/html');
+        const segNodes = [];
+        if (segDoc.body) for (const n of segDoc.body.childNodes) segNodes.push(n);
+        const segRoots = opts.skipWhitespaceText
+          ? segNodes.filter((n) => !(n.nodeType === 3 && /^\s*$/.test(n.nodeValue)))
+          : segNodes;
+        if (seg.kind === 'loop') {
+          const info = loops.find((l) => l.id === seg.id) || { kind: 'for', headerSrc: '/* loop */' };
+          const header = info.kind === 'while'
+            ? 'while (' + info.headerSrc + ')'
+            : 'for (' + info.headerSrc + ')';
+          lines.push(header + ' {');
+          const loopUsed = new Set(used);
+          const loopLines = [];
+          for (const n of segRoots) convertNode(n, attachTarget, loopLines, loopUsed, opts, null);
+          for (const l of loopLines) lines.push('  ' + l);
+          lines.push('}');
+        } else {
+          for (const n of segRoots) convertNode(n, attachTarget, lines, used, opts, null);
+        }
+      }
+    } else {
+      for (const n of useRoots) {
+        convertNode(n, attachTarget, lines, used, opts, null);
+      }
     }
 
     if (fragVar) {
