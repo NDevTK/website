@@ -253,6 +253,49 @@ group('destructuring', () => {
     `var { html: h } = { html: '<a>' }; document.body.innerHTML = h;`, '<a>');
   check('array destructuring',
     `var [a, b] = ['<a>', '<b>']; document.body.innerHTML = a + b;`, '<a><b>');
+  check('object destructuring with default',
+    `var { a = 'dflt' } = {}; document.body.innerHTML = a;`, 'dflt');
+  check('object destructuring default when value present',
+    `var { a = 'dflt' } = { a: 'here' }; document.body.innerHTML = a;`, 'here');
+  check('object destructuring rename with default',
+    `var { a: x = 'd' } = {}; document.body.innerHTML = x;`, 'd');
+  check('object destructuring with rest',
+    `var { a, ...rest } = { a: 'x', b: 'y', c: 'z' }; document.body.innerHTML = JSON.stringify(rest);`,
+    '{"b":"y","c":"z"}');
+  check('array destructuring with defaults',
+    `var [a = 'x', b = 'y'] = ['1']; document.body.innerHTML = a + b;`, '1y');
+  check('array destructuring with rest',
+    `var [a, ...r] = ['x','y','z']; document.body.innerHTML = r.join(',');`, 'y,z');
+});
+
+// -----------------------------------------------------------------------
+// Modules: import/export must not derail the walker
+// -----------------------------------------------------------------------
+group('modules', () => {
+  check('import default skipped',
+    `import foo from 'bar'; var a='<x>'; document.body.innerHTML = a;`, '<x>');
+  check('import named skipped',
+    `import { foo, bar } from 'baz'; var a='hi'; document.body.innerHTML = a;`, 'hi');
+  check('export const stripped',
+    `export const a = '<z>'; document.body.innerHTML = a;`, '<z>');
+  check('export default expression skipped',
+    `export default 42; var a='ok'; document.body.innerHTML = a;`, 'ok');
+  check('export { list } skipped',
+    `var x='hi'; export { x }; document.body.innerHTML = x;`, 'hi');
+});
+
+// -----------------------------------------------------------------------
+// Array.* builtins
+// -----------------------------------------------------------------------
+group('Array builtins', () => {
+  check('Array.isArray on array',
+    `var a=['x','y']; document.body.innerHTML = Array.isArray(a) ? 'A' : 'O';`, 'A');
+  check('Array.of literal list',
+    `var b = Array.of('a','b','c'); document.body.innerHTML = b.join(',');`, 'a,b,c');
+  check('Array.from over array with mapFn',
+    `var a=['x','y']; var b = Array.from(a, (x,i) => i+':'+x); document.body.innerHTML = b.join(',');`, '0:x,1:y');
+  check('Array.from length spec with mapFn',
+    `var b = Array.from({length:3}, (_,i) => i); document.body.innerHTML = b.join('-');`, '0-1-2');
 });
 
 // -----------------------------------------------------------------------
