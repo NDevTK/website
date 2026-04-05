@@ -162,9 +162,18 @@
 
   const IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 
+  // A synthetic `+` token used when splicing together a concat chain from
+  // `.join(sep)` (the original source has no plus there). findBestConcatChain
+  // only inspects `type`, so minimal fields are enough.
+  const SYNTH_PLUS = { type: 'plus', start: 0, end: 0, _src: '' };
+  const TERMS_TOP = { sep: [',', ';'], close: [] };
+  const TERMS_ARR = { sep: [','], close: [']'] };
+  const TERMS_NONE = { sep: [], close: [] };
+
   // Walk tokens [0, stopAt), tracking lexical scopes, and return an object
-  // with a `resolve(name)` that yields the current string/template token (or
-  // null) bound to `name` at position `stopAt`.
+  // with a `resolve(name)` that yields the current binding (an array of
+  // operand/plus tokens forming a concat chain, or null) for `name` at
+  // position `stopAt`.
   //
   // Scopes follow JavaScript semantics enough for reasonable snippets:
   // - `{ ... }` opens a block scope; `let`/`const` bind there.
@@ -172,8 +181,10 @@
   //   bindings hoist to the nearest function (or global) scope.
   // - Bare `x = v` reassigns the innermost existing binding (or creates an
   //   implicit global) — honoring reassignment order and shadowing.
-  // - A declaration with a non-literal (or compound) RHS records `null`,
-  //   clearing any prior value so stale literals don't leak through.
+  // - RHS expressions can mix string/template literals, already-known
+  //   identifiers, and `[str,str,...].join(sep)` patterns joined by `+`.
+  //   Anything outside that grammar records `null`, clearing any prior value
+  //   so stale literals can't leak through.
   function buildScopeState(tokens, stopAt) {
     const stack = [{ bindings: Object.create(null), isFunction: true }];
     let pendingFunctionBrace = false;
@@ -198,19 +209,6 @@
       return null;
     };
 
-    // Read a single-token literal value (string or template) starting at
-    // index `k`. Returns the token if the RHS is exactly that single literal
-    // (followed by `,`, `;`, EOF, or the stop boundary), otherwise null.
-    const readLiteralInit = (k, stop) => {
-      const valTok = tokens[k];
-      if (!valTok || (valTok.type !== 'str' && valTok.type !== 'tmpl')) return null;
-      const after = tokens[k + 1];
-      if (k + 1 >= stop) return valTok;
-      if (!after) return valTok;
-      if (after.type === 'sep' && (after.char === ',' || after.char === ';')) return valTok;
-      return null;
-    };
-
     // Skip over the RHS expression of a declarator or assignment starting at
     // index `k`, returning the index of the terminating `,`/`;` (or `stop`).
     const skipExpr = (k, stop) => {
@@ -225,6 +223,101 @@
         k++;
       }
       return k;
+    };
+
+    // Read one operand starting at index `k` within [k, stop). Returns
+    // `{ toks, next }` where `toks` is an array of operand/plus tokens for a
+    // concat chain, or null if the form isn't supported. Operand forms:
+    //   - string or template literal
+    //   - identifier reference (resolved via the in-progress scope state)
+    //   - `[ str/ident (, str/ident)* ].join(strLiteral)` array-join pattern
+    const readOperand = (k, stop) => {
+      const t = tokens[k];
+      if (!t) return null;
+      if (t.type === 'str' || t.type === 'tmpl') return { toks: [t], next: k + 1 };
+      if (t.type === 'other' && IDENT_RE.test(t.text)) {
+        const val = resolve(t.text);
+        if (!val) return null;
+        return { toks: val.slice(), next: k + 1 };
+      }
+      if (t.type === 'open' && t.char === '[') {
+        const elems = [];
+        let i = k + 1;
+        // Empty array -> empty string on any .join separator.
+        while (i < stop) {
+          const tk = tokens[i];
+          if (tk.type === 'close' && tk.char === ']') break;
+          // Each element is itself a concat expression (str/ident/array/plus).
+          const elem = readConcatExpr(i, stop, TERMS_ARR);
+          if (!elem) return null;
+          elems.push(elem.toks);
+          i = elem.next;
+          const sep = tokens[i];
+          if (sep && sep.type === 'sep' && sep.char === ',') { i++; continue; }
+          break;
+        }
+        const close = tokens[i];
+        if (!close || close.type !== 'close' || close.char !== ']') return null;
+        i++;
+        const joinTok = tokens[i];
+        if (!joinTok || joinTok.type !== 'other' || joinTok.text !== '.join') return null;
+        i++;
+        const lp = tokens[i];
+        if (!lp || lp.type !== 'open' || lp.char !== '(') return null;
+        i++;
+        const sepTok = tokens[i];
+        if (!sepTok || (sepTok.type !== 'str' && sepTok.type !== 'tmpl')) return null;
+        i++;
+        const rp = tokens[i];
+        if (!rp || rp.type !== 'close' || rp.char !== ')') return null;
+        i++;
+        if (elems.length === 0) return { toks: [{ type: 'str', quote: "'", raw: '', text: '', start: 0, end: 0, _src: '' }], next: i };
+        const out = [];
+        for (let e = 0; e < elems.length; e++) {
+          if (e > 0) { out.push(SYNTH_PLUS); out.push(sepTok); out.push(SYNTH_PLUS); }
+          for (const vt of elems[e]) out.push(vt);
+        }
+        return { toks: out, next: i };
+      }
+      return null;
+    };
+
+    // Read a concat chain (operand [+ operand]*) starting at `k`, stopping at
+    // the first top-level token matching any terminator in `terms`
+    // (`{ sep: [...], close: [...] }`). Returns `{ toks, next }` or null.
+    const readConcatExpr = (k, stop, terms) => {
+      const out = [];
+      const endAt = (tk) => {
+        if (!tk) return true;
+        if (tk.type === 'sep' && terms.sep.includes(tk.char)) return true;
+        if (tk.type === 'close' && terms.close.includes(tk.char)) return true;
+        return false;
+      };
+      let i = k;
+      // Read first operand.
+      if (endAt(tokens[i])) return null;
+      let op = readOperand(i, stop);
+      if (!op) return null;
+      for (const t of op.toks) out.push(t);
+      i = op.next;
+      // Read subsequent (+ operand)* pairs.
+      while (i < stop && !endAt(tokens[i])) {
+        const plus = tokens[i];
+        if (!plus || plus.type !== 'plus') return null;
+        i++;
+        op = readOperand(i, stop);
+        if (!op) return null;
+        out.push(plus);
+        for (const t of op.toks) out.push(t);
+        i = op.next;
+      }
+      return { toks: out, next: i };
+    };
+
+    // Top-level RHS reader: reads a concat chain up to `,`/`;`/stop.
+    const readInit = (k, stop) => {
+      const r = readConcatExpr(k, stop, TERMS_TOP);
+      return r ? r.toks : null;
     };
 
     const stop = Math.min(stopAt, tokens.length);
@@ -264,7 +357,7 @@
           let k = j + 1;
           if (eqTok && eqTok.type === 'sep' && eqTok.char === '=') {
             hasInit = true;
-            value = readLiteralInit(j + 2, stop);
+            value = readInit(j + 2, stop);
             k = skipExpr(j + 2, stop);
           }
           if (hasInit) {
@@ -287,11 +380,11 @@
         continue;
       }
 
-      // Bare assignment: IDENT = <single literal>.
+      // Bare assignment: IDENT = <concat chain>.
       if (IDENT_RE.test(t.text)) {
         const eqTok = tokens[i + 1];
         if (eqTok && eqTok.type === 'sep' && eqTok.char === '=') {
-          const value = readLiteralInit(i + 2, stop);
+          const value = readInit(i + 2, stop);
           assignName(t.text, value);
           i = skipExpr(i + 2, stop) - 1;
           continue;
@@ -299,7 +392,16 @@
       }
     }
 
-    return { resolve };
+    // Parse tokens[start, end) as a concat chain, expanding identifier
+    // references and `[...].join(sep)` patterns. Returns the flat chain
+    // tokens (alternating operand / plus) or null.
+    const parseRange = (start, end) => {
+      const r = readConcatExpr(start, end, TERMS_NONE);
+      if (!r || r.next !== end) return null;
+      return r.toks;
+    };
+
+    return { resolve, parseRange };
   }
 
   function hasBinding(stack, name) {
@@ -307,11 +409,15 @@
     return false;
   }
 
-  // Replace identifier references in tokens[startIdx, endIdx) with the
-  // string/template token currently bound to that name at startIdx, leaving
-  // assignment targets and unknown identifiers untouched.
+  // Expand tokens[startIdx, endIdx) using the scope state at startIdx.
+  // First tries to parse the range as a full concat chain (resolving
+  // identifier references and `[...].join(sep)` patterns); if that fails,
+  // falls back to per-identifier substitution so downstream chain detection
+  // still finds partial matches.
   function resolveIdentifiers(tokens, startIdx, endIdx) {
     const state = buildScopeState(tokens, startIdx);
+    const full = state.parseRange(startIdx, endIdx);
+    if (full) return full;
     const out = [];
     for (let i = startIdx; i < endIdx; i++) {
       const t = tokens[i];
@@ -320,7 +426,7 @@
         const isLhs = next && next.type === 'sep' && next.char === '=';
         if (!isLhs) {
           const val = state.resolve(t.text);
-          if (val) { out.push(val); continue; }
+          if (val) { for (const vt of val) out.push(vt); continue; }
         }
       }
       out.push(t);
