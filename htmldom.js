@@ -112,7 +112,15 @@
       const r = resolveIdentifiers(tokens, assign.rhsStart, assign.rhsEnd);
       searchTokens = r.tokens;
       if (r.parsed) {
-        const m = materializeFlatChain(searchTokens);
+        const m = materializeFlatChain(searchTokens, r.loopInfo);
+        // Materialize each loop-built variable into its own { html, autoSubs }
+        // so the caller can emit the corresponding pre-computation loops.
+        if (r.loopVars && r.loopVars.length) {
+          m.loopVars = r.loopVars.map((lv) => {
+            const mv = materializeFlatChain(lv.chain, r.loopInfo);
+            return Object.assign({ name: lv.name, loop: lv.loop }, mv);
+          });
+        }
         return Object.assign(m, { target, assignProp, assignOp });
       }
     } else {
@@ -236,6 +244,31 @@
     type: 'str', quote: "'", raw: text, text, start: 0, end: 0, _src: '',
   });
 
+  // Clone operand tokens, applying a `loopId` tag. Plus tokens pass through
+  // unchanged. Any existing tag is overridden — when a chain from a
+  // previous loop is spliced into another loop's body, the outer loop's tag
+  // applies to the whole spliced sequence (the inner loop's structure is
+  // captured separately on the originating binding).
+  function tagWithLoop(toks, loopId) {
+    return toks.map((t) => {
+      if (t.type === 'plus') return t;
+      return Object.assign({}, t, { loopId });
+    });
+  }
+
+  // Clone operand tokens, removing a specific `loopId` tag (e.g. when a
+  // chain is captured as a loopVar and the outer loop is already implied
+  // by the loopVar entry — we don't want double-wrapping markers).
+  function stripLoopTag(toks, loopId) {
+    return toks.map((t) => {
+      if (t.type === 'plus') return t;
+      if (t.loopId !== loopId) return t;
+      const copy = Object.assign({}, t);
+      delete copy.loopId;
+      return copy;
+    });
+  }
+
   // Represent an unresolved subexpression as a single operand token whose
   // source slice equals `text`. It uses the same `other` token shape the
   // tokenizer emits for plain identifiers, so the downstream materializer
@@ -275,6 +308,16 @@
     const stack = [{ bindings: Object.create(null), isFunction: true }];
     let pendingFunctionBrace = false;
     let pendingFunctionParams = null;
+    // Loop detection stack: each entry is `{ id, kind, headerSrc, bodyEnd,
+    // frame, modifiedVars }` recording an enclosing `for`/`while`. Operands
+    // added to a binding's chain while a loop is active carry a `loopId` tag
+    // so the materializer can wrap them in loop boundaries on output.
+    const loopStack = [];
+    const loopInfo = Object.create(null); // id -> {kind, headerSrc}
+    // Variables whose final value was built inside a loop, captured on
+    // loop exit. Each entry: { name, loop: {id,kind,headerSrc}, chain }.
+    const loopVars = [];
+    let nextLoopId = 0;
     // Swappable token array for the inner parsing functions. The main scope
     // walker always uses `tokens` directly. Helpers like `evalExprSrc` can
     // temporarily swap `tks` to parse an unrelated token sequence (e.g., a
@@ -1053,6 +1096,25 @@
 
     const stop = Math.min(stopAt, tokens.length);
     for (let i = 0; i < stop; i++) {
+      // Pop any loops whose body we've walked past (and their shadow frames).
+      // For each variable modified during the loop, capture its final chain
+      // as a loopVar entry (informational secondary output). Bindings stay
+      // intact so subsequent references still see the loop-tagged chain.
+      while (loopStack.length > 0 && i >= loopStack[loopStack.length - 1].bodyEnd) {
+        const entry = loopStack.pop();
+        const topIdx = stack.indexOf(entry.frame);
+        if (topIdx >= 0) stack.splice(topIdx, 1);
+        for (const name of entry.modifiedVars) {
+          const b = resolve(name);
+          if (b && b.kind === 'chain') {
+            loopVars.push({
+              name,
+              loop: { id: entry.id, kind: entry.kind, headerSrc: entry.headerSrc },
+              chain: stripLoopTag(b.toks, entry.id),
+            });
+          }
+        }
+      }
       const t = tokens[i];
 
       if (t.type === 'open' && t.char === '{') {
@@ -1078,6 +1140,74 @@
 
       if (t.type !== 'other') continue;
 
+      if (t.text === 'for' || t.text === 'while') {
+        // Detect loop header and body range. The body is either a `{ ... }`
+        // block or a single statement terminated by `;`.
+        const openParen = tokens[i + 1];
+        if (openParen && openParen.type === 'open' && openParen.char === '(') {
+          let depth = 1, j = i + 2;
+          while (j < stop && depth > 0) {
+            const tk = tokens[j];
+            if (tk.type === 'open' && tk.char === '(') depth++;
+            else if (tk.type === 'close' && tk.char === ')') depth--;
+            if (depth === 0) break;
+            j++;
+          }
+          if (j < stop && tokens[j].type === 'close' && tokens[j].char === ')' && j > i + 2) {
+            const headerFirst = tokens[i + 2];
+            const headerLast = tokens[j - 1];
+            const headerSrc = headerFirst._src.slice(headerFirst.start, headerLast.end);
+            const bodyTok = tokens[j + 1];
+            let bodyEnd;
+            if (bodyTok && bodyTok.type === 'open' && bodyTok.char === '{') {
+              let d = 1, k = j + 2;
+              while (k < stop && d > 0) {
+                const tk = tokens[k];
+                if (tk.type === 'open' && tk.char === '{') d++;
+                else if (tk.type === 'close' && tk.char === '}') d--;
+                k++;
+              }
+              bodyEnd = k;
+            } else {
+              let sd = 0, k = j + 1;
+              while (k < stop) {
+                const tk = tokens[k];
+                if (tk.type === 'open') sd++;
+                else if (tk.type === 'close') sd--;
+                else if (sd === 0 && tk.type === 'sep' && tk.char === ';') { k++; break; }
+                k++;
+              }
+              bodyEnd = k;
+            }
+            const id = nextLoopId++;
+            loopInfo[id] = { kind: t.text, headerSrc };
+            // Extract loop variables from the init clause (`var/let/const X`)
+            // and push a shadow block scope for the loop body — the walker
+            // processes the init clause with this frame on top, but `var`
+            // bindings still hoist to the enclosing function scope. Loop
+            // counters resolve through this frame to reference tokens so
+            // per-iteration values surface as autoSubs placeholders. This
+            // works for both block-bodied (`for (...) { ... }`) and
+            // single-statement (`for (...) stmt;`) loops.
+            const loopFrame = { bindings: Object.create(null), isFunction: false };
+            for (let h = i + 2; h < j; h++) {
+              const hk = tokens[h];
+              if (hk.type === 'other' && (hk.text === 'var' || hk.text === 'let' || hk.text === 'const')) {
+                const nm = tokens[h + 1];
+                if (nm && nm.type === 'other' && IDENT_RE.test(nm.text)) {
+                  loopFrame.bindings[nm.text] = chainBinding([exprRef(nm.text)]);
+                }
+              }
+            }
+            stack.push(loopFrame);
+            loopStack.push({
+              id, kind: t.text, headerSrc, bodyEnd, frame: loopFrame,
+              modifiedVars: new Set(),
+            });
+          }
+        }
+        continue;
+      }
       if (t.text === 'function') {
         // Try to capture a function declaration: `function NAME(params) { body }`.
         const nameTok = tokens[i + 1];
@@ -1209,9 +1339,12 @@
           const cur = resolve(t.text);
           let combined = null;
           if (cur && cur.kind === 'chain' && rhs && rhs.kind === 'chain') {
-            combined = chainBinding([...cur.toks, SYNTH_PLUS, ...rhs.toks]);
+            const loopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
+            const tagged = loopId !== null ? tagWithLoop(rhs.toks, loopId) : rhs.toks;
+            combined = chainBinding([...cur.toks, SYNTH_PLUS, ...tagged]);
           }
           assignName(t.text, combined);
+          if (loopStack.length > 0) loopStack[loopStack.length - 1].modifiedVars.add(t.text);
           i = skipExpr(i + 2, stop) - 1;
           continue;
         }
@@ -1227,7 +1360,7 @@
       return r.toks;
     };
 
-    return { resolve, resolvePath, parseRange, rewriteTemplate };
+    return { resolve, resolvePath, parseRange, rewriteTemplate, loopInfo, loopVars };
   }
 
   function hasBinding(stack, name) {
@@ -1243,7 +1376,7 @@
   function resolveIdentifiers(tokens, startIdx, endIdx) {
     const state = buildScopeState(tokens, startIdx);
     const full = state.parseRange(startIdx, endIdx);
-    if (full) return { tokens: full, parsed: true };
+    if (full) return { tokens: full, parsed: true, loopInfo: state.loopInfo, loopVars: state.loopVars };
     const out = [];
     for (let i = startIdx; i < endIdx; i++) {
       const t = tokens[i];
@@ -1258,13 +1391,15 @@
       }
       out.push(t);
     }
-    return { tokens: out, parsed: false };
+    return { tokens: out, parsed: false, loopInfo: state.loopInfo, loopVars: state.loopVars };
   }
 
   // Materialize a flat concat chain (tokens alternating operand/plus) into
-  // { html, autoSubs }. Unlike materializeChain, doesn't require at least
-  // one string operand — a lone opaque operand yields a placeholder.
-  function materializeFlatChain(chainTokens) {
+  // { html, autoSubs, loops }. Unlike materializeChain, doesn't require at
+  // least one string operand — a lone opaque operand yields a placeholder.
+  // Operands tagged with `loopId` emit `__HDLOOP#S__` / `__HDLOOP#E__`
+  // boundary markers and populate the `loops` array.
+  function materializeFlatChain(chainTokens, loopInfoMap) {
     const operands = [];
     let cur = [];
     for (const t of chainTokens) {
@@ -1272,11 +1407,27 @@
       else cur.push(t);
     }
     if (cur.length) operands.push({ toks: cur });
-    if (operands.length === 0) return { html: '', autoSubs: [] };
+    const loopsSeen = Object.create(null);
     let html = '';
     const autoSubs = [];
     let idx = 0;
+    let activeLoop = null;
+    const closeActive = () => {
+      if (activeLoop !== null) {
+        html += '__HDLOOP' + activeLoop + 'E__';
+        activeLoop = null;
+      }
+    };
     for (const op of operands) {
+      const opLoop = op.toks[0].loopId != null ? op.toks[0].loopId : null;
+      if (opLoop !== activeLoop) {
+        closeActive();
+        if (opLoop !== null) {
+          html += '__HDLOOP' + opLoop + 'S__';
+          activeLoop = opLoop;
+          if (loopInfoMap && loopInfoMap[opLoop]) loopsSeen[opLoop] = loopInfoMap[opLoop];
+        }
+      }
       if (op.toks.length === 1 && (op.toks[0].type === 'str' || op.toks[0].type === 'tmpl')) {
         const m = materializeStringToken(op.toks[0], idx);
         html += m.html;
@@ -1291,7 +1442,11 @@
         html += ph;
       }
     }
-    return { html, autoSubs };
+    closeActive();
+    const loops = Object.keys(loopsSeen).map((id) => ({
+      id: Number(id), kind: loopsSeen[id].kind, headerSrc: loopsSeen[id].headerSrc,
+    }));
+    return loops.length ? { html, autoSubs, loops } : { html, autoSubs };
   }
 
   const EXPR_PREFIX = '__HDX';

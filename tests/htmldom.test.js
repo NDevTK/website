@@ -45,6 +45,8 @@ function check(name, input, expected) {
     assignProp: out.assignProp || null,
     assignOp: out.assignOp || null,
     autoSubs: out.autoSubs || [],
+    loops: out.loops || undefined,
+    loopVars: out.loopVars || undefined,
   };
   // Normalize expected (allow string shorthand -> just html match).
   const want = typeof expected === 'string' ? { html: expected } : expected;
@@ -510,6 +512,48 @@ group('function bodies with assignments', () => {
      }`,
     { html: '<__HDX0__>hi</__HDX1__>', target: 'out',
       autoSubs: [['__HDX0__', 'tag'], ['__HDX1__', 'tag']] });
+});
+
+// -----------------------------------------------------------------------
+// Loops (for / while) wrapping += contributions
+// -----------------------------------------------------------------------
+group('loops', () => {
+  // When a variable is built via `+=` inside a `for`/`while` loop, the
+  // resulting chain is tagged so the main html gets `__HDLOOP#S__`/
+  // `__HDLOOP#E__` markers around the per-iteration contribution. The
+  // loop header(s) are echoed in `loops`, and `loopVars` records each
+  // loop-built variable's final contribution for downstream use.
+  check('for loop wraps += body',
+    `var s=''; for (var i=0; i<n; i++) { s += '<a>'; } document.body.innerHTML=s;`,
+    { html: '__HDLOOP0S__<a>__HDLOOP0E__',
+      loops: [{ id: 0, kind: 'for', headerSrc: 'var i=0; i<n; i++' }] });
+  check('for loop with multi-part body',
+    `var s=''; for (var i=0; i<n; i++) { s += '<a>'; s += '<b>'; } document.body.innerHTML=s;`,
+    { html: '__HDLOOP0S__<a><b>__HDLOOP0E__' });
+  check('while loop',
+    `var s=''; while (s.length < 10) s += 'x'; document.body.innerHTML=s;`,
+    { html: '__HDLOOP0S__x__HDLOOP0E__',
+      loops: [{ id: 0, kind: 'while', headerSrc: 's.length < 10' }] });
+  check('static prefix + loop + suffix',
+    `var s='<header>'; for (var i=0; i<n; i++) s += '<item>'; s += '<footer>';
+     document.body.innerHTML=s;`,
+    { html: '<header>__HDLOOP0S__<item>__HDLOOP0E__<footer>' });
+  check('loop body resolves var references',
+    `var tag='<a>'; var s=''; for (var i=0;i<n;i++) s += tag;
+     document.body.innerHTML=s;`,
+    { html: '__HDLOOP0S__<a>__HDLOOP0E__' });
+  check('loop body reaches unresolved as opaque',
+    `var s=''; for (var i=0;i<n;i++) s += items[i];
+     document.body.innerHTML=s;`,
+    { html: '__HDLOOP0S____HDX0____HDLOOP0E__', autoSubs: [['__HDX0__', 'items[i]']] });
+  check('innerHTML assigned to loop-built var in function',
+    `function write() {
+       var s = '';
+       for (var i=0; i<n; i++) s += '<p>' + i + '</p>';
+       out.innerHTML = s;
+     }`,
+    { html: '__HDLOOP0S__<p>__HDX0__</p>__HDLOOP0E__',
+      target: 'out', autoSubs: [['__HDX0__', 'i']] });
 });
 
 // -----------------------------------------------------------------------
