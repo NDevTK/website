@@ -5,7 +5,7 @@
   // IDL properties that reflect HTML attributes on common elements.
   const IDL_PROPS = new Set([
     'id', 'title', 'lang', 'dir', 'hidden', 'draggable', 'translate',
-    'src', 'href', 'alt', 'name', 'type', 'value', 'placeholder',
+    'src', 'href', 'alt', 'name', 'type', 'placeholder',
     'width', 'height', 'rel', 'target', 'download', 'ping', 'hreflang',
     'loading', 'fetchPriority', 'srcdoc', 'srcset', 'sizes', 'allow',
     'integrity', 'min', 'max', 'step', 'pattern', 'autocomplete',
@@ -47,8 +47,10 @@
   };
 
   // Boolean HTML attributes — empty value means true, absence means false.
+  // Note: `checked` and `selected` are intentionally omitted so they go
+  // through setAttribute, preserving defaultChecked/defaultSelected semantics.
   const BOOLEAN_ATTRS = new Set([
-    'disabled', 'checked', 'readonly', 'required', 'multiple', 'selected',
+    'disabled', 'readonly', 'required', 'multiple',
     'autofocus', 'novalidate', 'allowfullscreen', 'async', 'defer',
     'hidden', 'ismap', 'loop', 'muted', 'open', 'reversed', 'autoplay',
     'controls', 'default', 'formnovalidate', 'nomodule', 'playsinline',
@@ -67,6 +69,8 @@
   const SVG_NS = 'http://www.w3.org/2000/svg';
   const MATHML_NS = 'http://www.w3.org/1998/Math/MathML';
   const XLINK_NS = 'http://www.w3.org/1999/xlink';
+  const XML_NS = 'http://www.w3.org/XML/1998/namespace';
+  const XMLNS_NS = 'http://www.w3.org/2000/xmlns/';
 
   const SVG_TAGS = new Set([
     'svg', 'g', 'defs', 'symbol', 'use', 'path', 'rect', 'circle', 'ellipse',
@@ -442,6 +446,24 @@
       lines.push(parentVar + '.appendChild(' + v + ');');
       return;
     }
+    // CDATA section (appears in foreign content, e.g. SVG).
+    if (node.nodeType === 4) {
+      const v = makeVar('cdata', used);
+      const lit = jsStr(node.nodeValue, opts.subs);
+      // HTML documents cannot create CDATA nodes; emit via an XML document.
+      lines.push('const ' + v + " = document.implementation.createDocument(null, null).createCDATASection(" + lit.code + ');');
+      lines.push(parentVar + '.appendChild(' + v + ');');
+      return;
+    }
+    // Processing instruction.
+    if (node.nodeType === 7) {
+      const v = makeVar('pi', used);
+      const target = jsStr(node.target, opts.subs).code;
+      const data = jsStr(node.nodeValue, opts.subs).code;
+      lines.push('const ' + v + ' = document.createProcessingInstruction(' + target + ', ' + data + ');');
+      lines.push(parentVar + '.appendChild(' + v + ');');
+      return;
+    }
     if (node.nodeType !== 1) return;
 
     const tag = node.tagName.toLowerCase();
@@ -453,13 +475,24 @@
     else if (tag === 'math') ns = MATHML_NS;
     else if (tag === 'foreignobject') ns = null; // children revert to HTML
 
+    const attrs = Array.from(node.attributes || []);
+
+    // Detect `is=` for customized built-ins (HTML namespace only).
+    let isAttr = null;
+    if (ns !== SVG_NS && ns !== MATHML_NS) {
+      for (const a of attrs) {
+        if (a.name === 'is') { isAttr = a.value; break; }
+      }
+    }
+
     if (ns === SVG_NS || ns === MATHML_NS) {
       lines.push('const ' + v + " = document.createElementNS('" + ns + "', '" + node.tagName + "');");
+    } else if (isAttr !== null) {
+      const isLit = jsStr(isAttr, opts.subs).code;
+      lines.push('const ' + v + " = document.createElement('" + tag + "', { is: " + isLit + ' });');
     } else {
       lines.push('const ' + v + " = document.createElement('" + tag + "');");
     }
-
-    const attrs = Array.from(node.attributes || []);
 
     for (const attr of attrs) {
       const name = attr.name;
@@ -496,9 +529,17 @@
         continue;
       }
 
-      // Namespaced attributes (e.g. xlink:href) -> setAttributeNS.
+      // Namespaced attributes -> setAttributeNS.
       if (name.startsWith('xlink:')) {
         lines.push(v + ".setAttributeNS('" + XLINK_NS + "', '" + name + "', " + jsStr(val, opts.subs).code + ');');
+        continue;
+      }
+      if (name === 'xmlns' || name.startsWith('xmlns:')) {
+        lines.push(v + ".setAttributeNS('" + XMLNS_NS + "', '" + name + "', " + jsStr(val, opts.subs).code + ');');
+        continue;
+      }
+      if (name.startsWith('xml:')) {
+        lines.push(v + ".setAttributeNS('" + XML_NS + "', '" + name + "', " + jsStr(val, opts.subs).code + ');');
         continue;
       }
 
@@ -533,7 +574,22 @@
     }
 
     // Children — use textContent shortcut when single text child and no substitution.
-    const children = Array.from(node.childNodes);
+    // <template> holds its parsed subtree on `.content` (a DocumentFragment),
+    // not on childNodes. Recurse into that fragment instead.
+    let children;
+    if (tag === 'template' && node.content) {
+      children = Array.from(node.content.childNodes);
+      if (children.length) {
+        // Append into the template's content fragment rather than the element itself.
+        const childNs = null;
+        for (const child of children) {
+          convertNode(child, v + '.content', lines, used, opts, childNs);
+        }
+        lines.push(parentVar + '.appendChild(' + v + ');');
+        return;
+      }
+    }
+    children = Array.from(node.childNodes);
     if (opts.textContentShortcut &&
         children.length === 1 &&
         children[0].nodeType === 3 &&
