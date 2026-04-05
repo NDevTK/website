@@ -108,7 +108,9 @@ group('simple variable resolution', () => {
   check('reassignment after site', `var x='<a>'; document.body.innerHTML=x; x='<b>';`, '<a>');
   check('multi decl', `var a='<x>', b='<y>'; document.body.innerHTML=b;`, '<y>');
   check('declare then assign', `var x; x='<a>'; document.body.innerHTML=x;`, '<a>');
-  check('unknown identifier', `document.body.innerHTML=y;`, '');
+  check('unknown identifier',
+    `document.body.innerHTML=y;`,
+    { html: '__HDX0__', autoSubs: [['__HDX0__', 'y']] });
 });
 
 // -----------------------------------------------------------------------
@@ -116,9 +118,11 @@ group('simple variable resolution', () => {
 // -----------------------------------------------------------------------
 group('scoping', () => {
   check('let in block doesn\'t leak',
-    `{ let x='<a>'; } document.body.innerHTML=x;`, '');
+    `{ let x='<a>'; } document.body.innerHTML=x;`,
+    { html: '__HDX0__', autoSubs: [['__HDX0__', 'x']] });
   check('const in block doesn\'t leak',
-    `{ const x='<a>'; } document.body.innerHTML=x;`, '');
+    `{ const x='<a>'; } document.body.innerHTML=x;`,
+    { html: '__HDX0__', autoSubs: [['__HDX0__', 'x']] });
   check('var leaks out of block (function-scoped)',
     `{ var x='<a>'; } document.body.innerHTML=x;`, '<a>');
   check('let shadowing',
@@ -126,9 +130,11 @@ group('scoping', () => {
   check('let shadowing (inner site)',
     `let x='<a>'; { let x='<b>'; document.body.innerHTML=x; }`, '<b>');
   check('var in function does not leak',
-    `function f(){ var x='<a>'; } document.body.innerHTML=x;`, '');
+    `function f(){ var x='<a>'; } document.body.innerHTML=x;`,
+    { html: '__HDX0__', autoSubs: [['__HDX0__', 'x']] });
   check('let in function does not leak',
-    `function f(){ let x='<a>'; } document.body.innerHTML=x;`, '');
+    `function f(){ let x='<a>'; } document.body.innerHTML=x;`,
+    { html: '__HDX0__', autoSubs: [['__HDX0__', 'x']] });
   check('outer var visible past function',
     `var x='<a>'; function f(){} document.body.innerHTML=x;`, '<a>');
   check('arrow expression body (no scope opened)',
@@ -136,9 +142,11 @@ group('scoping', () => {
   check('arrow block body (scope opened)',
     `var f = () => { var x='<bad>'; }; var y='<a>'; document.body.innerHTML=y;`, '<a>');
   check('nested blocks',
-    `{ { let x='<a>'; } } document.body.innerHTML=x;`, '');
+    `{ { let x='<a>'; } } document.body.innerHTML=x;`,
+    { html: '__HDX0__', autoSubs: [['__HDX0__', 'x']] });
   check('nested function scopes',
-    `function a(){ function b(){ var x='<a>'; } } document.body.innerHTML=x;`, '');
+    `function a(){ function b(){ var x='<a>'; } } document.body.innerHTML=x;`,
+    { html: '__HDX0__', autoSubs: [['__HDX0__', 'x']] });
 });
 
 // -----------------------------------------------------------------------
@@ -155,13 +163,15 @@ group('concat chains', () => {
     `var a='<a>'; var b=a+'<b>'; var c=b+'<c>'; document.body.innerHTML=c;`, '<a><b><c>');
   check('concat inline in innerHTML',
     `var msg='world'; document.body.innerHTML='<p>hi '+msg+'!</p>';`, '<p>hi world!</p>');
-  check('unknown ident breaks chain',
-    `var x='<a>'+unknownVar; document.body.innerHTML=x;`, '');
-  check('non-literal breaks chain (call)',
-    `var x='<a>'+foo(); document.body.innerHTML=x;`, '');
-  check('unresolved ident becomes a placeholder expression',
+  check('unknown ident captured as placeholder',
+    `var x='<a>'+unknownVar; document.body.innerHTML=x;`,
+    { html: '<a>__HDX0__', autoSubs: [['__HDX0__', 'unknownVar']] });
+  check('unknown call captured as placeholder',
+    `var x='<a>'+foo(); document.body.innerHTML=x;`,
+    { html: '<a>__HDX0__', autoSubs: [['__HDX0__', 'foo()']] });
+  check('unresolved parts propagate through variables',
     `var x = 'a' + foo(); document.body.innerHTML = '<a>'+x+'</a>';`,
-    { html: '<a>__HDX0__</a>', autoSubs: [['__HDX0__', 'x']] });
+    { html: '<a>a__HDX0__</a>', autoSubs: [['__HDX0__', 'foo()']] });
 });
 
 // -----------------------------------------------------------------------
@@ -198,8 +208,8 @@ group('templates', () => {
 // HTML content filter (only return chains with `<`)
 // -----------------------------------------------------------------------
 group('HTML content filter', () => {
-  check('non-HTML concat returns empty',
-    `var x = 'a' + 'b'; document.body.innerHTML=x;`, '');
+  check('non-HTML concat still materializes',
+    `var x = 'a' + 'b'; document.body.innerHTML=x;`, 'ab');
   check('HTML-looking char found',
     `var x = 'a<b'; document.body.innerHTML=x;`, 'a<b');
 });
@@ -213,7 +223,8 @@ group('object property access', () => {
   check('obj.prop with concat',
     `var obj = { a: '<a>', b: '<b>' }; document.body.innerHTML = obj.a + obj.b;`, '<a><b>');
   check('unknown prop',
-    `var obj = { html: '<a>' }; document.body.innerHTML = obj.missing;`, '');
+    `var obj = { html: '<a>' }; document.body.innerHTML = obj.missing;`,
+    { html: '__HDX0__', autoSubs: [['__HDX0__', 'obj.missing']] });
   check('quoted keys',
     `var obj = { "html": '<a>' }; document.body.innerHTML = obj.html;`, '<a>');
 });
@@ -347,8 +358,9 @@ group('bound array access', () => {
     `var arr=['<a>','<b>']; document.body.innerHTML=arr[1];`, '<b>');
   check('arr[0]+arr[1]',
     `var arr=['<a>','<b>']; document.body.innerHTML=arr[0]+arr[1];`, '<a><b>');
-  check('out-of-bounds returns empty',
-    `var arr=['<a>']; document.body.innerHTML=arr[5];`, '');
+  check('out-of-bounds index',
+    `var arr=['<a>']; document.body.innerHTML=arr[5];`,
+    { html: '__HDX0__', autoSubs: [['__HDX0__', 'arr[5]']] });
 });
 
 // -----------------------------------------------------------------------
@@ -360,7 +372,8 @@ group('bracket object access', () => {
   check(`obj["key"]`,
     `var obj={html:'<a>'}; document.body.innerHTML=obj["html"];`, '<a>');
   check('unknown key',
-    `var obj={html:'<a>'}; document.body.innerHTML=obj['missing'];`, '');
+    `var obj={html:'<a>'}; document.body.innerHTML=obj['missing'];`,
+    { html: '__HDX0__', autoSubs: [["__HDX0__", "obj['missing']"]] });
 });
 
 // -----------------------------------------------------------------------
@@ -387,7 +400,8 @@ group('scope+binding interactions', () => {
   check('reassign object inside block',
     `var o = {html:'<a>'}; { o = {html:'<b>'}; } document.body.innerHTML = o.html;`, '<b>');
   check('let object doesn\'t leak',
-    `{ let o = {html:'<a>'}; } document.body.innerHTML = o.html;`, '');
+    `{ let o = {html:'<a>'}; } document.body.innerHTML = o.html;`,
+    { html: '__HDX0__', autoSubs: [['__HDX0__', 'o.html']] });
   check('object with shadowed inner prop',
     `var o = { html: '<outer>' }; { let o = { html: '<inner>' }; } document.body.innerHTML = o.html;`, '<outer>');
 });
@@ -424,9 +438,10 @@ group('function calls', () => {
 // Function edge cases
 // -----------------------------------------------------------------------
 group('function edge cases', () => {
-  check('function with unknown arg (unsupported, returns empty)',
+  check('function with unknown arg (captured as placeholder)',
     `const f = x => '<a>' + x + '</a>';
-     document.body.innerHTML = f(unknown);`, '');
+     document.body.innerHTML = f(unknown);`,
+    { html: '<a>__HDX0__</a>', autoSubs: [['__HDX0__', 'unknown']] });
   check('recursion is capped (no infinite loop)',
     `function f(x) { return '<p>' + x + '</p>'; }
      document.body.innerHTML = f(f('hi'));`, '<p><p>hi</p></p>');
@@ -440,8 +455,61 @@ group('function edge cases', () => {
   check('function in object',
     `var O = { build: (x) => '<a>' + x + '</a>' };
      document.body.innerHTML = O.build('hi');`, '<a>hi</a>');
-  check('function called with missing arg (unsupported)',
-    `function f(x) { return '<a>'+x+'</a>'; } document.body.innerHTML = f();`, '');
+  check('function called with missing arg (param surfaces as placeholder)',
+    `function f(x) { return '<a>'+x+'</a>'; } document.body.innerHTML = f();`,
+    { html: '<a>__HDX0__</a>', autoSubs: [['__HDX0__', 'x']] });
+});
+
+// -----------------------------------------------------------------------
+// Compound assignment
+// -----------------------------------------------------------------------
+group('compound assignment', () => {
+  check('+= builds string',
+    `var s=''; s+='<a>'; s+='<b>'; document.body.innerHTML=s;`, '<a><b>');
+  check('+= with identifier',
+    `var tag='<x>'; var s='<wrap>'; s+=tag; s+='</wrap>';
+     document.body.innerHTML=s;`, '<wrap><x></wrap>');
+  check('+= propagates through unresolved base',
+    `var s=unknownBase; s+='<a>'; document.body.innerHTML=s;`,
+    { html: '__HDX0__<a>', autoSubs: [['__HDX0__', 'unknownBase']] });
+});
+
+// -----------------------------------------------------------------------
+// Unresolved expressions (opaque references)
+// -----------------------------------------------------------------------
+group('opaque references', () => {
+  check('variable-indexed array',
+    `var arr=['<a>']; document.body.innerHTML=arr[someIdx];`,
+    { html: '__HDX0__', autoSubs: [['__HDX0__', 'arr[someIdx]']] });
+  check('variable-indexed through alias',
+    `var arr=['<a>']; var url=arr[i]; document.body.innerHTML='<p>'+url+'</p>';`,
+    { html: '<p>__HDX0__</p>', autoSubs: [['__HDX0__', 'arr[i]']] });
+  check('chained unresolvable',
+    `var o={a:'<x>'}; document.body.innerHTML=o[key].foo;`,
+    { html: '__HDX0__', autoSubs: [['__HDX0__', 'o[key].foo']] });
+  check('unresolved call propagates source',
+    `document.body.innerHTML='<a>'+parseInt(s,10)+'</a>';`,
+    { html: '<a>__HDX0__</a>', autoSubs: [['__HDX0__', 'parseInt(s,10)']] });
+});
+
+// -----------------------------------------------------------------------
+// Functions with assignments inside (walker traverses body)
+// -----------------------------------------------------------------------
+group('function bodies with assignments', () => {
+  check('inner innerHTML in function body',
+    `function f() {
+       var s = '<a>';
+       s += '<b>';
+       out.innerHTML = s;
+     }`,
+    { html: '<a><b>', target: 'out', assignProp: 'innerHTML', assignOp: '=' });
+  check('function param referenced inside body',
+    `function wrap(tag) {
+       var s = '<' + tag + '>hi</' + tag + '>';
+       out.innerHTML = s;
+     }`,
+    { html: '<__HDX0__>hi</__HDX1__>', target: 'out',
+      autoSubs: [['__HDX0__', 'tag'], ['__HDX1__', 'tag']] });
 });
 
 // -----------------------------------------------------------------------

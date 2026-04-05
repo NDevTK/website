@@ -98,14 +98,26 @@
     // If there's an `X.innerHTML = ...` / `X.outerHTML = ...` assignment,
     // restrict HTML extraction to the right-hand side and surface the target.
     const assign = findHtmlAssignment(tokens);
-    let searchTokens = assign ? tokens.slice(assign.rhsStart, assign.rhsEnd) : tokens;
-    // Resolve identifier references inside the RHS using the binding state at
-    // the assignment site (honoring var/let/const scope, shadowing, and
-    // reassignment order).
-    if (assign) searchTokens = resolveIdentifiers(tokens, assign.rhsStart, assign.rhsEnd);
     const target = assign ? assign.target : null;
     const assignProp = assign ? assign.prop : null;
     const assignOp = assign ? assign.op : null;
+
+    // Resolve identifier references inside the RHS using the binding state at
+    // the assignment site (honoring var/let/const scope, shadowing, and
+    // reassignment order). When parsing succeeds we materialize the concat
+    // chain directly so even single-operand results (including pure opaque
+    // references) become a valid { html, autoSubs } pair.
+    let searchTokens;
+    if (assign) {
+      const r = resolveIdentifiers(tokens, assign.rhsStart, assign.rhsEnd);
+      searchTokens = r.tokens;
+      if (r.parsed) {
+        const m = materializeFlatChain(searchTokens);
+        return Object.assign(m, { target, assignProp, assignOp });
+      }
+    } else {
+      searchTokens = tokens;
+    }
 
     const chain = findBestConcatChain(searchTokens);
     if (chain) return Object.assign(chain, { target, assignProp, assignOp });
@@ -224,6 +236,16 @@
     type: 'str', quote: "'", raw: text, text, start: 0, end: 0, _src: '',
   });
 
+  // Represent an unresolved subexpression as a single operand token whose
+  // source slice equals `text`. It uses the same `other` token shape the
+  // tokenizer emits for plain identifiers, so the downstream materializer
+  // turns it into a `__HDX#__` placeholder and records the original source
+  // in autoSubs — the same mechanism that already handles standalone
+  // unresolved identifiers in a concat chain.
+  const exprRef = (text) => ({
+    type: 'other', text, start: 0, end: text.length, _src: text,
+  });
+
   // A synthetic `+` token used when splicing together a concat chain from
   // `.join(sep)` (the original source has no plus there). findBestConcatChain
   // only inspects `type`, so minimal fields are enough.
@@ -252,8 +274,9 @@
   function buildScopeState(tokens, stopAt) {
     const stack = [{ bindings: Object.create(null), isFunction: true }];
     let pendingFunctionBrace = false;
+    let pendingFunctionParams = null;
     // Swappable token array for the inner parsing functions. The main scope
-    // walker always uses `tokens` directly. Helpers like `evalExprTokens` can
+    // walker always uses `tokens` directly. Helpers like `evalExprSrc` can
     // temporarily swap `tks` to parse an unrelated token sequence (e.g., a
     // template-literal expression that was re-tokenized) while sharing the
     // current scope stack.
@@ -657,7 +680,7 @@
     const readValue = (k, stop, terms) => {
       const t = tks[k];
       if (!t) return null;
-      // Try arrow function first (it can start with `(` or with an ident).
+      // Arrow function (it can start with `(` or with an ident).
       const arrow = peekArrow(k, stop);
       if (arrow) {
         const body = readArrowBody(arrow.arrowNext, stop);
@@ -667,15 +690,24 @@
           next: body.next,
         };
       }
-      if (t.type === 'open' && t.char === '{') return readObjectLit(k, stop);
-      if (t.type === 'open' && t.char === '[') {
-        // Could be `[...].join(...)` (a concat operand) or a plain array.
-        // Try concat first (it consumes the join suffix); fall back to
-        // plain array literal.
-        const saved = readChainFromHere(k, stop, terms);
-        if (saved) return { binding: chainBinding(saved.toks), next: saved.next };
-        return readArrayLit(k, stop);
+      // Try the expression as a single base + postfix accessors. This
+      // preserves typed bindings (array/object/function) when the RHS is a
+      // bare literal or a member access that doesn't need to coerce to a
+      // chain. If the next top-level token is `+`, escalate to concat-chain
+      // parsing so the accessor result becomes the first operand.
+      const base = readBase(k, stop);
+      if (base) {
+        const s = applySuffixes(base.bind, base.next, stop);
+        if (s.bind) {
+          const nt = tks[s.next];
+          if (nt && nt.type === 'plus') {
+            const r = readChainFromHere(k, stop, terms);
+            if (r) return { binding: chainBinding(r.toks), next: r.next };
+          }
+          return { binding: s.bind, next: s.next };
+        }
       }
+      // Fall through: chain parsing (with opaque-capture for unresolved).
       const r = readChainFromHere(k, stop, terms);
       if (r) return { binding: chainBinding(r.toks), next: r.next };
       return null;
@@ -695,29 +727,43 @@
       while (next < stop && bind) {
         const t = tks[next];
         if (!t) break;
-        // Bracket subscript: [strLit] (object key) or [intLit] (array index).
+        // Bracket subscript: [strLit] (object key) or [intLit] (array index)
+        // or [<unresolvable-expr>] (marks the access as opaque and bails).
         if (t.type === 'open' && t.char === '[') {
-          const keyTok = tks[next + 1];
-          const close = tks[next + 2];
-          if (!keyTok || !close || close.type !== 'close' || close.char !== ']') break;
-          if (keyTok.type === 'str') {
-            if (bind.kind === 'object') {
-              bind = bind.props[keyTok.text] || null;
-            } else if (bind.kind === 'array' && /^\d+$/.test(keyTok.text)) {
-              bind = bind.elems[parseInt(keyTok.text, 10)] || null;
-            } else break;
-            next = next + 3;
-            continue;
+          // Find matching ']' at depth 0 relative to this bracket.
+          let depth = 1, j = next + 1;
+          while (j < stop && depth > 0) {
+            const tk = tks[j];
+            if (tk.type === 'open' && tk.char === '[') depth++;
+            else if (tk.type === 'close' && tk.char === ']') depth--;
+            if (depth === 0) break;
+            j++;
           }
-          if (keyTok.type === 'other' && /^-?\d+$/.test(keyTok.text)) {
-            if (bind.kind === 'array') {
-              bind = bind.elems[parseInt(keyTok.text, 10)] || null;
-              next = next + 3;
+          const close = tks[j];
+          if (!close || close.type !== 'close' || close.char !== ']') break;
+          const inner = j - (next + 1);
+          // Only literal single-token keys resolve; anything else marks the
+          // subscript result as unknown so the caller captures it opaquely.
+          if (inner === 1) {
+            const keyTok = tks[next + 1];
+            if (keyTok.type === 'str') {
+              if (bind.kind === 'object') bind = bind.props[keyTok.text] || null;
+              else if (bind.kind === 'array' && /^\d+$/.test(keyTok.text)) bind = bind.elems[parseInt(keyTok.text, 10)] || null;
+              else bind = null;
+              next = j + 1;
               continue;
             }
-            break;
+            if (keyTok.type === 'other' && /^-?\d+$/.test(keyTok.text)) {
+              if (bind.kind === 'array') bind = bind.elems[parseInt(keyTok.text, 10)] || null;
+              else bind = null;
+              next = j + 1;
+              continue;
+            }
           }
-          break;
+          // Unresolvable subscript expression.
+          bind = null;
+          next = j + 1;
+          continue;
         }
         // Separate-token method call: `].join(sep)` or `'a'.concat(...)`.
         // Also handles `.prop.concat(...)` / `.prop.join(...)` when attached.
@@ -894,15 +940,50 @@
       return result;
     };
 
-    // Read one operand of a concat chain. Returns { toks, next } where toks
-    // is a flat concat sub-chain, or null. Requires the final binding to be
-    // a chain; non-chain bindings (bare array/object/function) return null.
-    const readOperand = (k, stop) => {
+    // Locate the end of an operand expression: the next `+` at depth 0 or
+    // the first terminator in `terms`.
+    const skipOperand = (k, stop, terms) => {
+      let depth = 0;
+      while (k < stop) {
+        const tk = tks[k];
+        if (tk.type === 'open') depth++;
+        else if (tk.type === 'close') {
+          if (depth === 0) return k;
+          depth--;
+        } else if (depth === 0) {
+          if (tk.type === 'plus') return k;
+          if (tk.type === 'sep' && terms.sep.includes(tk.char)) return k;
+        }
+        k++;
+      }
+      return k;
+    };
+
+    // Read one operand of a concat chain. An operand is either fully
+    // resolvable (returned as its chain of string/template tokens) or opaque
+    // (captured as a single expression-ref operand whose source slice spans
+    // the original text — the same representation used for standalone
+    // unresolved identifiers already emitted by the tokenizer). This dual
+    // representation is the tool's fundamental model for string expressions:
+    // known parts become text, unknown parts become placeholders.
+    const readOperand = (k, stop, terms) => {
       const base = readBase(k, stop);
-      if (!base) return null;
-      const r = applySuffixes(base.bind, base.next, stop);
-      if (!r.bind || r.bind.kind !== 'chain') return null;
-      return { toks: r.bind.toks.slice(), next: r.next };
+      if (base) {
+        const r = applySuffixes(base.bind, base.next, stop);
+        if (r.bind && r.bind.kind === 'chain') {
+          const boundary = skipOperand(r.next, stop, terms);
+          if (boundary === r.next) return { toks: r.bind.toks.slice(), next: r.next };
+        }
+      }
+      const end = skipOperand(k, stop, terms);
+      if (end === k) return null;
+      const first = tks[k];
+      const last = tks[end - 1];
+      const src = first._src.slice(first.start, last.end);
+      return {
+        toks: [{ type: 'other', text: src, start: first.start, end: last.end, _src: first._src }],
+        next: end,
+      };
     };
 
     // Parse `( chain, chain, ... )` starting at the `(` token index. Returns
@@ -946,7 +1027,7 @@
       let i = k;
       // Read first operand.
       if (endAt(tks[i])) return null;
-      let op = readOperand(i, stop);
+      let op = readOperand(i, stop, terms);
       if (!op) return null;
       for (const t of op.toks) out.push(t);
       i = op.next;
@@ -955,7 +1036,7 @@
         const plus = tks[i];
         if (!plus || plus.type !== 'plus') return null;
         i++;
-        op = readOperand(i, stop);
+        op = readOperand(i, stop, terms);
         if (!op) return null;
         out.push(plus);
         for (const t of op.toks) out.push(t);
@@ -975,8 +1056,19 @@
       const t = tokens[i];
 
       if (t.type === 'open' && t.char === '{') {
-        stack.push({ bindings: Object.create(null), isFunction: pendingFunctionBrace });
+        const frame = { bindings: Object.create(null), isFunction: pendingFunctionBrace };
+        if (pendingFunctionBrace && pendingFunctionParams) {
+          // Bind function parameters as references to their own names so
+          // uses within the body surface via autoSubs when the body is
+          // parsed in scope (e.g. for an innerHTML assignment inside the
+          // function). At call sites, instantiateFunction rebinds them.
+          for (const name of pendingFunctionParams) {
+            frame.bindings[name] = chainBinding([exprRef(name)]);
+          }
+        }
+        stack.push(frame);
         pendingFunctionBrace = false;
+        pendingFunctionParams = null;
         continue;
       }
       if (t.type === 'close' && t.char === '}') {
@@ -1022,7 +1114,13 @@
             }
             if (depth === 0) {
               declFunction(nameTok.text, functionBinding(params, j + 1, k - 1, true));
-              i = k - 1;
+              // Fall through to let the walker traverse the body in a new
+              // function scope, so inner `var`/`let`/`const` and assignments
+              // (including `this.innerHTML = ...` sites) remain visible to
+              // parseRange while staying isolated from the outer scope.
+              pendingFunctionBrace = true;
+              pendingFunctionParams = params;
+              i = j - 1;
               continue;
             }
           }
@@ -1095,12 +1193,25 @@
         continue;
       }
 
-      // Bare assignment: IDENT = <value>.
+      // Bare assignment: IDENT = <value>, or compound `IDENT += <value>`
+      // (which translates to `IDENT = IDENT + <value>`).
       if (IDENT_RE.test(t.text)) {
         const eqTok = tokens[i + 1];
         if (eqTok && eqTok.type === 'sep' && eqTok.char === '=') {
           const r = readValue(i + 2, stop, TERMS_TOP);
           assignName(t.text, r ? r.binding : null);
+          i = skipExpr(i + 2, stop) - 1;
+          continue;
+        }
+        if (eqTok && eqTok.type === 'sep' && eqTok.char === '+=') {
+          const r = readValue(i + 2, stop, TERMS_TOP);
+          const rhs = r ? r.binding : null;
+          const cur = resolve(t.text);
+          let combined = null;
+          if (cur && cur.kind === 'chain' && rhs && rhs.kind === 'chain') {
+            combined = chainBinding([...cur.toks, SYNTH_PLUS, ...rhs.toks]);
+          }
+          assignName(t.text, combined);
           i = skipExpr(i + 2, stop) - 1;
           continue;
         }
@@ -1132,7 +1243,7 @@
   function resolveIdentifiers(tokens, startIdx, endIdx) {
     const state = buildScopeState(tokens, startIdx);
     const full = state.parseRange(startIdx, endIdx);
-    if (full) return full;
+    if (full) return { tokens: full, parsed: true };
     const out = [];
     for (let i = startIdx; i < endIdx; i++) {
       const t = tokens[i];
@@ -1147,7 +1258,40 @@
       }
       out.push(t);
     }
-    return out;
+    return { tokens: out, parsed: false };
+  }
+
+  // Materialize a flat concat chain (tokens alternating operand/plus) into
+  // { html, autoSubs }. Unlike materializeChain, doesn't require at least
+  // one string operand — a lone opaque operand yields a placeholder.
+  function materializeFlatChain(chainTokens) {
+    const operands = [];
+    let cur = [];
+    for (const t of chainTokens) {
+      if (t.type === 'plus') { if (cur.length) operands.push({ toks: cur }); cur = []; }
+      else cur.push(t);
+    }
+    if (cur.length) operands.push({ toks: cur });
+    if (operands.length === 0) return { html: '', autoSubs: [] };
+    let html = '';
+    const autoSubs = [];
+    let idx = 0;
+    for (const op of operands) {
+      if (op.toks.length === 1 && (op.toks[0].type === 'str' || op.toks[0].type === 'tmpl')) {
+        const m = materializeStringToken(op.toks[0], idx);
+        html += m.html;
+        for (const s of m.autoSubs) autoSubs.push(s);
+        idx = m.nextIdx;
+      } else {
+        const first = op.toks[0];
+        const last = op.toks[op.toks.length - 1];
+        const expr = first._src.slice(first.start, last.end).trim();
+        const ph = makePlaceholder(idx++);
+        autoSubs.push([ph, expr]);
+        html += ph;
+      }
+    }
+    return { html, autoSubs };
   }
 
   const EXPR_PREFIX = '__HDX';
