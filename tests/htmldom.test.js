@@ -261,10 +261,10 @@ group('nested structures', () => {
      document.body.innerHTML = cfg.parts.head + cfg.parts.body;`, '<h><b>');
   check('array of objects',
     `var items = [{ html: '<a>' }, { html: '<b>' }];
-     document.body.innerHTML = items[0].html;`, '');  // array indexing not supported
+     document.body.innerHTML = items[0].html;`, '<a>');
   check('object containing array',
     `var o = { parts: ['<a>','<b>'] };
-     document.body.innerHTML = o.parts.join('');`, ''); // binding-array .join not supported
+     document.body.innerHTML = o.parts.join('');`, '<a><b>');
 });
 
 // -----------------------------------------------------------------------
@@ -308,6 +308,88 @@ group('real-world patterns', () => {
      document.body.innerHTML = html;`, '<a><b><c>');
   check('builder pattern via concat',
     `var s = ''; s = s + '<a>'; s = s + '<b>'; document.body.innerHTML = s;`, '<a><b>');
+});
+
+// -----------------------------------------------------------------------
+// Primitive literals in concat
+// -----------------------------------------------------------------------
+group('primitive literals', () => {
+  check('int literal', `document.body.innerHTML='<x>'+42+'</x>';`, '<x>42</x>');
+  check('float literal', `document.body.innerHTML='<x>'+3.14+'</x>';`, '<x>3.14</x>');
+  check('true', `document.body.innerHTML='<x>'+true+'</x>';`, '<x>true</x>');
+  check('false', `document.body.innerHTML='<x>'+false+'</x>';`, '<x>false</x>');
+  check('null', `document.body.innerHTML='<x>'+null+'</x>';`, '<x>null</x>');
+});
+
+// -----------------------------------------------------------------------
+// Parenthesized expressions
+// -----------------------------------------------------------------------
+group('parentheses', () => {
+  check('grouped concat',
+    `document.body.innerHTML=('<a>'+'<b>')+'<c>';`, '<a><b><c>');
+  check('nested parens',
+    `document.body.innerHTML=(('<a>'+'<b>')+'<c>');`, '<a><b><c>');
+  check('parens in binding',
+    `var x=('<a>'+'<b>'); document.body.innerHTML=x+'<c>';`, '<a><b><c>');
+});
+
+// -----------------------------------------------------------------------
+// Bound array .join and indexing
+// -----------------------------------------------------------------------
+group('bound array access', () => {
+  check('.join on bound array',
+    `var arr=['<a>','<b>']; document.body.innerHTML=arr.join('');`, '<a><b>');
+  check('.join with sep on bound array',
+    `var arr=['<a>','<b>','<c>']; document.body.innerHTML=arr.join('-');`, '<a>-<b>-<c>');
+  check('arr[0]',
+    `var arr=['<a>','<b>']; document.body.innerHTML=arr[0];`, '<a>');
+  check('arr[1]',
+    `var arr=['<a>','<b>']; document.body.innerHTML=arr[1];`, '<b>');
+  check('arr[0]+arr[1]',
+    `var arr=['<a>','<b>']; document.body.innerHTML=arr[0]+arr[1];`, '<a><b>');
+  check('out-of-bounds returns empty',
+    `var arr=['<a>']; document.body.innerHTML=arr[5];`, '');
+});
+
+// -----------------------------------------------------------------------
+// Bracket object access
+// -----------------------------------------------------------------------
+group('bracket object access', () => {
+  check(`obj['key']`,
+    `var obj={html:'<a>'}; document.body.innerHTML=obj['html'];`, '<a>');
+  check(`obj["key"]`,
+    `var obj={html:'<a>'}; document.body.innerHTML=obj["html"];`, '<a>');
+  check('unknown key',
+    `var obj={html:'<a>'}; document.body.innerHTML=obj['missing'];`, '');
+});
+
+// -----------------------------------------------------------------------
+// Chained access (combinations)
+// -----------------------------------------------------------------------
+group('chained access', () => {
+  check('array of objects .html[0]',
+    `var items = [{html:'<a>'}, {html:'<b>'}];
+     document.body.innerHTML = items[0].html + items[1].html;`, '<a><b>');
+  check('object map via join',
+    `var tags = { open: '<a>', close: '</a>' };
+     document.body.innerHTML = [tags.open, 'hi', tags.close].join('');`, '<a>hi</a>');
+  check('nested index',
+    `var grid = [['<r0c0>', '<r0c1>'], ['<r1c0>']];
+     document.body.innerHTML = grid[0][0] + grid[0][1];`, '<r0c0><r0c1>');
+  check('concat with method call chain',
+    `var s = '<a>'; document.body.innerHTML = s.concat('<b>').concat('<c>');`, '<a><b><c>');
+});
+
+// -----------------------------------------------------------------------
+// Scope + bindings interaction
+// -----------------------------------------------------------------------
+group('scope+binding interactions', () => {
+  check('reassign object inside block',
+    `var o = {html:'<a>'}; { o = {html:'<b>'}; } document.body.innerHTML = o.html;`, '<b>');
+  check('let object doesn\'t leak',
+    `{ let o = {html:'<a>'}; } document.body.innerHTML = o.html;`, '');
+  check('object with shadowed inner prop',
+    `var o = { html: '<outer>' }; { let o = { html: '<inner>' }; } document.body.innerHTML = o.html;`, '<outer>');
 });
 
 // -----------------------------------------------------------------------

@@ -574,79 +574,170 @@
       return null;
     };
 
-    // Read one operand starting at index `k` within [k, stop). Returns
-    // `{ toks, next }` where `toks` is an array of operand/plus tokens for a
-    // concat chain, or null if the form isn't supported. Operand forms:
-    //   - string or template literal (templates get exprs inlined when known)
-    //   - identifier or dotted path (resolved via the in-progress scope state)
-    //   - `[ ... ].join(strLiteral)` array-join pattern
-    //   - `<operand>.concat(args...)` string concat method
-    const readOperand = (k, stop) => {
+    // Detect a primitive literal token and return its string form, or null.
+    const primitiveAsString = (text) => {
+      if (/^-?\d+$/.test(text)) return text.replace(/^-?0+(?=\d)/, (m) => m.startsWith('-') ? '-' : '');
+      if (/^-?\d*\.\d+$/.test(text)) return text;
+      if (text === 'true' || text === 'false' || text === 'null' || text === 'undefined') return text;
+      return null;
+    };
+
+    // Apply `[key]` subscripts and separate-token `.method(args)` calls as
+    // postfix accessors on a typed binding. Returns { bind, next }.
+    const applySuffixes = (bind, next, stop) => {
+      while (next < stop && bind) {
+        const t = tokens[next];
+        if (!t) break;
+        // Bracket subscript: [strLit] (object key) or [intLit] (array index).
+        if (t.type === 'open' && t.char === '[') {
+          const keyTok = tokens[next + 1];
+          const close = tokens[next + 2];
+          if (!keyTok || !close || close.type !== 'close' || close.char !== ']') break;
+          if (keyTok.type === 'str') {
+            if (bind.kind === 'object') {
+              bind = bind.props[keyTok.text] || null;
+            } else if (bind.kind === 'array' && /^\d+$/.test(keyTok.text)) {
+              bind = bind.elems[parseInt(keyTok.text, 10)] || null;
+            } else break;
+            next = next + 3;
+            continue;
+          }
+          if (keyTok.type === 'other' && /^-?\d+$/.test(keyTok.text)) {
+            if (bind.kind === 'array') {
+              bind = bind.elems[parseInt(keyTok.text, 10)] || null;
+              next = next + 3;
+              continue;
+            }
+            break;
+          }
+          break;
+        }
+        // Separate-token method call: `].join(sep)` or `'a'.concat(...)`.
+        // Also handles `.prop.concat(...)` / `.prop.join(...)` when attached.
+        if (t.type === 'other' && /^(?:\.[A-Za-z_$][A-Za-z0-9_$]*)+$/.test(t.text)) {
+          const paren = tokens[next + 1];
+          const isCall = paren && paren.type === 'open' && paren.char === '(';
+          const segs = t.text.slice(1).split('.');
+          const lastSeg = segs[segs.length - 1];
+          const isMethodCall = isCall && (lastSeg === 'concat' || lastSeg === 'join');
+          // Walk any leading property segments into an object binding.
+          const propSegs = isMethodCall ? segs.slice(0, -1) : segs;
+          let cur = bind;
+          for (const p of propSegs) {
+            if (!cur || cur.kind !== 'object') { cur = null; break; }
+            cur = cur.props[p] || null;
+          }
+          if (isMethodCall) {
+            const r = applyMethod(cur, lastSeg, next + 1, stop);
+            if (!r) break;
+            bind = chainBinding(r.toks);
+            next = r.next;
+            continue;
+          }
+          bind = cur;
+          next = next + 1;
+          continue;
+        }
+        break;
+      }
+      return { bind, next };
+    };
+
+    // Apply a method call: .concat on chain, or .join on array.
+    const applyMethod = (bind, method, parenIdx, stop) => {
+      if (method === 'concat') {
+        if (!bind || bind.kind !== 'chain') return null;
+        const args = readConcatArgs(parenIdx, stop);
+        if (!args) return null;
+        const toks = bind.toks.slice();
+        for (const a of args.args) { toks.push(SYNTH_PLUS); for (const v of a) toks.push(v); }
+        return { toks, next: args.next };
+      }
+      if (method === 'join') {
+        if (!bind || bind.kind !== 'array') return null;
+        const lp = tokens[parenIdx];
+        if (!lp || lp.type !== 'open' || lp.char !== '(') return null;
+        const sepTok = tokens[parenIdx + 1];
+        if (!sepTok || (sepTok.type !== 'str' && sepTok.type !== 'tmpl')) return null;
+        const rp = tokens[parenIdx + 2];
+        if (!rp || rp.type !== 'close' || rp.char !== ')') return null;
+        const elems = bind.elems;
+        if (elems.length === 0) return { toks: [makeSynthStr('')], next: parenIdx + 3 };
+        const out = [];
+        for (let e = 0; e < elems.length; e++) {
+          const eb = elems[e];
+          if (!eb || eb.kind !== 'chain') return null;
+          if (e > 0) { out.push(SYNTH_PLUS); out.push(rewriteTemplate(sepTok)); out.push(SYNTH_PLUS); }
+          for (const vt of eb.toks) out.push(vt);
+        }
+        return { toks: out, next: parenIdx + 3 };
+      }
+      return null;
+    };
+
+    // Read a "base" value before any suffixes: literals, identifiers/paths
+    // (with optional attached .concat/.join method), parenthesized
+    // subexpressions, array literals, and object literals.
+    const readBase = (k, stop) => {
       const t = tokens[k];
       if (!t) return null;
-      let base = null;
-      let next = k;
-      if (t.type === 'str') { base = [t]; next = k + 1; }
-      else if (t.type === 'tmpl') { base = [rewriteTemplate(t)]; next = k + 1; }
-      else if (t.type === 'other' && IDENT_OR_PATH_RE.test(t.text)) {
-        // `prefix.concat(...)` is tokenized as a single identifier ending in
-        // `.concat` followed by `(`. Peel that suffix off before resolving.
-        let path = t.text;
-        const afterTok = tokens[k + 1];
-        const isCall = afterTok && afterTok.type === 'open' && afterTok.char === '(';
-        const callingConcat = isCall && /\.concat$/.test(path);
-        if (callingConcat) path = path.slice(0, -'.concat'.length);
-        const b = path ? resolvePath(path) : null;
-        if (!b || b.kind !== 'chain') return null;
-        base = b.toks.slice();
-        next = k + 1;
-        if (callingConcat) {
-          const args = readConcatArgs(next, stop);
-          if (!args) return null;
-          for (const a of args.args) { base.push(SYNTH_PLUS); for (const v of a) base.push(v); }
-          next = args.next;
-        }
-      }
-      else if (t.type === 'open' && t.char === '[') {
-        // `[ elem, elem, ... ].join(sep)` → concat chain with sep interleaved.
-        const arr = readArrayLit(k, stop);
-        if (!arr || arr.binding.kind !== 'array') return null;
-        const joinTok = tokens[arr.next];
-        if (!joinTok || joinTok.type !== 'other' || joinTok.text !== '.join') return null;
-        const lp = tokens[arr.next + 1];
-        if (!lp || lp.type !== 'open' || lp.char !== '(') return null;
-        const sepTok = tokens[arr.next + 2];
-        if (!sepTok || (sepTok.type !== 'str' && sepTok.type !== 'tmpl')) return null;
-        const rp = tokens[arr.next + 3];
+      if (t.type === 'str') return { bind: chainBinding([t]), next: k + 1 };
+      if (t.type === 'tmpl') return { bind: chainBinding([rewriteTemplate(t)]), next: k + 1 };
+      if (t.type === 'open' && t.char === '(') {
+        const r = readConcatExpr(k + 1, stop, { sep: [], close: [')'] });
+        if (!r) return null;
+        const rp = tokens[r.next];
         if (!rp || rp.type !== 'close' || rp.char !== ')') return null;
-        const elems = arr.binding.elems;
-        if (elems.length === 0) { base = [makeSynthStr('')]; next = arr.next + 4; }
-        else {
-          const out = [];
-          for (let e = 0; e < elems.length; e++) {
-            const eb = elems[e];
-            if (!eb || eb.kind !== 'chain') return null;
-            if (e > 0) { out.push(SYNTH_PLUS); out.push(rewriteTemplate(sepTok)); out.push(SYNTH_PLUS); }
-            for (const vt of eb.toks) out.push(vt);
+        return { bind: chainBinding(r.toks), next: r.next + 1 };
+      }
+      if (t.type === 'open' && t.char === '[') {
+        const a = readArrayLit(k, stop);
+        if (!a) return null;
+        return { bind: a.binding, next: a.next };
+      }
+      if (t.type === 'open' && t.char === '{') {
+        const o = readObjectLit(k, stop);
+        if (!o) return null;
+        return { bind: o.binding, next: o.next };
+      }
+      if (t.type !== 'other') return null;
+      // Primitive literal.
+      const lit = primitiveAsString(t.text);
+      if (lit !== null) return { bind: chainBinding([makeSynthStr(lit)]), next: k + 1 };
+      // Identifier/path, possibly with attached .concat/.join method call.
+      if (IDENT_OR_PATH_RE.test(t.text)) {
+        const paren = tokens[k + 1];
+        const isCall = paren && paren.type === 'open' && paren.char === '(';
+        if (isCall) {
+          const dot = t.text.lastIndexOf('.');
+          if (dot > 0) {
+            const method = t.text.slice(dot + 1);
+            if (method === 'concat' || method === 'join') {
+              const prefix = t.text.slice(0, dot);
+              const prefBind = resolvePath(prefix);
+              if (prefBind) {
+                const r = applyMethod(prefBind, method, k + 1, stop);
+                if (r) return { bind: chainBinding(r.toks), next: r.next };
+              }
+              return null;
+            }
           }
-          base = out; next = arr.next + 4;
         }
+        const b = resolvePath(t.text);
+        if (b) return { bind: b, next: k + 1 };
       }
-      else {
-        return null;
-      }
-      // Optional `.concat(chain, chain, ...)` suffix (chainable). This loop
-      // handles the form where `.concat` is a separate token (after a string
-      // literal base). The attached form (`a.concat`) is handled above.
-      while (next < stop) {
-        const ntok = tokens[next];
-        if (!ntok || ntok.type !== 'other' || ntok.text !== '.concat') break;
-        const args = readConcatArgs(next + 1, stop);
-        if (!args) return null;
-        for (const a of args.args) { base.push(SYNTH_PLUS); for (const v of a) base.push(v); }
-        next = args.next;
-      }
-      return { toks: base, next };
+      return null;
+    };
+
+    // Read one operand of a concat chain. Returns { toks, next } where toks
+    // is a flat concat sub-chain, or null. Combines readBase + applySuffixes
+    // and requires the final binding to be a chain (strings/templates).
+    const readOperand = (k, stop) => {
+      const base = readBase(k, stop);
+      if (!base) return null;
+      const r = applySuffixes(base.bind, base.next, stop);
+      if (!r.bind || r.bind.kind !== 'chain') return null;
+      return { toks: r.bind.toks.slice(), next: r.next };
     };
 
     // Parse `( chain, chain, ... )` starting at the `(` token index. Returns
