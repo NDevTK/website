@@ -1007,6 +1007,12 @@
           }
         }
         const b = resolvePath(t.text);
+        if (!b) {
+          // Unresolved identifier: return it as an opaque chain carrying
+          // its source text, so it can participate in arithmetic / concat
+          // as a symbolic operand.
+          return { bind: chainBinding([{ type: 'other', text: t.text, start: t.start, end: t.end, _src: t._src }]), next: k + 1 };
+        }
         if (b) {
           // Call syntax: `name(args)` where name resolves to a function binding.
           if (b.kind === 'function' && isCall) {
@@ -1097,13 +1103,10 @@
     // representation is the tool's fundamental model for string expressions:
     // known parts become text, unknown parts become placeholders.
     const readOperand = (k, stop, terms) => {
-      const base = readBase(k, stop);
-      if (base) {
-        const r = applySuffixes(base.bind, base.next, stop);
-        if (r.bind && r.bind.kind === 'chain') {
-          const boundary = skipOperand(r.next, stop, terms);
-          if (boundary === r.next) return { toks: r.bind.toks.slice(), next: r.next };
-        }
+      const parsed = parseArithExpr(k, stop);
+      if (parsed) {
+        const boundary = skipOperand(parsed.next, stop, terms);
+        if (boundary === parsed.next) return { toks: parsed.bind.toks.slice(), next: parsed.next };
       }
       const end = skipOperand(k, stop, terms);
       if (end === k) return null;
@@ -1114,6 +1117,105 @@
         toks: [{ type: 'other', text: src, start: first.start, end: last.end, _src: first._src }],
         next: end,
       };
+    };
+
+    // Read an arithmetic/logical/comparison expression built from a base
+    // operand followed by any sequence of operator-operand pairs (left
+    // associative, no precedence). Produces a chain binding where concrete
+    // operands get folded to literals and unknown parts surface as a single
+    // opaque operand with a faithful source text of the partial computation.
+    const parseArithExpr = (k, stop) => {
+      const base = readBase(k, stop);
+      if (!base) return null;
+      const r = applySuffixes(base.bind, base.next, stop);
+      let cur = r.bind;
+      let next = r.next;
+      while (next < stop) {
+        const opTok = tks[next];
+        if (!opTok || opTok.type !== 'op') break;
+        if (opTok.text === '++' || opTok.text === '--' || opTok.text === '!' || opTok.text === '~') break;
+        const rightBase = readBase(next + 1, stop);
+        if (!rightBase) break;
+        const rightR = applySuffixes(rightBase.bind, rightBase.next, stop);
+        cur = combineArith(cur, opTok.text, rightR.bind);
+        next = rightR.next;
+        if (!cur) return null;
+      }
+      if (!cur || cur.kind !== 'chain') return null;
+      return { bind: cur, next };
+    };
+
+    // Combine two chain bindings via a binary operator. If both sides are
+    // single literal numbers/booleans, the result is computed. Otherwise
+    // returns a chain holding one opaque operand whose source is the
+    // parenthesized partial expression, preserving any already-evaluated
+    // sub-results.
+    const combineArith = (left, op, right) => {
+      if (!left || left.kind !== 'chain' || !right || right.kind !== 'chain') return null;
+      const lNum = chainAsNumber(left);
+      const rNum = chainAsNumber(right);
+      if (lNum !== null && rNum !== null) {
+        let v;
+        switch (op) {
+          case '-': v = lNum - rNum; break;
+          case '*': v = lNum * rNum; break;
+          case '/': v = lNum / rNum; break;
+          case '%': v = lNum % rNum; break;
+          case '**': v = lNum ** rNum; break;
+          case '|': v = lNum | rNum; break;
+          case '&': v = lNum & rNum; break;
+          case '^': v = lNum ^ rNum; break;
+          case '<<': v = lNum << rNum; break;
+          case '>>': v = lNum >> rNum; break;
+          case '>>>': v = lNum >>> rNum; break;
+          case '<': v = lNum < rNum; break;
+          case '>': v = lNum > rNum; break;
+          case '<=': v = lNum <= rNum; break;
+          case '>=': v = lNum >= rNum; break;
+          case '==': v = lNum == rNum; break;
+          case '!=': v = lNum != rNum; break;
+          case '===': v = lNum === rNum; break;
+          case '!==': v = lNum !== rNum; break;
+          case '&&': v = lNum && rNum; break;
+          case '||': v = lNum || rNum; break;
+          case '??': v = (lNum === null || lNum === undefined) ? rNum : lNum; break;
+          default: return null;
+        }
+        return chainBinding([makeSynthStr(String(v))]);
+      }
+      // Short-circuit on known truthy/falsy for logical operators, even when
+      // only one side is a concrete number.
+      if (op === '&&' && lNum === 0) return chainBinding([makeSynthStr('0')]);
+      if (op === '||' && lNum !== null && lNum !== 0) return chainBinding([makeSynthStr(String(lNum))]);
+      // Symbolic: combine texts.
+      const lt = chainAsExprText(left);
+      const rt = chainAsExprText(right);
+      if (lt === null || rt === null) return null;
+      const text = '(' + lt + ' ' + op + ' ' + rt + ')';
+      return chainBinding([{ type: 'other', text, start: 0, end: text.length, _src: text }]);
+    };
+
+    const chainAsNumber = (chain) => {
+      if (chain.toks.length !== 1) return null;
+      const t = chain.toks[0];
+      if (t.type !== 'str') return null;
+      const n = Number(t.text);
+      if (Number.isNaN(n)) return null;
+      if (String(n) !== t.text) return null;
+      return n;
+    };
+
+    const chainAsExprText = (chain) => {
+      if (chain.toks.length !== 1) return null;
+      const t = chain.toks[0];
+      if (t.type === 'str') {
+        // Quote literal strings; bare numbers flow as-is.
+        const n = Number(t.text);
+        if (!Number.isNaN(n) && String(n) === t.text) return t.text;
+        return JSON.stringify(t.text);
+      }
+      if (t.type === 'other') return t.text;
+      return null;
     };
 
     // Parse `( chain, chain, ... )` starting at the `(` token index. Returns
@@ -1735,6 +1837,18 @@
       if (c === '=' && src[i + 1] === '>') { push({ type: 'other', text: '=>', start: i, end: i + 2 }); i += 2; continue; }
       if (c === '(' || c === '[' || c === '{') { push({ type: 'open', char: c, start: i, end: i + 1 }); i++; continue; }
       if (c === ')' || c === ']' || c === '}') { push({ type: 'close', char: c, start: i, end: i + 1 }); i++; continue; }
+      // Multi-char arithmetic/comparison/bitwise/logical operators.
+      {
+        const multiOps = ['===', '!==', '>>>', '**', '<<', '>>', '<=', '>=', '==', '!=', '&&', '||', '??', '++', '--'];
+        let matched = false;
+        for (const op of multiOps) {
+          if (src.startsWith(op, i)) { push({ type: 'op', text: op, start: i, end: i + op.length }); i += op.length; matched = true; break; }
+        }
+        if (matched) continue;
+      }
+      // Single-char operators.
+      if ('-*%<>|&^!~'.indexOf(c) !== -1) { push({ type: 'op', text: c, start: i, end: i + 1 }); i++; continue; }
+      if (c === '/' && src[i + 1] !== '/' && src[i + 1] !== '*') { push({ type: 'op', text: '/', start: i, end: i + 1 }); i++; continue; }
       // Identifier/number/punctuation run — consumed until we hit a special char.
       const start = i;
       while (i < n) {
@@ -1746,8 +1860,8 @@
         if (ch === '=') break;
         if (ch === ':') break;
         if (ch === '?') break;
+        if ('-*/%<>|&^!~'.indexOf(ch) !== -1) break;
         if (ch === '(' || ch === ')' || ch === '[' || ch === ']' || ch === '{' || ch === '}') break;
-        if (ch === '/' && (src[i + 1] === '/' || src[i + 1] === '*')) break;
         i++;
       }
       if (i > start) push({ type: 'other', text: src.slice(start, i), start, end: i });

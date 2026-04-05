@@ -579,12 +579,36 @@ group('ternary/operators', () => {
   check('ternary captured as opaque',
     `document.body.innerHTML = '<a>' + (cond ? '<b>' : '<c>') + '</a>';`,
     { html: '<a>__HDX0__</a>', autoSubs: [['__HDX0__', "cond ? '<b>' : '<c>'"]] });
-  check('bitwise expression captured as opaque',
+  check('bitwise expression folded symbolically',
     `document.body.innerHTML = '<x>' + (a|0) + '</x>';`,
-    { html: '<x>__HDX0__</x>', autoSubs: [['__HDX0__', 'a|0']] });
-  check('logical OR default captured as opaque',
+    { html: '<x>__HDX0__</x>', autoSubs: [['__HDX0__', '(a | 0)']] });
+  check('logical OR default folded symbolically',
     `document.body.innerHTML = '<x>' + (name || 'anon') + '</x>';`,
-    { html: '<x>__HDX0__</x>', autoSubs: [['__HDX0__', "name || 'anon'"]] });
+    { html: '<x>__HDX0__</x>', autoSubs: [['__HDX0__', '(name || "anon")']] });
+});
+
+// -----------------------------------------------------------------------
+// Arithmetic evaluation
+// -----------------------------------------------------------------------
+group('arithmetic', () => {
+  check('subtract literals',
+    `document.body.innerHTML = 'n=' + (3 - 2);`, 'n=1');
+  check('multiply literals',
+    `document.body.innerHTML = 'n=' + (3 * 4);`, 'n=12');
+  check('divide literals',
+    `document.body.innerHTML = 'n=' + (10 / 4);`, 'n=2.5');
+  check('bitwise OR literals',
+    `document.body.innerHTML = 'n=' + (3.7 | 0);`, 'n=3');
+  check('multiply then parenthesized concat',
+    `document.body.innerHTML = 'n=' + (3 * 4);`, 'n=12');
+  check('array length arithmetic',
+    `var a=['x','y','z']; document.body.innerHTML = 'n=' + (a.length - 1);`, 'n=2');
+  check('unknown + literal',
+    `document.body.innerHTML = 'n=' + (x * 2);`,
+    { html: 'n=__HDX0__', autoSubs: [['__HDX0__', '(x * 2)']] });
+  check('partial eval with unknown',
+    `var a=['x','y','z']; document.body.innerHTML = 'n=' + ((a.length - 2) / y);`,
+    { html: 'n=__HDX0__', autoSubs: [['__HDX0__', '(1 / y)']] });
 });
 
 // -----------------------------------------------------------------------
