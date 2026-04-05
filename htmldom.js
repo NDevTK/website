@@ -2910,7 +2910,26 @@
 
   function convert() {
     const raw = $('in').value;
-    const result = extractHTML(raw);
+    const extractions = extractAllHTML(raw);
+    if (extractions.length === 0) {
+      // No innerHTML/outerHTML assignments — fall back to single-input
+      // extraction so raw HTML inputs and `<` snippets still work.
+      convertOne(raw, extractHTML(raw), /*multi=*/false, /*emitTitle=*/false);
+      return;
+    }
+    const out = [];
+    for (let i = 0; i < extractions.length; i++) {
+      const ex = extractions[i];
+      const block = convertOne(raw, ex, /*multi=*/extractions.length > 1, /*emitTitle=*/extractions.length > 1);
+      if (i > 0) out.push('');
+      out.push(block);
+    }
+    $('out').value = out.join('\n');
+  }
+
+  // Produce the DOM-API code block for a single innerHTML/outerHTML
+  // extraction. `multi` toggles the leading target-divider comment.
+  function convertOne(raw, result, multi, emitTitle) {
     const { html, autoSubs, target, assignProp, assignOp } = result;
     const loops = result.loops || [];
     const subStr = $('subStr').value;
@@ -2986,8 +3005,7 @@
     }
 
     if (useRoots.length === 0) {
-      $('out').value = '// (no nodes parsed)';
-      return;
+      return '// (no nodes parsed)';
     }
 
     // Replicate `el.innerHTML = x` semantics (replace existing children) when
@@ -3045,7 +3063,11 @@
       lines.push(parent + '.appendChild(' + fragVar + ');');
     }
 
-    $('out').value = lines.join('\n');
+    let block = lines.join('\n');
+    if (emitTitle) {
+      block = '// === ' + target + '.' + assignProp + ' ' + assignOp + ' ... ===\n' + block;
+    }
+    return block;
   }
 
   $('go').addEventListener('click', convert);
