@@ -229,14 +229,37 @@
     const assignOp = assign.op;
     const r = resolveIdentifiers(tokens, assign.rhsStart, assign.rhsEnd);
     if (r.parsed) {
-      const m = materializeFlatChain(r.tokens, r.loopInfo);
-      // Keep only loopVars whose name is still in scope at this assignment
-      // site (so loop-built variables from sibling functions don't leak).
+      // Unroll loopVar references so the main html carries the loop's
+      // per-iteration content. When a loop exits the walker replaces the
+      // loop-built variable's binding with a single reference token; this
+      // post-pass expands that reference back to the loopVar's chain
+      // wrapped in the appropriate loop tags, so the downstream materializer
+      // produces matching loop markers. Runs iteratively for chained loops.
+      // Unroll ONE level only: references to loop-built variables in the
+      // main chain get expanded to their loopVars' chains (preserving the
+      // original loop-body tags so the materializer emits matching loop
+      // markers). References inside those expanded chains to OTHER
+      // loop-built variables stay as autoSubs placeholders — the caller
+      // can emit their pre-computation loops separately via loopVars.
+      let mainTokens = r.tokens;
+      const lvMap = Object.create(null);
+      if (r.loopVars) for (const lv of r.loopVars) lvMap[lv.name] = lv;
+      const expanded = [];
+      for (const t of mainTokens) {
+        if (t.type === 'other' && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(t.text) && lvMap[t.text]) {
+          for (const vt of lvMap[t.text].chain) expanded.push(vt);
+        } else {
+          expanded.push(t);
+        }
+      }
+      mainTokens = expanded;
+      const m = materializeFlatChain(mainTokens, r.loopInfo);
       if (r.loopVars && r.loopVars.length && r.inScope) {
         const kept = r.loopVars.filter((lv) => r.inScope(lv.name));
         if (kept.length) {
           m.loopVars = kept.map((lv) => {
-            const mv = materializeFlatChain(lv.chain, r.loopInfo);
+            const stripped = stripLoopTag(lv.chain, lv.loop.id);
+            const mv = materializeFlatChain(stripped, r.loopInfo);
             return Object.assign({ name: lv.name, loop: lv.loop }, mv);
           });
         }
@@ -470,14 +493,15 @@
     type: 'str', quote: "'", raw: text, text, start: 0, end: 0, _src: '',
   });
 
-  // Clone operand tokens, applying a `loopId` tag. Plus tokens pass through
-  // unchanged. Any existing tag is overridden — when a chain from a
-  // previous loop is spliced into another loop's body, the outer loop's tag
-  // applies to the whole spliced sequence (the inner loop's structure is
-  // captured separately on the originating binding).
+  // Clone operand tokens, applying a `loopId` tag to operands that don't
+  // already carry one. Plus tokens pass through unchanged. Existing tags
+  // are preserved, so content carried in through a loop-built variable
+  // (pre-tagged with its own loop's id) stays associated with that loop
+  // even when spliced through another loop body.
   function tagWithLoop(toks, loopId) {
     return toks.map((t) => {
       if (t.type === 'plus') return t;
+      if ('loopId' in t) return t;
       return Object.assign({}, t, { loopId });
     });
   }
@@ -1903,8 +1927,9 @@
     for (let i = 0; i < stop; i++) {
       // Pop any loops whose body we've walked past (and their shadow frames).
       // For each variable modified during the loop, capture its final chain
-      // as a loopVar entry (informational secondary output). Bindings stay
-      // intact so subsequent references still see the loop-tagged chain.
+      // as a loopVar entry AND replace its binding with a single reference
+      // token carrying the variable's name, so subsequent code reads it
+      // as a named variable rather than inlining the one-iteration chain.
       while (loopStack.length > 0 && i >= loopStack[loopStack.length - 1].bodyEnd) {
         const entry = loopStack.pop();
         const topIdx = stack.indexOf(entry.frame);
@@ -1912,11 +1937,17 @@
         for (const name of entry.modifiedVars) {
           const b = resolve(name);
           if (b && b.kind === 'chain') {
+            // Store the chain UNSTRIPPED; strip the outer loop's tags only
+            // at display time via loopVarHtml. The unstripped chain is
+            // needed when unrolling references in a main-chain substitution.
             loopVars.push({
               name,
               loop: { id: entry.id, kind: entry.kind, headerSrc: entry.headerSrc },
-              chain: stripLoopTag(b.toks, entry.id),
+              chain: b.toks,
             });
+            assignName(name, chainBinding([{
+              type: 'other', text: name, start: 0, end: name.length, _src: name,
+            }]));
           }
         }
       }
@@ -2009,6 +2040,12 @@
               id, kind: t.text, headerSrc, bodyEnd, frame: loopFrame,
               modifiedVars: new Set(),
             });
+            // Skip past the loop header — the init/cond/update clauses
+            // don't count as body mutations, so we resume at the body's
+            // opening token (j is the `)` token index; loop's i++ takes
+            // us to j, which is the close-paren we safely skip past).
+            i = j - 1;
+            continue;
           }
         }
         continue;
