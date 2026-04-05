@@ -1709,6 +1709,20 @@
           i = skipExpr(i + 2, stop) - 1;
           continue;
         }
+        // Post-increment/decrement: IDENT++ or IDENT--.
+        if (eqTok && eqTok.type === 'op' && (eqTok.text === '++' || eqTok.text === '--')) {
+          const cur = resolve(t.text);
+          const n = cur && cur.kind === 'chain' ? chainAsNumber(cur) : null;
+          if (n !== null) {
+            const delta = eqTok.text === '++' ? 1 : -1;
+            assignName(t.text, chainBinding([makeSynthStr(String(n + delta))]));
+          } else {
+            assignName(t.text, null);
+          }
+          if (loopStack.length > 0) loopStack[loopStack.length - 1].modifiedVars.add(t.text);
+          i = i + 1;
+          continue;
+        }
       }
     }
 
@@ -2027,7 +2041,7 @@
         const ch = src[i];
         if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r') break;
         if (ch === "'" || ch === '"' || ch === '`') break;
-        if (ch === '+' && src[i + 1] !== '+') break;
+        if (ch === '+') break;
         if (ch === ',' || ch === ';') break;
         if (ch === '=') break;
         if (ch === ':') break;
