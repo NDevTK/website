@@ -7,7 +7,7 @@ references.
 
 ## Public API
 
-Loaded as a plain `<script>` in `htmldom.html`. Three extraction
+Loaded as a plain `<script>` in `index.html`. Three extraction
 functions are exposed inside the IIFE (accessible via the UI's
 `Convert` button):
 

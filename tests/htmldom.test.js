@@ -23,7 +23,7 @@ global.DOMParser = class {
 
 // Load htmldom.js and expose its internal extractHTML via globalThis by
 // splicing export lines into the source before eval.
-const src = fs.readFileSync(path.join(__dirname, '..', 'htmldom.js'), 'utf8');
+const src = fs.readFileSync(path.join(__dirname, '..', 'htmldom', 'htmldom.js'), 'utf8');
 const patched = src.replace(
   'function extractHTML(input) {',
   'globalThis.__extractHTML = extractHTML;\n  globalThis.__extractAllHTML = extractAllHTML;\n  globalThis.__extractAllDOM = extractAllDOM;\n  function extractHTML(input) {'
