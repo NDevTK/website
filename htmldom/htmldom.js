@@ -437,9 +437,12 @@
   const KNOWN_METHODS = new Set([
     'concat', 'join',
     'toUpperCase', 'toLowerCase', 'trim', 'trimStart', 'trimEnd', 'trimLeft', 'trimRight',
-    'repeat', 'slice', 'substring', 'substr', 'charAt', 'indexOf', 'lastIndexOf',
+    'repeat', 'slice', 'substring', 'substr', 'charAt', 'at', 'indexOf', 'lastIndexOf',
     'includes', 'startsWith', 'endsWith', 'padStart', 'padEnd', 'toString',
     'split', 'reverse', 'map', 'filter', 'forEach', 'reduce',
+    'replace', 'replaceAll', 'charCodeAt', 'codePointAt',
+    'find', 'findIndex', 'some', 'every', 'flat', 'flatMap', 'fill', 'splice',
+    'sort', 'keys', 'values', 'entries',
   ]);
 
   const MATH_CONSTANTS = {
@@ -489,6 +492,24 @@
 
   const makeSynthStr = (text) => ({
     type: 'str', quote: "'", raw: text, text, start: 0, end: 0, _src: '',
+  });
+  // Like makeSynthStr but for numeric values — no quote wrapper, so
+  // chainAsNumber recognises them as numeric rather than string.
+  const makeSynthNum = (n) => ({
+    type: 'str', quote: '', raw: String(n), text: String(n), start: 0, end: 0, _src: '', jsType: 'number',
+  });
+  // Boolean token — `jsType: 'boolean'` lets typeof fold correctly and
+  // allows truthiness checks to work reliably.  JS coerces true→1,
+  // false→0 in arithmetic, so chainAsNumber can fold these.
+  const makeSynthBool = (v) => ({
+    type: 'str', quote: '', raw: String(v), text: String(v), start: 0, end: 0, _src: '', jsType: 'boolean',
+  });
+  // null / undefined tokens.
+  const makeSynthNull = () => ({
+    type: 'str', quote: '', raw: 'null', text: 'null', start: 0, end: 0, _src: '', jsType: 'null',
+  });
+  const makeSynthUndef = () => ({
+    type: 'str', quote: '', raw: 'undefined', text: 'undefined', start: 0, end: 0, _src: '', jsType: 'undefined',
   });
 
   // Clone operand tokens, applying a `loopId` tag to operands that don't
@@ -639,6 +660,33 @@
         const next = tokens[i + 1];
         if (next && next.type === 'sep' && /^[-+*/%]?=$/.test(next.char)) noteMut(t.text);
         if (next && next.type === 'op' && (next.text === '++' || next.text === '--')) noteMut(t.text);
+        // `arr[i] = ...` / `obj[k] = ...` mutates arr/obj.
+        if (next && next.type === 'open' && next.char === '[') {
+          let d = 1; let j = i + 2;
+          while (j < tokens.length && d > 0) {
+            const tk = tokens[j];
+            if (tk.type === 'open' && tk.char === '[') d++;
+            else if (tk.type === 'close' && tk.char === ']') d--;
+            if (d > 0) j++;
+          }
+          const eq = tokens[j + 1];
+          if (eq && eq.type === 'sep' && eq.char === '=') noteMut(t.text);
+        }
+      }
+      // `arr.push(...)` / `obj.foo = ...` — the path token carries the base
+      // name as its prefix. Flag mutation if followed by a mutating method or `=`.
+      if (t.type === 'other' && PATH_RE.test(t.text)) {
+        const dot = t.text.indexOf('.');
+        const base = t.text.slice(0, dot);
+        const rest = t.text.slice(dot + 1);
+        const next = tokens[i + 1];
+        if (next && next.type === 'sep' && /^[-+*/%]?=$/.test(next.char)) noteMut(base);
+        if (next && next.type === 'open' && next.char === '(') {
+          // Last segment is the method name.
+          const lastDot = rest.lastIndexOf('.');
+          const method = lastDot >= 0 ? rest.slice(lastDot + 1) : rest;
+          if (method === 'push' || method === 'pop' || method === 'shift' || method === 'unshift' || method === 'splice' || method === 'sort' || method === 'reverse' || method === 'fill' || method === 'copyWithin') noteMut(base);
+        }
       }
     }
     const externallyMutable = new Set();
@@ -813,6 +861,14 @@
       }
       return null;
     };
+    // Check if a global builtin name (possibly dotted like 'Math.floor')
+    // has been shadowed by a user-declared binding. Returns true when the
+    // root identifier appears in ANY scope frame, meaning the user
+    // redefined it and we must NOT apply builtin semantics.
+    const isShadowed = (dottedName) => {
+      const root = dottedName.includes('.') ? dottedName.slice(0, dottedName.indexOf('.')) : dottedName;
+      return resolve(root) !== null;
+    };
     // Walk a dotted path ('obj.a.b') resolving into object/array/chain
     // bindings. Handles `.length` specially on arrays and on chains whose
     // operands are all known string/template literals.
@@ -824,7 +880,7 @@
         if (b.kind === 'object') {
           b = b.props[p] || null;
         } else if (p === 'length' && b.kind === 'array') {
-          b = chainBinding([makeSynthStr(String(b.elems.length))]);
+          b = chainBinding([makeSynthNum(b.elems.length)]);
         } else if (p === 'length' && b.kind === 'chain') {
           let n = 0; let ok = true;
           for (const tk of b.toks) {
@@ -842,7 +898,7 @@
             }
             ok = false; break;
           }
-          b = ok ? chainBinding([makeSynthStr(String(n))]) : null;
+          b = ok ? chainBinding([makeSynthNum(n)]) : null;
         } else {
           return null;
         }
@@ -1466,10 +1522,10 @@
           if (nt && nt.type === 'other' && IDENT_RE.test(nt.text)) {
             const prop = nt.text;
             if (bind.kind === 'object') bind = bind.props[prop] || null;
-            else if (prop === 'length' && bind.kind === 'array') bind = chainBinding([makeSynthStr(String(bind.elems.length))]);
+            else if (prop === 'length' && bind.kind === 'array') bind = chainBinding([makeSynthNum(bind.elems.length)]);
             else if (prop === 'length' && bind.kind === 'chain') {
               const s = chainAsKnownString(bind);
-              bind = s === null ? null : chainBinding([makeSynthStr(String(s.length))]);
+              bind = s === null ? null : chainBinding([makeSynthNum(s.length)]);
             } else bind = null;
             next += 2;
             continue;
@@ -1535,7 +1591,7 @@
             if (cur.kind === 'object') {
               cur = cur.props[p] || null;
             } else if (p === 'length' && cur.kind === 'array') {
-              cur = chainBinding([makeSynthStr(String(cur.elems.length))]);
+              cur = chainBinding([makeSynthNum(cur.elems.length)]);
             } else if (p === 'length' && cur.kind === 'chain') {
               let n = 0; let ok = true;
               for (const tk of cur.toks) {
@@ -1553,7 +1609,7 @@
                 }
                 ok = false; break;
               }
-              cur = ok ? chainBinding([makeSynthStr(String(n))]) : null;
+              cur = ok ? chainBinding([makeSynthNum(n)]) : null;
             } else {
               cur = null;
               break;
@@ -1577,8 +1633,7 @@
 
     // Apply a method call: .concat on chain, or .join on array.
     const applyMethod = (bind, method, parenIdx, stop) => {
-      if (method === 'concat') {
-        if (!bind || bind.kind !== 'chain') return null;
+      if (method === 'concat' && bind && bind.kind === 'chain') {
         const args = readConcatArgs(parenIdx, stop);
         if (!args) return null;
         const toks = bind.toks.slice();
@@ -1643,6 +1698,11 @@
               case 'padStart': if (argVals.length <= 2) result = s.padStart(...argVals); break;
               case 'padEnd': if (argVals.length <= 2) result = s.padEnd(...argVals); break;
               case 'toString': if (argVals.length === 0) result = s; break;
+              case 'at': if (argVals.length === 1) result = s.at(argVals[0]); break;
+              case 'replace': if (argVals.length === 2 && typeof argVals[0] === 'string') result = s.replace(argVals[0], argVals[1]); break;
+              case 'replaceAll': if (argVals.length === 2 && typeof argVals[0] === 'string') result = s.replaceAll(argVals[0], argVals[1]); break;
+              case 'charCodeAt': if (argVals.length === 1) result = String(s.charCodeAt(argVals[0])); break;
+              case 'codePointAt': if (argVals.length === 1) result = String(s.codePointAt(argVals[0])); break;
               case 'split': {
                 if (argVals.length === 1) {
                   const parts = s.split(argVals[0]);
@@ -1696,6 +1756,57 @@
           }
           return { bind: arrayBinding(results), next: body.next + 1 };
         }
+        // Callback-based: find, findIndex, some, every, flatMap.
+        if (method === 'find' || method === 'findIndex' || method === 'some' || method === 'every' || method === 'flatMap') {
+          const lp = tks[parenIdx];
+          if (!lp || lp.type !== 'open' || lp.char !== '(') return null;
+          const arrow = peekArrow(parenIdx + 1, stop);
+          if (!arrow) return null;
+          const body = readArrowBody(arrow.arrowNext, stop);
+          if (!body) return null;
+          const rp = tks[body.next];
+          if (!rp || rp.type !== 'close' || rp.char !== ')') return null;
+          const fn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock);
+          if (method === 'flatMap') {
+            const out = [];
+            for (const el of bind.elems) {
+              if (!el) return null;
+              const r = instantiateFunctionBinding(fn, [el]);
+              if (!r) return null;
+              if (r.kind === 'array') { for (const e of r.elems) out.push(e); }
+              else out.push(r);
+            }
+            return { bind: arrayBinding(out), next: body.next + 1 };
+          }
+          for (let idx = 0; idx < bind.elems.length; idx++) {
+            const el = bind.elems[idx];
+            if (!el) return null;
+            const toks = instantiateFunction(fn, [el, chainBinding([makeSynthStr(String(idx))])]);
+            if (!toks) return null;
+            const resChain = chainBinding(toks);
+            const n = chainAsNumber(resChain);
+            const s = n === null ? chainAsKnownString(resChain) : null;
+            const truthy = (n !== null && n !== 0) || (s !== null && s !== '' && s !== 'false' && s !== 'null' && s !== 'undefined' && s !== '0' && s !== 'NaN');
+            const falsy = n === 0 || s === '' || s === 'false' || s === 'null' || s === 'undefined' || s === '0' || s === 'NaN';
+            if (method === 'find') {
+              if (truthy) return { bind: el, next: body.next + 1 };
+              if (!falsy) return null;
+            } else if (method === 'findIndex') {
+              if (truthy) return { bind: chainBinding([makeSynthStr(String(idx))]), next: body.next + 1 };
+              if (!falsy) return null;
+            } else if (method === 'some') {
+              if (truthy) return { bind: chainBinding([makeSynthStr('true')]), next: body.next + 1 };
+              if (!falsy) return null;
+            } else if (method === 'every') {
+              if (falsy) return { bind: chainBinding([makeSynthStr('false')]), next: body.next + 1 };
+              if (!truthy) return null;
+            }
+          }
+          if (method === 'find') return { bind: chainBinding([makeSynthStr('undefined')]), next: body.next + 1 };
+          if (method === 'findIndex') return { bind: chainBinding([makeSynthStr('-1')]), next: body.next + 1 };
+          if (method === 'some') return { bind: chainBinding([makeSynthStr('false')]), next: body.next + 1 };
+          if (method === 'every') return { bind: chainBinding([makeSynthStr('true')]), next: body.next + 1 };
+        }
         // `.reduce(fn, init)` — two-arg reducer: invoke the callback
         // per element with (accumulator, element) and thread the
         // running result through.
@@ -1722,6 +1833,18 @@
           }
           const acc = accBind.toks;
           return { bind: chainBinding(acc), next: init.next + 1 };
+        }
+        // Methods that handle their own arg resolution (args may be arrays
+        // or other non-scalar bindings).
+        if (method === 'concat') {
+          const argRes = readCallArgBindings(parenIdx, stop);
+          if (!argRes) return null;
+          const out = bind.elems.slice();
+          for (const ab of argRes.bindings) {
+            if (ab && ab.kind === 'array') { for (const e of ab.elems) out.push(e); }
+            else out.push(ab);
+          }
+          return { bind: arrayBinding(out), next: argRes.next };
         }
         const args = readConcatArgs(parenIdx, stop);
         if (!args) return null;
@@ -1759,6 +1882,54 @@
         }
         if (method === 'reverse' && argVals.length === 0) {
           return { bind: arrayBinding(bind.elems.slice().reverse()), next: args.next };
+        }
+        if (method === 'concat') {
+          // arr.concat(arr2, arr3, ...) — merges arrays/values.
+          const out = bind.elems.slice();
+          for (const a of args.args) {
+            const ab = chainBinding(a);
+            const resolved = ab.toks.length === 1 && ab.toks[0].type === 'other' ? resolve(ab.toks[0].text) : null;
+            const src = resolved && resolved.kind === 'array' ? resolved : (ab.kind === 'array' ? ab : null);
+            if (src && src.kind === 'array') { for (const e of src.elems) out.push(e); }
+            else out.push(chainBinding(a));
+          }
+          return { bind: arrayBinding(out), next: args.next };
+        }
+        if (method === 'flat' && argVals.length <= 1) {
+          const depth = argVals.length === 1 ? argVals[0] : 1;
+          const flattenArr = (arr, d) => {
+            const out = [];
+            for (const el of arr) {
+              if (d > 0 && el && el.kind === 'array') out.push(...flattenArr(el.elems, d - 1));
+              else out.push(el);
+            }
+            return out;
+          };
+          return { bind: arrayBinding(flattenArr(bind.elems, depth)), next: args.next };
+        }
+        if (method === 'fill') {
+          const out = bind.elems.slice();
+          const val = args.args.length >= 1 ? chainBinding(args.args[0]) : null;
+          const start = argVals.length >= 2 ? argVals[1] : 0;
+          const end = argVals.length >= 3 ? argVals[2] : out.length;
+          for (let k = start; k < end && k < out.length; k++) out[k] = val;
+          return { bind: arrayBinding(out), next: args.next };
+        }
+        if (method === 'splice' && argVals.length >= 1) {
+          const out = bind.elems.slice();
+          const startIdx = argVals[0] < 0 ? Math.max(0, out.length + argVals[0]) : argVals[0];
+          const delCount = argVals.length >= 2 ? argVals[1] : out.length - startIdx;
+          const items = args.args.slice(2).map((a) => chainBinding(a));
+          const removed = out.splice(startIdx, delCount, ...items);
+          // Mutate the original binding AND return removed.
+          bind.elems.length = 0;
+          for (const e of out) bind.elems.push(e);
+          return { bind: arrayBinding(removed), next: args.next };
+        }
+        if (method === 'at' && argVals.length === 1) {
+          const idx = argVals[0] < 0 ? bind.elems.length + argVals[0] : argVals[0];
+          const el = bind.elems[idx] || null;
+          return el ? { bind: el, next: args.next } : null;
         }
       }
       return null;
@@ -1805,7 +1976,7 @@
     const jsonToBinding = (v) => {
       if (v === null) return chainBinding([makeSynthStr('null')]);
       if (typeof v === 'boolean') return chainBinding([makeSynthStr(String(v))]);
-      if (typeof v === 'number') return chainBinding([makeSynthStr(String(v))]);
+      if (typeof v === 'number') return chainBinding([makeSynthNum(v)]);
       if (typeof v === 'string') return chainBinding([makeSynthStr(v)]);
       if (Array.isArray(v)) return arrayBinding(v.map(jsonToBinding));
       if (typeof v === 'object') {
@@ -1864,6 +2035,30 @@
       if (t.type === 'other' && (t.text === 'await' || t.text === 'yield' || t.text === 'typeof' || t.text === 'void' || t.text === 'delete')) {
         const inner = readBase(k + 1, stop);
         if (!inner) return null;
+        // `typeof` folds to a concrete string when the operand has a known
+        // binding kind or a concrete scalar value.
+        if (t.text === 'typeof') {
+          const b = inner.bind;
+          if (b && b.kind === 'object') return { bind: chainBinding([makeSynthStr('object')]), next: inner.next };
+          if (b && b.kind === 'array') return { bind: chainBinding([makeSynthStr('object')]), next: inner.next };
+          if (b && b.kind === 'function') return { bind: chainBinding([makeSynthStr('function')]), next: inner.next };
+          if (b && b.kind === 'element') return { bind: chainBinding([makeSynthStr('object')]), next: inner.next };
+          if (b && b.kind === 'chain' && b.toks.length === 1 && b.toks[0].jsType) {
+            const jt = b.toks[0].jsType;
+            const mapped = jt === 'null' ? 'object' : jt;
+            return { bind: chainBinding([makeSynthStr(mapped)]), next: inner.next };
+          }
+          if (b && b.kind === 'chain') {
+            const n = chainAsNumber(b);
+            if (n !== null) return { bind: chainBinding([makeSynthStr('number')]), next: inner.next };
+            const s = chainAsKnownString(b);
+            if (s !== null) return { bind: chainBinding([makeSynthStr('string')]), next: inner.next };
+          }
+        }
+        // `void expr` is always `undefined`.
+        if (t.text === 'void') {
+          return { bind: chainBinding([makeSynthUndef()]), next: inner.next };
+        }
         const et = chainAsExprText(inner.bind);
         if (et === null) return null;
         const text = t.text + ' ' + et;
@@ -1878,6 +2073,11 @@
         return { bind: applied, next: inner.next };
       }
       if (t.type === 'str') return { bind: chainBinding([t]), next: k + 1 };
+      // Bare number literal: the tokenizer emits digits as type 'other'.
+      // Recognise them here so arithmetic folding works.
+      if (t.type === 'other' && /^[0-9]/.test(t.text) && !Number.isNaN(Number(t.text)) && String(Number(t.text)) === t.text) {
+        return { bind: chainBinding([makeSynthNum(Number(t.text))]), next: k + 1 };
+      }
       if (t.type === 'tmpl') return { bind: chainBinding([rewriteTemplate(t)]), next: k + 1 };
       if (t.type === 'regex') return { bind: chainBinding([exprRef(t.text)]), next: k + 1 };
       if (t.type === 'open' && t.char === '(') {
@@ -1899,36 +2099,57 @@
       }
       if (t.type !== 'other') return null;
       // Primitive literal.
+      if (t.text === 'true') return { bind: chainBinding([makeSynthBool(true)]), next: k + 1 };
+      if (t.text === 'false') return { bind: chainBinding([makeSynthBool(false)]), next: k + 1 };
+      if (t.text === 'null') return { bind: chainBinding([makeSynthNull()]), next: k + 1 };
+      if (t.text === 'undefined') return { bind: chainBinding([makeSynthUndef()]), next: k + 1 };
       const lit = primitiveAsString(t.text);
-      if (lit !== null) return { bind: chainBinding([makeSynthStr(lit)]), next: k + 1 };
+      if (lit !== null) return { bind: chainBinding([makeSynthNum(Number(lit))]), next: k + 1 };
       // Identifier/path, possibly with attached .concat/.join method call.
       if (IDENT_OR_PATH_RE.test(t.text)) {
         const paren = tks[k + 1];
         const isCall = paren && paren.type === 'open' && paren.char === '(';
         // Known math/numeric constants like `Math.PI`.
-        if (!isCall && MATH_CONSTANTS[t.text] !== undefined) {
-          return { bind: chainBinding([makeSynthStr(String(MATH_CONSTANTS[t.text]))]), next: k + 1 };
+        if (!isCall && MATH_CONSTANTS[t.text] !== undefined && !isShadowed(t.text)) {
+          return { bind: chainBinding([makeSynthNum(MATH_CONSTANTS[t.text])]), next: k + 1 };
         }
         // Known global builtin function call (numeric Math.*, parseInt...).
-        if (isCall && BUILTINS[t.text]) {
+        if (isCall && BUILTINS[t.text] && !isShadowed(t.text)) {
           const args = readConcatArgs(k + 1, stop);
           if (args) {
+            // Collect args as numbers. parseInt/parseFloat/Number/Boolean
+            // also accept string arguments, so try chainAsKnownString as
+            // a fallback and coerce via Number() / parseInt() / parseFloat().
             const nums = [];
-            let allNum = true;
+            let allResolved = true;
+            const coerceFns = { 'parseInt': true, 'parseFloat': true, 'Number': true, 'Boolean': true, 'isNaN': true, 'isFinite': true };
+            const acceptsStrings = coerceFns[t.text] || false;
             for (const a of args.args) {
               const ch = chainBinding(a);
               const n = chainAsNumber(ch);
-              if (n === null) { allNum = false; break; }
-              nums.push(n);
+              if (n !== null) { nums.push(n); continue; }
+              if (acceptsStrings) {
+                const s = chainAsKnownString(ch);
+                if (s !== null) { nums.push(s); continue; }
+              }
+              allResolved = false; break;
             }
-            if (allNum) {
+            if (allResolved) {
               const v = BUILTINS[t.text](...nums);
-              return { bind: chainBinding([makeSynthStr(String(v))]), next: args.next };
+              if (typeof v === 'number' && !Number.isNaN(v)) {
+                return { bind: chainBinding([makeSynthNum(v)]), next: args.next };
+              }
+              if (typeof v === 'boolean') {
+                return { bind: chainBinding([makeSynthBool(v)]), next: args.next };
+              }
+              if (typeof v === 'number') {
+                return { bind: chainBinding([makeSynthNum(v)]), next: args.next };
+              }
             }
           }
         }
         // Object.keys/values/entries on known object bindings.
-        if (isCall && (t.text === 'Object.keys' || t.text === 'Object.values' || t.text === 'Object.entries')) {
+        if (isCall && (t.text === 'Object.keys' || t.text === 'Object.values' || t.text === 'Object.entries') && !isShadowed(t.text)) {
           const argRes = readCallArgBindings(k + 1, stop);
           if (argRes && argRes.bindings.length === 1) {
             const ob = argRes.bindings[0];
@@ -1949,8 +2170,41 @@
             }
           }
         }
+        // Object.assign / Object.fromEntries on known bindings.
+        if (isCall && t.text === 'Object.assign' && !isShadowed(t.text)) {
+          const argRes = readCallArgBindings(k + 1, stop);
+          if (argRes && argRes.bindings.length >= 1) {
+            const target = argRes.bindings[0];
+            if (target && target.kind === 'object') {
+              for (let a = 1; a < argRes.bindings.length; a++) {
+                const src = argRes.bindings[a];
+                if (src && src.kind === 'object') {
+                  for (const key of Object.keys(src.props)) target.props[key] = src.props[key];
+                }
+              }
+              return { bind: target, next: argRes.next };
+            }
+          }
+        }
+        if (isCall && t.text === 'Object.fromEntries' && !isShadowed(t.text)) {
+          const argRes = readCallArgBindings(k + 1, stop);
+          if (argRes && argRes.bindings.length === 1) {
+            const src = argRes.bindings[0];
+            if (src && src.kind === 'array') {
+              const props = Object.create(null);
+              let ok = true;
+              for (const entry of src.elems) {
+                if (!entry || entry.kind !== 'array' || entry.elems.length < 2) { ok = false; break; }
+                const key = entry.elems[0] && entry.elems[0].kind === 'chain' ? chainAsKnownString(entry.elems[0]) : null;
+                if (key === null) { ok = false; break; }
+                props[key] = entry.elems[1];
+              }
+              if (ok) return { bind: objectBinding(props), next: argRes.next };
+            }
+          }
+        }
         // Array.isArray / Array.from / Array.of on known bindings.
-        if (isCall && t.text === 'Array.isArray') {
+        if (isCall && t.text === 'Array.isArray' && !isShadowed(t.text)) {
           const argRes = readCallArgBindings(k + 1, stop);
           if (argRes && argRes.bindings.length === 1) {
             const ob = argRes.bindings[0];
@@ -1958,11 +2212,11 @@
             if (v !== null) return { bind: chainBinding([makeSynthStr(v)]), next: argRes.next };
           }
         }
-        if (isCall && t.text === 'Array.of') {
+        if (isCall && t.text === 'Array.of' && !isShadowed(t.text)) {
           const argRes = readCallArgBindings(k + 1, stop);
           if (argRes) return { bind: arrayBinding(argRes.bindings.slice()), next: argRes.next };
         }
-        if (isCall && t.text === 'Array.from') {
+        if (isCall && t.text === 'Array.from' && !isShadowed(t.text)) {
           const argRes = readCallArgBindings(k + 1, stop);
           if (argRes && argRes.bindings.length >= 1) {
             const src = argRes.bindings[0];
@@ -2006,7 +2260,7 @@
           }
         }
         // JSON.stringify on known scalar / object / array bindings.
-        if (isCall && (t.text === 'JSON.stringify' || t.text === 'JSON.parse')) {
+        if (isCall && (t.text === 'JSON.stringify' || t.text === 'JSON.parse') && !isShadowed(t.text)) {
           const argRes = readCallArgBindings(k + 1, stop);
           if (argRes && argRes.bindings.length >= 1) {
             const val = bindingToJson(argRes.bindings[0]);
@@ -2033,7 +2287,7 @@
           }
         }
         // `String(x)` coerces any literal to its string form.
-        if (isCall && t.text === 'String') {
+        if (isCall && t.text === 'String' && !isShadowed(t.text)) {
           const args = readConcatArgs(k + 1, stop);
           if (args && args.args.length === 1) {
             const ch = chainBinding(args.args[0]);
@@ -2165,6 +2419,57 @@
       return result;
     };
 
+    // Like instantiateFunction but returns a typed binding (array/object/chain)
+    // instead of raw tokens. Used by flatMap where the callback returns an
+    // array literal that readConcatExpr can't represent as a token chain.
+    const instantiateFunctionBinding = (fn, argBindings) => {
+      stack.push({ bindings: Object.create(null), isFunction: true });
+      const frame = stack[stack.length - 1];
+      const savedTks = tks;
+      tks = tokens;
+      for (let p = 0; p < fn.params.length; p++) {
+        const pi = fn.params[p];
+        const a = argBindings[p];
+        if (a) {
+          frame.bindings[pi.name] = a;
+        } else if (pi.defaultStart != null) {
+          const r = readConcatExpr(pi.defaultStart, pi.defaultEnd, TERMS_NONE);
+          frame.bindings[pi.name] = (r && r.next === pi.defaultEnd) ? chainBinding(r.toks) : null;
+        } else {
+          frame.bindings[pi.name] = null;
+        }
+      }
+      let result = null;
+      if (fn.isBlock) {
+        let i = fn.bodyStart;
+        while (i < fn.bodyEnd) {
+          const t = tks[i];
+          if (t && t.type === 'other' && t.text === 'return') {
+            const r = readValue(i + 1, fn.bodyEnd, TERMS_TOP);
+            if (r) result = r.binding;
+            break;
+          }
+          if (t && t.type === 'open' && t.char === '{') {
+            let depth = 1; i++;
+            while (i < fn.bodyEnd && depth > 0) {
+              const tk = tks[i];
+              if (tk.type === 'open' && tk.char === '{') depth++;
+              else if (tk.type === 'close' && tk.char === '}') depth--;
+              i++;
+            }
+            continue;
+          }
+          i++;
+        }
+      } else {
+        const r = readValue(fn.bodyStart, fn.bodyEnd, TERMS_NONE);
+        if (r && r.next === fn.bodyEnd) result = r.binding;
+      }
+      tks = savedTks;
+      stack.pop();
+      return result;
+    };
+
     // Locate the end of an operand expression: the next `+` at depth 0 or
     // the first terminator in `terms`.
     const skipOperand = (k, stop, terms) => {
@@ -2235,6 +2540,9 @@
         const opTok = tks[next];
         let opText, prec;
         if (opTok && opTok.type === 'op' && BINOP_PREC[opTok.text] !== undefined) {
+          opText = opTok.text; prec = BINOP_PREC[opText];
+        } else if (opTok && opTok.type === 'other' && (opTok.text === '==' || opTok.text === '!=' || opTok.text === '===' || opTok.text === '!==')) {
+          // Equality operators are emitted with type 'other' by the tokenizer.
           opText = opTok.text; prec = BINOP_PREC[opText];
         } else if (opTok && opTok.type === 'plus') {
           // Treat `+` at precedence 12: numeric add when both operands are
@@ -2338,7 +2646,29 @@
           case '??': v = (lNum === null || lNum === undefined) ? rNum : lNum; break;
           default: return null;
         }
-        return chainBinding([makeSynthStr(String(v))]);
+        if (typeof v === 'boolean') return chainBinding([makeSynthBool(v)]);
+        return chainBinding([typeof v === 'number' ? makeSynthNum(v) : makeSynthStr(String(v))]);
+      }
+      // String comparison folding: when both operands are known strings,
+      // fold `== != === !== < > <= >=` to a boolean literal.
+      if (op === '==' || op === '!=' || op === '===' || op === '!==' ||
+          op === '<' || op === '>' || op === '<=' || op === '>=') {
+        const lS = chainAsKnownString(left);
+        const rS = chainAsKnownString(right);
+        if (lS !== null && rS !== null) {
+          let v;
+          switch (op) {
+            case '==': v = lS == rS; break;
+            case '!=': v = lS != rS; break;
+            case '===': v = lS === rS; break;
+            case '!==': v = lS !== rS; break;
+            case '<': v = lS < rS; break;
+            case '>': v = lS > rS; break;
+            case '<=': v = lS <= rS; break;
+            case '>=': v = lS >= rS; break;
+          }
+          return chainBinding([makeSynthBool(v)]);
+        }
       }
       // `+` is overloaded in JS. When both operands aren't concrete numbers
       // we decline here and let the caller (concat-chain parser) handle it
@@ -2346,10 +2676,11 @@
       if (op === '+') return null;
       // Short-circuit logical/nullish operators using whichever concrete
       // value (number or string) the left-hand side has.
+      const lJsType = left.toks.length === 1 ? left.toks[0].jsType : null;
       const lStr = lNum === null ? chainAsKnownString(left) : null;
-      const lTruthy = (lNum !== null && lNum !== 0) || (lStr !== null && lStr !== '' && lStr !== 'false' && lStr !== 'null' && lStr !== 'undefined' && lStr !== '0' && lStr !== 'NaN');
-      const lFalsy = lNum === 0 || lStr === '' || lStr === 'false' || lStr === 'null' || lStr === 'undefined' || lStr === '0' || lStr === 'NaN';
-      const lNullish = lStr === 'null' || lStr === 'undefined';
+      const lTruthy = (lNum !== null && lNum !== 0) || (lStr !== null && lStr !== '' && lStr !== '0' && lStr !== 'NaN') || lJsType === 'boolean' && lNum === 1;
+      const lFalsy = lNum === 0 || lStr === '' || lStr === '0' || lStr === 'NaN' || lJsType === 'null' || lJsType === 'undefined';
+      const lNullish = lJsType === 'null' || lJsType === 'undefined';
       if (op === '&&') { if (lFalsy) return left; if (lTruthy) return right; }
       else if (op === '||') { if (lTruthy) return left; if (lFalsy) return right; }
       else if (op === '??') { if (lNullish) return right; if (lStr !== null || lNum !== null) return left; }
@@ -2376,7 +2707,8 @@
           case '~': v = ~n; break;
           default: return null;
         }
-        return chainBinding([makeSynthStr(String(v))]);
+        if (typeof v === 'boolean') return chainBinding([makeSynthBool(v)]);
+        return chainBinding([typeof v === 'number' ? makeSynthNum(v) : makeSynthStr(String(v))]);
       }
       const et = chainAsExprText(operand);
       if (et === null) return null;
@@ -2387,7 +2719,17 @@
     const chainAsNumber = (chain) => {
       if (chain.toks.length !== 1) return null;
       const t = chain.toks[0];
-      if (t.type !== 'str') return null;
+      // Quoted strings (`'1'`, `"2"`) are string values even when they look
+      // numeric. Only bare number-literal tokens (type 'other' from the
+      // tokenizer, or type 'str' with empty/missing quote from makeSynthNum
+      // or arithmetic results) fold to numbers.
+      if (t.type === 'str' && t.quote && t.quote !== '') return null;
+      if (t.type !== 'str' && t.type !== 'other') return null;
+      // Booleans coerce: true→1, false→0 (JS semantics).
+      if (t.jsType === 'boolean') return t.text === 'true' ? 1 : 0;
+      // null coerces to 0; undefined to NaN (not numeric).
+      if (t.jsType === 'null') return 0;
+      if (t.jsType === 'undefined') return null;
       const n = Number(t.text);
       if (Number.isNaN(n)) return null;
       if (String(n) !== t.text) return null;
@@ -2492,8 +2834,15 @@
       return r ? r.toks : null;
     };
 
-    const stop = Math.min(stopAt, tokens.length);
-    for (let i = 0; i < stop; i++) {
+    let stop = Math.min(stopAt, tokens.length);
+    const walkRange = (startI, endI) => {
+      const savedStop = stop;
+      stop = endI;
+      walkRangeImpl(startI, endI);
+      stop = savedStop;
+    };
+    const walkRangeImpl = (startI, endI) => {
+    for (let i = startI; i < endI; i++) {
       // Pop any loops whose body we've walked past (and their shadow frames).
       // For each variable modified during the loop, capture its final chain
       // as a loopVar entry AND replace its binding with a single reference
@@ -2506,6 +2855,8 @@
         for (const name of entry.modifiedVars) {
           const b = resolve(name);
           if (b && b.kind === 'chain') {
+            // (Static for-of/for-in unrolling is handled above by walking the
+            // body multiple times with the loop var bound per element.)
             // Store the chain UNSTRIPPED; strip the outer loop's tags only
             // at display time via loopVarHtml. The unstripped chain is
             // needed when unrolling references in a main-chain substitution.
@@ -2582,6 +2933,53 @@
               }
               bodyEnd = k;
             }
+            // Detect for-of / for-in with a static iterable: header shape
+            // `[var|let|const] NAME (of|in) EXPR`. When EXPR is a known
+            // array/object binding, re-walk the body once per element with
+            // NAME bound to that element — a full static unroll with no
+            // loop markers in the output.
+            let unrollVar = null;
+            let unrollElems = null;
+            {
+              let h = i + 2;
+              if (tokens[h] && tokens[h].type === 'other' && (tokens[h].text === 'var' || tokens[h].text === 'let' || tokens[h].text === 'const')) h++;
+              const nameTok = tokens[h];
+              const kwTok = tokens[h + 1];
+              if (nameTok && nameTok.type === 'other' && IDENT_RE.test(nameTok.text) &&
+                  kwTok && kwTok.type === 'other' && (kwTok.text === 'of' || kwTok.text === 'in')) {
+                const iterRes = readValue(h + 2, j, null);
+                if (iterRes && iterRes.binding) {
+                  const b = iterRes.binding;
+                  if (kwTok.text === 'of' && b.kind === 'array') {
+                    unrollVar = nameTok.text;
+                    unrollElems = b.elems.slice();
+                  } else if (kwTok.text === 'in' && b.kind === 'object') {
+                    unrollVar = nameTok.text;
+                    unrollElems = Object.keys(b.props).map((k) => chainBinding([makeSynthStr(k)]));
+                  }
+                }
+              }
+            }
+            if (unrollVar && unrollElems) {
+              // Body range: for `{ ... }` body, skip past the braces so the
+              // inner walk re-enters block scope naturally via the open-`{`
+              // handler. For single-statement body, walk the whole stmt.
+              const bodyIsBlock = tokens[j + 1] && tokens[j + 1].type === 'open' && tokens[j + 1].char === '{';
+              const bodyStart = bodyIsBlock ? j + 1 : j + 1;
+              for (const elem of unrollElems) {
+                if (elem === null) { i = bodyEnd - 1; break; }
+                const iterFrame = { bindings: Object.create(null), isFunction: false };
+                iterFrame.bindings[unrollVar] = elem;
+                stack.push(iterFrame);
+                walkRange(bodyStart, bodyEnd);
+                // Pop in case walker left the frame dangling (block-`{`
+                // would have already popped it if body was a block).
+                const idx = stack.indexOf(iterFrame);
+                if (idx >= 0) stack.splice(idx, 1);
+              }
+              i = bodyEnd - 1;
+              continue;
+            }
             const id = nextLoopId++;
             loopInfo[id] = { kind: t.text, headerSrc };
             // Extract loop variables from the init clause (`var/let/const X`)
@@ -2606,6 +3004,7 @@
             loopStack.push({
               id, kind: t.text, headerSrc, bodyEnd, frame: loopFrame,
               modifiedVars: new Set(),
+              unrollVar: null, unrollElems: null,
             });
             // Skip past the loop header — the init/cond/update clauses
             // don't count as body mutations, so we resume at the body's
@@ -2617,6 +3016,135 @@
         }
         continue;
       }
+      // `switch (expr) { case ... }` — when the discriminant is a concrete
+      // value, walk only the matching case's body. Otherwise walk the entire
+      // switch body and let the variable-tracking accumulate normally.
+      if (t.text === 'switch') {
+        const lp = tokens[i + 1];
+        if (lp && lp.type === 'open' && lp.char === '(') {
+          let depth = 1, j = i + 2;
+          while (j < stop && depth > 0) {
+            const tk = tokens[j];
+            if (tk.type === 'open' && tk.char === '(') depth++;
+            else if (tk.type === 'close' && tk.char === ')') depth--;
+            if (depth === 0) break;
+            j++;
+          }
+          // j is at closing `)`.
+          const exprVal = readValue(i + 2, j, null);
+          const bodyOpen = tokens[j + 1];
+          if (bodyOpen && bodyOpen.type === 'open' && bodyOpen.char === '{') {
+            let d = 1, k = j + 2;
+            while (k < stop && d > 0) {
+              const tk = tokens[k];
+              if (tk.type === 'open' && tk.char === '{') d++;
+              else if (tk.type === 'close' && tk.char === '}') d--;
+              k++;
+            }
+            const switchEnd = k;
+            // Try concrete match: find the matching case and walk from there.
+            const exprStr = exprVal ? chainAsKnownString(exprVal.binding) : null;
+            const exprNum = exprVal ? chainAsNumber(exprVal.binding) : null;
+            if (exprStr !== null || exprNum !== null) {
+              // Scan for matching case/default.
+              let matchStart = -1;
+              let defaultStart = -1;
+              let ci = j + 2;
+              while (ci < switchEnd - 1) {
+                const ctk = tokens[ci];
+                if (ctk.type === 'other' && ctk.text === 'case') {
+                  const cv = readValue(ci + 1, switchEnd, null);
+                  if (cv) {
+                    const cs = chainAsKnownString(cv.binding);
+                    const cn = chainAsNumber(cv.binding);
+                    if ((exprStr !== null && cs === exprStr) || (exprNum !== null && cn === exprNum)) {
+                      // Skip past the `:` after the case expression.
+                      let cj = cv.next;
+                      if (tokens[cj] && tokens[cj].type === 'other' && tokens[cj].text === ':') cj++;
+                      matchStart = cj;
+                      break;
+                    }
+                  }
+                } else if (ctk.type === 'other' && ctk.text === 'default') {
+                  let cj = ci + 1;
+                  if (tokens[cj] && tokens[cj].type === 'other' && tokens[cj].text === ':') cj++;
+                  defaultStart = cj;
+                }
+                ci++;
+              }
+              const caseStart = matchStart >= 0 ? matchStart : defaultStart;
+              if (caseStart >= 0) {
+                walkRange(caseStart, switchEnd - 1);
+              }
+            } else {
+              // Unknown discriminant: walk entire switch body.
+              walkRange(j + 2, switchEnd - 1);
+            }
+            i = switchEnd - 1;
+            continue;
+          }
+        }
+      }
+
+      // `try { ... } catch (e) { ... } finally { ... }` — walk each block
+      // sequentially. For the catch block, bind the error parameter as opaque.
+      if (t.text === 'try') {
+        const openTry = tokens[i + 1];
+        if (openTry && openTry.type === 'open' && openTry.char === '{') {
+          let d = 1, k = i + 2;
+          while (k < stop && d > 0) {
+            const tk = tokens[k];
+            if (tk.type === 'open' && tk.char === '{') d++;
+            else if (tk.type === 'close' && tk.char === '}') d--;
+            k++;
+          }
+          walkRange(i + 1, k);
+          let j = k;
+          // catch block?
+          if (tokens[j] && tokens[j].type === 'other' && tokens[j].text === 'catch') {
+            j++;
+            // Optional `(e)` param.
+            if (tokens[j] && tokens[j].type === 'open' && tokens[j].char === '(') {
+              let dp = 1; j++;
+              while (j < stop && dp > 0) {
+                const tk = tokens[j];
+                if (tk.type === 'open' && tk.char === '(') dp++;
+                else if (tk.type === 'close' && tk.char === ')') dp--;
+                j++;
+              }
+            }
+            if (tokens[j] && tokens[j].type === 'open' && tokens[j].char === '{') {
+              let d2 = 1, k2 = j + 1;
+              while (k2 < stop && d2 > 0) {
+                const tk = tokens[k2];
+                if (tk.type === 'open' && tk.char === '{') d2++;
+                else if (tk.type === 'close' && tk.char === '}') d2--;
+                k2++;
+              }
+              walkRange(j, k2);
+              j = k2;
+            }
+          }
+          // finally block?
+          if (tokens[j] && tokens[j].type === 'other' && tokens[j].text === 'finally') {
+            j++;
+            if (tokens[j] && tokens[j].type === 'open' && tokens[j].char === '{') {
+              let d3 = 1, k3 = j + 1;
+              while (k3 < stop && d3 > 0) {
+                const tk = tokens[k3];
+                if (tk.type === 'open' && tk.char === '{') d3++;
+                else if (tk.type === 'close' && tk.char === '}') d3--;
+                k3++;
+              }
+              walkRange(j, k3);
+              j = k3;
+            }
+          }
+          i = j - 1;
+          continue;
+        }
+      }
+
       if (t.text === 'function') {
         // Try to capture a function declaration: `function NAME(params) { body }`.
         const nameTok = tokens[i + 1];
@@ -2795,7 +3323,7 @@
           const n = cur && cur.kind === 'chain' ? chainAsNumber(cur) : null;
           if (n !== null) {
             const delta = eqTok.text === '++' ? 1 : -1;
-            assignName(t.text, chainBinding([makeSynthStr(String(n + delta))]));
+            assignName(t.text, chainBinding([makeSynthNum(n + delta)]));
           } else {
             assignName(t.text, null);
           }
@@ -2820,6 +3348,23 @@
             i = skipExpr(i + 2, stop) - 1;
             continue;
           }
+          // Object-path assignment: `obj.a = v`, `obj.a.b = v`. Walks into
+          // the known object binding and installs the new value at the
+          // terminal key. Bails if any intermediate step isn't an object.
+          if (baseBind && baseBind.kind === 'object' && parts.length >= 2) {
+            const r = readValue(i + 2, stop, TERMS_TOP);
+            const val = r ? r.binding : null;
+            let cur = baseBind;
+            let ok = true;
+            for (let p = 1; p < parts.length - 1; p++) {
+              const nxt = cur.props[parts[p]];
+              if (!nxt || nxt.kind !== 'object') { ok = false; break; }
+              cur = nxt;
+            }
+            if (ok) cur.props[parts[parts.length - 1]] = val;
+            i = skipExpr(i + 2, stop) - 1;
+            continue;
+          }
         }
         // Path method call: `el.appendChild(child)`, `el.setAttribute(...)`.
         const parenTok = tokens[i + 1];
@@ -2837,10 +3382,90 @@
                 continue;
               }
             }
+            // Array mutation methods on a known array binding.
+            // `arr.push(v)`, `arr.pop()`, `arr.shift()`, `arr.unshift(v,...)`.
+            if (baseBind && baseBind.kind === 'array' && (method === 'push' || method === 'pop' || method === 'shift' || method === 'unshift' || method === 'splice' || method === 'fill' || method === 'reverse' || method === 'sort')) {
+              const argResult = readCallArgBindings(i + 1, stop);
+              if (argResult) {
+                if (method === 'push') {
+                  for (const b of argResult.bindings) baseBind.elems.push(b);
+                } else if (method === 'pop') {
+                  baseBind.elems.pop();
+                } else if (method === 'shift') {
+                  baseBind.elems.shift();
+                } else if (method === 'unshift') {
+                  baseBind.elems.unshift(...argResult.bindings);
+                } else if (method === 'splice') {
+                  const startN = argResult.bindings[0] ? chainAsNumber(argResult.bindings[0]) : null;
+                  const delN = argResult.bindings[1] ? chainAsNumber(argResult.bindings[1]) : null;
+                  if (startN !== null) {
+                    const start = startN < 0 ? Math.max(0, baseBind.elems.length + startN) : startN;
+                    const del = delN !== null ? delN : baseBind.elems.length - start;
+                    const items = argResult.bindings.slice(2);
+                    baseBind.elems.splice(start, del, ...items);
+                  }
+                } else if (method === 'fill') {
+                  const val = argResult.bindings[0] || null;
+                  const startN = argResult.bindings[1] ? chainAsNumber(argResult.bindings[1]) : 0;
+                  const endN = argResult.bindings[2] ? chainAsNumber(argResult.bindings[2]) : baseBind.elems.length;
+                  for (let k = (startN || 0); k < (endN || baseBind.elems.length); k++) baseBind.elems[k] = val;
+                } else if (method === 'reverse') {
+                  baseBind.elems.reverse();
+                } else if (method === 'sort') {
+                  // No comparator support at statement level; just reverse-sort strings.
+                  baseBind.elems.sort((a, b) => {
+                    const sa = a && a.kind === 'chain' ? chainAsKnownString(a) : null;
+                    const sb = b && b.kind === 'chain' ? chainAsKnownString(b) : null;
+                    if (sa === null || sb === null) return 0;
+                    return sa < sb ? -1 : sa > sb ? 1 : 0;
+                  });
+                }
+                i = argResult.next - 1;
+                continue;
+              }
+            }
+          }
+        }
+      }
+
+      // Bracket-indexed assignment: `arr[i] = v`, `obj['key'] = v`.
+      // Walks into the array/object binding and sets the slot when the
+      // key is a concrete number/string.
+      if (t.type === 'other' && IDENT_RE.test(t.text)) {
+        const openTok = tokens[i + 1];
+        if (openTok && openTok.type === 'open' && openTok.char === '[') {
+          // Scan to matching `]`.
+          let d = 1; let j = i + 2;
+          while (j < stop && d > 0) {
+            const tk = tokens[j];
+            if (tk.type === 'open' && tk.char === '[') d++;
+            else if (tk.type === 'close' && tk.char === ']') d--;
+            if (d > 0) j++;
+          }
+          const eqTok = tokens[j + 1];
+          if (j < stop && eqTok && eqTok.type === 'sep' && eqTok.char === '=') {
+            const keyRes = readValue(i + 2, j, null);
+            const valRes = readValue(j + 2, stop, TERMS_TOP);
+            const baseBind = resolve(t.text);
+            const keyN = keyRes ? chainAsNumber(keyRes.binding) : null;
+            const keyS = keyRes && keyN === null ? chainAsKnownString(keyRes.binding) : null;
+            if (baseBind && baseBind.kind === 'array' && keyN !== null && Number.isInteger(keyN) && keyN >= 0) {
+              while (baseBind.elems.length <= keyN) baseBind.elems.push(null);
+              baseBind.elems[keyN] = valRes ? valRes.binding : null;
+              i = skipExpr(j + 2, stop) - 1;
+              continue;
+            }
+            if (baseBind && baseBind.kind === 'object' && keyS !== null) {
+              baseBind.props[keyS] = valRes ? valRes.binding : null;
+              i = skipExpr(j + 2, stop) - 1;
+              continue;
+            }
           }
         }
       }
     }
+    };
+    walkRange(0, stop);
 
     // Parse tokens[start, end) as a concat chain, expanding identifier
     // references, member paths, `[...].join(sep)`, and `.concat(...)` calls.
