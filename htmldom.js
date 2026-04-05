@@ -469,13 +469,22 @@
     const tag = node.tagName.toLowerCase();
     const v = makeVar(tag, used);
 
-    // Namespace detection.
-    let ns = nsCtx;
-    if (tag === 'svg') ns = SVG_NS;
-    else if (tag === 'math') ns = MATHML_NS;
-    else if (tag === 'foreignobject') ns = null; // children revert to HTML
-
     const attrs = Array.from(node.attributes || []);
+
+    // Namespace detection. Elements in a parsed HTML document expose their
+    // namespaceURI; prefer that when present, so fragments like
+    // `<g xmlns="http://www.w3.org/2000/svg">` route through createElementNS
+    // even without a wrapping <svg>. Fall back to tag-name heuristics for
+    // elements lacking a namespaceURI.
+    let ns = node.namespaceURI || nsCtx;
+    if (ns === 'http://www.w3.org/1999/xhtml') ns = null;
+    // Fallback tag-name heuristics for nodes without a namespaceURI.
+    if (!node.namespaceURI) {
+      if (tag === 'svg') ns = SVG_NS;
+      else if (tag === 'math') ns = MATHML_NS;
+    }
+    // Note: <foreignObject> itself stays in SVG; its children revert to HTML
+    // via `childNs` below.
 
     // Detect `is=` for customized built-ins (HTML namespace only).
     let isAttr = null;
