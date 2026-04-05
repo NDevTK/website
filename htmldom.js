@@ -91,6 +91,132 @@
   // Extract every `X.innerHTML`/`X.outerHTML` assignment in the input,
   // returning an array of extraction results in source order. Each result
   // has the same shape as `extractHTML`'s return value.
+  // Extract the virtual DOM constructed by the script: every
+  // `document.createElement`/`getElementById`/`createTextNode` call
+  // produces a tracked element, and subsequent `el.prop = ...`,
+  // `el.setAttribute(...)`, `el.appendChild(...)` statements mutate it.
+  // Returns { elements, ops, roots, html }, where:
+  //   - elements: all tracked virtual elements/text nodes in creation order
+  //   - ops:      the sequence of DOM operations the script performs
+  //   - roots:    elements that weren't appended to another tracked element
+  //   - html:     a per-element HTML serialization (best-effort)
+  function extractAllDOM(input) {
+    const trimmed = input.trim();
+    if (!trimmed) return { elements: [], ops: [], roots: [], html: {} };
+    const tokens = tokenize(trimmed);
+    const state = buildScopeState(tokens, tokens.length);
+    const elements = state.domElements;
+    const roots = elements.filter((el) => !el.attached);
+    const html = {};
+    for (const el of elements) html[el.elementId] = serializeElement(el);
+    return {
+      elements: elements.map(summarizeElement),
+      ops: state.domOps.map((o) => ({
+        op: o.op,
+        elementId: o.element ? o.element.elementId : null,
+        name: o.name, value: o.value ? bindingAsText(o.value) : undefined,
+        path: o.path,
+      })),
+      roots: roots.map(summarizeElement),
+      html,
+    };
+  }
+
+  // Best-effort conversion of a binding to a displayable string/source text.
+  function bindingAsText(b) {
+    if (!b) return null;
+    if (b.kind === 'chain') {
+      let s = '';
+      for (const t of b.toks) {
+        if (t.type === 'plus') continue;
+        if (t.type === 'str') s += t.text;
+        else if (t.type === 'tmpl') {
+          for (const p of t.parts) {
+            if (p.kind === 'text') s += p.raw;
+            else s += '${' + p.expr + '}';
+          }
+        } else if (t.type === 'other') s += '${' + t.text + '}';
+      }
+      return s;
+    }
+    return null;
+  }
+
+  function summarizeElement(el) {
+    if (el.kind === 'textNode') {
+      return { id: el.elementId, kind: 'textNode', text: bindingAsText(el.text), attached: el.attached };
+    }
+    return {
+      id: el.elementId,
+      kind: 'element',
+      origin: el.origin,
+      attrs: mapValues(el.attrs, bindingAsText),
+      props: mapValues(el.props, bindingAsText),
+      styles: mapValues(el.styles, bindingAsText),
+      classList: el.classList,
+      children: el.children.map((c) => c.elementId != null ? c.elementId : null),
+      text: bindingAsText(el.text),
+      html: bindingAsText(el.html),
+      attached: el.attached,
+    };
+  }
+
+  function mapValues(obj, f) {
+    const out = {};
+    for (const k in obj) out[k] = f(obj[k]);
+    return out;
+  }
+
+  // Serialize an element (with its children) to an HTML string, using any
+  // known text/html/attrs. Returns a template-literal-style string where
+  // unresolved sub-expressions surface as ${expr}.
+  function serializeElement(el) {
+    if (el.kind === 'textNode') return bindingAsText(el.text) || '';
+    const origin = el.origin;
+    const tag = origin.kind === 'create' ? origin.tag : (origin.kind === 'lookup' ? null : null);
+    if (el.html != null) {
+      const inner = bindingAsText(el.html) || '';
+      if (tag) return '<' + tag + serializeAttrs(el) + '>' + inner + '</' + tag + '>';
+      return inner;
+    }
+    let inner = '';
+    if (el.text != null) inner = escapeHTML(bindingAsText(el.text) || '');
+    else if (el.children.length) {
+      for (const c of el.children) {
+        if (c.kind === 'textNode') inner += escapeHTML(bindingAsText(c.text) || '');
+        else if (c.kind === 'textLike') inner += escapeHTML(bindingAsText(c.chain) || '');
+        else if (c.kind === 'element') inner += serializeElement(c);
+      }
+    }
+    if (tag) return '<' + tag + serializeAttrs(el) + '>' + inner + '</' + tag + '>';
+    // Lookup-origin element without its own tag: emit children only.
+    return inner;
+  }
+
+  function serializeAttrs(el) {
+    let out = '';
+    if (el.classList && el.classList.length) {
+      out += ' class="' + escapeHTML(el.classList.join(' ')) + '"';
+    }
+    for (const k in el.attrs) {
+      const v = bindingAsText(el.attrs[k]);
+      if (v != null) out += ' ' + k + '="' + escapeHTML(v) + '"';
+    }
+    // IDL reflected props worth echoing into attributes for display.
+    const REFLECTED = ['id', 'href', 'src', 'alt', 'title', 'name', 'value', 'type', 'placeholder'];
+    for (const k of REFLECTED) {
+      if (k in el.props) {
+        const v = bindingAsText(el.props[k]);
+        if (v != null) out += ' ' + k + '="' + escapeHTML(v) + '"';
+      }
+    }
+    return out;
+  }
+
+  function escapeHTML(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
   function extractAllHTML(input) {
     const trimmed = input.trim();
     if (!trimmed) return [];
@@ -278,6 +404,16 @@
     'isNaN': isNaN, 'isFinite': isFinite,
     // String(x) can coerce any literal — kept separate so it handles strings.
   };
+  // DOM methods recognized on element bindings. Used by the walker's
+  // path-method-call handler to route to applyElementMethod.
+  const DOM_METHODS = new Set([
+    'appendChild', 'append', 'prepend', 'insertBefore', 'replaceChild', 'removeChild',
+    'setAttribute', 'removeAttribute', 'setAttributeNS', 'removeAttributeNS',
+    'addEventListener', 'removeEventListener',
+    'replaceWith', 'remove', 'insertAdjacentHTML', 'insertAdjacentElement',
+    'replaceChildren',
+  ]);
+
   // Method names recognized on typed bindings (chain/array). Used by
   // applySuffixes and readBase's attached-method detection to route to
   // applyMethod for evaluation.
@@ -304,6 +440,35 @@
   const functionBinding = (params, bodyStart, bodyEnd, isBlock) => ({
     kind: 'function', params, bodyStart, bodyEnd, isBlock,
   });
+  // Virtual DOM element binding factories. Each `buildScopeState` invocation
+  // maintains its own element-id counter via a closure (see below). The
+  // `origin` records how the element was created: either
+  // `{kind:'create', tag}` from document.createElement, `{kind:'lookup',
+  // by:'id', value}` from document.getElementById, etc.
+  const makeElementFactory = () => {
+    let nextElementId = 0;
+    return {
+      element: (origin) => ({
+        kind: 'element',
+        elementId: nextElementId++,
+        origin,
+        attrs: Object.create(null),
+        props: Object.create(null),
+        styles: Object.create(null),
+        classList: [],
+        children: [],
+        text: null,
+        html: null,
+        attached: false,
+      }),
+      textNode: (chain) => ({
+        kind: 'textNode',
+        elementId: nextElementId++,
+        text: chain,
+        attached: false,
+      }),
+    };
+  };
 
   const makeSynthStr = (text) => ({
     type: 'str', quote: "'", raw: text, text, start: 0, end: 0, _src: '',
@@ -389,6 +554,120 @@
     // template-literal expression that was re-tokenized) while sharing the
     // current scope stack.
     let tks = tokens;
+    // Tracked virtual DOM elements, recorded in creation order. Each entry
+    // is an elementBinding/textNodeBinding (mutable) so subsequent
+    // `el.prop = ...` / `el.appendChild(...)` statements update the same
+    // object across references.
+    const domElements = [];
+    const domOps = [];
+    const domFactory = makeElementFactory();
+    const elementBinding = domFactory.element;
+    const textNodeBinding = domFactory.textNode;
+    // Apply a mutation to an element binding's property path.
+    const applyElementSet = (el, path, val) => {
+      if (!el || el.kind !== 'element') return;
+      const seg = path[0];
+      if (path.length === 1) {
+        if (seg === 'innerHTML' || seg === 'outerHTML') { el.html = val; }
+        else if (seg === 'textContent' || seg === 'innerText' || seg === 'nodeValue') { el.text = val; }
+        else if (seg === 'className') {
+          const s = val && val.kind === 'chain' ? chainAsKnownString(val) : null;
+          el.classList = s === null ? null : s.split(/\s+/).filter(Boolean);
+        }
+        else { el.props[seg] = val; }
+      } else if (path.length === 2 && seg === 'style') {
+        el.styles[path[1]] = val;
+      } else if (path.length >= 2 && seg === 'dataset') {
+        el.attrs['data-' + path[1]] = val;
+      }
+      domOps.push({ op: 'set', element: el, path, value: val });
+    };
+    // Apply a DOM method call to an element binding. `argBinds` is an
+    // array of bindings (chain / element / etc.) from readCallArgBindings.
+    const applyElementMethod = (el, method, argBinds) => {
+      if (!el || el.kind !== 'element') return;
+      if (method === 'appendChild' || method === 'append' || method === 'prepend') {
+        for (const arg of argBinds) {
+          if (!arg) continue;
+          if (arg.kind === 'element' || arg.kind === 'textNode') {
+            arg.attached = true;
+            if (method === 'prepend') el.children.unshift(arg);
+            else el.children.push(arg);
+          } else if (arg.kind === 'chain') {
+            // append text / stringified fragment
+            if (method === 'prepend') el.children.unshift({ kind: 'textLike', chain: arg });
+            else el.children.push({ kind: 'textLike', chain: arg });
+          }
+        }
+        domOps.push({ op: method, element: el, args: argBinds });
+        return;
+      }
+      if (method === 'setAttribute' && argBinds.length === 2) {
+        const name = argBinds[0] && argBinds[0].kind === 'chain' ? chainAsKnownString(argBinds[0]) : null;
+        if (name !== null) el.attrs[name] = argBinds[1];
+        domOps.push({ op: 'setAttribute', element: el, name, value: argBinds[1] });
+        return;
+      }
+      if (method === 'removeAttribute' && argBinds.length === 1) {
+        const name = argBinds[0] && argBinds[0].kind === 'chain' ? chainAsKnownString(argBinds[0]) : null;
+        if (name !== null) delete el.attrs[name];
+        domOps.push({ op: 'removeAttribute', element: el, name });
+        return;
+      }
+      domOps.push({ op: method, element: el, args: argBinds });
+    };
+
+    // Cache DOM factory results by the token index where the call starts,
+    // so repeated readBase attempts at the same position return the same
+    // element binding (readValue's two-pass approach can call readBase
+    // twice for one source expression).
+    const domFactoryCache = Object.create(null);
+    const cacheOrCall = (k, make) => {
+      if (domFactoryCache[k]) return domFactoryCache[k];
+      const r = make();
+      if (r) domFactoryCache[k] = r;
+      return r;
+    };
+    // DOM factory functions: `document.createElement(tag)`,
+    // `document.getElementById(id)`, etc. Each is called with the arg
+    // chain list and returns { bind, next } or null.
+    const DOM_FACTORIES = {
+      'document.createElement': (args, k, next) => cacheOrCall(k, () => {
+        if (args.length !== 1) return null;
+        const tag = chainAsKnownString(chainBinding(args[0]));
+        if (tag === null) return null;
+        const el = elementBinding({ kind: 'create', tag });
+        domElements.push(el);
+        domOps.push({ op: 'create', element: el });
+        return { bind: el, next };
+      }),
+      'document.createTextNode': (args, k, next) => cacheOrCall(k, () => {
+        if (args.length !== 1) return null;
+        const chain = chainBinding(args[0]);
+        const tn = textNodeBinding(chain);
+        domElements.push(tn);
+        domOps.push({ op: 'createTextNode', element: tn });
+        return { bind: tn, next };
+      }),
+      'document.getElementById': (args, k, next) => cacheOrCall(k, () => {
+        if (args.length !== 1) return null;
+        const id = chainAsKnownString(chainBinding(args[0]));
+        if (id === null) return null;
+        const el = elementBinding({ kind: 'lookup', by: 'id', value: id });
+        domElements.push(el);
+        domOps.push({ op: 'lookup', element: el, by: 'id', value: id });
+        return { bind: el, next };
+      }),
+      'document.querySelector': (args, k, next) => cacheOrCall(k, () => {
+        if (args.length !== 1) return null;
+        const sel = chainAsKnownString(chainBinding(args[0]));
+        if (sel === null) return null;
+        const el = elementBinding({ kind: 'lookup', by: 'selector', value: sel });
+        domElements.push(el);
+        domOps.push({ op: 'lookup', element: el, by: 'selector', value: sel });
+        return { bind: el, next };
+      }),
+    };
 
     const topBlock = () => stack[stack.length - 1];
     const declBlock = (name, value) => { topBlock().bindings[name] = value; };
@@ -1177,6 +1456,14 @@
             }
           }
         }
+        // DOM factories return a tracked virtual element.
+        if (isCall && DOM_FACTORIES[t.text]) {
+          const args = readConcatArgs(k + 1, stop);
+          if (args) {
+            const r = DOM_FACTORIES[t.text](args.args, k, args.next, t);
+            if (r) return r;
+          }
+        }
         // `String(x)` coerces any literal to its string form.
         if (isCall && t.text === 'String') {
           const args = readConcatArgs(k + 1, stop);
@@ -1529,6 +1816,30 @@
 
     // Parse `( chain, chain, ... )` starting at the `(` token index. Returns
     // { args: [tks[], ...], next } or null.
+    // Parse `( arg, arg, ... )` where each arg is a full value (binding),
+    // returning { bindings: [binding|null, ...], next } or null. Used by
+    // the DOM method call handler so element-typed arguments stay intact.
+    const readCallArgBindings = (k, stop) => {
+      const lp = tks[k];
+      if (!lp || lp.type !== 'open' || lp.char !== '(') return null;
+      const bindings = [];
+      let i = k + 1;
+      const maybeRp = tks[i];
+      if (maybeRp && maybeRp.type === 'close' && maybeRp.char === ')') return { bindings, next: i + 1 };
+      while (i < stop) {
+        const v = readValue(i, stop, TERMS_ARG);
+        if (!v) return null;
+        bindings.push(v.binding);
+        i = v.next;
+        const sep = tks[i];
+        if (sep && sep.type === 'sep' && sep.char === ',') { i++; continue; }
+        break;
+      }
+      const rp = tks[i];
+      if (!rp || rp.type !== 'close' || rp.char !== ')') return null;
+      return { bindings, next: i + 1 };
+    };
+
     const readConcatArgs = (k, stop) => {
       const lp = tks[k];
       if (!lp || lp.type !== 'open' || lp.char !== '(') return null;
@@ -1861,6 +2172,42 @@
           continue;
         }
       }
+
+      // Path assignment on a tracked DOM element: `el.prop = value`,
+      // `el.style.color = value`, etc. Records the mutation on the
+      // element binding so subsequent DOM serialization sees it.
+      if (t.type === 'other' && PATH_RE.test(t.text)) {
+        const eqTok = tokens[i + 1];
+        if (eqTok && eqTok.type === 'sep' && eqTok.char === '=') {
+          const parts = t.text.split('.');
+          const baseBind = resolve(parts[0]);
+          if (baseBind && baseBind.kind === 'element') {
+            const r = readValue(i + 2, stop, TERMS_TOP);
+            const val = r ? r.binding : null;
+            applyElementSet(baseBind, parts.slice(1), val);
+            i = skipExpr(i + 2, stop) - 1;
+            continue;
+          }
+        }
+        // Path method call: `el.appendChild(child)`, `el.setAttribute(...)`.
+        const parenTok = tokens[i + 1];
+        if (parenTok && parenTok.type === 'open' && parenTok.char === '(') {
+          const dot = t.text.lastIndexOf('.');
+          if (dot > 0) {
+            const base = t.text.slice(0, dot);
+            const method = t.text.slice(dot + 1);
+            const baseBind = resolve(base);
+            if (baseBind && baseBind.kind === 'element' && DOM_METHODS.has(method)) {
+              const argResult = readCallArgBindings(i + 1, stop);
+              if (argResult) {
+                applyElementMethod(baseBind, method, argResult.bindings);
+                i = argResult.next - 1;
+                continue;
+              }
+            }
+          }
+        }
+      }
     }
 
     // Parse tokens[start, end) as a concat chain, expanding identifier
@@ -1876,7 +2223,7 @@
       for (let i = stack.length - 1; i >= 0; i--) if (name in stack[i].bindings) return true;
       return false;
     };
-    return { resolve, resolvePath, parseRange, rewriteTemplate, loopInfo, loopVars, inScope };
+    return { resolve, resolvePath, parseRange, rewriteTemplate, loopInfo, loopVars, inScope, domElements, domOps };
   }
 
   function hasBinding(stack, name) {

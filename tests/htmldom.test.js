@@ -26,12 +26,13 @@ global.DOMParser = class {
 const src = fs.readFileSync(path.join(__dirname, '..', 'htmldom.js'), 'utf8');
 const patched = src.replace(
   'function extractHTML(input) {',
-  'globalThis.__extractHTML = extractHTML;\n  globalThis.__extractAllHTML = extractAllHTML;\n  function extractHTML(input) {'
+  'globalThis.__extractHTML = extractHTML;\n  globalThis.__extractAllHTML = extractAllHTML;\n  globalThis.__extractAllDOM = extractAllDOM;\n  function extractHTML(input) {'
 );
 // eslint-disable-next-line no-eval
 eval(patched);
 const extractHTML = globalThis.__extractHTML;
 const extractAllHTML = globalThis.__extractAllHTML;
+const extractAllDOM = globalThis.__extractAllDOM;
 
 // Test harness.
 let pass = 0;
@@ -673,6 +674,61 @@ group('array methods', () => {
   else { fail++; failures.push({ name: 'all[1]', got: all[1] }); }
   if (all[2] && all[2].target === `document.getElementById('nums')` && all[2].assignOp === '+=' && /<br>__HDX0__/.test(all[2].html)) pass++;
   else { fail++; failures.push({ name: 'all[2]', got: all[2] }); }
+  console.log(`  (${pass + fail - before} cases)`);
+})();
+
+// -----------------------------------------------------------------------
+// extractAllDOM: virtual DOM construction tracking
+// -----------------------------------------------------------------------
+(function () {
+  console.log('\nextractAllDOM');
+  console.log('-------------');
+  const before = pass + fail;
+
+  // Basic create + appendChild.
+  {
+    const r = extractAllDOM(`var a = document.createElement('a'); a.href = '/'; a.textContent = 'home'; document.body.appendChild(a);`);
+    if (r.elements.length === 1 && r.elements[0].origin.tag === 'a' && r.elements[0].props.href === '/' && r.elements[0].text === 'home') pass++;
+    else { fail++; failures.push({ name: 'createElement basic', got: r }); }
+  }
+  // Nested tree with for-loop-built children.
+  {
+    const r = extractAllDOM(`var t=document.createElement('table'); var tr=document.createElement('tr'); var td=document.createElement('td'); td.textContent='cell'; tr.appendChild(td); t.appendChild(tr);`);
+    if (r.html[0] === '<table><tr><td>cell</td></tr></table>') pass++;
+    else { fail++; failures.push({ name: 'nested createElement tree', html0: r.html && r.html[0] }); }
+  }
+  // setAttribute.
+  {
+    const r = extractAllDOM(`var el=document.createElement('div'); el.setAttribute('data-id', '42'); el.setAttribute('role', 'button');`);
+    if (r.elements[0].attrs['data-id'] === '42' && r.elements[0].attrs.role === 'button') pass++;
+    else { fail++; failures.push({ name: 'setAttribute', got: r.elements[0] }); }
+  }
+  // className → classList.
+  {
+    const r = extractAllDOM(`var el=document.createElement('div'); el.className = 'foo bar baz';`);
+    if (r.elements[0].classList.join(' ') === 'foo bar baz') pass++;
+    else { fail++; failures.push({ name: 'className', got: r.elements[0] }); }
+  }
+  // style.prop assignments.
+  {
+    const r = extractAllDOM(`var el=document.createElement('div'); el.style.color='red'; el.style.fontSize='12px';`);
+    if (r.elements[0].styles.color === 'red' && r.elements[0].styles.fontSize === '12px') pass++;
+    else { fail++; failures.push({ name: 'style', got: r.elements[0] }); }
+  }
+  // getElementById + append — root element is the looked-up element.
+  {
+    const r = extractAllDOM(`var out=document.getElementById('out'); var a=document.createElement('a'); out.appendChild(a);`);
+    const outEl = r.elements.find((e) => e.origin && e.origin.value === 'out');
+    if (outEl && outEl.children.length === 1) pass++;
+    else { fail++; failures.push({ name: 'getElementById append', got: r }); }
+  }
+  // innerHTML capture on element.
+  {
+    const r = extractAllDOM(`var t=document.createElement('div'); t.innerHTML = '<p>hi</p>';`);
+    if (r.elements[0].html === '<p>hi</p>') pass++;
+    else { fail++; failures.push({ name: 'innerHTML on element', got: r.elements[0] }); }
+  }
+
   console.log(`  (${pass + fail - before} cases)`);
 })();
 
