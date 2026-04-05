@@ -702,6 +702,67 @@
     // object across references.
     const domElements = [];
     const domOps = [];
+    // Given a chain's tokens carrying one loop-id tag's worth of body
+    // contributions, replicate the tagged section per iterable element with
+    // the loop-var references replaced by the element's concrete string.
+    // Returns new token list or null if the chain can't be unrolled.
+    const unrollLoopChain = (toks, loopId, loopVar, elems) => {
+      // Find the first token tagged with this loopId; everything before it
+      // is the pre-loop baseline.
+      let firstTagged = -1;
+      for (let i = 0; i < toks.length; i++) {
+        if (toks[i].type !== 'plus' && toks[i].loopId === loopId) { firstTagged = i; break; }
+      }
+      if (firstTagged === -1) return null;
+      // Expect a `+` at firstTagged-1 separating baseline from body contribution.
+      // Trim that `+` from the baseline; we'll re-add it per iteration.
+      let baseEnd = firstTagged - 1;
+      if (baseEnd >= 0 && toks[baseEnd].type !== 'plus') return null;
+      // Tagged region: all tokens with loopId===this id. Must be contiguous
+      // through the end of the chain for this simple unroll.
+      const body = [];
+      for (let i = firstTagged; i < toks.length; i++) {
+        const tk = toks[i];
+        if (tk.type === 'plus') { body.push(tk); continue; }
+        if (tk.loopId !== loopId) return null;
+        // Strip the loopId tag on the clone.
+        const stripped = Object.assign({}, tk);
+        delete stripped.loopId;
+        body.push(stripped);
+      }
+      // Substitute loop-var references. For each element, clone body
+      // (pre-pending a `+` to bridge from existing content) and replace
+      // operand tokens whose text === loopVar with the element's
+      // concrete string form.
+      const out = [];
+      for (let i = 0; i < baseEnd; i++) out.push(toks[i]);
+      for (let e = 0; e < elems.length; e++) {
+        const elem = elems[e];
+        if (!elem) return null;
+        // Derive string form from the element binding.
+        let elemStr = null;
+        if (elem.kind === 'chain') {
+          const s = chainAsKnownString(elem);
+          if (s !== null) elemStr = s;
+        }
+        if (elemStr === null) return null;
+        // Connect to prior content with a `+` when there is any.
+        if (out.length > 0) out.push(SYNTH_PLUS);
+        for (const tk of body) {
+          if (tk.type === 'plus') { out.push(tk); continue; }
+          if (tk.type === 'other' && tk.text === loopVar) {
+            out.push(makeSynthStr(elemStr));
+          } else {
+            out.push(tk);
+          }
+        }
+      }
+      // Edge case: zero elements — result is just baseline (or empty string).
+      if (elems.length === 0) {
+        return baseEnd > 0 ? toks.slice(0, baseEnd) : [makeSynthStr('')];
+      }
+      return out;
+    };
     const domFactory = makeElementFactory();
     const elementBinding = domFactory.element;
     const textNodeBinding = domFactory.textNode;
@@ -2581,6 +2642,23 @@
         for (const name of entry.modifiedVars) {
           const b = resolve(name);
           if (b && b.kind === 'chain') {
+            // Static unroll: if the for-of/for-in loop had a known iterable
+            // and the body's contribution to this var is one iteration's
+            // worth of tokens, replicate those tokens per element with the
+            // loop var substituted by each concrete element's string form.
+            if (entry.unrollElems && entry.unrollVar) {
+              const unrolled = unrollLoopChain(b.toks, entry.id, entry.unrollVar, entry.unrollElems);
+              if (unrolled) {
+                // If still inside an enclosing loop, carry its tag so that
+                // loop's post-walk unroll/marker stage still sees these
+                // tokens as body contributions, and record the mutation.
+                const outer = loopStack.length > 0 ? loopStack[loopStack.length - 1] : null;
+                const tagged = outer ? tagWithLoop(unrolled, outer.id) : unrolled;
+                assignName(name, chainBinding(tagged));
+                if (outer) outer.modifiedVars.add(name);
+                continue;
+              }
+            }
             // Store the chain UNSTRIPPED; strip the outer loop's tags only
             // at display time via loopVarHtml. The unstripped chain is
             // needed when unrolling references in a main-chain substitution.
@@ -2668,6 +2746,34 @@
             // works for both block-bodied (`for (...) { ... }`) and
             // single-statement (`for (...) stmt;`) loops.
             const loopFrame = { bindings: Object.create(null), isFunction: false };
+            // Detect for-of / for-in with a static iterable: header shape
+            // `[var|let|const] NAME (of|in) EXPR`. When EXPR is a known
+            // array/object binding, remember the elements so we can unroll
+            // body contributions after the loop body walks once.
+            let unrollVar = null;
+            let unrollElems = null;
+            {
+              let h = i + 2;
+              if (tokens[h] && tokens[h].type === 'other' && (tokens[h].text === 'var' || tokens[h].text === 'let' || tokens[h].text === 'const')) h++;
+              const nameTok = tokens[h];
+              const kwTok = tokens[h + 1];
+              if (nameTok && nameTok.type === 'other' && IDENT_RE.test(nameTok.text) &&
+                  kwTok && kwTok.type === 'other' && (kwTok.text === 'of' || kwTok.text === 'in')) {
+                const iterRes = readValue(h + 2, j, null);
+                if (iterRes && iterRes.binding) {
+                  const b = iterRes.binding;
+                  if (kwTok.text === 'of' && b.kind === 'array') {
+                    unrollVar = nameTok.text;
+                    unrollElems = b.elems.slice();
+                  } else if (kwTok.text === 'in' && b.kind === 'object') {
+                    unrollVar = nameTok.text;
+                    unrollElems = Object.keys(b.props).map((k) => chainBinding([makeSynthStr(k)]));
+                  } else if (kwTok.text === 'of' && b.kind === 'object') {
+                    // for-of on an object is a runtime error — leave opaque.
+                  }
+                }
+              }
+            }
             for (let h = i + 2; h < j; h++) {
               const hk = tokens[h];
               if (hk.type === 'other' && (hk.text === 'var' || hk.text === 'let' || hk.text === 'const')) {
@@ -2681,6 +2787,7 @@
             loopStack.push({
               id, kind: t.text, headerSrc, bodyEnd, frame: loopFrame,
               modifiedVars: new Set(),
+              unrollVar, unrollElems,
             });
             // Skip past the loop header — the init/cond/update clauses
             // don't count as body mutations, so we resume at the body's

@@ -338,6 +338,32 @@ group('mutations', () => {
 });
 
 // -----------------------------------------------------------------------
+// for-of / for-in static unrolling
+// -----------------------------------------------------------------------
+group('for-of unrolling', () => {
+  check('accumulator over static array',
+    `var a=''; for (var x of ['a','b','c']) { a += '<li>'+x+'</li>'; } document.body.innerHTML=a;`,
+    '<li>a</li><li>b</li><li>c</li>');
+  check('accumulator with prefix',
+    `var a='X:'; for (var x of ['a','b','c']) { a += '<li>'+x+'</li>'; } document.body.innerHTML=a;`,
+    'X:<li>a</li><li>b</li><li>c</li>');
+  check('for-in over static object iterates keys',
+    `var o={a:1,b:2,c:3}; var s=''; for (var k in o) { s += k; } document.body.innerHTML=s;`, 'abc');
+  check('empty iterable leaves baseline',
+    `var a='pre:'; for (var x of []) { a += x; } document.body.innerHTML=a;`, 'pre:');
+  check('single-statement body',
+    `var a=''; for (var x of ['a','b']) a += x; document.body.innerHTML=a;`, 'ab');
+  check('loop var used twice',
+    `var a=''; for (var x of ['a','b']) a += x+':'+x+','; document.body.innerHTML=a;`, 'a:a,b:b,');
+  check('nested for-of unrolls both',
+    `var a=''; for (var x of ['a','b']) for (var y of ['1','2']) a += x+y+'/'; document.body.innerHTML=a;`,
+    'a1/a2/b1/b2/');
+  check('for-of over precomputed array',
+    `var items=['one','two']; var a=''; for (var x of items) a += '['+x+']'; document.body.innerHTML=a;`,
+    '[one][two]');
+});
+
+// -----------------------------------------------------------------------
 // Array.* builtins
 // -----------------------------------------------------------------------
 group('Array builtins', () => {
