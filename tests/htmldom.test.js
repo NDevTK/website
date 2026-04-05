@@ -633,6 +633,24 @@ group('string methods', () => {
     `var n='World'; document.body.innerHTML = 'Hello ' + n.toUpperCase();`, 'Hello WORLD');
   check('String(num) then method',
     `var n=42; document.body.innerHTML = String(n).padStart(5, '0');`, '00042');
+  check('split then join',
+    `var parts='a,b,c'.split(','); document.body.innerHTML = parts.join('|');`, 'a|b|c');
+  check('indexOf literal',
+    `document.body.innerHTML = 'pos=' + 'hello world'.indexOf('world');`, 'pos=6');
+});
+
+// -----------------------------------------------------------------------
+// Array methods (.slice / .indexOf / .includes / .reverse)
+// -----------------------------------------------------------------------
+group('array methods', () => {
+  check('slice + join',
+    `var a=[1,2,3,4,5]; document.body.innerHTML = a.slice(1,3).join(',');`, '2,3');
+  check('indexOf on array',
+    `var a=['x','y','z']; document.body.innerHTML = 'at ' + a.indexOf('y');`, 'at 1');
+  check('includes on array',
+    `var a=['x','y','z']; document.body.innerHTML = 'has ' + a.includes('y');`, 'has true');
+  check('reverse + join',
+    `var a=['a','b','c']; document.body.innerHTML = a.reverse().join('');`, 'cba');
 });
 
 // -----------------------------------------------------------------------

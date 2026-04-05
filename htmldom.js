@@ -286,6 +286,7 @@
     'toUpperCase', 'toLowerCase', 'trim', 'trimStart', 'trimEnd', 'trimLeft', 'trimRight',
     'repeat', 'slice', 'substring', 'substr', 'charAt', 'indexOf', 'lastIndexOf',
     'includes', 'startsWith', 'endsWith', 'padStart', 'padEnd', 'toString',
+    'split', 'reverse',
   ]);
 
   const MATH_CONSTANTS = {
@@ -955,7 +956,7 @@
           if (isMethodCall) {
             const r = applyMethod(cur, lastSeg, next + 1, stop);
             if (!r) break;
-            bind = chainBinding(r.toks);
+            bind = r.binding ? r.binding : chainBinding(r.toks);
             next = r.next;
             continue;
           }
@@ -1036,10 +1037,57 @@
               case 'padStart': if (argVals.length <= 2) result = s.padStart(...argVals); break;
               case 'padEnd': if (argVals.length <= 2) result = s.padEnd(...argVals); break;
               case 'toString': if (argVals.length === 0) result = s; break;
+              case 'split': {
+                if (argVals.length === 1) {
+                  const parts = s.split(argVals[0]);
+                  return { toks: null, binding: arrayBinding(parts.map((p) => chainBinding([makeSynthStr(p)]))), next: args.next };
+                }
+                break;
+              }
             }
           } catch (_) { return null; }
           if (result === undefined) return null;
           return { toks: [makeSynthStr(result)], next: args.next };
+        }
+      }
+      // Array methods on known array bindings.
+      if (bind && bind.kind === 'array') {
+        const args = readConcatArgs(parenIdx, stop);
+        if (!args) return null;
+        const argVals = [];
+        let allConcrete = true;
+        for (const a of args.args) {
+          const ch = chainBinding(a);
+          const n = chainAsNumber(ch);
+          if (n !== null) { argVals.push(n); continue; }
+          const k = chainAsKnownString(ch);
+          if (k !== null) { argVals.push(k); continue; }
+          allConcrete = false; break;
+        }
+        if (!allConcrete) return null;
+        if (method === 'slice' && argVals.length <= 2) {
+          return { toks: null, binding: arrayBinding(bind.elems.slice(...argVals)), next: args.next };
+        }
+        if (method === 'indexOf' && argVals.length === 1) {
+          const target = argVals[0];
+          let idx = -1;
+          for (let i = 0; i < bind.elems.length; i++) {
+            const es = bind.elems[i] && bind.elems[i].kind === 'chain' ? chainAsKnownString(bind.elems[i]) : null;
+            if (es === target || (typeof target === 'number' && Number(es) === target)) { idx = i; break; }
+          }
+          return { toks: [makeSynthStr(String(idx))], next: args.next };
+        }
+        if (method === 'includes' && argVals.length === 1) {
+          const target = argVals[0];
+          let has = false;
+          for (const el of bind.elems) {
+            const es = el && el.kind === 'chain' ? chainAsKnownString(el) : null;
+            if (es === target || (typeof target === 'number' && Number(es) === target)) { has = true; break; }
+          }
+          return { toks: [makeSynthStr(String(has))], next: args.next };
+        }
+        if (method === 'reverse' && argVals.length === 0) {
+          return { toks: null, binding: arrayBinding(bind.elems.slice().reverse()), next: args.next };
         }
       }
       return null;
@@ -1148,7 +1196,7 @@
               const prefBind = resolvePath(prefix);
               if (prefBind) {
                 const r = applyMethod(prefBind, method, k + 1, stop);
-                if (r) return { bind: chainBinding(r.toks), next: r.next };
+                if (r) return { bind: r.binding ? r.binding : chainBinding(r.toks), next: r.next };
               }
             }
             // Fall through to the opaque-ident handling below for unknown
