@@ -791,6 +791,83 @@ group('class methods', () => {
 });
 
 // -----------------------------------------------------------------------
+// Object literal extensions (getters, method shorthand, shorthand props, computed keys)
+// -----------------------------------------------------------------------
+group('object extensions', () => {
+  check('getter method does not break object',
+    `const o={get html(){return 'x';}, msg:'ok'}; document.body.innerHTML=o.msg;`, 'ok');
+  check('method shorthand does not break object',
+    `const o={render(){return 'x';}, title:'T'}; document.body.innerHTML=o.title;`, 'T');
+  check('shorthand property',
+    `const title='Hello'; const o={title}; document.body.innerHTML=o.title;`, 'Hello');
+  check('computed key',
+    `const k='foo'; const o={[k]:'<p>'}; document.body.innerHTML=o.foo;`, '<p>');
+});
+
+// -----------------------------------------------------------------------
+// new / typeof / void / delete / await / yield
+// -----------------------------------------------------------------------
+group('keyword prefixes', () => {
+  check('new Constructor(args)',
+    `document.body.innerHTML = '<p>' + new Date().toString() + '</p>';`,
+    { html: '<p>__HDX0__</p>', autoSubs: [['__HDX0__', 'new Date().toString()']] });
+  check('typeof',
+    `document.body.innerHTML = '<p>' + typeof x + '</p>';`,
+    { html: '<p>__HDX0__</p>', autoSubs: [['__HDX0__', 'typeof x']] });
+  check('await fetch',
+    `async function f() { const x = await fetch('/a'); document.body.innerHTML = '<p>'+x+'</p>'; }`,
+    { html: '<p>__HDX0__</p>' });
+});
+
+// -----------------------------------------------------------------------
+// Object.keys/values/entries, JSON.stringify/parse
+// -----------------------------------------------------------------------
+group('Object/JSON builtins', () => {
+  check('Object.keys',
+    `const o={a:'x',b:'y'}; document.body.innerHTML = Object.keys(o).join(',');`, 'a,b');
+  check('Object.values',
+    `const o={a:1,b:2}; document.body.innerHTML = Object.values(o).join(',');`, '1,2');
+  check('Object.entries',
+    `const o={a:'1'}; document.body.innerHTML = Object.entries(o).map(e=>e[0]+'='+e[1]).join(',');`, 'a=1');
+  check('JSON.stringify object',
+    `const o={a:'x'}; document.body.innerHTML = JSON.stringify(o);`, '{"a":"x"}');
+  check('JSON.stringify array',
+    `document.body.innerHTML = JSON.stringify([1,2,3]);`, '[1,2,3]');
+  check('JSON.parse round-trip',
+    `const s='{"k":42}'; document.body.innerHTML = 'v=' + JSON.parse(s).k;`, 'v=42');
+});
+
+// -----------------------------------------------------------------------
+// Array.reduce
+// -----------------------------------------------------------------------
+group('array.reduce', () => {
+  check('sum',
+    `const a=[1,2,3,4]; document.body.innerHTML = a.reduce((acc,n)=>acc+n, 0) + '';`, '10');
+  check('concat strings',
+    `const a=['x','y','z']; document.body.innerHTML = a.reduce((acc,s)=>acc+s, '');`, 'xyz');
+});
+
+// -----------------------------------------------------------------------
+// Regex literals don't break tokenization
+// -----------------------------------------------------------------------
+group('regex literals', () => {
+  check('regex in replace call',
+    `var s='abc'; document.body.innerHTML = s.replace(/b/g,'X');`,
+    { html: '__HDX0__', autoSubs: [['__HDX0__', "s.replace(/b/g,'X')"]] });
+  check('regex variable does not crash',
+    `var re=/abc/i; document.body.innerHTML = '<p>ok</p>';`, '<p>ok</p>');
+});
+
+// -----------------------------------------------------------------------
+// Tagged template literals captured as opaque
+// -----------------------------------------------------------------------
+group('tagged template', () => {
+  check('tag`...` captured as opaque',
+    'document.body.innerHTML = html`<p>hi</p>`;',
+    { html: '__HDX0__', autoSubs: [['__HDX0__', 'html`<p>hi</p>`']] });
+});
+
+// -----------------------------------------------------------------------
 // Original iframe case from the feature request
 // -----------------------------------------------------------------------
 group('feature-request case', () => {
