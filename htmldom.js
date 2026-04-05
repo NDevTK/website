@@ -278,6 +278,16 @@
     'isNaN': isNaN, 'isFinite': isFinite,
     // String(x) can coerce any literal — kept separate so it handles strings.
   };
+  // Method names recognized on typed bindings (chain/array). Used by
+  // applySuffixes and readBase's attached-method detection to route to
+  // applyMethod for evaluation.
+  const KNOWN_METHODS = new Set([
+    'concat', 'join',
+    'toUpperCase', 'toLowerCase', 'trim', 'trimStart', 'trimEnd', 'trimLeft', 'trimRight',
+    'repeat', 'slice', 'substring', 'substr', 'charAt', 'indexOf', 'lastIndexOf',
+    'includes', 'startsWith', 'endsWith', 'padStart', 'padEnd', 'toString',
+  ]);
+
   const MATH_CONSTANTS = {
     'Math.PI': Math.PI, 'Math.E': Math.E, 'Math.LN2': Math.LN2, 'Math.LN10': Math.LN10,
     'Math.LOG2E': Math.LOG2E, 'Math.LOG10E': Math.LOG10E,
@@ -906,7 +916,7 @@
           const isCall = paren && paren.type === 'open' && paren.char === '(';
           const segs = t.text.slice(1).split('.');
           const lastSeg = segs[segs.length - 1];
-          const isMethodCall = isCall && (lastSeg === 'concat' || lastSeg === 'join');
+          const isMethodCall = isCall && KNOWN_METHODS.has(lastSeg);
           // Walk any leading property segments. Special-cases: `.length` on
           // a known array returns the element count; `.length` on a chain
           // whose operands are all string/template literals returns the
@@ -987,7 +997,73 @@
         }
         return { toks: out, next: parenIdx + 3 };
       }
+      // Pure string methods on a known chain string: evaluate when all args
+      // are concrete literals. Non-evaluatable cases return null.
+      if (bind && bind.kind === 'chain') {
+        const s = chainAsKnownString(bind);
+        if (s !== null) {
+          const args = readConcatArgs(parenIdx, stop);
+          if (!args) return null;
+          const argVals = [];
+          let allConcrete = true;
+          for (const a of args.args) {
+            const ch = chainBinding(a);
+            const n = chainAsNumber(ch);
+            if (n !== null) { argVals.push(n); continue; }
+            const k = chainAsKnownString(ch);
+            if (k !== null) { argVals.push(k); continue; }
+            allConcrete = false; break;
+          }
+          if (!allConcrete) return null;
+          let result;
+          try {
+            switch (method) {
+              case 'toUpperCase': if (argVals.length === 0) result = s.toUpperCase(); break;
+              case 'toLowerCase': if (argVals.length === 0) result = s.toLowerCase(); break;
+              case 'trim': if (argVals.length === 0) result = s.trim(); break;
+              case 'trimStart': case 'trimLeft': if (argVals.length === 0) result = s.trimStart(); break;
+              case 'trimEnd': case 'trimRight': if (argVals.length === 0) result = s.trimEnd(); break;
+              case 'repeat': if (argVals.length === 1) result = s.repeat(argVals[0]); break;
+              case 'slice': if (argVals.length <= 2) result = s.slice(...argVals); break;
+              case 'substring': if (argVals.length <= 2) result = s.substring(...argVals); break;
+              case 'substr': if (argVals.length <= 2) result = s.substr(...argVals); break;
+              case 'charAt': if (argVals.length === 1) result = s.charAt(argVals[0]); break;
+              case 'indexOf': if (argVals.length <= 2) result = String(s.indexOf(...argVals)); break;
+              case 'lastIndexOf': if (argVals.length <= 2) result = String(s.lastIndexOf(...argVals)); break;
+              case 'includes': if (argVals.length <= 2) result = String(s.includes(...argVals)); break;
+              case 'startsWith': if (argVals.length <= 2) result = String(s.startsWith(...argVals)); break;
+              case 'endsWith': if (argVals.length <= 2) result = String(s.endsWith(...argVals)); break;
+              case 'padStart': if (argVals.length <= 2) result = s.padStart(...argVals); break;
+              case 'padEnd': if (argVals.length <= 2) result = s.padEnd(...argVals); break;
+              case 'toString': if (argVals.length === 0) result = s; break;
+            }
+          } catch (_) { return null; }
+          if (result === undefined) return null;
+          return { toks: [makeSynthStr(result)], next: args.next };
+        }
+      }
       return null;
+    };
+
+    // Materialize a chain binding to its concrete string value if all of
+    // its operands are fully known string/template literals. Returns null
+    // otherwise (e.g. chain contains an opaque expression reference).
+    const chainAsKnownString = (chain) => {
+      if (!chain || chain.kind !== 'chain') return null;
+      let s = '';
+      for (const t of chain.toks) {
+        if (t.type === 'plus') continue;
+        if (t.type === 'str') { s += t.text; continue; }
+        if (t.type === 'tmpl') {
+          for (const p of t.parts) {
+            if (p.kind === 'text') s += decodeJsString(p.raw, '`');
+            else return null;
+          }
+          continue;
+        }
+        return null;
+      }
+      return s;
     };
 
     // Read a "base" value before any suffixes: literals, identifiers/paths
@@ -1067,15 +1143,16 @@
           const dot = t.text.lastIndexOf('.');
           if (dot > 0) {
             const method = t.text.slice(dot + 1);
-            if (method === 'concat' || method === 'join') {
+            if (KNOWN_METHODS.has(method)) {
               const prefix = t.text.slice(0, dot);
               const prefBind = resolvePath(prefix);
               if (prefBind) {
                 const r = applyMethod(prefBind, method, k + 1, stop);
                 if (r) return { bind: chainBinding(r.toks), next: r.next };
               }
-              return null;
             }
+            // Fall through to the opaque-ident handling below for unknown
+            // methods or unresolved prefixes.
           }
         }
         const b = resolvePath(t.text);

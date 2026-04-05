@@ -616,6 +616,26 @@ group('arithmetic', () => {
 });
 
 // -----------------------------------------------------------------------
+// String methods
+// -----------------------------------------------------------------------
+group('string methods', () => {
+  check('toUpperCase on var',
+    `var s='hello'; document.body.innerHTML = s.toUpperCase();`, 'HELLO');
+  check('trim on literal',
+    `document.body.innerHTML = '  hi  '.trim();`, 'hi');
+  check('repeat on literal',
+    `document.body.innerHTML = '#'.repeat(5);`, '#####');
+  check('slice on literal',
+    `document.body.innerHTML = 'abcdef'.slice(1, 4);`, 'bcd');
+  check('padStart with zeros',
+    `document.body.innerHTML = 'abc'.padStart(6, '0');`, '000abc');
+  check('chain toUpper + concat',
+    `var n='World'; document.body.innerHTML = 'Hello ' + n.toUpperCase();`, 'Hello WORLD');
+  check('String(num) then method',
+    `var n=42; document.body.innerHTML = String(n).padStart(5, '0');`, '00042');
+});
+
+// -----------------------------------------------------------------------
 // extractAllHTML: multiple innerHTML sinks
 // -----------------------------------------------------------------------
 (function () {
