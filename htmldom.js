@@ -263,6 +263,27 @@
   const IDENT_OR_PATH_RE = /^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*$/;
   const TEMPLATE_EXPR_PATH_RE = /^\s*[A-Za-z_$][A-Za-z0-9_$]*(?:\s*\.\s*[A-Za-z_$][A-Za-z0-9_$]*)*\s*$/;
 
+  // Pure global builtins whose values are fully determined by their numeric
+  // arguments. Called when a known identifier path ends in a `(...)` call
+  // whose args are all concrete numbers.
+  const BUILTINS = {
+    'Math.floor': Math.floor, 'Math.ceil': Math.ceil, 'Math.round': Math.round,
+    'Math.trunc': Math.trunc, 'Math.abs': Math.abs, 'Math.sqrt': Math.sqrt,
+    'Math.log': Math.log, 'Math.log2': Math.log2, 'Math.log10': Math.log10,
+    'Math.exp': Math.exp, 'Math.sin': Math.sin, 'Math.cos': Math.cos, 'Math.tan': Math.tan,
+    'Math.min': Math.min, 'Math.max': Math.max, 'Math.pow': Math.pow,
+    'Math.sign': Math.sign, 'Math.cbrt': Math.cbrt,
+    'parseInt': (s, r) => parseInt(s, r == null ? 10 : r),
+    'parseFloat': parseFloat, 'Number': Number, 'Boolean': Boolean,
+    'isNaN': isNaN, 'isFinite': isFinite,
+    // String(x) can coerce any literal — kept separate so it handles strings.
+  };
+  const MATH_CONSTANTS = {
+    'Math.PI': Math.PI, 'Math.E': Math.E, 'Math.LN2': Math.LN2, 'Math.LN10': Math.LN10,
+    'Math.LOG2E': Math.LOG2E, 'Math.LOG10E': Math.LOG10E,
+    'Math.SQRT2': Math.SQRT2, 'Math.SQRT1_2': Math.SQRT1_2,
+  };
+
   // A chain binding wraps an array of operand/plus tokens. Object and array
   // bindings hold named or indexed child bindings (each itself a chain,
   // object, or array) so member access and destructuring can walk into them.
@@ -998,6 +1019,38 @@
       if (IDENT_OR_PATH_RE.test(t.text)) {
         const paren = tks[k + 1];
         const isCall = paren && paren.type === 'open' && paren.char === '(';
+        // Known math/numeric constants like `Math.PI`.
+        if (!isCall && MATH_CONSTANTS[t.text] !== undefined) {
+          return { bind: chainBinding([makeSynthStr(String(MATH_CONSTANTS[t.text]))]), next: k + 1 };
+        }
+        // Known global builtin function call (numeric Math.*, parseInt...).
+        if (isCall && BUILTINS[t.text]) {
+          const args = readConcatArgs(k + 1, stop);
+          if (args) {
+            const nums = [];
+            let allNum = true;
+            for (const a of args.args) {
+              const ch = chainBinding(a);
+              const n = chainAsNumber(ch);
+              if (n === null) { allNum = false; break; }
+              nums.push(n);
+            }
+            if (allNum) {
+              const v = BUILTINS[t.text](...nums);
+              return { bind: chainBinding([makeSynthStr(String(v))]), next: args.next };
+            }
+          }
+        }
+        // `String(x)` coerces any literal to its string form.
+        if (isCall && t.text === 'String') {
+          const args = readConcatArgs(k + 1, stop);
+          if (args && args.args.length === 1) {
+            const ch = chainBinding(args.args[0]);
+            if (ch.toks.length === 1 && ch.toks[0].type === 'str') {
+              return { bind: ch, next: args.next };
+            }
+          }
+        }
         if (isCall) {
           const dot = t.text.lastIndexOf('.');
           if (dot > 0) {
