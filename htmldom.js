@@ -377,13 +377,39 @@
       }
       return null;
     };
-    // Walk a dotted path ('obj.a.b') into an object binding tree.
+    // Walk a dotted path ('obj.a.b') resolving into object/array/chain
+    // bindings. Handles `.length` specially on arrays and on chains whose
+    // operands are all known string/template literals.
     const resolvePath = (path) => {
       const parts = path.split('.');
       let b = resolve(parts[0]);
       for (let i = 1; i < parts.length && b; i++) {
-        if (b.kind !== 'object') return null;
-        b = b.props[parts[i]] || null;
+        const p = parts[i];
+        if (b.kind === 'object') {
+          b = b.props[p] || null;
+        } else if (p === 'length' && b.kind === 'array') {
+          b = chainBinding([makeSynthStr(String(b.elems.length))]);
+        } else if (p === 'length' && b.kind === 'chain') {
+          let n = 0; let ok = true;
+          for (const tk of b.toks) {
+            if (tk.type === 'plus') continue;
+            if (tk.type === 'str') { n += tk.text.length; continue; }
+            if (tk.type === 'tmpl') {
+              let hasExpr = false; let tl = 0;
+              for (const part of tk.parts) {
+                if (part.kind === 'text') tl += decodeJsString(part.raw, '`').length;
+                else { hasExpr = true; break; }
+              }
+              if (hasExpr) { ok = false; break; }
+              n += tl;
+              continue;
+            }
+            ok = false; break;
+          }
+          b = ok ? chainBinding([makeSynthStr(String(n))]) : null;
+        } else {
+          return null;
+        }
       }
       return b;
     };
@@ -849,12 +875,40 @@
           const segs = t.text.slice(1).split('.');
           const lastSeg = segs[segs.length - 1];
           const isMethodCall = isCall && (lastSeg === 'concat' || lastSeg === 'join');
-          // Walk any leading property segments into an object binding.
+          // Walk any leading property segments. Special-cases: `.length` on
+          // a known array returns the element count; `.length` on a chain
+          // whose operands are all string/template literals returns the
+          // concatenated string length.
           const propSegs = isMethodCall ? segs.slice(0, -1) : segs;
           let cur = bind;
           for (const p of propSegs) {
-            if (!cur || cur.kind !== 'object') { cur = null; break; }
-            cur = cur.props[p] || null;
+            if (!cur) break;
+            if (cur.kind === 'object') {
+              cur = cur.props[p] || null;
+            } else if (p === 'length' && cur.kind === 'array') {
+              cur = chainBinding([makeSynthStr(String(cur.elems.length))]);
+            } else if (p === 'length' && cur.kind === 'chain') {
+              let n = 0; let ok = true;
+              for (const tk of cur.toks) {
+                if (tk.type === 'plus') continue;
+                if (tk.type === 'str') { n += tk.text.length; continue; }
+                if (tk.type === 'tmpl') {
+                  let hasExpr = false; let tl = 0;
+                  for (const part of tk.parts) {
+                    if (part.kind === 'text') tl += decodeJsString(part.raw, '`').length;
+                    else { hasExpr = true; break; }
+                  }
+                  if (hasExpr) { ok = false; break; }
+                  n += tl;
+                  continue;
+                }
+                ok = false; break;
+              }
+              cur = ok ? chainBinding([makeSynthStr(String(n))]) : null;
+            } else {
+              cur = null;
+              break;
+            }
           }
           if (isMethodCall) {
             const r = applyMethod(cur, lastSeg, next + 1, stop);

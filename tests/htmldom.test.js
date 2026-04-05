@@ -558,6 +558,21 @@ group('loops', () => {
 });
 
 // -----------------------------------------------------------------------
+// .length on known arrays and strings
+// -----------------------------------------------------------------------
+group('.length', () => {
+  check('array.length',
+    `var arr=['a','b','c']; document.body.innerHTML = 'count: ' + arr.length;`, 'count: 3');
+  check('string.length via variable',
+    `var s='hello'; document.body.innerHTML = '<p>' + s.length + '</p>';`, '<p>5</p>');
+  check('length on object-array member',
+    `var o={items:['x','y','z','w']}; document.body.innerHTML = 'n='+o.items.length;`, 'n=4');
+  check('length on unknown stays opaque',
+    `document.body.innerHTML = 'n='+items.length;`,
+    { html: 'n=__HDX0__', autoSubs: [['__HDX0__', 'items.length']] });
+});
+
+// -----------------------------------------------------------------------
 // Ternary expressions and other operators (captured as opaque)
 // -----------------------------------------------------------------------
 group('ternary/operators', () => {
