@@ -556,6 +556,29 @@
   // walker can't statically predict its value at a given extraction
   // site, so we should resolve it as a name reference instead of its
   // initial literal.
+  // Parse a single function parameter starting at `k`. Returns
+  // `{ param: { name, defaultStart?, defaultEnd? }, next }` or null.
+  // `next` is the index after the param (points at `,` or `)`).
+  function parseParamWithDefault(tokens, k, stop) {
+    const nm = tokens[k];
+    if (!nm || nm.type !== 'other' || !IDENT_RE.test(nm.text)) return null;
+    let j = k + 1;
+    const sep = tokens[j];
+    if (sep && sep.type === 'sep' && sep.char === '=') {
+      const defStart = j + 1;
+      let d = 0; j = defStart;
+      while (j < stop) {
+        const tk = tokens[j];
+        if (tk.type === 'open') d++;
+        else if (tk.type === 'close') { if (d === 0) break; d--; }
+        else if (d === 0 && tk.type === 'sep' && tk.char === ',') break;
+        j++;
+      }
+      return { param: { name: nm.text, defaultStart: defStart, defaultEnd: j }, next: j };
+    }
+    return { param: { name: nm.text }, next: j };
+  }
+
   function scanMutations(tokens) {
     const declaredAt = Object.create(null);
     const mutatedAt = Object.create(null);
@@ -1047,6 +1070,21 @@
       while (i < stop) {
         const tk = tks[i];
         if (tk.type === 'close' && tk.char === '}') break;
+        // Spread: `...obj` merges a known object binding's props in.
+        if (tk.type === 'other' && tk.text.startsWith('...')) {
+          const name = tk.text.slice(3);
+          if (IDENT_OR_PATH_RE.test(name)) {
+            const b = resolvePath(name);
+            if (b && b.kind === 'object') {
+              for (const kk in b.props) props[kk] = b.props[kk];
+              i++;
+              const sep = tks[i];
+              if (sep && sep.type === 'sep' && sep.char === ',') { i++; continue; }
+              break;
+            }
+          }
+          return null;
+        }
         // Key: either a str token or an 'other' identifier (possibly with
         // an attached trailing ':').
         let keyName = null;
@@ -1107,6 +1145,21 @@
       while (i < stop) {
         const tk = tks[i];
         if (tk.type === 'close' && tk.char === ']') break;
+        // Spread: `...arr` splices a known array binding's elements in.
+        if (tk.type === 'other' && tk.text.startsWith('...')) {
+          const name = tk.text.slice(3);
+          if (IDENT_OR_PATH_RE.test(name)) {
+            const b = resolvePath(name);
+            if (b && b.kind === 'array') {
+              for (const e of b.elems) elems.push(e);
+              i++;
+              const sep = tks[i];
+              if (sep && sep.type === 'sep' && sep.char === ',') { i++; continue; }
+              break;
+            }
+          }
+          return null;
+        }
         const val = readValue(i, stop, TERMS_ARR);
         if (!val) return null;
         elems.push(val.binding);
@@ -1131,7 +1184,7 @@
       if (t.type === 'other' && IDENT_RE.test(t.text)) {
         const arrow = tks[k + 1];
         if (arrow && arrow.type === 'other' && arrow.text === '=>') {
-          return { params: [t.text], arrowNext: k + 2 };
+          return { params: [{ name: t.text }], arrowNext: k + 2 };
         }
         return null;
       }
@@ -1148,10 +1201,10 @@
         return null;
       }
       while (i < stop) {
-        const tk = tks[i];
-        if (!tk || tk.type !== 'other' || !IDENT_RE.test(tk.text)) return null;
-        params.push(tk.text);
-        i++;
+        const pt = parseParamWithDefault(tks, i, stop);
+        if (!pt) return null;
+        params.push(pt.param);
+        i = pt.next;
         const sep = tks[i];
         if (sep && sep.type === 'close' && sep.char === ')') { i++; break; }
         if (sep && sep.type === 'sep' && sep.char === ',') { i++; continue; }
@@ -1250,6 +1303,28 @@
       while (next < stop && bind) {
         const t = tks[next];
         if (!t) break;
+        // Optional chaining `?.`: access a property/index/call on `bind`
+        // the same way the non-optional form would. Drops the optional
+        // semantics because we never propagate null/undefined through
+        // the resolver anyway.
+        if (t.type === 'op' && t.text === '?.') {
+          const nt = tks[next + 1];
+          if (nt && nt.type === 'other' && IDENT_RE.test(nt.text)) {
+            const prop = nt.text;
+            if (bind.kind === 'object') bind = bind.props[prop] || null;
+            else if (prop === 'length' && bind.kind === 'array') bind = chainBinding([makeSynthStr(String(bind.elems.length))]);
+            else if (prop === 'length' && bind.kind === 'chain') {
+              const s = chainAsKnownString(bind);
+              bind = s === null ? null : chainBinding([makeSynthStr(String(s.length))]);
+            } else bind = null;
+            next += 2;
+            continue;
+          }
+          // `?.[expr]` or `?.(args)` — skip the `?.` and let the next
+          // iteration handle the bracket/call normally.
+          if (nt && nt.type === 'open' && (nt.char === '[' || nt.char === '(')) { next++; continue; }
+          break;
+        }
         // Bracket subscript: parse inner expression and use it as a key if
         // it folds to a numeric or string literal. Marks the subscript
         // result as unknown otherwise.
@@ -1643,14 +1718,24 @@
     const instantiateFunction = (fn, argToks) => {
       stack.push({ bindings: Object.create(null), isFunction: true });
       const frame = stack[stack.length - 1];
-      for (let p = 0; p < fn.params.length; p++) {
-        const a = argToks[p];
-        frame.bindings[fn.params[p]] = a ? chainBinding(a) : null;
-      }
       // Body indices are into the original `tokens` array; swap `tks` if we
       // happen to be evaluating a re-tokenized expression right now.
       const savedTks = tks;
       tks = tokens;
+      for (let p = 0; p < fn.params.length; p++) {
+        const pi = fn.params[p];
+        const a = argToks[p];
+        if (a) {
+          frame.bindings[pi.name] = chainBinding(a);
+        } else if (pi.defaultStart != null) {
+          // Evaluate the parameter's default expression in the current
+          // (call-site) scope so enclosing bindings can be referenced.
+          const r = readConcatExpr(pi.defaultStart, pi.defaultEnd, TERMS_NONE);
+          frame.bindings[pi.name] = (r && r.next === pi.defaultEnd) ? chainBinding(r.toks) : null;
+        } else {
+          frame.bindings[pi.name] = null;
+        }
+      }
       let result = null;
       if (fn.isBlock) {
         // Look for a top-level `return <expr>;` in the block.
@@ -1852,10 +1937,15 @@
       // we decline here and let the caller (concat-chain parser) handle it
       // as string concatenation.
       if (op === '+') return null;
-      // Short-circuit on known truthy/falsy for logical operators, even when
-      // only one side is a concrete number.
-      if (op === '&&' && lNum === 0) return chainBinding([makeSynthStr('0')]);
-      if (op === '||' && lNum !== null && lNum !== 0) return chainBinding([makeSynthStr(String(lNum))]);
+      // Short-circuit logical/nullish operators using whichever concrete
+      // value (number or string) the left-hand side has.
+      const lStr = lNum === null ? chainAsKnownString(left) : null;
+      const lTruthy = (lNum !== null && lNum !== 0) || (lStr !== null && lStr !== '' && lStr !== 'false' && lStr !== 'null' && lStr !== 'undefined' && lStr !== '0' && lStr !== 'NaN');
+      const lFalsy = lNum === 0 || lStr === '' || lStr === 'false' || lStr === 'null' || lStr === 'undefined' || lStr === '0' || lStr === 'NaN';
+      const lNullish = lStr === 'null' || lStr === 'undefined';
+      if (op === '&&') { if (lFalsy) return left; if (lTruthy) return right; }
+      else if (op === '||') { if (lTruthy) return left; if (lFalsy) return right; }
+      else if (op === '??') { if (lNullish) return right; if (lStr !== null || lNum !== null) return left; }
       // Symbolic: combine texts.
       const lt = chainAsExprText(left);
       const rt = chainAsExprText(right);
@@ -2030,8 +2120,8 @@
           // uses within the body surface via autoSubs when the body is
           // parsed in scope (e.g. for an innerHTML assignment inside the
           // function). At call sites, instantiateFunction rebinds them.
-          for (const name of pendingFunctionParams) {
-            frame.bindings[name] = chainBinding([exprRef(name)]);
+          for (const p of pendingFunctionParams) {
+            frame.bindings[p.name] = chainBinding([exprRef(p.name)]);
           }
         }
         stack.push(frame);
@@ -2133,10 +2223,10 @@
           else {
             let ok = true;
             while (j < stop) {
-              const tk = tokens[j];
-              if (!tk || tk.type !== 'other' || !IDENT_RE.test(tk.text)) { ok = false; break; }
-              params.push(tk.text);
-              j++;
+              const pt = parseParamWithDefault(tokens, j, stop);
+              if (!pt) { ok = false; break; }
+              params.push(pt.param);
+              j = pt.next;
               const sep = tokens[j];
               if (sep && sep.type === 'close' && sep.char === ')') { j++; break; }
               if (sep && sep.type === 'sep' && sep.char === ',') { j++; continue; }
@@ -2586,7 +2676,16 @@
       if (c === '+' && src[i + 1] !== '+' && src[i + 1] !== '=') { push({ type: 'plus', start: i, end: i + 1 }); i++; continue; }
       if (c === ',' || c === ';') { push({ type: 'sep', char: c, start: i, end: i + 1 }); i++; continue; }
       if (c === ':') { push({ type: 'other', text: ':', start: i, end: i + 1 }); i++; continue; }
-      if (c === '?') { push({ type: 'other', text: '?', start: i, end: i + 1 }); i++; continue; }
+      if (c === '?') {
+        // Multi-char tokens starting with '?': `??` (nullish coalescing)
+        // and `?.` (optional chaining; ignore `?.<digit>` which is a
+        // ternary followed by a decimal number).
+        if (src[i + 1] === '?') { push({ type: 'op', text: '??', start: i, end: i + 2 }); i += 2; continue; }
+        if (src[i + 1] === '.' && !/[0-9]/.test(src[i + 2] || '')) {
+          push({ type: 'op', text: '?.', start: i, end: i + 2 }); i += 2; continue;
+        }
+        push({ type: 'other', text: '?', start: i, end: i + 1 }); i++; continue;
+      }
       // Assignment operators (including compound) act as chain terminators.
       {
         const assigns = ['**=', '<<=', '>>>=', '>>=', '&&=', '||=', '??=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^='];
@@ -2613,7 +2712,7 @@
       if (c === ')' || c === ']' || c === '}') { push({ type: 'close', char: c, start: i, end: i + 1 }); i++; continue; }
       // Multi-char arithmetic/comparison/bitwise/logical operators.
       {
-        const multiOps = ['===', '!==', '>>>', '**', '<<', '>>', '<=', '>=', '==', '!=', '&&', '||', '??', '++', '--'];
+        const multiOps = ['===', '!==', '>>>', '**', '<<', '>>', '<=', '>=', '==', '!=', '&&', '||', '??', '?.', '++', '--'];
         let matched = false;
         for (const op of multiOps) {
           if (src.startsWith(op, i)) { push({ type: 'op', text: op, start: i, end: i + op.length }); i += op.length; matched = true; break; }
@@ -3026,21 +3125,47 @@
 
   function convert() {
     const raw = $('in').value;
+    const blocks = [];
     const extractions = extractAllHTML(raw);
     if (extractions.length === 0) {
-      // No innerHTML/outerHTML assignments — fall back to single-input
-      // extraction so raw HTML inputs and `<` snippets still work.
-      convertOne(raw, extractHTML(raw), /*multi=*/false, /*emitTitle=*/false);
-      return;
+      // No innerHTML/outerHTML assignments — if the script builds DOM
+      // via createElement/appendChild, summarize what it constructs;
+      // otherwise fall back to the single-input extractor for raw
+      // HTML snippets.
+      const summary = summarizeDomConstruction(raw);
+      if (summary) blocks.push(summary);
+      else blocks.push(convertOne(raw, extractHTML(raw), false, false));
+    } else {
+      const multi = extractions.length > 1;
+      for (const ex of extractions) blocks.push(convertOne(raw, ex, multi, multi));
     }
-    const out = [];
-    for (let i = 0; i < extractions.length; i++) {
-      const ex = extractions[i];
-      const block = convertOne(raw, ex, /*multi=*/extractions.length > 1, /*emitTitle=*/extractions.length > 1);
-      if (i > 0) out.push('');
-      out.push(block);
+    $('out').value = blocks.filter((b) => b).join('\n\n');
+  }
+
+  // Summarize the DOM tree the script constructs via createElement /
+  // appendChild / setAttribute as HTML comments. The script's own code
+  // is already safe (no innerHTML), so there's nothing to rewrite; the
+  // summary shows what the user ends up building.
+  function summarizeDomConstruction(raw) {
+    const dom = extractAllDOM(raw);
+    if (!dom || !dom.roots || !dom.roots.length) return '';
+    const hasCreate = dom.ops && dom.ops.some((o) => o.op === 'create' || o.op === 'createTextNode');
+    if (!hasCreate) return '';
+    const lines = ['// === DOM construction (already safe; summary only) ==='];
+    for (const root of dom.roots) {
+      if (root.kind === 'textNode') continue;
+      if (!root.origin || root.origin.kind !== 'create') continue;
+      lines.push('//   ' + (dom.html[root.id] || '').replace(/\n/g, ' '));
     }
-    $('out').value = out.join('\n');
+    // Show what the attached children of looked-up elements become.
+    for (const el of dom.elements) {
+      if (el.kind !== 'element') continue;
+      if (!el.origin || el.origin.kind !== 'lookup') continue;
+      if (!el.children.length) continue;
+      const where = '#' + el.origin.value + (el.origin.by === 'selector' ? ' (query)' : '');
+      lines.push('//   ' + where + ' receives: ' + (dom.html[el.id] || '').replace(/\n/g, ' '));
+    }
+    return lines.length > 1 ? lines.join('\n') : '';
   }
 
   // Produce the DOM-API code block for a single innerHTML/outerHTML
