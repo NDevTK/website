@@ -573,24 +573,64 @@
       }
     }
 
-    // Children — use textContent shortcut when single text child and no substitution.
+    // <noscript>: with scripting enabled, the HTML parser stores children as
+    // raw text. DOMParser parses with scripting disabled, so children are real
+    // nodes — serialize them back to text to match runtime semantics.
+    if (tag === 'noscript' && ns !== SVG_NS && ns !== MATHML_NS) {
+      const text = node.innerHTML;
+      if (text !== '') {
+        lines.push(v + '.textContent = ' + jsStr(text, opts.subs).code + ';');
+      }
+      lines.push(parentVar + '.appendChild(' + v + ');');
+      return;
+    }
+
     // <template> holds its parsed subtree on `.content` (a DocumentFragment),
     // not on childNodes. Recurse into that fragment instead.
-    let children;
     if (tag === 'template' && node.content) {
-      children = Array.from(node.content.childNodes);
-      if (children.length) {
-        // Append into the template's content fragment rather than the element itself.
-        const childNs = null;
-        for (const child of children) {
-          convertNode(child, v + '.content', lines, used, opts, childNs);
+      const tplChildren = Array.from(node.content.childNodes);
+      for (const child of tplChildren) {
+        convertNode(child, v + '.content', lines, used, opts, null);
+      }
+      lines.push(parentVar + '.appendChild(' + v + ');');
+      return;
+    }
+
+    let children = Array.from(node.childNodes);
+
+    // Declarative Shadow DOM: if a direct child is <template shadowrootmode="…">,
+    // attach a shadow root on this element and recurse the template content
+    // into the shadow root instead. Only the first such template is honored,
+    // matching the HTML parser.
+    let shadowTpl = null;
+    if (ns !== SVG_NS && ns !== MATHML_NS) {
+      for (let i = 0; i < children.length; i++) {
+        const c = children[i];
+        if (c.nodeType !== 1) continue;
+        if (c.tagName === 'TEMPLATE' && c.getAttribute && c.getAttribute('shadowrootmode')) {
+          shadowTpl = c;
+          children.splice(i, 1);
         }
-        lines.push(parentVar + '.appendChild(' + v + ');');
-        return;
+        break;
       }
     }
-    children = Array.from(node.childNodes);
-    if (opts.textContentShortcut &&
+    if (shadowTpl) {
+      const mode = shadowTpl.getAttribute('shadowrootmode');
+      const initParts = ['mode: ' + jsStr(mode).code];
+      if (shadowTpl.hasAttribute('shadowrootdelegatesfocus')) initParts.push('delegatesFocus: true');
+      if (shadowTpl.hasAttribute('shadowrootserializable')) initParts.push('serializable: true');
+      if (shadowTpl.hasAttribute('shadowrootclonable')) initParts.push('clonable: true');
+      const sv = makeVar('shadow', used);
+      lines.push('const ' + sv + ' = ' + v + '.attachShadow({ ' + initParts.join(', ') + ' });');
+      if (shadowTpl.content) {
+        for (const c of shadowTpl.content.childNodes) {
+          convertNode(c, sv, lines, used, opts, null);
+        }
+      }
+    }
+
+    // Children — use textContent shortcut when single text child and no substitution.
+    if (!shadowTpl && opts.textContentShortcut &&
         children.length === 1 &&
         children[0].nodeType === 3 &&
         tag !== 'script' && tag !== 'style') {
