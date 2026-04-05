@@ -88,6 +88,54 @@
   // embedded via string concatenation or template-literal interpolation, and
   // `target` is the detected parent element expression from an
   // `X.innerHTML = ...` (or outerHTML) assignment, or null if none was found.
+  // Extract every `X.innerHTML`/`X.outerHTML` assignment in the input,
+  // returning an array of extraction results in source order. Each result
+  // has the same shape as `extractHTML`'s return value.
+  function extractAllHTML(input) {
+    const trimmed = input.trim();
+    if (!trimmed) return [];
+    const tokens = tokenize(trimmed);
+    const assigns = findAllHtmlAssignments(tokens);
+    return assigns.map((assign) => extractOneAssignment(tokens, assign));
+  }
+
+  // Produce an { html, autoSubs, target, assignProp, assignOp, ... } record
+  // for a single innerHTML/outerHTML assignment located in `tokens`.
+  function extractOneAssignment(tokens, assign) {
+    const target = assign.target;
+    const assignProp = assign.prop;
+    const assignOp = assign.op;
+    const r = resolveIdentifiers(tokens, assign.rhsStart, assign.rhsEnd);
+    if (r.parsed) {
+      const m = materializeFlatChain(r.tokens, r.loopInfo);
+      // Keep only loopVars whose name is still in scope at this assignment
+      // site (so loop-built variables from sibling functions don't leak).
+      if (r.loopVars && r.loopVars.length && r.inScope) {
+        const kept = r.loopVars.filter((lv) => r.inScope(lv.name));
+        if (kept.length) {
+          m.loopVars = kept.map((lv) => {
+            const mv = materializeFlatChain(lv.chain, r.loopInfo);
+            return Object.assign({ name: lv.name, loop: lv.loop }, mv);
+          });
+        }
+      }
+      return Object.assign(m, { target, assignProp, assignOp });
+    }
+    const chain = findBestConcatChain(r.tokens);
+    if (chain) return Object.assign(chain, { target, assignProp, assignOp });
+    let best = null;
+    for (const t of r.tokens) {
+      if (t.type === 'str' || t.type === 'tmpl') {
+        const { html, autoSubs } = materializeStringToken(t, 0);
+        if (/</.test(html) && (!best || html.length > best.html.length)) {
+          best = { html, autoSubs };
+        }
+      }
+    }
+    if (best) return Object.assign(best, { target, assignProp, assignOp });
+    return { html: '', autoSubs: [], target, assignProp, assignOp };
+  }
+
   function extractHTML(input) {
     const trimmed = input.trim();
     if (!trimmed) return { html: '', autoSubs: [], target: null };
@@ -109,23 +157,9 @@
     // references) become a valid { html, autoSubs } pair.
     let searchTokens;
     if (assign) {
-      const r = resolveIdentifiers(tokens, assign.rhsStart, assign.rhsEnd);
-      searchTokens = r.tokens;
-      if (r.parsed) {
-        const m = materializeFlatChain(searchTokens, r.loopInfo);
-        // Materialize each loop-built variable into its own { html, autoSubs }
-        // so the caller can emit the corresponding pre-computation loops.
-        if (r.loopVars && r.loopVars.length) {
-          m.loopVars = r.loopVars.map((lv) => {
-            const mv = materializeFlatChain(lv.chain, r.loopInfo);
-            return Object.assign({ name: lv.name, loop: lv.loop }, mv);
-          });
-        }
-        return Object.assign(m, { target, assignProp, assignOp });
-      }
-    } else {
-      searchTokens = tokens;
+      return extractOneAssignment(tokens, assign);
     }
+    searchTokens = tokens;
 
     const chain = findBestConcatChain(searchTokens);
     if (chain) return Object.assign(chain, { target, assignProp, assignOp });
@@ -157,28 +191,29 @@
   // target across several tokens; we reconstruct the full expression by
   // walking back through balanced parens/brackets.
   function findHtmlAssignment(tokens) {
+    const all = findAllHtmlAssignments(tokens);
+    return all.length ? all[0] : null;
+  }
+
+  // Find every `X.innerHTML`/`X.outerHTML` `=` / `+=` assignment in the
+  // token stream. Returns an array in source order.
+  function findAllHtmlAssignments(tokens) {
+    const out = [];
     for (let i = 1; i < tokens.length; i++) {
       const t = tokens[i];
       if (t.type !== 'sep') continue;
       if (t.char !== '=' && t.char !== '+=') continue;
       const prev = tokens[i - 1];
       if (!prev || prev.type !== 'other') continue;
-      // The trailing accessor must look like `.innerHTML` / `.outerHTML` or
-      // `<something>.innerHTML` (simple member chain lumped in one token).
       const trail = prev.text.match(/^(.*)\.(innerHTML|outerHTML)$/);
       if (!trail) continue;
       const prop = trail[2];
       let target = trail[1];
-      let k = i - 2;
-      // If the accessor stood alone (`.innerHTML`), walk back through a
-      // balanced call/index expression to capture the real target.
       if (target === '') {
         const r = reconstructTarget(tokens, i - 1);
         if (!r) continue;
         target = r;
-        k = i - 2; // unused; walk-back is already captured in r
       }
-      // Find the end of the RHS: next top-level `;` or `,` separator, else EOF.
       let depth = 0;
       let rhsEnd = tokens.length;
       for (let j = i + 1; j < tokens.length; j++) {
@@ -190,11 +225,9 @@
           break;
         }
       }
-      return { target, prop, op: t.char, rhsStart: i + 1, rhsEnd };
-      // (`k` is referenced only to silence lints if re-added later.)
-      void k;
+      out.push({ target, prop, op: t.char, rhsStart: i + 1, rhsEnd });
     }
-    return null;
+    return out;
   }
 
   // Given the token index of the trailing `.innerHTML`/`.outerHTML` accessor,
@@ -209,7 +242,7 @@
       const tk = tokens[j];
       if (tk.type === 'close') { depth++; j--; continue; }
       if (tk.type === 'open') {
-        if (depth === 0) return null;
+        if (depth === 0) break;
         depth--; j--; continue;
       }
       if (depth > 0) { j--; continue; }
@@ -1360,7 +1393,11 @@
       return r.toks;
     };
 
-    return { resolve, resolvePath, parseRange, rewriteTemplate, loopInfo, loopVars };
+    const inScope = (name) => {
+      for (let i = stack.length - 1; i >= 0; i--) if (name in stack[i].bindings) return true;
+      return false;
+    };
+    return { resolve, resolvePath, parseRange, rewriteTemplate, loopInfo, loopVars, inScope };
   }
 
   function hasBinding(stack, name) {
@@ -1376,7 +1413,7 @@
   function resolveIdentifiers(tokens, startIdx, endIdx) {
     const state = buildScopeState(tokens, startIdx);
     const full = state.parseRange(startIdx, endIdx);
-    if (full) return { tokens: full, parsed: true, loopInfo: state.loopInfo, loopVars: state.loopVars };
+    if (full) return { tokens: full, parsed: true, loopInfo: state.loopInfo, loopVars: state.loopVars, inScope: state.inScope };
     const out = [];
     for (let i = startIdx; i < endIdx; i++) {
       const t = tokens[i];
@@ -1391,7 +1428,7 @@
       }
       out.push(t);
     }
-    return { tokens: out, parsed: false, loopInfo: state.loopInfo, loopVars: state.loopVars };
+    return { tokens: out, parsed: false, loopInfo: state.loopInfo, loopVars: state.loopVars, inScope: state.inScope };
   }
 
   // Materialize a flat concat chain (tokens alternating operand/plus) into
@@ -1618,6 +1655,8 @@
       }
       if (c === '+' && src[i + 1] !== '+' && src[i + 1] !== '=') { push({ type: 'plus', start: i, end: i + 1 }); i++; continue; }
       if (c === ',' || c === ';') { push({ type: 'sep', char: c, start: i, end: i + 1 }); i++; continue; }
+      if (c === ':') { push({ type: 'other', text: ':', start: i, end: i + 1 }); i++; continue; }
+      if (c === '?') { push({ type: 'other', text: '?', start: i, end: i + 1 }); i++; continue; }
       // Assignment operators (including compound) act as chain terminators.
       {
         const assigns = ['**=', '<<=', '>>>=', '>>=', '&&=', '||=', '??=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^='];
@@ -1651,6 +1690,8 @@
         if (ch === '+' && src[i + 1] !== '+') break;
         if (ch === ',' || ch === ';') break;
         if (ch === '=') break;
+        if (ch === ':') break;
+        if (ch === '?') break;
         if (ch === '(' || ch === ')' || ch === '[' || ch === ']' || ch === '{' || ch === '}') break;
         if (ch === '/' && (src[i + 1] === '/' || src[i + 1] === '*')) break;
         i++;

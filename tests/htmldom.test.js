@@ -22,15 +22,16 @@ global.DOMParser = class {
 };
 
 // Load htmldom.js and expose its internal extractHTML via globalThis by
-// splicing an export line into the source before eval.
+// splicing export lines into the source before eval.
 const src = fs.readFileSync(path.join(__dirname, '..', 'htmldom.js'), 'utf8');
 const patched = src.replace(
   'function extractHTML(input) {',
-  'globalThis.__extractHTML = extractHTML;\n  function extractHTML(input) {'
+  'globalThis.__extractHTML = extractHTML;\n  globalThis.__extractAllHTML = extractAllHTML;\n  function extractHTML(input) {'
 );
 // eslint-disable-next-line no-eval
 eval(patched);
 const extractHTML = globalThis.__extractHTML;
+const extractAllHTML = globalThis.__extractAllHTML;
 
 // Test harness.
 let pass = 0;
@@ -555,6 +556,44 @@ group('loops', () => {
     { html: '__HDLOOP0S__<p>__HDX0__</p>__HDLOOP0E__',
       target: 'out', autoSubs: [['__HDX0__', 'i']] });
 });
+
+// -----------------------------------------------------------------------
+// Ternary expressions and other operators (captured as opaque)
+// -----------------------------------------------------------------------
+group('ternary/operators', () => {
+  check('ternary captured as opaque',
+    `document.body.innerHTML = '<a>' + (cond ? '<b>' : '<c>') + '</a>';`,
+    { html: '<a>__HDX0__</a>', autoSubs: [['__HDX0__', "cond ? '<b>' : '<c>'"]] });
+  check('bitwise expression captured as opaque',
+    `document.body.innerHTML = '<x>' + (a|0) + '</x>';`,
+    { html: '<x>__HDX0__</x>', autoSubs: [['__HDX0__', 'a|0']] });
+  check('logical OR default captured as opaque',
+    `document.body.innerHTML = '<x>' + (name || 'anon') + '</x>';`,
+    { html: '<x>__HDX0__</x>', autoSubs: [['__HDX0__', "name || 'anon'"]] });
+});
+
+// -----------------------------------------------------------------------
+// extractAllHTML: multiple innerHTML sinks
+// -----------------------------------------------------------------------
+(function () {
+  console.log('\nextractAllHTML');
+  console.log('--------------');
+  const script = `
+    function write() { out.innerHTML = '<a>' + url + '</a>'; }
+    function setup() { table.innerHTML = '<tr><th>Hi</th></tr>'; }
+    function log(s) { document.getElementById('nums').innerHTML += '<br>' + s; }
+  `;
+  const all = extractAllHTML(script);
+  const before = pass + fail;
+  if (all.length === 3) pass++; else { fail++; failures.push({ name: 'all length', got: all.length }); }
+  if (all[0] && all[0].target === 'out' && /<a>__HDX0__<\/a>/.test(all[0].html)) pass++;
+  else { fail++; failures.push({ name: 'all[0]', got: all[0] }); }
+  if (all[1] && all[1].target === 'table' && all[1].html === '<tr><th>Hi</th></tr>') pass++;
+  else { fail++; failures.push({ name: 'all[1]', got: all[1] }); }
+  if (all[2] && all[2].target === `document.getElementById('nums')` && all[2].assignOp === '+=' && /<br>__HDX0__/.test(all[2].html)) pass++;
+  else { fail++; failures.push({ name: 'all[2]', got: all[2] }); }
+  console.log(`  (${pass + fail - before} cases)`);
+})();
 
 // -----------------------------------------------------------------------
 // Original iframe case from the feature request
