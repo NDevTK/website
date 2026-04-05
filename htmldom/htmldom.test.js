@@ -388,6 +388,90 @@ group('Array builtins', () => {
 });
 
 // -----------------------------------------------------------------------
+// String methods: replace/replaceAll/at
+// -----------------------------------------------------------------------
+group('string methods extended', () => {
+  check('replace literal',
+    `document.body.innerHTML = 'hello world'.replace('world', 'js');`, 'hello js');
+  check('replaceAll literal',
+    `document.body.innerHTML = 'aXbXc'.replaceAll('X', '-');`, 'a-b-c');
+  check('at negative index',
+    `document.body.innerHTML = 'abc'.at(-1);`, 'c');
+  check('charCodeAt',
+    `document.body.innerHTML = 'A'.charCodeAt(0);`, '65');
+});
+
+// -----------------------------------------------------------------------
+// Array methods extended
+// -----------------------------------------------------------------------
+group('array methods extended', () => {
+  check('find with predicate',
+    `var a=[1,2,3]; document.body.innerHTML = a.find(x => x > 1);`, '2');
+  check('findIndex with predicate',
+    `var a=[1,2,3]; document.body.innerHTML = a.findIndex(x => x > 1);`, '1');
+  check('some true',
+    `var a=[1,2,3]; document.body.innerHTML = a.some(x => x > 2);`, 'true');
+  check('some false',
+    `var a=[1,2,3]; document.body.innerHTML = a.some(x => x > 5);`, 'false');
+  check('every true',
+    `var a=[1,2,3]; document.body.innerHTML = a.every(x => x > 0);`, 'true');
+  check('every false',
+    `var a=[1,2,3]; document.body.innerHTML = a.every(x => x > 1);`, 'false');
+  check('concat arrays',
+    `var a=[1,2]; var b=[3,4]; document.body.innerHTML = a.concat(b).join(',');`, '1,2,3,4');
+  check('concat inline arrays',
+    `document.body.innerHTML = [1,2].concat([3],[4,5]).join(',');`, '1,2,3,4,5');
+  check('flat nested',
+    `var a=[[1,2],[3,4]]; document.body.innerHTML = a.flat().join(',');`, '1,2,3,4');
+  check('fill range',
+    `var a=[1,2,3]; document.body.innerHTML = a.fill(0,1,2).join(',');`, '1,0,3');
+  check('splice at statement level',
+    `var a=[1,2,3]; a.splice(1,1,'x'); document.body.innerHTML = a.join(',');`, '1,x,3');
+  check('at negative',
+    `var a=['a','b','c']; document.body.innerHTML = a.at(-1);`, 'c');
+  check('flatMap',
+    `var a=[1,2,3]; document.body.innerHTML = a.flatMap(x => [x, x*2]).join(',');`, '1,2,2,4,3,6');
+  check('sort at statement level',
+    `var a=['c','a','b']; a.sort(); document.body.innerHTML = a.join(',');`, 'a,b,c');
+  check('reverse at statement level',
+    `var a=[1,2,3]; a.reverse(); document.body.innerHTML = a.join(',');`, '3,2,1');
+});
+
+// -----------------------------------------------------------------------
+// Object builtins
+// -----------------------------------------------------------------------
+group('Object builtins', () => {
+  check('Object.assign via expression',
+    `var a={x:1}; var c = Object.assign(a,{y:2}); document.body.innerHTML = c.x + ',' + c.y;`, '1,2');
+  check('Object.fromEntries',
+    `var o = Object.fromEntries([['a','1'],['b','2']]); document.body.innerHTML = o.a + o.b;`, '12');
+});
+
+// -----------------------------------------------------------------------
+// switch / try-catch
+// -----------------------------------------------------------------------
+group('control flow', () => {
+  check('switch concrete match',
+    `var x = 'b'; var r = ''; switch(x) { case 'a': r = 'A'; break; case 'b': r = 'B'; break; } document.body.innerHTML = r;`, 'B');
+  check('switch default',
+    `var x = 'z'; var r = ''; switch(x) { case 'a': r = 'A'; break; default: r = 'D'; } document.body.innerHTML = r;`, 'D');
+  check('try-catch walks try body',
+    `var a = 'init'; try { a = 'tried'; } catch(e) {} document.body.innerHTML = a;`, 'tried');
+});
+
+// -----------------------------------------------------------------------
+// Number vs string + operator
+// -----------------------------------------------------------------------
+group('number/string distinction', () => {
+  check('number + number = numeric add',
+    `document.body.innerHTML = 1 + 2;`, '3');
+  check('string + string = concat',
+    `var x = '1'; var y = '2'; document.body.innerHTML = x + y;`, '12');
+  check('string + number = concat',
+    `document.body.innerHTML = 'a' + 1;`, 'a1');
+});
+
+// -----------------------------------------------------------------------
 // Template literal interpolation resolution
 // -----------------------------------------------------------------------
 group('template interpolation', () => {
