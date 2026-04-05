@@ -83,22 +83,33 @@
 
   function $(id) { return document.getElementById(id); }
 
-  // Extract HTML from input. Returns { html, autoSubs } where autoSubs is a list
-  // of [placeholder, originalExpression] pairs for JS expressions embedded via
-  // string concatenation or template-literal interpolation.
+  // Extract HTML from input. Returns { html, autoSubs, target } where autoSubs
+  // is a list of [placeholder, originalExpression] pairs for JS expressions
+  // embedded via string concatenation or template-literal interpolation, and
+  // `target` is the detected parent element expression from an
+  // `X.innerHTML = ...` (or outerHTML) assignment, or null if none was found.
   function extractHTML(input) {
     const trimmed = input.trim();
-    if (!trimmed) return { html: '', autoSubs: [] };
-    if (trimmed.startsWith('<')) return { html: trimmed, autoSubs: [] };
+    if (!trimmed) return { html: '', autoSubs: [], target: null };
+    if (trimmed.startsWith('<')) return { html: trimmed, autoSubs: [], target: null };
 
     const tokens = tokenize(trimmed);
-    const chain = findBestConcatChain(tokens);
-    if (chain) return chain;
+
+    // If there's an `X.innerHTML = ...` / `X.outerHTML = ...` assignment,
+    // restrict HTML extraction to the right-hand side and surface the target.
+    const assign = findHtmlAssignment(tokens);
+    const searchTokens = assign ? tokens.slice(assign.rhsStart, assign.rhsEnd) : tokens;
+    const target = assign ? assign.target : null;
+    const assignProp = assign ? assign.prop : null;
+    const assignOp = assign ? assign.op : null;
+
+    const chain = findBestConcatChain(searchTokens);
+    if (chain) return Object.assign(chain, { target, assignProp, assignOp });
 
     // Fallback: pick the single string/template literal with the most HTML-ish
     // content.
     let best = null;
-    for (const t of tokens) {
+    for (const t of searchTokens) {
       if (t.type === 'str' || t.type === 'tmpl') {
         const { html, autoSubs } = materializeStringToken(t, 0);
         if (/</.test(html) && (!best || html.length > best.html.length)) {
@@ -106,8 +117,43 @@
         }
       }
     }
-    if (best) return best;
-    return { html: trimmed, autoSubs: [] };
+    if (best) return Object.assign(best, { target, assignProp, assignOp });
+    // If an assignment target was identified but its RHS held no HTML,
+    // don't fall back to scanning the whole input — that would graft
+    // unrelated HTML from elsewhere (e.g. `x='<iframe>'`) onto the target.
+    if (assign) return { html: '', autoSubs: [], target, assignProp, assignOp };
+    return { html: trimmed, autoSubs: [], target: null, assignProp: null, assignOp: null };
+  }
+
+  // Find the first top-level `<expr>.innerHTML = ...` / `.outerHTML = ...` /
+  // `.innerHTML += ...` assignment in the token stream. Returns
+  // { target, rhsStart, rhsEnd } or null. The tokenizer lumps identifier
+  // chains like `document.body.innerHTML` into a single `other` token, so we
+  // just inspect the preceding token before an `=` / `+=` separator.
+  function findHtmlAssignment(tokens) {
+    for (let i = 1; i < tokens.length; i++) {
+      const t = tokens[i];
+      if (t.type !== 'sep') continue;
+      if (t.char !== '=' && t.char !== '+=') continue;
+      const prev = tokens[i - 1];
+      if (!prev || prev.type !== 'other') continue;
+      const m = prev.text.match(/^(.+)\.(innerHTML|outerHTML)$/);
+      if (!m) continue;
+      // Find the end of the RHS: next top-level `;` or `,` separator, else EOF.
+      let depth = 0;
+      let rhsEnd = tokens.length;
+      for (let j = i + 1; j < tokens.length; j++) {
+        const tk = tokens[j];
+        if (tk.type === 'open') depth++;
+        else if (tk.type === 'close') depth--;
+        else if (depth === 0 && tk.type === 'sep' && (tk.char === ';' || tk.char === ',')) {
+          rhsEnd = j;
+          break;
+        }
+      }
+      return { target: m[1], prop: m[2], op: t.char, rhsStart: i + 1, rhsEnd };
+    }
+    return null;
   }
 
   const EXPR_PREFIX = '__HDX';
@@ -309,7 +355,7 @@
         const ch = src[i];
         if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r') break;
         if (ch === "'" || ch === '"' || ch === '`') break;
-        if (ch === '+' && src[i + 1] !== '+' && src[i + 1] !== '=') break;
+        if (ch === '+' && src[i + 1] !== '+') break;
         if (ch === ',' || ch === ';') break;
         if (ch === '=') break;
         if (ch === '(' || ch === ')' || ch === '[' || ch === ']' || ch === '{' || ch === '}') break;
@@ -660,7 +706,7 @@
 
   function convert() {
     const raw = $('in').value;
-    const { html, autoSubs } = extractHTML(raw);
+    const { html, autoSubs, target, assignProp, assignOp } = extractHTML(raw);
     const subStr = $('subStr').value;
     const subVar = $('subVar').value.trim();
     const subs = [];
@@ -672,9 +718,15 @@
     for (const s of autoSubs) subs.push(s);
 
     let parent = 'document.body';
+    let parentFromAssignment = false;
     if ($('parentVar').checked) {
       const p = $('parentName').value.trim();
       if (p) parent = p;
+    } else if (target) {
+      // `el.outerHTML = ...` replaces `el` itself, so new nodes land in
+      // `el.parentNode`. `el.innerHTML = ...` replaces `el`'s children.
+      parent = assignProp === 'outerHTML' ? target + '.parentNode' : target;
+      parentFromAssignment = true;
     }
 
     const opts = {
@@ -730,6 +782,16 @@
     if (useRoots.length === 0) {
       $('out').value = '// (no nodes parsed)';
       return;
+    }
+
+    // Replicate `el.innerHTML = x` semantics (replace existing children) when
+    // the input used `=` rather than `+=`, for innerHTML only. outerHTML is
+    // emitted as a note since faithful replacement requires replaceWith().
+    if (parentFromAssignment && assignOp === '=' && assignProp === 'innerHTML') {
+      lines.push(target + '.replaceChildren();');
+    } else if (parentFromAssignment && assignProp === 'outerHTML') {
+      lines.push('// Note: ' + target + '.outerHTML = ... replaces ' + target + ' itself;');
+      lines.push('//       call ' + target + '.replaceWith(...) or adjust as needed.');
     }
 
     let attachTarget = parent;
