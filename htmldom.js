@@ -173,20 +173,16 @@
   function serializeElement(el) {
     if (el.kind === 'textNode') return bindingAsText(el.text) || '';
     const origin = el.origin;
-    const tag = origin.kind === 'create' ? origin.tag : (origin.kind === 'lookup' ? null : null);
-    if (el.html != null) {
-      const inner = bindingAsText(el.html) || '';
-      if (tag) return '<' + tag + serializeAttrs(el) + '>' + inner + '</' + tag + '>';
-      return inner;
-    }
+    const tag = origin.kind === 'create' ? origin.tag : null;
     let inner = '';
-    if (el.text != null) inner = escapeHTML(bindingAsText(el.text) || '');
-    else if (el.children.length) {
-      for (const c of el.children) {
-        if (c.kind === 'textNode') inner += escapeHTML(bindingAsText(c.text) || '');
-        else if (c.kind === 'textLike') inner += escapeHTML(bindingAsText(c.chain) || '');
-        else if (c.kind === 'element') inner += serializeElement(c);
-      }
+    // `innerHTML = ...` sets the element's HTML; later appendChild calls
+    // add more children on top. Combine both so users see the full DOM.
+    if (el.html != null) inner += bindingAsText(el.html) || '';
+    else if (el.text != null) inner += escapeHTML(bindingAsText(el.text) || '');
+    for (const c of el.children) {
+      if (c.kind === 'textNode') inner += escapeHTML(bindingAsText(c.text) || '');
+      else if (c.kind === 'textLike') inner += escapeHTML(bindingAsText(c.chain) || '');
+      else if (c.kind === 'element') inner += serializeElement(c);
     }
     if (tag) return '<' + tag + serializeAttrs(el) + '>' + inner + '</' + tag + '>';
     // Lookup-origin element without its own tag: emit children only.
