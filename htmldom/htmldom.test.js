@@ -361,6 +361,16 @@ group('for-of unrolling', () => {
   check('for-of over precomputed array',
     `var items=['one','two']; var a=''; for (var x of items) a += '['+x+']'; document.body.innerHTML=a;`,
     '[one][two]');
+  check('method call on loop var (toUpperCase)',
+    `var a=''; for (var x of ['a','b']) a += x.toUpperCase(); document.body.innerHTML = a;`, 'AB');
+  check('arithmetic on loop var',
+    `var a=''; for (var x of [1,2,3]) a += (x*10)+','; document.body.innerHTML = a;`, '10,20,30,');
+  check('arr.push inside for-of',
+    `var out=[]; for (var x of ['a','b','c']) out.push('<li>'+x+'</li>'); document.body.innerHTML = out.join('');`,
+    '<li>a</li><li>b</li><li>c</li>');
+  check('template literal in for-of body',
+    "var a=''; for (var x of ['a','b']) a += `<li>${x}</li>`; document.body.innerHTML=a;",
+    '<li>a</li><li>b</li>');
 });
 
 // -----------------------------------------------------------------------
