@@ -829,10 +829,10 @@
       while (next < stop && bind) {
         const t = tks[next];
         if (!t) break;
-        // Bracket subscript: [strLit] (object key) or [intLit] (array index)
-        // or [<unresolvable-expr>] (marks the access as opaque and bails).
+        // Bracket subscript: parse inner expression and use it as a key if
+        // it folds to a numeric or string literal. Marks the subscript
+        // result as unknown otherwise.
         if (t.type === 'open' && t.char === '[') {
-          // Find matching ']' at depth 0 relative to this bracket.
           let depth = 1, j = next + 1;
           while (j < stop && depth > 0) {
             const tk = tks[j];
@@ -843,27 +843,26 @@
           }
           const close = tks[j];
           if (!close || close.type !== 'close' || close.char !== ']') break;
-          const inner = j - (next + 1);
-          // Only literal single-token keys resolve; anything else marks the
-          // subscript result as unknown so the caller captures it opaquely.
-          if (inner === 1) {
-            const keyTok = tks[next + 1];
-            if (keyTok.type === 'str') {
-              if (bind.kind === 'object') bind = bind.props[keyTok.text] || null;
-              else if (bind.kind === 'array' && /^\d+$/.test(keyTok.text)) bind = bind.elems[parseInt(keyTok.text, 10)] || null;
-              else bind = null;
-              next = j + 1;
-              continue;
-            }
-            if (keyTok.type === 'other' && /^-?\d+$/.test(keyTok.text)) {
-              if (bind.kind === 'array') bind = bind.elems[parseInt(keyTok.text, 10)] || null;
-              else bind = null;
-              next = j + 1;
-              continue;
+          let resolved = false;
+          if (j > next + 1) {
+            const inner = parseArithExpr(next + 1, j, 0);
+            if (inner && inner.next === j && inner.bind && inner.bind.toks.length === 1 && inner.bind.toks[0].type === 'str') {
+              const keyText = inner.bind.toks[0].text;
+              const asNum = Number(keyText);
+              const isNumeric = !Number.isNaN(asNum) && String(asNum) === keyText;
+              if (bind.kind === 'array' && isNumeric) {
+                bind = bind.elems[asNum] || null;
+                resolved = true;
+              } else if (bind.kind === 'object') {
+                bind = bind.props[keyText] || null;
+                resolved = true;
+              } else if (bind.kind === 'array' && /^\d+$/.test(keyText)) {
+                bind = bind.elems[parseInt(keyText, 10)] || null;
+                resolved = true;
+              }
             }
           }
-          // Unresolvable subscript expression.
-          bind = null;
+          if (!resolved) bind = null;
           next = j + 1;
           continue;
         }
@@ -964,6 +963,14 @@
     const readBase = (k, stop) => {
       const t = tks[k];
       if (!t) return null;
+      // Unary operators: `-`, `+`, `!`, `~`.
+      if (t.type === 'op' && (t.text === '-' || t.text === '+' || t.text === '!' || t.text === '~')) {
+        const inner = readBase(k + 1, stop);
+        if (!inner) return null;
+        const applied = applyUnary(t.text, inner.bind);
+        if (!applied) return null;
+        return { bind: applied, next: inner.next };
+      }
       if (t.type === 'str') return { bind: chainBinding([t]), next: k + 1 };
       if (t.type === 'tmpl') return { bind: chainBinding([rewriteTemplate(t)]), next: k + 1 };
       if (t.type === 'open' && t.char === '(') {
@@ -1009,9 +1016,37 @@
         const b = resolvePath(t.text);
         if (!b) {
           // Unresolved identifier: return it as an opaque chain carrying
-          // its source text, so it can participate in arithmetic / concat
-          // as a symbolic operand.
-          return { bind: chainBinding([{ type: 'other', text: t.text, start: t.start, end: t.end, _src: t._src }]), next: k + 1 };
+          // its source text. If followed by a balanced `(...)` (call) or
+          // `[...]` (subscript) or `.prop` chain, absorb those too so the
+          // whole postfix expression becomes one symbolic operand.
+          let end = k + 1;
+          while (end < stop) {
+            const nx = tks[end];
+            if (!nx) break;
+            if (nx.type === 'open' && (nx.char === '(' || nx.char === '[')) {
+              const matchChar = nx.char === '(' ? ')' : ']';
+              let depth = 1, j = end + 1;
+              while (j < stop && depth > 0) {
+                const tk = tks[j];
+                if (tk.type === 'open' && tk.char === nx.char) depth++;
+                else if (tk.type === 'close' && tk.char === matchChar) depth--;
+                if (depth === 0) break;
+                j++;
+              }
+              if (depth !== 0) break;
+              end = j + 1;
+              continue;
+            }
+            if (nx.type === 'other' && /^(?:\.[A-Za-z_$][A-Za-z0-9_$]*)+$/.test(nx.text)) {
+              end++;
+              continue;
+            }
+            break;
+          }
+          const first = tks[k];
+          const last = tks[end - 1];
+          const text = first._src.slice(first.start, last.end);
+          return { bind: chainBinding([{ type: 'other', text, start: first.start, end: last.end, _src: first._src }]), next: end };
         }
         if (b) {
           // Call syntax: `name(args)` where name resolves to a function binding.
@@ -1145,14 +1180,21 @@
       let next = r.next;
       while (next < stop) {
         const opTok = tks[next];
-        if (!opTok || opTok.type !== 'op') break;
-        const prec = BINOP_PREC[opTok.text];
-        if (prec === undefined || prec < minPrec) break;
-        const nextMinPrec = opTok.text === '**' ? prec : prec + 1;
+        let opText, prec;
+        if (opTok && opTok.type === 'op' && BINOP_PREC[opTok.text] !== undefined) {
+          opText = opTok.text; prec = BINOP_PREC[opText];
+        } else if (opTok && opTok.type === 'plus') {
+          // Treat `+` at precedence 12: numeric add when both operands are
+          // number literals, otherwise leave it to the concat-chain parser.
+          opText = '+'; prec = 12;
+        } else break;
+        if (prec < minPrec) break;
+        const nextMinPrec = opText === '**' ? prec : prec + 1;
         const right = parseArithExpr(next + 1, stop, nextMinPrec);
         if (!right) break;
-        cur = combineArith(cur, opTok.text, right.bind);
-        if (!cur) return null;
+        const combined = combineArith(cur, opText, right.bind);
+        if (!combined) break;
+        cur = combined;
         next = right.next;
       }
       if (!cur || cur.kind !== 'chain') return null;
@@ -1206,6 +1248,7 @@
       if (lNum !== null && rNum !== null) {
         let v;
         switch (op) {
+          case '+': v = lNum + rNum; break;
           case '-': v = lNum - rNum; break;
           case '*': v = lNum * rNum; break;
           case '/': v = lNum / rNum; break;
@@ -1232,6 +1275,10 @@
         }
         return chainBinding([makeSynthStr(String(v))]);
       }
+      // `+` is overloaded in JS. When both operands aren't concrete numbers
+      // we decline here and let the caller (concat-chain parser) handle it
+      // as string concatenation.
+      if (op === '+') return null;
       // Short-circuit on known truthy/falsy for logical operators, even when
       // only one side is a concrete number.
       if (op === '&&' && lNum === 0) return chainBinding([makeSynthStr('0')]);
@@ -1241,6 +1288,29 @@
       const rt = chainAsExprText(right);
       if (lt === null || rt === null) return null;
       const text = '(' + lt + ' ' + op + ' ' + rt + ')';
+      return chainBinding([{ type: 'other', text, start: 0, end: text.length, _src: text }]);
+    };
+
+    // Apply a unary prefix operator to a chain binding. Folds to a literal
+    // when the operand is concrete; otherwise produces canonical symbolic
+    // text like `(-x)` or `(!cond)`.
+    const applyUnary = (op, operand) => {
+      if (!operand || operand.kind !== 'chain') return null;
+      const n = chainAsNumber(operand);
+      if (n !== null) {
+        let v;
+        switch (op) {
+          case '-': v = -n; break;
+          case '+': v = +n; break;
+          case '!': v = !n; break;
+          case '~': v = ~n; break;
+          default: return null;
+        }
+        return chainBinding([makeSynthStr(String(v))]);
+      }
+      const et = chainAsExprText(operand);
+      if (et === null) return null;
+      const text = op + et;
       return chainBinding([{ type: 'other', text, start: 0, end: text.length, _src: text }]);
     };
 
