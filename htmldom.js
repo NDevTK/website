@@ -1119,12 +1119,25 @@
       };
     };
 
-    // Read an arithmetic/logical/comparison expression built from a base
-    // operand followed by any sequence of operator-operand pairs (left
-    // associative, no precedence). Produces a chain binding where concrete
-    // operands get folded to literals and unknown parts surface as a single
-    // opaque operand with a faithful source text of the partial computation.
-    const parseArithExpr = (k, stop) => {
+    // Binary operator precedence table (higher binds tighter). `**` is the
+    // only right-associative operator we support.
+    const BINOP_PREC = {
+      '**': 14,
+      '*': 13, '/': 13, '%': 13,
+      '-': 12,
+      '<<': 11, '>>': 11, '>>>': 11,
+      '<': 10, '>': 10, '<=': 10, '>=': 10,
+      '==': 9, '!=': 9, '===': 9, '!==': 9,
+      '&': 8, '^': 7, '|': 6,
+      '&&': 5, '||': 4, '??': 4,
+    };
+
+    // Precedence-climbing parser for arithmetic/bitwise/logical/comparison
+    // expressions. Reads an atom then greedily consumes operator-operand
+    // pairs while their precedence is at least `minPrec`. Concrete operands
+    // fold to literals; unknown subparts yield canonical symbolic text.
+    const parseArithExpr = (k, stop, minPrec) => {
+      minPrec = minPrec || 0;
       const base = readBase(k, stop);
       if (!base) return null;
       const r = applySuffixes(base.bind, base.next, stop);
@@ -1133,16 +1146,52 @@
       while (next < stop) {
         const opTok = tks[next];
         if (!opTok || opTok.type !== 'op') break;
-        if (opTok.text === '++' || opTok.text === '--' || opTok.text === '!' || opTok.text === '~') break;
-        const rightBase = readBase(next + 1, stop);
-        if (!rightBase) break;
-        const rightR = applySuffixes(rightBase.bind, rightBase.next, stop);
-        cur = combineArith(cur, opTok.text, rightR.bind);
-        next = rightR.next;
+        const prec = BINOP_PREC[opTok.text];
+        if (prec === undefined || prec < minPrec) break;
+        const nextMinPrec = opTok.text === '**' ? prec : prec + 1;
+        const right = parseArithExpr(next + 1, stop, nextMinPrec);
+        if (!right) break;
+        cur = combineArith(cur, opTok.text, right.bind);
         if (!cur) return null;
+        next = right.next;
       }
       if (!cur || cur.kind !== 'chain') return null;
+      // Ternary at the lowest precedence: `cond ? a : b`.
+      const q = tks[next];
+      if (minPrec === 0 && q && q.type === 'other' && q.text === '?') {
+        const t = parseArithExpr(next + 1, stop, 0);
+        if (!t) return { bind: cur, next };
+        const colon = tks[t.next];
+        if (!colon || colon.type !== 'other' || colon.text !== ':') return { bind: cur, next };
+        const f = parseArithExpr(t.next + 1, stop, 0);
+        if (!f) return { bind: cur, next };
+        cur = combineTernary(cur, t.bind, f.bind);
+        if (!cur) return null;
+        next = f.next;
+      }
       return { bind: cur, next };
+    };
+
+    // Fold a ternary when the condition is a concrete value; otherwise emit
+    // canonical symbolic text.
+    const combineTernary = (cond, ifT, ifF) => {
+      if (!cond || cond.kind !== 'chain') return null;
+      if (!ifT || ifT.kind !== 'chain') return null;
+      if (!ifF || ifF.kind !== 'chain') return null;
+      const cNum = chainAsNumber(cond);
+      if (cNum !== null) return cNum ? ifT : ifF;
+      // Check for known boolean-ish strings.
+      if (cond.toks.length === 1 && cond.toks[0].type === 'str') {
+        const text = cond.toks[0].text;
+        if (text === 'true') return ifT;
+        if (text === 'false' || text === 'null' || text === 'undefined' || text === '') return ifF;
+      }
+      const ct = chainAsExprText(cond);
+      const tt = chainAsExprText(ifT);
+      const ft = chainAsExprText(ifF);
+      if (ct === null || tt === null || ft === null) return null;
+      const text = '(' + ct + ' ? ' + tt + ' : ' + ft + ')';
+      return chainBinding([{ type: 'other', text, start: 0, end: text.length, _src: text }]);
     };
 
     // Combine two chain bindings via a binary operator. If both sides are

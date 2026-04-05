@@ -576,9 +576,13 @@ group('.length', () => {
 // Ternary expressions and other operators (captured as opaque)
 // -----------------------------------------------------------------------
 group('ternary/operators', () => {
-  check('ternary captured as opaque',
+  check('ternary folded symbolically',
     `document.body.innerHTML = '<a>' + (cond ? '<b>' : '<c>') + '</a>';`,
-    { html: '<a>__HDX0__</a>', autoSubs: [['__HDX0__', "cond ? '<b>' : '<c>'"]] });
+    { html: '<a>__HDX0__</a>', autoSubs: [['__HDX0__', '(cond ? "<b>" : "<c>")']] });
+  check('ternary with known true-ish condition',
+    `var ok = 1; document.body.innerHTML = (ok ? '<yes>' : '<no>');`, '<yes>');
+  check('ternary with known false-ish condition',
+    `var off = 0; document.body.innerHTML = (off ? '<yes>' : '<no>');`, '<no>');
   check('bitwise expression folded symbolically',
     `document.body.innerHTML = '<x>' + (a|0) + '</x>';`,
     { html: '<x>__HDX0__</x>', autoSubs: [['__HDX0__', '(a | 0)']] });
