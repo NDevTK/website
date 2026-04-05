@@ -379,14 +379,18 @@
     const startAccessor = tokens[accessorIdx];
     while (j >= 0) {
       const tk = tokens[j];
-      if (tk.type === 'close') { depth++; j--; continue; }
+      // Only `)`/`]` act as balanced closers for backward call/index walks.
+      // A `}` at depth 0 is a statement boundary (end of the previous block)
+      // and must terminate the walk, not start a balanced group.
+      if (tk.type === 'close' && (tk.char === ')' || tk.char === ']')) { depth++; j--; continue; }
+      if (tk.type === 'close' && tk.char === '}') break;
       if (tk.type === 'open') {
         if (depth === 0) break;
         depth--; j--; continue;
       }
       if (depth > 0) { j--; continue; }
-      // At depth 0, accept identifier-like `other` tokens or `.propName`
-      // accessors as continuing the member chain.
+      // At depth 0, accept identifier-like `other` tokens as continuing the
+      // member chain. Statement-level tokens (sep, plus, op) terminate.
       if (tk.type === 'other') { j--; continue; }
       break;
     }
