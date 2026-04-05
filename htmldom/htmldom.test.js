@@ -285,6 +285,125 @@ group('modules', () => {
 });
 
 // -----------------------------------------------------------------------
+// typeof folding
+// -----------------------------------------------------------------------
+group('typeof folding', () => {
+  check('typeof string',
+    `var a = 'hi'; document.body.innerHTML = typeof a;`, 'string');
+  check('typeof number',
+    `var a = 5; document.body.innerHTML = typeof a;`, 'number');
+  check('typeof boolean',
+    `var a = true; document.body.innerHTML = typeof a;`, 'boolean');
+  check('typeof array/object/function',
+    `var a = [1]; var o = {x:1}; var f = () => 1; document.body.innerHTML = typeof a + '-' + typeof o + '-' + typeof f;`,
+    'object-object-function');
+  check('typeof + equality',
+    `var a = 5; document.body.innerHTML = (typeof a === 'number') ? 'Y' : 'N';`, 'Y');
+  check('void is undefined',
+    `document.body.innerHTML = 'v:' + (void 0);`, 'v:undefined');
+  check('typeof null',
+    `document.body.innerHTML = typeof null;`, 'object');
+  check('typeof undefined',
+    `document.body.innerHTML = typeof undefined;`, 'undefined');
+  check('typeof computed boolean',
+    `var x = 3 > 2; document.body.innerHTML = typeof x;`, 'boolean');
+  check('typeof void',
+    `document.body.innerHTML = typeof (void 0);`, 'undefined');
+});
+
+// -----------------------------------------------------------------------
+// Boolean / null / undefined type tracking
+// -----------------------------------------------------------------------
+group('primitive type tracking', () => {
+  check('true + 1 = 2 (boolean coerces to number)',
+    `document.body.innerHTML = true + 1;`, '2');
+  check('false + 1 = 1',
+    `document.body.innerHTML = false + 1;`, '1');
+  check('comparison result in arithmetic',
+    `document.body.innerHTML = (3>2) + 1;`, '2');
+  check('ternary with boolean condition',
+    `document.body.innerHTML = (3>2) ? 'yes' : 'no';`, 'yes');
+  check('ternary with false condition',
+    `document.body.innerHTML = (1>2) ? 'yes' : 'no';`, 'no');
+  check('null ?? default',
+    `var x = null; document.body.innerHTML = x ?? 'default';`, 'default');
+  check('undefined ?? default',
+    `var x = undefined; document.body.innerHTML = x ?? 'default';`, 'default');
+  check('value ?? default',
+    `var x = 'value'; document.body.innerHTML = x ?? 'default';`, 'value');
+});
+
+// -----------------------------------------------------------------------
+// String equality folding
+// -----------------------------------------------------------------------
+group('string comparison', () => {
+  check('=== on strings',
+    `document.body.innerHTML = ('abc' === 'abc' ? 'A' : 'B');`, 'A');
+  check('!== on strings',
+    `document.body.innerHTML = ('a' !== 'b' ? 'A' : 'B');`, 'A');
+  check('< on strings',
+    `document.body.innerHTML = ('a' < 'b' ? 'lt' : 'ge');`, 'lt');
+});
+
+// -----------------------------------------------------------------------
+// Mutation tracking on bindings
+// -----------------------------------------------------------------------
+group('mutations', () => {
+  check('arr.push appends',
+    `var a = ['x']; a.push('y','z'); document.body.innerHTML = a.join(',');`, 'x,y,z');
+  check('arr.pop removes last',
+    `var a = ['x','y','z']; a.pop(); document.body.innerHTML = a.join(',');`, 'x,y');
+  check('arr.shift removes first',
+    `var a = ['x','y','z']; a.shift(); document.body.innerHTML = a.join(',');`, 'y,z');
+  check('arr.unshift prepends',
+    `var a = ['b','c']; a.unshift('a'); document.body.innerHTML = a.join(',');`, 'a,b,c');
+  check('indexed write arr[i]=v',
+    `var a = [1,2,3]; a[0] = 9; document.body.innerHTML = a.join(',');`, '9,2,3');
+  check('member write obj.x=v',
+    `var o = {a:1}; o.b = 2; document.body.innerHTML = o.a + ',' + o.b;`, '1,2');
+  check('keyed write obj[k]=v',
+    `var o = {a:1}; o['c'] = 3; document.body.innerHTML = o.c;`, '3');
+  check('nested member write',
+    `var o = {n:{x:1}}; o.n.x = 5; document.body.innerHTML = o.n.x;`, '5');
+});
+
+// -----------------------------------------------------------------------
+// for-of / for-in static unrolling
+// -----------------------------------------------------------------------
+group('for-of unrolling', () => {
+  check('accumulator over static array',
+    `var a=''; for (var x of ['a','b','c']) { a += '<li>'+x+'</li>'; } document.body.innerHTML=a;`,
+    '<li>a</li><li>b</li><li>c</li>');
+  check('accumulator with prefix',
+    `var a='X:'; for (var x of ['a','b','c']) { a += '<li>'+x+'</li>'; } document.body.innerHTML=a;`,
+    'X:<li>a</li><li>b</li><li>c</li>');
+  check('for-in over static object iterates keys',
+    `var o={a:1,b:2,c:3}; var s=''; for (var k in o) { s += k; } document.body.innerHTML=s;`, 'abc');
+  check('empty iterable leaves baseline',
+    `var a='pre:'; for (var x of []) { a += x; } document.body.innerHTML=a;`, 'pre:');
+  check('single-statement body',
+    `var a=''; for (var x of ['a','b']) a += x; document.body.innerHTML=a;`, 'ab');
+  check('loop var used twice',
+    `var a=''; for (var x of ['a','b']) a += x+':'+x+','; document.body.innerHTML=a;`, 'a:a,b:b,');
+  check('nested for-of unrolls both',
+    `var a=''; for (var x of ['a','b']) for (var y of ['1','2']) a += x+y+'/'; document.body.innerHTML=a;`,
+    'a1/a2/b1/b2/');
+  check('for-of over precomputed array',
+    `var items=['one','two']; var a=''; for (var x of items) a += '['+x+']'; document.body.innerHTML=a;`,
+    '[one][two]');
+  check('method call on loop var (toUpperCase)',
+    `var a=''; for (var x of ['a','b']) a += x.toUpperCase(); document.body.innerHTML = a;`, 'AB');
+  check('arithmetic on loop var',
+    `var a=''; for (var x of [1,2,3]) a += (x*10)+','; document.body.innerHTML = a;`, '10,20,30,');
+  check('arr.push inside for-of',
+    `var out=[]; for (var x of ['a','b','c']) out.push('<li>'+x+'</li>'); document.body.innerHTML = out.join('');`,
+    '<li>a</li><li>b</li><li>c</li>');
+  check('template literal in for-of body',
+    "var a=''; for (var x of ['a','b']) a += `<li>${x}</li>`; document.body.innerHTML=a;",
+    '<li>a</li><li>b</li>');
+});
+
+// -----------------------------------------------------------------------
 // Array.* builtins
 // -----------------------------------------------------------------------
 group('Array builtins', () => {
@@ -296,6 +415,118 @@ group('Array builtins', () => {
     `var a=['x','y']; var b = Array.from(a, (x,i) => i+':'+x); document.body.innerHTML = b.join(',');`, '0:x,1:y');
   check('Array.from length spec with mapFn',
     `var b = Array.from({length:3}, (_,i) => i); document.body.innerHTML = b.join('-');`, '0-1-2');
+});
+
+// -----------------------------------------------------------------------
+// String methods: replace/replaceAll/at
+// -----------------------------------------------------------------------
+group('string methods extended', () => {
+  check('replace literal',
+    `document.body.innerHTML = 'hello world'.replace('world', 'js');`, 'hello js');
+  check('replaceAll literal',
+    `document.body.innerHTML = 'aXbXc'.replaceAll('X', '-');`, 'a-b-c');
+  check('at negative index',
+    `document.body.innerHTML = 'abc'.at(-1);`, 'c');
+  check('charCodeAt',
+    `document.body.innerHTML = 'A'.charCodeAt(0);`, '65');
+});
+
+// -----------------------------------------------------------------------
+// Array methods extended
+// -----------------------------------------------------------------------
+group('array methods extended', () => {
+  check('find with predicate',
+    `var a=[1,2,3]; document.body.innerHTML = a.find(x => x > 1);`, '2');
+  check('findIndex with predicate',
+    `var a=[1,2,3]; document.body.innerHTML = a.findIndex(x => x > 1);`, '1');
+  check('some true',
+    `var a=[1,2,3]; document.body.innerHTML = a.some(x => x > 2);`, 'true');
+  check('some false',
+    `var a=[1,2,3]; document.body.innerHTML = a.some(x => x > 5);`, 'false');
+  check('every true',
+    `var a=[1,2,3]; document.body.innerHTML = a.every(x => x > 0);`, 'true');
+  check('every false',
+    `var a=[1,2,3]; document.body.innerHTML = a.every(x => x > 1);`, 'false');
+  check('concat arrays',
+    `var a=[1,2]; var b=[3,4]; document.body.innerHTML = a.concat(b).join(',');`, '1,2,3,4');
+  check('concat inline arrays',
+    `document.body.innerHTML = [1,2].concat([3],[4,5]).join(',');`, '1,2,3,4,5');
+  check('flat nested',
+    `var a=[[1,2],[3,4]]; document.body.innerHTML = a.flat().join(',');`, '1,2,3,4');
+  check('fill range',
+    `var a=[1,2,3]; document.body.innerHTML = a.fill(0,1,2).join(',');`, '1,0,3');
+  check('splice at statement level',
+    `var a=[1,2,3]; a.splice(1,1,'x'); document.body.innerHTML = a.join(',');`, '1,x,3');
+  check('at negative',
+    `var a=['a','b','c']; document.body.innerHTML = a.at(-1);`, 'c');
+  check('flatMap',
+    `var a=[1,2,3]; document.body.innerHTML = a.flatMap(x => [x, x*2]).join(',');`, '1,2,2,4,3,6');
+  check('sort at statement level',
+    `var a=['c','a','b']; a.sort(); document.body.innerHTML = a.join(',');`, 'a,b,c');
+  check('reverse at statement level',
+    `var a=[1,2,3]; a.reverse(); document.body.innerHTML = a.join(',');`, '3,2,1');
+});
+
+// -----------------------------------------------------------------------
+// Object builtins
+// -----------------------------------------------------------------------
+group('Object builtins', () => {
+  check('Object.assign via expression',
+    `var a={x:1}; var c = Object.assign(a,{y:2}); document.body.innerHTML = c.x + ',' + c.y;`, '1,2');
+  check('Object.fromEntries',
+    `var o = Object.fromEntries([['a','1'],['b','2']]); document.body.innerHTML = o.a + o.b;`, '12');
+});
+
+// -----------------------------------------------------------------------
+// switch / try-catch
+// -----------------------------------------------------------------------
+group('control flow', () => {
+  check('switch concrete match',
+    `var x = 'b'; var r = ''; switch(x) { case 'a': r = 'A'; break; case 'b': r = 'B'; break; } document.body.innerHTML = r;`, 'B');
+  check('switch default',
+    `var x = 'z'; var r = ''; switch(x) { case 'a': r = 'A'; break; default: r = 'D'; } document.body.innerHTML = r;`, 'D');
+  check('try-catch walks try body',
+    `var a = 'init'; try { a = 'tried'; } catch(e) {} document.body.innerHTML = a;`, 'tried');
+});
+
+// -----------------------------------------------------------------------
+// Number vs string + operator
+// -----------------------------------------------------------------------
+group('number/string distinction', () => {
+  check('number + number = numeric add',
+    `document.body.innerHTML = 1 + 2;`, '3');
+  check('string + string = concat',
+    `var x = '1'; var y = '2'; document.body.innerHTML = x + y;`, '12');
+  check('string + number = concat',
+    `document.body.innerHTML = 'a' + 1;`, 'a1');
+});
+
+// -----------------------------------------------------------------------
+// Shadowed builtins respected
+// -----------------------------------------------------------------------
+group('builtin shadowing', () => {
+  check('unshadowed Math.floor works',
+    `document.body.innerHTML = Math.floor(3.7);`, '3');
+  check('shadowed Math uses user object',
+    `var Math = {floor:99}; document.body.innerHTML = Math.floor;`, '99');
+  check('shadowed parseInt uses user function',
+    `function parseInt(x){return x+'!';} document.body.innerHTML = parseInt('5');`, '5!');
+  check('unshadowed parseInt folds string arg',
+    `document.body.innerHTML = parseInt('42');`, '42');
+  check('unshadowed parseFloat folds string arg',
+    `document.body.innerHTML = parseFloat('3.14');`, '3.14');
+  check('unshadowed Number coerces string',
+    `document.body.innerHTML = Number('99');`, '99');
+  check('unshadowed Boolean coerces number',
+    `document.body.innerHTML = Boolean(1);`, 'true');
+  check('shadowed Object.keys uses user function',
+    `var Object = {keys:()=>'fake'}; document.body.innerHTML = Object.keys();`, 'fake');
+  check('user method on object via property lookup',
+    `var obj = {greet:()=>'hello'}; document.body.innerHTML = obj.greet();`, 'hello');
+  check('.length on plain object uses property',
+    `var obj = {length:'custom'}; document.body.innerHTML = obj.length;`, 'custom');
+  check('.length on array gives count',
+    `var a=[1,2,3]; document.body.innerHTML = a.length;`, '3');
 });
 
 // -----------------------------------------------------------------------
