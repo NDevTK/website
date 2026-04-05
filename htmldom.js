@@ -104,7 +104,7 @@
     const trimmed = input.trim();
     if (!trimmed) return { elements: [], ops: [], roots: [], html: {} };
     const tokens = tokenize(trimmed);
-    const state = buildScopeState(tokens, tokens.length);
+    const state = buildScopeState(tokens, tokens.length, scanMutations(tokens));
     const elements = state.domElements;
     const roots = elements.filter((el) => !el.attached);
     const html = {};
@@ -554,7 +554,81 @@
   //   identifiers, and `[str,str,...].join(sep)` patterns joined by `+`.
   //   Anything outside that grammar records `null`, clearing any prior value
   //   so stale literals can't leak through.
-  function buildScopeState(tokens, stopAt) {
+  // Scan the full token stream for simple-identifier mutations
+  // (reassignments `x = ...`, compound `x += ...`, post-fix `x++`/`x--`)
+  // and record each name's declaration function-depth and max mutation
+  // function-depth. Any name mutated at a greater depth than where it
+  // was first declared is considered "externally mutable": a linear
+  // walker can't statically predict its value at a given extraction
+  // site, so we should resolve it as a name reference instead of its
+  // initial literal.
+  function scanMutations(tokens) {
+    const declaredAt = Object.create(null);
+    const mutatedAt = Object.create(null);
+    let depth = 0;
+    let pendingFnBrace = false;
+    const braceKinds = [];
+    const noteDecl = (name) => { if (!(name in declaredAt)) declaredAt[name] = depth; };
+    const noteMut = (name) => {
+      if (!(name in mutatedAt) || depth > mutatedAt[name]) mutatedAt[name] = depth;
+    };
+    for (let i = 0; i < tokens.length; i++) {
+      const t = tokens[i];
+      if (t.type === 'other' && t.text === 'function') { pendingFnBrace = true; continue; }
+      if (t.type === 'other' && t.text === '=>') {
+        const nt = tokens[i + 1];
+        if (nt && nt.type === 'open' && nt.char === '{') pendingFnBrace = true;
+        continue;
+      }
+      if (t.type === 'open' && t.char === '{') {
+        if (pendingFnBrace) { depth++; braceKinds.push('fn'); } else { braceKinds.push('block'); }
+        pendingFnBrace = false;
+        continue;
+      }
+      if (t.type === 'close' && t.char === '}') {
+        const kind = braceKinds.pop();
+        if (kind === 'fn') depth--;
+        continue;
+      }
+      if (t.type === 'other' && (t.text === 'var' || t.text === 'let' || t.text === 'const')) {
+        let j = i + 1;
+        while (j < tokens.length) {
+          const nm = tokens[j];
+          if (!nm || nm.type !== 'other' || !IDENT_RE.test(nm.text)) break;
+          noteDecl(nm.text);
+          j++;
+          if (tokens[j] && tokens[j].type === 'sep' && tokens[j].char === '=') {
+            let d = 0;
+            j++;
+            while (j < tokens.length) {
+              const tk = tokens[j];
+              if (tk.type === 'open') d++;
+              else if (tk.type === 'close') { if (d === 0) break; d--; }
+              else if (d === 0 && tk.type === 'sep' && (tk.char === ',' || tk.char === ';')) break;
+              j++;
+            }
+          }
+          if (tokens[j] && tokens[j].type === 'sep' && tokens[j].char === ',') { j++; continue; }
+          break;
+        }
+        i = j - 1;
+        continue;
+      }
+      if (t.type === 'other' && IDENT_RE.test(t.text)) {
+        const next = tokens[i + 1];
+        if (next && next.type === 'sep' && /^[-+*/%]?=$/.test(next.char)) noteMut(t.text);
+        if (next && next.type === 'op' && (next.text === '++' || next.text === '--')) noteMut(t.text);
+      }
+    }
+    const externallyMutable = new Set();
+    for (const name in mutatedAt) {
+      const dd = declaredAt[name] !== undefined ? declaredAt[name] : 0;
+      if (mutatedAt[name] > dd) externallyMutable.add(name);
+    }
+    return externallyMutable;
+  }
+
+  function buildScopeState(tokens, stopAt, externallyMutable) {
     const stack = [{ bindings: Object.create(null), isFunction: true }];
     let pendingFunctionBrace = false;
     let pendingFunctionParams = null;
@@ -690,17 +764,27 @@
     };
 
     const topBlock = () => stack[stack.length - 1];
-    const declBlock = (name, value) => { topBlock().bindings[name] = value; };
+    // Replace the actual value with a name-reference chain for variables
+    // the pre-pass flagged as externally mutable, so reads of such names
+    // consistently produce an opaque source reference rather than a
+    // stale initial value.
+    const asRef = (name, value) => {
+      if (externallyMutable && externallyMutable.has(name)) {
+        return chainBinding([{ type: 'other', text: name, start: 0, end: name.length, _src: name }]);
+      }
+      return value;
+    };
+    const declBlock = (name, value) => { topBlock().bindings[name] = asRef(name, value); };
     const declFunction = (name, value) => {
       for (let i = stack.length - 1; i >= 0; i--) {
-        if (stack[i].isFunction) { stack[i].bindings[name] = value; return; }
+        if (stack[i].isFunction) { stack[i].bindings[name] = asRef(name, value); return; }
       }
     };
     const assignName = (name, value) => {
       for (let i = stack.length - 1; i >= 0; i--) {
-        if (name in stack[i].bindings) { stack[i].bindings[name] = value; return; }
+        if (name in stack[i].bindings) { stack[i].bindings[name] = asRef(name, value); return; }
       }
-      stack[0].bindings[name] = value; // implicit global
+      stack[0].bindings[name] = asRef(name, value); // implicit global
     };
     const resolve = (name) => {
       for (let i = stack.length - 1; i >= 0; i--) {
@@ -2270,7 +2354,8 @@
   // fails, falls back to per-identifier substitution so downstream chain
   // detection can still find partial matches.
   function resolveIdentifiers(tokens, startIdx, endIdx) {
-    const state = buildScopeState(tokens, startIdx);
+    const externallyMutable = scanMutations(tokens);
+    const state = buildScopeState(tokens, startIdx, externallyMutable);
     const full = state.parseRange(startIdx, endIdx);
     if (full) return { tokens: full, parsed: true, loopInfo: state.loopInfo, loopVars: state.loopVars, inScope: state.inScope };
     const out = [];
