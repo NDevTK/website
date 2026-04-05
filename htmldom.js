@@ -95,15 +95,14 @@
 
     const tokens = tokenize(trimmed);
 
-    // Collect top-level `IDENT = STRING/TEMPLATE` assignments so a later
-    // `.innerHTML = someVar` can resolve the variable back to its literal.
-    const vars = collectStringVars(tokens);
-
     // If there's an `X.innerHTML = ...` / `X.outerHTML = ...` assignment,
     // restrict HTML extraction to the right-hand side and surface the target.
     const assign = findHtmlAssignment(tokens);
     let searchTokens = assign ? tokens.slice(assign.rhsStart, assign.rhsEnd) : tokens;
-    searchTokens = substituteVars(searchTokens, vars);
+    // Resolve identifier references inside the RHS using the binding state at
+    // the assignment site (honoring var/let/const scope, shadowing, and
+    // reassignment order).
+    if (assign) searchTokens = resolveIdentifiers(tokens, assign.rhsStart, assign.rhsEnd);
     const target = assign ? assign.target : null;
     const assignProp = assign ? assign.prop : null;
     const assignOp = assign ? assign.op : null;
@@ -161,38 +160,168 @@
     return null;
   }
 
-  // Collect variables whose value is a single string or template literal:
-  // `x = '...'`, `var x = '...'`, `let x = \`...\``, `const x = '...'`.
-  // Only records the first assignment seen for each name.
-  function collectStringVars(tokens) {
-    const vars = Object.create(null);
-    const identRe = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
-    for (let i = 0; i < tokens.length; i++) {
+  const IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+
+  // Walk tokens [0, stopAt), tracking lexical scopes, and return an object
+  // with a `resolve(name)` that yields the current string/template token (or
+  // null) bound to `name` at position `stopAt`.
+  //
+  // Scopes follow JavaScript semantics enough for reasonable snippets:
+  // - `{ ... }` opens a block scope; `let`/`const` bind there.
+  // - `function ... { ... }` and `=> { ... }` open function scopes; `var`
+  //   bindings hoist to the nearest function (or global) scope.
+  // - Bare `x = v` reassigns the innermost existing binding (or creates an
+  //   implicit global) — honoring reassignment order and shadowing.
+  // - A declaration with a non-literal (or compound) RHS records `null`,
+  //   clearing any prior value so stale literals don't leak through.
+  function buildScopeState(tokens, stopAt) {
+    const stack = [{ bindings: Object.create(null), isFunction: true }];
+    let pendingFunctionBrace = false;
+
+    const topBlock = () => stack[stack.length - 1];
+    const declBlock = (name, value) => { topBlock().bindings[name] = value; };
+    const declFunction = (name, value) => {
+      for (let i = stack.length - 1; i >= 0; i--) {
+        if (stack[i].isFunction) { stack[i].bindings[name] = value; return; }
+      }
+    };
+    const assignName = (name, value) => {
+      for (let i = stack.length - 1; i >= 0; i--) {
+        if (name in stack[i].bindings) { stack[i].bindings[name] = value; return; }
+      }
+      stack[0].bindings[name] = value; // implicit global
+    };
+    const resolve = (name) => {
+      for (let i = stack.length - 1; i >= 0; i--) {
+        if (name in stack[i].bindings) return stack[i].bindings[name];
+      }
+      return null;
+    };
+
+    // Read a single-token literal value (string or template) starting at
+    // index `k`. Returns the token if the RHS is exactly that single literal
+    // (followed by `,`, `;`, EOF, or the stop boundary), otherwise null.
+    const readLiteralInit = (k, stop) => {
+      const valTok = tokens[k];
+      if (!valTok || (valTok.type !== 'str' && valTok.type !== 'tmpl')) return null;
+      const after = tokens[k + 1];
+      if (k + 1 >= stop) return valTok;
+      if (!after) return valTok;
+      if (after.type === 'sep' && (after.char === ',' || after.char === ';')) return valTok;
+      return null;
+    };
+
+    // Skip over the RHS expression of a declarator or assignment starting at
+    // index `k`, returning the index of the terminating `,`/`;` (or `stop`).
+    const skipExpr = (k, stop) => {
+      let depth = 0;
+      while (k < stop) {
+        const tk = tokens[k];
+        if (tk.type === 'open') depth++;
+        else if (tk.type === 'close') {
+          if (depth === 0) break;
+          depth--;
+        } else if (depth === 0 && tk.type === 'sep' && (tk.char === ',' || tk.char === ';')) break;
+        k++;
+      }
+      return k;
+    };
+
+    const stop = Math.min(stopAt, tokens.length);
+    for (let i = 0; i < stop; i++) {
       const t = tokens[i];
-      if (t.type !== 'other' || !identRe.test(t.text)) continue;
-      const sep = tokens[i + 1];
-      if (!sep || sep.type !== 'sep' || sep.char !== '=') continue;
-      const val = tokens[i + 2];
-      if (!val || (val.type !== 'str' && val.type !== 'tmpl')) continue;
-      // Ensure the statement ends here (next is EOF, ; or ,), so we don't
-      // pick up `x = 'a' + foo` assignments where the whole RHS matters.
-      const after = tokens[i + 3];
-      if (after && !(after.type === 'sep' && (after.char === ';' || after.char === ','))) continue;
-      if (!(t.text in vars)) vars[t.text] = val;
+
+      if (t.type === 'open' && t.char === '{') {
+        stack.push({ bindings: Object.create(null), isFunction: pendingFunctionBrace });
+        pendingFunctionBrace = false;
+        continue;
+      }
+      if (t.type === 'close' && t.char === '}') {
+        if (stack.length > 1) stack.pop();
+        continue;
+      }
+
+      if (t.type !== 'other') continue;
+
+      if (t.text === 'function') { pendingFunctionBrace = true; continue; }
+      if (t.text === '=>') {
+        // Only arrow bodies of the form `=> { ... }` open a function scope;
+        // expression arrows (`x => x + 1`) don't.
+        const next = tokens[i + 1];
+        if (next && next.type === 'open' && next.char === '{') pendingFunctionBrace = true;
+        continue;
+      }
+
+      if (t.text === 'var' || t.text === 'let' || t.text === 'const') {
+        const kind = t.text;
+        let j = i + 1;
+        while (j < stop) {
+          const nameTok = tokens[j];
+          if (!nameTok || nameTok.type !== 'other' || !IDENT_RE.test(nameTok.text)) break;
+          const eqTok = tokens[j + 1];
+          let value = null;
+          let hasInit = false;
+          let k = j + 1;
+          if (eqTok && eqTok.type === 'sep' && eqTok.char === '=') {
+            hasInit = true;
+            value = readLiteralInit(j + 2, stop);
+            k = skipExpr(j + 2, stop);
+          }
+          if (hasInit) {
+            if (kind === 'var') declFunction(nameTok.text, value);
+            else declBlock(nameTok.text, value);
+          } else {
+            // Declaration without initializer.
+            if (kind === 'var') {
+              // `var x;` is a no-op if x already exists; otherwise hoists as undefined.
+              if (!hasBinding(stack, nameTok.text)) declFunction(nameTok.text, null);
+            } else {
+              declBlock(nameTok.text, null);
+            }
+          }
+          j = k;
+          if (tokens[j] && tokens[j].type === 'sep' && tokens[j].char === ',') { j++; continue; }
+          break;
+        }
+        i = j - 1;
+        continue;
+      }
+
+      // Bare assignment: IDENT = <single literal>.
+      if (IDENT_RE.test(t.text)) {
+        const eqTok = tokens[i + 1];
+        if (eqTok && eqTok.type === 'sep' && eqTok.char === '=') {
+          const value = readLiteralInit(i + 2, stop);
+          assignName(t.text, value);
+          i = skipExpr(i + 2, stop) - 1;
+          continue;
+        }
+      }
     }
-    return vars;
+
+    return { resolve };
   }
 
-  // Replace bare identifier tokens with their known string/template tokens,
-  // except when the identifier is itself the target of an assignment.
-  function substituteVars(toks, vars) {
+  function hasBinding(stack, name) {
+    for (let i = stack.length - 1; i >= 0; i--) if (name in stack[i].bindings) return true;
+    return false;
+  }
+
+  // Replace identifier references in tokens[startIdx, endIdx) with the
+  // string/template token currently bound to that name at startIdx, leaving
+  // assignment targets and unknown identifiers untouched.
+  function resolveIdentifiers(tokens, startIdx, endIdx) {
+    const state = buildScopeState(tokens, startIdx);
     const out = [];
-    for (let i = 0; i < toks.length; i++) {
-      const t = toks[i];
-      if (t.type === 'other' && vars[t.text]) {
-        const next = toks[i + 1];
+    for (let i = startIdx; i < endIdx; i++) {
+      const t = tokens[i];
+      if (t.type === 'other' && IDENT_RE.test(t.text)) {
+        const next = tokens[i + 1];
         const isLhs = next && next.type === 'sep' && next.char === '=';
-        if (!isLhs) { out.push(vars[t.text]); continue; }
+        if (!isLhs) {
+          const val = state.resolve(t.text);
+          if (val) { out.push(val); continue; }
+        }
       }
       out.push(t);
     }
