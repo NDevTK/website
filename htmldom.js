@@ -813,11 +813,23 @@
           next: body.next,
         };
       }
-      // Try the expression as a single base + postfix accessors. This
-      // preserves typed bindings (array/object/function) when the RHS is a
-      // bare literal or a member access that doesn't need to coerce to a
-      // chain. If the next top-level token is `+`, escalate to concat-chain
-      // parsing so the accessor result becomes the first operand.
+      // Try the expression as an arithmetic expression with postfix
+      // accessors. This folds arithmetic/bitwise/logical/comparison/ternary
+      // ops while preserving typed bindings (array/object/function) when
+      // the RHS is a bare literal or member access. If the next top-level
+      // token is `+`, escalate to concat-chain parsing so the result
+      // becomes the first operand.
+      const arith = parseArithExpr(k, stop, 0);
+      if (arith && arith.bind) {
+        const nt = tks[arith.next];
+        if (nt && nt.type === 'plus') {
+          const r = readChainFromHere(k, stop, terms);
+          if (r) return { binding: chainBinding(r.toks), next: r.next };
+        }
+        return { binding: arith.bind, next: arith.next };
+      }
+      // Fall back to readBase for typed bindings (array/object) that
+      // parseArithExpr rejected because they're not chain results.
       const base = readBase(k, stop);
       if (base) {
         const s = applySuffixes(base.bind, base.next, stop);
