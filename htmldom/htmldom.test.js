@@ -733,6 +733,64 @@ group('array methods', () => {
 })();
 
 // -----------------------------------------------------------------------
+// Array .map / .filter / .forEach with arrow callbacks
+// -----------------------------------------------------------------------
+group('array .map / .filter / .forEach', () => {
+  check('map + join',
+    `var a=['x','y','z']; document.body.innerHTML = a.map(i => '<li>'+i+'</li>').join('');`,
+    '<li>x</li><li>y</li><li>z</li>');
+  check('map with template literal body',
+    `var a=['1','2']; document.body.innerHTML = a.map(i => \`<p>\${i}</p>\`).join('');`,
+    '<p>1</p><p>2</p>');
+  check('filter keeps truthy',
+    `var a=['','x','','y']; document.body.innerHTML = a.filter(s => s).join(',');`, 'x,y');
+  check('filter + map chain',
+    `var a=[1,2,3,4]; document.body.innerHTML = a.filter(n => n>2).map(n => '['+n+']').join('');`,
+    '[3][4]');
+  check('forEach returns undefined',
+    `var a=['x']; document.body.innerHTML = String(a.forEach(i => i));`, 'undefined');
+});
+
+// -----------------------------------------------------------------------
+// Spread, default params, optional chaining, nullish coalescing
+// -----------------------------------------------------------------------
+group('modern operators', () => {
+  check('array spread',
+    `var a=['x','y']; var b=[...a, 'z']; document.body.innerHTML = b.join('|');`, 'x|y|z');
+  check('object spread',
+    `var o={html:'<a>'}; var p={...o, x:'<b>'}; document.body.innerHTML = p.html + p.x;`, '<a><b>');
+  check('default param used',
+    `function wrap(tag='b') { return '<' + tag + '>'; } document.body.innerHTML = wrap();`, '<b>');
+  check('default param overridden',
+    `function wrap(tag='b') { return '<' + tag + '>'; } document.body.innerHTML = wrap('em');`, '<em>');
+  check('arrow default',
+    `const hi = (who='World') => 'Hi ' + who; document.body.innerHTML = hi();`, 'Hi World');
+  check('optional chaining on known object',
+    `var o={name:'Alice'}; document.body.innerHTML = '<p>'+o?.name+'</p>';`, '<p>Alice</p>');
+  check('optional chaining on known array',
+    `var a=['x','y']; document.body.innerHTML = '<p>'+a?.[1]+'</p>';`, '<p>y</p>');
+  check('nullish with known value',
+    `var n='hi'; document.body.innerHTML = '<p>'+(n ?? 'def')+'</p>';`, '<p>hi</p>');
+  check('nullish with null picks right',
+    `var n=null; document.body.innerHTML = '<p>'+(n ?? 'def')+'</p>';`, '<p>def</p>');
+});
+
+// -----------------------------------------------------------------------
+// Class syntax (basic extraction via token scan)
+// -----------------------------------------------------------------------
+group('class methods', () => {
+  check('innerHTML inside class method',
+    `class W { render() { this.el.innerHTML = '<p>'+this.text+'</p>'; } }`,
+    { html: '<p>__HDX0__</p>', target: 'this.el', autoSubs: [['__HDX0__', 'this.text']] });
+  check('method local var builds html',
+    `class W { render() { var s='<a>'; s+='</a>'; this.el.innerHTML = s; } }`,
+    { html: '<a></a>', target: 'this.el' });
+  check('method with param',
+    `class W { render(msg) { this.el.innerHTML = '<p>'+msg+'</p>'; } }`,
+    { html: '<p>__HDX0__</p>', target: 'this.el', autoSubs: [['__HDX0__', 'msg']] });
+});
+
+// -----------------------------------------------------------------------
 // Original iframe case from the feature request
 // -----------------------------------------------------------------------
 group('feature-request case', () => {
