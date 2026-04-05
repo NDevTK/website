@@ -5,7 +5,7 @@
   // IDL properties that reflect HTML attributes on common elements.
   const IDL_PROPS = new Set([
     'id', 'title', 'lang', 'dir', 'hidden', 'draggable', 'translate',
-    'src', 'href', 'alt', 'name', 'type', 'value', 'placeholder',
+    'src', 'href', 'alt', 'name', 'type', 'placeholder',
     'width', 'height', 'rel', 'target', 'download', 'ping', 'hreflang',
     'loading', 'fetchPriority', 'srcdoc', 'srcset', 'sizes', 'allow',
     'integrity', 'min', 'max', 'step', 'pattern', 'autocomplete',
@@ -47,8 +47,10 @@
   };
 
   // Boolean HTML attributes — empty value means true, absence means false.
+  // Note: `checked` and `selected` are intentionally omitted so they go
+  // through setAttribute, preserving defaultChecked/defaultSelected semantics.
   const BOOLEAN_ATTRS = new Set([
-    'disabled', 'checked', 'readonly', 'required', 'multiple', 'selected',
+    'disabled', 'readonly', 'required', 'multiple',
     'autofocus', 'novalidate', 'allowfullscreen', 'async', 'defer',
     'hidden', 'ismap', 'loop', 'muted', 'open', 'reversed', 'autoplay',
     'controls', 'default', 'formnovalidate', 'nomodule', 'playsinline',
@@ -67,6 +69,8 @@
   const SVG_NS = 'http://www.w3.org/2000/svg';
   const MATHML_NS = 'http://www.w3.org/1998/Math/MathML';
   const XLINK_NS = 'http://www.w3.org/1999/xlink';
+  const XML_NS = 'http://www.w3.org/XML/1998/namespace';
+  const XMLNS_NS = 'http://www.w3.org/2000/xmlns/';
 
   const SVG_TAGS = new Set([
     'svg', 'g', 'defs', 'symbol', 'use', 'path', 'rect', 'circle', 'ellipse',
@@ -442,24 +446,62 @@
       lines.push(parentVar + '.appendChild(' + v + ');');
       return;
     }
+    // CDATA section (appears in foreign content, e.g. SVG).
+    if (node.nodeType === 4) {
+      const v = makeVar('cdata', used);
+      const lit = jsStr(node.nodeValue, opts.subs);
+      // HTML documents cannot create CDATA nodes; emit via an XML document.
+      lines.push('const ' + v + " = document.implementation.createDocument(null, null).createCDATASection(" + lit.code + ');');
+      lines.push(parentVar + '.appendChild(' + v + ');');
+      return;
+    }
+    // Processing instruction.
+    if (node.nodeType === 7) {
+      const v = makeVar('pi', used);
+      const target = jsStr(node.target, opts.subs).code;
+      const data = jsStr(node.nodeValue, opts.subs).code;
+      lines.push('const ' + v + ' = document.createProcessingInstruction(' + target + ', ' + data + ');');
+      lines.push(parentVar + '.appendChild(' + v + ');');
+      return;
+    }
     if (node.nodeType !== 1) return;
 
     const tag = node.tagName.toLowerCase();
     const v = makeVar(tag, used);
 
-    // Namespace detection.
-    let ns = nsCtx;
-    if (tag === 'svg') ns = SVG_NS;
-    else if (tag === 'math') ns = MATHML_NS;
-    else if (tag === 'foreignobject') ns = null; // children revert to HTML
+    const attrs = Array.from(node.attributes || []);
+
+    // Namespace detection. Elements in a parsed HTML document expose their
+    // namespaceURI; prefer that when present, so fragments like
+    // `<g xmlns="http://www.w3.org/2000/svg">` route through createElementNS
+    // even without a wrapping <svg>. Fall back to tag-name heuristics for
+    // elements lacking a namespaceURI.
+    let ns = node.namespaceURI || nsCtx;
+    if (ns === 'http://www.w3.org/1999/xhtml') ns = null;
+    // Fallback tag-name heuristics for nodes without a namespaceURI.
+    if (!node.namespaceURI) {
+      if (tag === 'svg') ns = SVG_NS;
+      else if (tag === 'math') ns = MATHML_NS;
+    }
+    // Note: <foreignObject> itself stays in SVG; its children revert to HTML
+    // via `childNs` below.
+
+    // Detect `is=` for customized built-ins (HTML namespace only).
+    let isAttr = null;
+    if (ns !== SVG_NS && ns !== MATHML_NS) {
+      for (const a of attrs) {
+        if (a.name === 'is') { isAttr = a.value; break; }
+      }
+    }
 
     if (ns === SVG_NS || ns === MATHML_NS) {
       lines.push('const ' + v + " = document.createElementNS('" + ns + "', '" + node.tagName + "');");
+    } else if (isAttr !== null) {
+      const isLit = jsStr(isAttr, opts.subs).code;
+      lines.push('const ' + v + " = document.createElement('" + tag + "', { is: " + isLit + ' });');
     } else {
       lines.push('const ' + v + " = document.createElement('" + tag + "');");
     }
-
-    const attrs = Array.from(node.attributes || []);
 
     for (const attr of attrs) {
       const name = attr.name;
@@ -496,9 +538,17 @@
         continue;
       }
 
-      // Namespaced attributes (e.g. xlink:href) -> setAttributeNS.
+      // Namespaced attributes -> setAttributeNS.
       if (name.startsWith('xlink:')) {
         lines.push(v + ".setAttributeNS('" + XLINK_NS + "', '" + name + "', " + jsStr(val, opts.subs).code + ');');
+        continue;
+      }
+      if (name === 'xmlns' || name.startsWith('xmlns:')) {
+        lines.push(v + ".setAttributeNS('" + XMLNS_NS + "', '" + name + "', " + jsStr(val, opts.subs).code + ');');
+        continue;
+      }
+      if (name.startsWith('xml:')) {
+        lines.push(v + ".setAttributeNS('" + XML_NS + "', '" + name + "', " + jsStr(val, opts.subs).code + ');');
         continue;
       }
 
@@ -532,9 +582,64 @@
       }
     }
 
+    // <noscript>: with scripting enabled, the HTML parser stores children as
+    // raw text. DOMParser parses with scripting disabled, so children are real
+    // nodes — serialize them back to text to match runtime semantics.
+    if (tag === 'noscript' && ns !== SVG_NS && ns !== MATHML_NS) {
+      const text = node.innerHTML;
+      if (text !== '') {
+        lines.push(v + '.textContent = ' + jsStr(text, opts.subs).code + ';');
+      }
+      lines.push(parentVar + '.appendChild(' + v + ');');
+      return;
+    }
+
+    // <template> holds its parsed subtree on `.content` (a DocumentFragment),
+    // not on childNodes. Recurse into that fragment instead.
+    if (tag === 'template' && node.content) {
+      const tplChildren = Array.from(node.content.childNodes);
+      for (const child of tplChildren) {
+        convertNode(child, v + '.content', lines, used, opts, null);
+      }
+      lines.push(parentVar + '.appendChild(' + v + ');');
+      return;
+    }
+
+    let children = Array.from(node.childNodes);
+
+    // Declarative Shadow DOM: if a direct child is <template shadowrootmode="…">,
+    // attach a shadow root on this element and recurse the template content
+    // into the shadow root instead. Only the first such template is honored,
+    // matching the HTML parser.
+    let shadowTpl = null;
+    if (ns !== SVG_NS && ns !== MATHML_NS) {
+      for (let i = 0; i < children.length; i++) {
+        const c = children[i];
+        if (c.nodeType !== 1) continue;
+        if (c.tagName === 'TEMPLATE' && c.getAttribute && c.getAttribute('shadowrootmode')) {
+          shadowTpl = c;
+          children.splice(i, 1);
+        }
+        break;
+      }
+    }
+    if (shadowTpl) {
+      const mode = shadowTpl.getAttribute('shadowrootmode');
+      const initParts = ['mode: ' + jsStr(mode).code];
+      if (shadowTpl.hasAttribute('shadowrootdelegatesfocus')) initParts.push('delegatesFocus: true');
+      if (shadowTpl.hasAttribute('shadowrootserializable')) initParts.push('serializable: true');
+      if (shadowTpl.hasAttribute('shadowrootclonable')) initParts.push('clonable: true');
+      const sv = makeVar('shadow', used);
+      lines.push('const ' + sv + ' = ' + v + '.attachShadow({ ' + initParts.join(', ') + ' });');
+      if (shadowTpl.content) {
+        for (const c of shadowTpl.content.childNodes) {
+          convertNode(c, sv, lines, used, opts, null);
+        }
+      }
+    }
+
     // Children — use textContent shortcut when single text child and no substitution.
-    const children = Array.from(node.childNodes);
-    if (opts.textContentShortcut &&
+    if (!shadowTpl && opts.textContentShortcut &&
         children.length === 1 &&
         children[0].nodeType === 3 &&
         tag !== 'script' && tag !== 'style') {
