@@ -5565,10 +5565,10 @@
     }
 
     const opts = {
-      useProps: $('useProps').checked,
-      eventsAsListeners: $('eventsAsListeners').checked,
-      textContentShortcut: $('textShortcut').checked,
-      useClassList: $('useClassList').checked,
+      useProps: true,
+      eventsAsListeners: true,
+      textContentShortcut: true,
+      useClassList: true,
       skipWhitespaceText: $('skipWS').checked,
       useFragment: $('useFragment').checked,
       subs
@@ -5688,7 +5688,7 @@
 
   // Live update on input changes.
   $('in').addEventListener('input', convert);
-  const toggles = ['useProps', 'eventsAsListeners', 'textShortcut', 'useClassList', 'skipWS', 'useFragment'];
+  const toggles = ['skipWS', 'useFragment'];
   for (const id of toggles) $(id).addEventListener('change', convert);
 
   convert();
