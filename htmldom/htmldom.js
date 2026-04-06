@@ -398,36 +398,45 @@
   //   - The innerHTML assignment itself
   // Returns { regionStart, regionEnd } (source char positions) or null.
   function findBuildRegion(tokens, assign) {
-    // Identify the build variable: the RHS of innerHTML must be a simple
-    // identifier reference for us to trace it.
     const rhsToks = [];
     for (let j = assign.rhsStart; j < assign.rhsEnd; j++) rhsToks.push(tokens[j]);
-    // Simple case: `el.innerHTML = varName;`
     if (rhsToks.length !== 1 || rhsToks[0].type !== 'other') return null;
     const buildVar = rhsToks[0].text;
     if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(buildVar)) return null;
 
-    // Scan backwards from the innerHTML assignment to find all statements
-    // that write to buildVar. Track statement boundaries via `;` and `{`/`}`.
-    const assignTokIdx = assign.eqIdx; // index of `=`/`+=` in tokens
-    // Collect token-index ranges of statements that write to buildVar.
-    // A "statement" here is everything between consecutive `;`/`{`/`}` boundaries.
-    const stmtRanges = []; // [{start, end, writesBuildVar, writesOther, isBuildVarDecl}]
-
-    // First, split all tokens before the innerHTML assignment into statements.
-    // We work with the target token (prev of `=`) index.
+    const assignTokIdx = assign.eqIdx;
     const targetTokIdx = assignTokIdx - 1;
-    let stmtStart = 0;
+
+    // Find the enclosing block start: walk backwards from the innerHTML
+    // site to find the `{` that opens the containing block (function body,
+    // if-body, loop body, or file scope). Track depth so nested blocks
+    // are skipped.
+    let blockStart = 0;
+    {
+      let depth = 0;
+      for (let j = targetTokIdx - 1; j >= 0; j--) {
+        const tk = tokens[j];
+        if (tk.type === 'close' && tk.char === '}') depth++;
+        if (tk.type === 'open' && tk.char === '{') {
+          if (depth === 0) { blockStart = j + 1; break; }
+          depth--;
+        }
+      }
+    }
+
+    // Split tokens[blockStart..targetTokIdx] into statements within this
+    // block. Respects brace depth (for nested blocks/loops) and paren
+    // depth (for `for(;;)` headers).
     const allStmts = [];
+    let stmtStart = blockStart;
     let braceDepth = 0;
     let parenDepth = 0;
-    for (let j = 0; j <= targetTokIdx; j++) {
+    for (let j = blockStart; j <= targetTokIdx; j++) {
       const tk = tokens[j];
       if (tk.type === 'open' && tk.char === '{') braceDepth++;
       if (tk.type === 'close' && tk.char === '}') {
         braceDepth--;
         if (braceDepth < 0) braceDepth = 0;
-        // End of a block at depth 0 is a statement boundary.
         if (braceDepth === 0 && parenDepth === 0) {
           allStmts.push({ tokStart: stmtStart, tokEnd: j + 1 });
           stmtStart = j + 1;
@@ -439,24 +448,19 @@
         parenDepth--;
         if (parenDepth < 0) parenDepth = 0;
       }
-      // `;` is a statement boundary only at depth 0 in both braces and parens.
       if (braceDepth === 0 && parenDepth === 0 && tk.type === 'sep' && tk.char === ';') {
         allStmts.push({ tokStart: stmtStart, tokEnd: j + 1 });
         stmtStart = j + 1;
       }
     }
 
-    // Now scan backwards from the innerHTML assignment. For each statement,
-    // check if it writes to buildVar and ONLY to buildVar (no other side effects
-    // that matter). Stop at the first statement that doesn't involve buildVar.
+    // Scan backwards to find the build region.
     let regionTokStart = -1;
     for (let s = allStmts.length - 1; s >= 0; s--) {
       const stmt = allStmts[s];
       const stmtTokens = tokens.slice(stmt.tokStart, stmt.tokEnd);
-      // Check if this statement writes to buildVar.
       let writesBuildVar = false;
       let isBuildVarDecl = false;
-      let isLoopWritingBuildVar = false;
 
       for (let j = 0; j < stmtTokens.length; j++) {
         const tk = stmtTokens[j];
@@ -466,7 +470,6 @@
             writesBuildVar = true;
           }
         }
-        // Check for `var/let/const buildVar`
         if (tk.type === 'other' && (tk.text === 'var' || tk.text === 'let' || tk.text === 'const')) {
           const nm = stmtTokens[j + 1];
           if (nm && nm.type === 'other' && nm.text === buildVar) {
@@ -474,14 +477,11 @@
             isBuildVarDecl = true;
           }
         }
-        // Check for `for` / `while` loop containing buildVar writes.
-        if (tk.type === 'other' && (tk.text === 'for' || tk.text === 'while')) {
-          // Scan the entire statement for buildVar writes.
+        if (tk.type === 'other' && (tk.text === 'for' || tk.text === 'while' || tk.text === 'do')) {
           for (let k = j; k < stmtTokens.length; k++) {
             if (stmtTokens[k].type === 'other' && stmtTokens[k].text === buildVar) {
               const nx = stmtTokens[k + 1];
               if (nx && nx.type === 'sep' && (nx.char === '=' || nx.char === '+=')) {
-                isLoopWritingBuildVar = true;
                 writesBuildVar = true;
               }
             }
@@ -489,22 +489,95 @@
         }
       }
 
-      if (!writesBuildVar) break; // stop — this statement doesn't touch buildVar
+      if (!writesBuildVar) break;
       regionTokStart = stmt.tokStart;
-      if (isBuildVarDecl) break; // found the declaration — stop here
+      if (isBuildVarDecl) break;
     }
 
     if (regionTokStart < 0) return null;
 
-    // Verify: is buildVar used AFTER the innerHTML assignment for anything
-    // other than innerHTML? If so, don't remove the build code.
-    const afterInnerHTML = assign.rhsEnd < tokens.length ? assign.rhsEnd + 1 : tokens.length;
-    for (let j = afterInnerHTML; j < tokens.length; j++) {
-      const tk = tokens[j];
-      if (tk.type === 'other' && tk.text === buildVar) {
-        // Used elsewhere — don't remove build code.
-        return null;
+    // Find enclosing block end for scope-limited checks.
+    let blockEnd = tokens.length;
+    {
+      let depth = 0;
+      for (let j = assign.rhsEnd; j < tokens.length; j++) {
+        const tk = tokens[j];
+        if (tk.type === 'open' && tk.char === '{') depth++;
+        if (tk.type === 'close' && tk.char === '}') {
+          if (depth === 0) { blockEnd = j; break; }
+          depth--;
+        }
       }
+    }
+
+    // Extend the region upward transitively: any statement immediately
+    // before the region that declares or mutates a variable ONLY used
+    // within the dead region is also dead. Repeat until no more
+    // statements can be absorbed (handles chains like var url → var text
+    // → while(text...) → for(...s+=...) → innerHTML = s).
+    //
+    // Collect all identifiers referenced within the current dead region.
+    const collectIdents = (start, end) => {
+      const ids = new Set();
+      for (let j = start; j < end; j++) {
+        if (tokens[j].type === 'other' && IDENT_RE.test(tokens[j].text)) ids.add(tokens[j].text);
+      }
+      return ids;
+    };
+    let changed = true;
+    while (changed) {
+      changed = false;
+      const deadIdents = collectIdents(regionTokStart, assign.rhsEnd);
+      for (let s = allStmts.length - 1; s >= 0; s--) {
+        const stmt = allStmts[s];
+        if (stmt.tokStart >= regionTokStart) continue;
+        if (stmt.tokEnd !== regionTokStart) continue;
+        // Find what this statement declares or primarily writes to.
+        const stmtTokens = tokens.slice(stmt.tokStart, stmt.tokEnd);
+        let declNames = [];
+        for (let j = 0; j < stmtTokens.length; j++) {
+          const tk = stmtTokens[j];
+          if (tk.type === 'other' && (tk.text === 'var' || tk.text === 'let' || tk.text === 'const')) {
+            const nm = stmtTokens[j + 1];
+            if (nm && nm.type === 'other' && IDENT_RE.test(nm.text)) declNames.push(nm.text);
+          }
+        }
+        // Also catch loops (for/while/do) that only mutate dead-region vars.
+        let isLoop = stmtTokens.some(tk => tk.type === 'other' && (tk.text === 'for' || tk.text === 'while' || tk.text === 'do'));
+        if (isLoop) {
+          // All identifiers written in this loop.
+          for (let j = 0; j < stmtTokens.length; j++) {
+            const tk = stmtTokens[j];
+            if (tk.type === 'other' && IDENT_RE.test(tk.text)) {
+              const nx = stmtTokens[j + 1];
+              if (nx && nx.type === 'sep' && (nx.char === '=' || nx.char === '+=')) declNames.push(tk.text);
+            }
+          }
+        }
+        if (declNames.length === 0) break;
+        // Check: are ALL declared names only used within the dead region
+        // (including this statement itself) and not after?
+        let allDead = true;
+        for (const name of declNames) {
+          if (!deadIdents.has(name) && name !== buildVar) { allDead = false; break; }
+          // Also check if used after the innerHTML site in the same scope.
+          for (let j = assign.rhsEnd + 1; j < blockEnd; j++) {
+            if (tokens[j].type === 'other' && tokens[j].text === name) { allDead = false; break; }
+          }
+          if (!allDead) break;
+        }
+        if (!allDead) break;
+        regionTokStart = stmt.tokStart;
+        changed = true;
+        break; // restart scan with extended region
+      }
+    }
+
+    // Verify: is buildVar used AFTER the innerHTML assignment within the
+    // same scope? If so, don't remove the build code.
+    for (let j = assign.rhsEnd + 1; j < blockEnd; j++) {
+      const tk = tokens[j];
+      if (tk.type === 'other' && tk.text === buildVar) return null;
       if (tk.type === 'other' && tk.text.endsWith('.' + buildVar)) return null;
     }
 
