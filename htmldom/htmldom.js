@@ -5898,7 +5898,7 @@
 
   function convert() {
     try {
-      const raw = $('in').value;
+      const raw = $('inCode') ? $('inCode').textContent : ($('in') ? $('in').value : '');
 
       // If input is HTML (starts with <), split into HTML portions and
       // <script> blocks. Convert HTML to DOM API, process script blocks
@@ -6234,10 +6234,68 @@
     }
   });
 
+  // Save and restore cursor position in contenteditable.
+  function saveCursor(el) {
+    const sel = window.getSelection();
+    if (!sel.rangeCount) return null;
+    const range = sel.getRangeAt(0);
+    const pre = range.cloneRange();
+    pre.selectNodeContents(el);
+    pre.setEnd(range.startContainer, range.startOffset);
+    return pre.toString().length;
+  }
+  function restoreCursor(el, pos) {
+    if (pos === null) return;
+    const sel = window.getSelection();
+    const range = document.createRange();
+    let current = 0;
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    while (walker.nextNode()) {
+      const node = walker.currentNode;
+      const len = node.textContent.length;
+      if (current + len >= pos) {
+        range.setStart(node, pos - current);
+        range.collapse(true);
+        sel.removeAllRanges();
+        sel.addRange(range);
+        return;
+      }
+      current += len;
+    }
+  }
+
+  function highlightInput() {
+    const codeEl = $('inCode');
+    if (!codeEl || typeof Prism === 'undefined') return;
+    const pre = $('inPre');
+    const pos = saveCursor(pre);
+    const text = codeEl.textContent;
+    const isMarkup = /^\s*</.test(text);
+    codeEl.className = isMarkup ? 'language-markup' : 'language-javascript';
+    Prism.highlightElement(codeEl);
+    restoreCursor(pre, pos);
+  }
+
   // Live update on input changes.
-  $('in').addEventListener('input', convert);
+  const inputEl = $('inPre') || $('in');
+  let highlightTimer = null;
+  inputEl.addEventListener('input', () => {
+    convert();
+    // Debounce highlighting to avoid cursor jank on fast typing.
+    clearTimeout(highlightTimer);
+    highlightTimer = setTimeout(highlightInput, 300);
+  });
+  // Paste as plain text to avoid HTML formatting.
+  if ($('inPre')) {
+    $('inPre').addEventListener('paste', (e) => {
+      e.preventDefault();
+      const text = e.clipboardData.getData('text/plain');
+      document.execCommand('insertText', false, text);
+    });
+  }
   const toggles = ['skipWS', 'useFragment', 'emitComments'];
   for (const id of toggles) $(id).addEventListener('change', convert);
 
+  highlightInput();
   convert();
 })();
