@@ -1143,17 +1143,40 @@
     // copies) so multiple closures over the same variable share state.
     const captureScope = () => stack.slice();
     const asRef = (name, value) => value;
+    // resolve() returns opaque references for externally-mutable variables
+    // when reading from inside a function body (sideEffects off). This
+    // prevents inlining values like `currentUrl = 0` into functions where
+    // the variable is modified at runtime by other functions.
+    const resolveWithMutability = (name) => {
+      const val = resolve(name);
+      if (!externallyMutable || !externallyMutable.has(name)) return val;
+      // If a synchronous call already modified this binding, it's fresh.
+      if (confirmedFresh.has(name)) return val;
+      // The variable is modified by functions at deeper scope. If the
+      // binding lives outside the current function scope, the value
+      // might be stale (set by uncalled async functions at runtime).
+      let bindingFrame = -1;
+      for (let i = stack.length - 1; i >= 0; i--) {
+        if (name in stack[i].bindings) { bindingFrame = i; break; }
+      }
+      if (bindingFrame < 0) return val;
+      for (let i = stack.length - 1; i > bindingFrame; i--) {
+        if (stack[i].isFunction) return chainBinding([exprRef(name)]);
+      }
+      return val;
+    };
     const declBlock = (name, value) => { topBlock().bindings[name] = asRef(name, value); };
     const declFunction = (name, value) => {
       for (let i = stack.length - 1; i >= 0; i--) {
         if (stack[i].isFunction) { stack[i].bindings[name] = asRef(name, value); return; }
       }
     };
+    // Track which bindings have been confirmed fresh by a synchronous
+    // function call (sideEffects on + cross-function write).
+    const confirmedFresh = new Set();
     const assignName = (name, value) => {
       for (let i = stack.length - 1; i >= 0; i--) {
         if (name in stack[i].bindings) {
-          // When side effects are off, don't modify bindings in frames
-          // below the nearest function scope (outer variables).
           if (!sideEffects) {
             let inCurrentFunction = false;
             for (let j = stack.length - 1; j >= i; j--) {
@@ -1163,6 +1186,13 @@
             if (!inCurrentFunction) return;
           }
           stack[i].bindings[name] = asRef(name, value);
+          // If modifying across a function boundary with effects on,
+          // mark as fresh so resolveWithMutability trusts the value.
+          if (sideEffects) {
+            for (let j = stack.length - 1; j > i; j--) {
+              if (stack[j].isFunction) { confirmedFresh.add(name); break; }
+            }
+          }
           return;
         }
       }
@@ -1194,7 +1224,7 @@
     // operands are all known string/template literals.
     const resolvePath = (path) => {
       const parts = path.split('.');
-      let b = resolve(parts[0]);
+      let b = resolveWithMutability(parts[0]);
       for (let i = 1; i < parts.length && b; i++) {
         const p = parts[i];
         if (b.kind === 'object') {
@@ -3352,11 +3382,11 @@
       }
       let result = null;
       if (fn.isBlock) {
-        // Walk the body via the statement walker so declarations (var,
-        // function, class) are registered in the scope. Then scan for
-        // the top-level `return` expression and evaluate it.
         walkRangeWithEffects(fn.bodyStart, fn.bodyEnd);
-        // After walking, scan for `return expr` at the top level.
+        // Evaluate the return expression with sideEffects on so
+        // resolveWithMutability returns real values, not opaque refs.
+        const savedEffects = sideEffects;
+        sideEffects = true;
         let i = fn.bodyStart;
         while (i < fn.bodyEnd) {
           const ft = tks[i];
@@ -3376,9 +3406,13 @@
           }
           i++;
         }
+        sideEffects = savedEffects;
       } else {
+        const savedEffects = sideEffects;
+        sideEffects = true;
         const r = readValue(fn.bodyStart, fn.bodyEnd, TERMS_NONE);
         if (r && r.next === fn.bodyEnd) result = r.binding;
+        sideEffects = savedEffects;
       }
       tks = savedTks;
       stack.pop();
