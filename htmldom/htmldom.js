@@ -353,10 +353,12 @@
       if (!trail) continue;
       const prop = trail[2];
       let target = trail[1];
+      let targetSrcStart = -1;
       if (target === '') {
         const r = reconstructTarget(tokens, i - 1);
         if (!r) continue;
-        target = r;
+        target = r.text;
+        targetSrcStart = r.srcStart;
       }
       let depth = 0;
       let rhsEnd = tokens.length;
@@ -370,7 +372,7 @@
         }
       }
       // Source character positions for the entire statement.
-      const srcStart = prev.start; // start of `target.innerHTML`
+      const srcStart = targetSrcStart >= 0 ? targetSrcStart : prev.start;
       let srcEnd = rhsEnd < tokens.length ? tokens[rhsEnd].end : tokens[tokens.length - 1].end;
       // Include trailing semicolon in the replaced range.
       if (rhsEnd < tokens.length && tokens[rhsEnd].type === 'sep' && tokens[rhsEnd].char === ';') {
@@ -410,7 +412,8 @@
     if (firstIdx > accessorIdx - 1) return null;
     const first = tokens[firstIdx];
     // Exclude the trailing .innerHTML/.outerHTML from the target slice.
-    return first._src.slice(first.start, startAccessor.start).trim() || null;
+    const text = first._src.slice(first.start, startAccessor.start).trim() || null;
+    return text ? { text, srcStart: first.start } : null;
   }
 
   const IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
