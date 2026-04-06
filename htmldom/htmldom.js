@@ -5329,20 +5329,17 @@
         continue;
       }
 
-      // Style attribute -> style.setProperty calls.
-      if (name === 'style' && opts.splitStyle) {
+      // Style attribute -> always use style.setProperty to prevent CSS injection.
+      // Never use setAttribute('style', ...) which could inject via crafted values.
+      if (name === 'style') {
         const decls = parseStyle(val);
-        if (decls.length === 0) {
-          lines.push(v + ".setAttribute('style', " + jsStr(val, opts.subs).code + ');');
-        } else {
-          for (const d of decls) {
-            const p = jsStr(d.prop).code;
-            const vv = jsStr(d.value, opts.subs).code;
-            if (d.priority) {
-              lines.push(v + '.style.setProperty(' + p + ', ' + vv + ", 'important');");
-            } else {
-              lines.push(v + '.style.setProperty(' + p + ', ' + vv + ');');
-            }
+        for (const d of decls) {
+          const p = jsStr(d.prop).code;
+          const vv = jsStr(d.value, opts.subs).code;
+          if (d.priority) {
+            lines.push(v + '.style.setProperty(' + p + ', ' + vv + ", 'important');");
+          } else {
+            lines.push(v + '.style.setProperty(' + p + ', ' + vv + ');');
           }
         }
         continue;
@@ -5569,7 +5566,6 @@
 
     const opts = {
       useProps: $('useProps').checked,
-      splitStyle: $('splitStyle').checked,
       eventsAsListeners: $('eventsAsListeners').checked,
       textContentShortcut: $('textShortcut').checked,
       useClassList: $('useClassList').checked,
@@ -5692,7 +5688,7 @@
 
   // Live update on input changes.
   $('in').addEventListener('input', convert);
-  const toggles = ['useProps', 'splitStyle', 'eventsAsListeners', 'textShortcut', 'useClassList', 'skipWS', 'useFragment'];
+  const toggles = ['useProps', 'eventsAsListeners', 'textShortcut', 'useClassList', 'skipWS', 'useFragment'];
   for (const id of toggles) $(id).addEventListener('change', convert);
 
   convert();
