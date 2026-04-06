@@ -4,24 +4,20 @@
 <meta charset="utf-8">
 <title>HTML/CSS to DOM API Converter</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="script-src 'self' 'inline-speculation-rules'; object-src 'none'; base-uri 'none';" />
-<link rel="stylesheet" href="prism-tomorrow.min.css">
+<meta http-equiv="Content-Security-Policy" content="script-src 'self' https://cdnjs.cloudflare.com 'inline-speculation-rules'; style-src 'self' https://cdnjs.cloudflare.com 'unsafe-inline'; object-src 'none'; base-uri 'none';" />
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/codemirror.min.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/theme/monokai.min.css">
 <style>
 body { font-family: system-ui, sans-serif; margin: 1rem; max-width: 960px; background: #212529; color: #eee; }
 h1 { font-size: 1.4rem; }
 label { display: block; margin-top: 0.75rem; font-weight: bold; }
-textarea { width: 100%; box-sizing: border-box; font-family: ui-monospace, Consolas, monospace; font-size: 0.9rem; background: #111; color: #eee; border: 1px solid #444; padding: 0.5rem; }
-textarea:focus { outline: 2px solid #6ea8fe; outline-offset: -1px; border-color: #6ea8fe; }
 button { margin-top: 0.75rem; padding: 0.4rem 0.9rem; background: #317EFB; color: #fff; border: 0; border-radius: 4px; cursor: pointer; }
 button:hover { background: #2568d4; }
 button:focus { outline: 2px solid #fff; outline-offset: 2px; }
 code { background: #2a2e33; padding: 0.05rem 0.25rem; border-radius: 3px; font-size: 0.85em; }
 .hint { color: #aaa; font-size: 0.85rem; line-height: 1.5; }
 .hint code { color: #ddd; }
-.codeblock { background: #1d1f21; border: 1px solid #444; border-radius: 4px; padding: 0.5rem; max-height: 500px; overflow: auto; font-size: 0.9rem; }
-.codeblock:focus { outline: 2px solid #6ea8fe; outline-offset: -1px; border-color: #6ea8fe; }
-.codeblock code { background: none; padding: 0; font-size: inherit; white-space: pre-wrap; word-wrap: break-word; }
-#inPre { min-height: 200px; }
+.CodeMirror { border: 1px solid #444; font-size: 0.9rem; height: auto; max-height: 400px; }
 </style>
 </head>
 <body>
@@ -29,19 +25,19 @@ code { background: #2a2e33; padding: 0.05rem 0.25rem; border-radius: 3px; font-s
 <p class="hint">Paste HTML or a JS snippet that builds HTML via <code>innerHTML</code>/<code>outerHTML</code> assignments. HTML is converted to safe <code>createElement</code>/<code>appendChild</code> calls, and inline <code>style</code> attributes are split into individual <code>style.setProperty()</code> calls. The JS resolver statically evaluates variables, expressions, loops, conditionals, and method calls. Runtime-only values flow through as named references.</p>
 
 <label>Input</label>
-<pre id="inPre" class="codeblock" contenteditable="true" spellcheck="false"><code id="inCode" class="language-markup">&lt;div style="position: fixed; z-index: -99; width: 100%; height: 100%"&gt;
-  &lt;iframe credentialless loading="lazy" id="background" title="background" sandbox="allow-scripts" frameborder="0" height="100%" width="100%" src="https://random.ndev.tk/"&gt;&lt;/iframe&gt;
-&lt;/div&gt;
-&lt;button onclick="alert('hello')"&gt;Greet&lt;/button&gt;
-&lt;script&gt;
+<textarea id="in"><div style="position: fixed; z-index: -99; width: 100%; height: 100%">
+  <iframe credentialless loading="lazy" id="background" title="background" sandbox="allow-scripts" frameborder="0" height="100%" width="100%" src="https://random.ndev.tk/"></iframe>
+</div>
+<button onclick="alert('hello')">Greet</button>
+<script>
 var items = ['Home', 'About', 'Contact', location.search];
-var html = '&lt;nav&gt;';
-for (var i = 0; i &lt; items.length; i++) {
-  html += '&lt;a href="/' + items[i].toLowerCase() + '"&gt;' + items[i] + '&lt;/a&gt;';
+var html = '<nav>';
+for (var i = 0; i < items.length; i++) {
+  html += '<a href="/' + items[i].toLowerCase() + '">' + items[i] + '</a>';
 }
-html += '&lt;/nav&gt;';
+html += '</nav>';
 document.body.innerHTML = html;
-&lt;/script&gt;</code></pre>
+</script></textarea>
 
 <details style="margin-top:0.75rem;">
   <summary style="cursor:pointer; color:#aaa;">Output options</summary>
@@ -55,11 +51,15 @@ document.body.innerHTML = html;
 <button id="copy">Copy output</button>
 
 <label>Output</label>
-<pre id="outPre" class="codeblock"><code id="outCode" class="language-javascript"></code></pre>
+<textarea id="out" readonly></textarea>
 
 <p class="hint"><a href="/" style="color:#6ea8fe">&larr; Home</a></p>
 
-<script src="prism.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/codemirror.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/mode/xml/xml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/mode/javascript/javascript.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/mode/css/css.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/mode/htmlmixed/htmlmixed.min.js"></script>
 <script src="htmldom.js"></script>
 </body>
 </html>

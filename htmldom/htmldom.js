@@ -5898,7 +5898,7 @@
 
   function convert() {
     try {
-      const raw = $('inCode') ? $('inCode').textContent : ($('in') ? $('in').value : '');
+      const raw = (typeof window !== 'undefined' && window._cmEditor) ? window._cmEditor.getValue() : ($('in') ? $('in').value : '');
 
       // If input is HTML (starts with <), split into HTML portions and
       // <script> blocks. Convert HTML to DOM API, process script blocks
@@ -6218,10 +6218,10 @@
   let lastOutput = '';
   function setOutput(text) {
     lastOutput = text;
-    const codeEl = $('outCode');
-    if (codeEl) {
-      codeEl.textContent = text;
-      if (typeof Prism !== 'undefined') Prism.highlightElement(codeEl);
+    if (typeof window !== 'undefined' && window._cmOut) {
+      window._cmOut.setValue(text);
+    } else if ($('out')) {
+      $('out').value = text;
     }
   }
 
@@ -6233,80 +6233,38 @@
     } catch (_) {}
   });
 
-  // Save and restore cursor position in contenteditable.
-  function saveCursor(el) {
-    const sel = window.getSelection();
-    if (!sel.rangeCount) return null;
-    const range = sel.getRangeAt(0);
-    const pre = range.cloneRange();
-    pre.selectNodeContents(el);
-    pre.setEnd(range.startContainer, range.startOffset);
-    return pre.toString().length;
-  }
-  function restoreCursor(el, pos) {
-    if (pos === null) return;
-    const sel = window.getSelection();
-    const range = document.createRange();
-    let current = 0;
-    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
-    while (walker.nextNode()) {
-      const node = walker.currentNode;
-      const len = node.textContent.length;
-      if (current + len >= pos) {
-        range.setStart(node, pos - current);
-        range.collapse(true);
-        sel.removeAllRanges();
-        sel.addRange(range);
-        return;
-      }
-      current += len;
-    }
+  // Initialize CodeMirror on the input textarea.
+  if (typeof CodeMirror !== 'undefined' && $('in')) {
+    const cm = CodeMirror.fromTextArea($('in'), {
+      mode: 'htmlmixed',
+      theme: 'monokai',
+      lineNumbers: true,
+      indentUnit: 2,
+      tabSize: 2,
+      indentWithTabs: false,
+      lineWrapping: true,
+      viewportMargin: Infinity,
+    });
+    window._cmEditor = cm;
+    cm.on('change', convert);
+  } else if ($('in')) {
+    $('in').addEventListener('input', convert);
   }
 
-  function highlightInput() {
-    const codeEl = $('inCode');
-    if (!codeEl || typeof Prism === 'undefined') return;
-    const pre = $('inPre');
-    const pos = saveCursor(pre);
-    const text = codeEl.textContent;
-    const isMarkup = /^\s*</.test(text);
-    codeEl.className = isMarkup ? 'language-markup' : 'language-javascript';
-    Prism.highlightElement(codeEl);
-    restoreCursor(pre, pos);
+  // Initialize CodeMirror on the output textarea (read-only).
+  if (typeof CodeMirror !== 'undefined' && $('out')) {
+    window._cmOut = CodeMirror.fromTextArea($('out'), {
+      mode: 'javascript',
+      theme: 'monokai',
+      lineNumbers: true,
+      readOnly: true,
+      lineWrapping: true,
+      viewportMargin: Infinity,
+    });
   }
 
-  // Live update on input changes.
-  const inputEl = $('inPre') || $('in');
-  let highlightTimer = null;
-  inputEl.addEventListener('input', () => {
-    convert();
-    // Debounce highlighting to avoid cursor jank on fast typing.
-    clearTimeout(highlightTimer);
-    highlightTimer = setTimeout(highlightInput, 300);
-  });
-  if ($('inPre')) {
-    // Enter inserts a plain newline, not a <div> or <br>.
-    $('inPre').addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        document.execCommand('insertText', false, '\n');
-      }
-      // Tab inserts two spaces.
-      if (e.key === 'Tab') {
-        e.preventDefault();
-        document.execCommand('insertText', false, '  ');
-      }
-    });
-    // Paste as plain text to avoid HTML formatting.
-    $('inPre').addEventListener('paste', (e) => {
-      e.preventDefault();
-      const text = e.clipboardData.getData('text/plain');
-      document.execCommand('insertText', false, text);
-    });
-  }
   const toggles = ['skipWS', 'useFragment', 'emitComments'];
   for (const id of toggles) $(id).addEventListener('change', convert);
 
-  highlightInput();
   convert();
 })();
