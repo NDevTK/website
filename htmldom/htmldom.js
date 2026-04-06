@@ -468,6 +468,8 @@
     }
     for (let s = allStmts.length - 1; s >= 0 && buildVar; s--) {
       const stmt = allStmts[s];
+      // Skip the innerHTML statement itself — it's being replaced, not a build stmt.
+      if (stmt.tokStart <= targetTokIdx && stmt.tokEnd > targetTokIdx) continue;
       const stmtTokens = tokens.slice(stmt.tokStart, stmt.tokEnd);
       let writesBuildVar = false;
       let isBuildVarDecl = false;
@@ -5829,9 +5831,83 @@
   function convert() {
     try {
       const raw = $('in').value;
+
+      // If input is HTML (starts with <), split into HTML portions and
+      // <script> blocks. Convert HTML to DOM API, process script blocks
+      // for innerHTML replacements.
+      if (/^\s*</.test(raw)) {
+        const scriptRe = /<script\b[^>]*>([\s\S]*?)<\/script>/gi;
+        let lastIdx = 0;
+        const parts = [];
+        let m;
+        while ((m = scriptRe.exec(raw)) !== null) {
+          // HTML before this script tag.
+          if (m.index > lastIdx) {
+            parts.push({ kind: 'html', text: raw.slice(lastIdx, m.index) });
+          }
+          parts.push({ kind: 'script', text: m[1], fullMatch: m[0], tagStart: m.index, tagEnd: m.index + m[0].length });
+          lastIdx = scriptRe.lastIndex;
+        }
+        // Trailing HTML after last script.
+        if (lastIdx < raw.length) {
+          parts.push({ kind: 'html', text: raw.slice(lastIdx) });
+        }
+        // If no script tags found, treat entire input as HTML.
+        if (parts.length === 0) parts.push({ kind: 'html', text: raw });
+
+        const outputParts = [];
+        for (const part of parts) {
+          if (part.kind === 'html') {
+            const htmlTrimmed = part.text.trim();
+            if (!htmlTrimmed) continue;
+            const result = extractHTML(htmlTrimmed);
+            const block = convertOne(htmlTrimmed, result, false, false);
+            if (block) outputParts.push(block);
+          } else {
+            // Process script content for innerHTML replacements.
+            const jsCode = part.text;
+            const extractions = extractAllHTML(jsCode);
+            if (extractions.length === 0) {
+              // No innerHTML in this script — keep as-is.
+              outputParts.push(jsCode);
+            } else {
+              // Inline replacement within the script.
+              const trimmed = jsCode;
+              let scriptOutput = '';
+              let cursor = 0;
+              for (const ex of extractions) {
+                if (ex.srcStart === undefined) continue;
+                const domBlock = convertOne(jsCode, ex, false, false);
+                let srcStart = ex.srcStart;
+                let srcEnd = ex.srcEnd;
+                if (ex._assign && ex._tokens) {
+                  const region = findBuildRegion(ex._tokens, ex._assign, domBlock || '');
+                  if (region) {
+                    srcStart = region.regionStart;
+                    srcEnd = region.regionEnd;
+                  }
+                }
+                scriptOutput += trimmed.slice(cursor, srcStart);
+                if (domBlock) {
+                  let lineStart = srcStart;
+                  while (lineStart > 0 && trimmed[lineStart - 1] !== '\n') lineStart--;
+                  const indent = trimmed.slice(lineStart, srcStart).match(/^(\s*)/)[1];
+                  const indented = domBlock.split('\n').map((line, i) => i === 0 ? line : indent + line).join('\n');
+                  scriptOutput += indented;
+                }
+                cursor = srcEnd;
+              }
+              scriptOutput += trimmed.slice(cursor);
+              outputParts.push(scriptOutput);
+            }
+          }
+        }
+        $('out').value = outputParts.join('\n');
+        return;
+      }
+
       const extractions = extractAllHTML(raw);
       if (extractions.length === 0) {
-        // No innerHTML sites — check for createElement-based DOM or raw HTML.
         const summary = summarizeDomConstruction(raw);
         if (summary) { $('out').value = summary; return; }
         $('out').value = convertOne(raw, extractHTML(raw), false, false) || '';
