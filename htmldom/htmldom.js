@@ -1139,15 +1139,9 @@
     // consistently produce an opaque source reference rather than a
     // stale initial value.
     // Snapshot all bindings currently in scope (for closures).
-    const captureScope = () => {
-      const merged = Object.create(null);
-      for (let i = 0; i < stack.length; i++) {
-        for (const name of Object.keys(stack[i].bindings)) {
-          merged[name] = stack[i].bindings[name];
-        }
-      }
-      return merged;
-    };
+    // Capture a closure: store references to the actual scope frames (not
+    // copies) so multiple closures over the same variable share state.
+    const captureScope = () => stack.slice();
     const asRef = (name, value) => value;
     const declBlock = (name, value) => { topBlock().bindings[name] = asRef(name, value); };
     const declFunction = (name, value) => {
@@ -1157,9 +1151,22 @@
     };
     const assignName = (name, value) => {
       for (let i = stack.length - 1; i >= 0; i--) {
-        if (name in stack[i].bindings) { stack[i].bindings[name] = asRef(name, value); return; }
+        if (name in stack[i].bindings) {
+          // When side effects are off, don't modify bindings in frames
+          // below the nearest function scope (outer variables).
+          if (!sideEffects) {
+            let inCurrentFunction = false;
+            for (let j = stack.length - 1; j >= i; j--) {
+              if (j === i) { inCurrentFunction = true; break; }
+              if (stack[j].isFunction) break;
+            }
+            if (!inCurrentFunction) return;
+          }
+          stack[i].bindings[name] = asRef(name, value);
+          return;
+        }
       }
-      stack[0].bindings[name] = asRef(name, value); // implicit global
+      if (sideEffects) stack[0].bindings[name] = asRef(name, value);
     };
     const resolve = (name) => {
       // `this` resolves to the nearest function scope's thisBinding.
@@ -2341,7 +2348,7 @@
               if (fn.params[1]) iterFrame.bindings[fn.params[1].name] = chainBinding([makeSynthNum(idx)]);
               if (fn.params[2]) iterFrame.bindings[fn.params[2].name] = bind;
               stack.push(iterFrame);
-              if (fn.isBlock) walkRange(fn.bodyStart, fn.bodyEnd);
+              if (fn.isBlock) walkRangeWithEffects(fn.bodyStart, fn.bodyEnd);
               stack.pop();
             }
             return { bind: chainBinding([makeSynthStr('undefined')]), next: cb.next + 1 };
@@ -2819,7 +2826,7 @@
                   const pi = cls.ctor.params[p];
                   frame.bindings[pi.name] = argRes.bindings[p] || null;
                 }
-                walkRange(cls.ctor.bodyStart, cls.ctor.bodyEnd);
+                walkRangeWithEffects(cls.ctor.bodyStart, cls.ctor.bodyEnd);
                 stack.pop();
               }
               return { bind: instance, next: argRes.next };
@@ -3328,7 +3335,11 @@
     // Unified function invocation: pushes closure + frame with this/super,
     // binds params (including rest), evaluates body, pops frames, returns result.
     const instantiateFunctionBinding = (fn, argBindings, thisObj, superClass) => {
-      if (fn.closure) stack.push({ bindings: Object.assign(Object.create(null), fn.closure), isFunction: true });
+      // Restore closure frames: push the ORIGINAL frames (by reference)
+      // so modifications to closed-over variables are shared across all
+      // closures that captured the same scope.
+      const closureFrameCount = fn.closure ? fn.closure.length : 0;
+      if (fn.closure) for (const frame of fn.closure) stack.push(frame);
       stack.push({ bindings: Object.create(null), isFunction: true, thisBinding: thisObj || null, superClass: superClass || null });
       const frame = stack[stack.length - 1];
       const savedTks = tks;
@@ -3355,7 +3366,7 @@
         // Walk the body via the statement walker so declarations (var,
         // function, class) are registered in the scope. Then scan for
         // the top-level `return` expression and evaluate it.
-        walkRange(fn.bodyStart, fn.bodyEnd);
+        walkRangeWithEffects(fn.bodyStart, fn.bodyEnd);
         // After walking, scan for `return expr` at the top level.
         let i = fn.bodyStart;
         while (i < fn.bodyEnd) {
@@ -3382,7 +3393,7 @@
       }
       tks = savedTks;
       stack.pop();
-      if (fn.closure) stack.pop();
+      for (let c = 0; c < closureFrameCount; c++) stack.pop();
       return result;
     };
 
@@ -3804,13 +3815,26 @@
     };
 
     let stop = Math.min(stopAt, tokens.length);
-    // walkRange returns a control flow signal: 'break', 'continue',
-    // 'break:label', 'continue:label', or undefined (normal completion).
+    // When false, assignments to outer-scope variables and bare function
+    // calls are skipped. This separates scope resolution (declarations,
+    // local bindings) from side-effect execution (mutations to outer vars).
+    // The initial pass runs with sideEffects OFF. Explicit invocations
+    // (instantiateFunctionBinding, loop simulation, forEach) turn it ON.
+    let sideEffects = false;
     const walkRange = (startI, endI) => {
       const savedStop = stop;
       stop = endI;
       const signal = walkRangeImpl(startI, endI);
       stop = savedStop;
+      return signal;
+    };
+    // walkRange with side effects enabled — used by function calls,
+    // loop simulation, forEach, etc.
+    const walkRangeWithEffects = (startI, endI) => {
+      const saved = sideEffects;
+      sideEffects = true;
+      const signal = walkRange(startI, endI);
+      sideEffects = saved;
       return signal;
     };
     const walkRangeImpl = (startI, endI) => {
@@ -3844,15 +3868,18 @@
       const t = tokens[i];
 
       if (t.type === 'open' && t.char === '{') {
-        const frame = { bindings: Object.create(null), isFunction: pendingFunctionBrace };
-        if (pendingFunctionBrace && pendingFunctionParams) {
-          // Bind function parameters as references to their own names so
-          // uses within the body surface via autoSubs when the body is
-          // parsed in scope (e.g. for an innerHTML assignment inside the
-          // function). At call sites, instantiateFunction rebinds them.
+        const enteringFunction = pendingFunctionBrace;
+        const frame = { bindings: Object.create(null), isFunction: enteringFunction };
+        if (enteringFunction && pendingFunctionParams) {
           for (const p of pendingFunctionParams) {
             frame.bindings[p.name] = chainBinding([exprRef(p.name)]);
           }
+        }
+        // When entering a function body via the walker (not via an explicit
+        // call), disable side effects — this is scope resolution only.
+        if (enteringFunction) {
+          frame._savedSideEffects = sideEffects;
+          sideEffects = false;
         }
         stack.push(frame);
         pendingFunctionBrace = false;
@@ -3860,13 +3887,20 @@
         continue;
       }
       if (t.type === 'close' && t.char === '}') {
-        if (stack.length > 1) stack.pop();
+        if (stack.length > 1) {
+          const popped = stack.pop();
+          // Restore side effects state when leaving a function scope
+          // that was entered via the walker (not an explicit call).
+          if (popped.isFunction && '_savedSideEffects' in popped) {
+            sideEffects = popped._savedSideEffects;
+          }
+        }
         continue;
       }
 
       // Bare function call at statement level: `fn()`, `fn(args)`,
       // `obj.method()`. Invoke for side effects (e.g. modifying outer vars).
-      if (t.type === 'other' && IDENT_RE.test(t.text)) {
+      if (sideEffects && t.type === 'other' && IDENT_RE.test(t.text)) {
         const callParen = tokens[i + 1];
         if (callParen && callParen.type === 'open' && callParen.char === '(') {
           const fn = resolve(t.text);
@@ -3881,7 +3915,7 @@
         }
       }
       // Bare method call: `obj.method()` at statement level.
-      if (t.type === 'other' && PATH_RE.test(t.text)) {
+      if (sideEffects && t.type === 'other' && PATH_RE.test(t.text)) {
         const callParen = tokens[i + 1];
         if (callParen && callParen.type === 'open' && callParen.char === '(') {
           const dot = t.text.lastIndexOf('.');
@@ -4078,7 +4112,7 @@
                   });
                 }
                 stack.push(iterFrame);
-                const sig = walkRange(bodyStart, bodyEnd);
+                const sig = walkRangeWithEffects(bodyStart, bodyEnd);
                 const idx = stack.indexOf(iterFrame);
                 if (idx >= 0) stack.splice(idx, 1);
                 // Handle signal with label awareness.
@@ -4114,7 +4148,7 @@
                   // Pre-check: evaluate init to set up counter, then test if
                   // the condition is concrete. If not, skip simulation entirely
                   // (don't dirty scope state).
-                  if (initEnd > initStart) walkRange(initStart, initEnd);
+                  if (initEnd > initStart) walkRangeWithEffects(initStart, initEnd);
                   const bodyStart = (tokens[j + 1] && tokens[j + 1].type === 'open' && tokens[j + 1].char === '{') ? j + 1 : j + 1;
                   // First condition check — if opaque, bail before any body walk.
                   const firstCond = condEnd > condStart ? readValue(condStart, condEnd, null) : null;
@@ -4134,21 +4168,21 @@
                     };
                     if (firstTruth === true) {
                       let brk = false;
-                      let action = handleSig(walkRange(bodyStart, bodyEnd));
+                      let action = handleSig(walkRangeWithEffects(bodyStart, bodyEnd));
                       if (action === 'break') brk = true;
                       else if (action !== 'ok' && action !== 'continue') return action; // propagate
                       if (!brk) {
-                        if (action !== 'continue' && updateEnd > updateStart) walkRange(updateStart, updateEnd);
-                        if (action === 'continue' && updateEnd > updateStart) walkRange(updateStart, updateEnd);
+                        if (action !== 'continue' && updateEnd > updateStart) walkRangeWithEffects(updateStart, updateEnd);
+                        if (action === 'continue' && updateEnd > updateStart) walkRangeWithEffects(updateStart, updateEnd);
                         while (!brk) {
                           if (condEnd <= condStart) break;
                           const condVal = readValue(condStart, condEnd, null);
                           const concrete = evalTruthiness(condVal ? condVal.binding : null);
                           if (concrete !== true) break;
-                          action = handleSig(walkRange(bodyStart, bodyEnd));
+                          action = handleSig(walkRangeWithEffects(bodyStart, bodyEnd));
                           if (action === 'break') { brk = true; break; }
                           if (action !== 'ok' && action !== 'continue') return action;
-                          if (updateEnd > updateStart) walkRange(updateStart, updateEnd);
+                          if (updateEnd > updateStart) walkRangeWithEffects(updateStart, updateEnd);
                         }
                       }
                     }
@@ -4173,14 +4207,14 @@
                       return sig;
                     };
                     let brk = false;
-                    let action = handleSig2(walkRange(bodyStart, bodyEnd));
+                    let action = handleSig2(walkRangeWithEffects(bodyStart, bodyEnd));
                     if (action === 'break') brk = true;
                     else if (action !== 'ok' && action !== 'continue') return action;
                     while (!brk) {
                       const condVal = readValue(condStart, condEnd, null);
                       const concrete = evalTruthiness(condVal ? condVal.binding : null);
                       if (concrete !== true) break;
-                      action = handleSig2(walkRange(bodyStart, bodyEnd));
+                      action = handleSig2(walkRangeWithEffects(bodyStart, bodyEnd));
                       if (action === 'break') { brk = true; break; }
                       if (action !== 'ok' && action !== 'continue') return action;
                     }
@@ -4667,11 +4701,11 @@
             }
             if (depth === 0) {
               declFunction(nameTok.text, functionBinding(params, j + 1, k - 1, true, stack.length > 1 ? captureScope() : null));
-              // Skip past the function body — it will be walked when
-              // the function is actually called (via instantiateFunctionBinding).
-              // innerHTML sites inside function bodies are found by the
-              // token-level scanner (findAllHtmlAssignments), not the walker.
-              i = k - 1;
+              // Let the `{` handler decide whether to walk or skip the body
+              // based on whether it contains our target range.
+              pendingFunctionBrace = true;
+              pendingFunctionParams = params;
+              i = j - 1;
               continue;
             }
           }
@@ -4680,8 +4714,6 @@
         continue;
       }
       if (t.text === '=>') {
-        // Only arrow bodies of the form `=> { ... }` open a function scope;
-        // expression arrows (`x => x + 1`) don't.
         const next = tokens[i + 1];
         if (next && next.type === 'open' && next.char === '{') pendingFunctionBrace = true;
         continue;
@@ -4708,7 +4740,7 @@
             for (let p = 0; p < superCls.ctor.params.length; p++) {
               frame.bindings[superCls.ctor.params[p].name] = argRes.bindings[p] || null;
             }
-            walkRange(superCls.ctor.bodyStart, superCls.ctor.bodyEnd);
+            walkRangeWithEffects(superCls.ctor.bodyStart, superCls.ctor.bodyEnd);
             stack.pop();
             i = argRes.next - 1;
             continue;
@@ -4930,6 +4962,10 @@
         }
       }
 
+      // All remaining handlers below perform mutations (path assignment,
+      // path increment, method calls, delete). Skip when side effects off.
+      if (!sideEffects) continue;
+
       // Path assignment on a tracked DOM element: `el.prop = value`,
       // `el.style.color = value`, etc. Records the mutation on the
       // element binding so subsequent DOM serialization sees it.
@@ -5076,7 +5112,7 @@
                       if (cb.fn.params[1]) iterFrame.bindings[cb.fn.params[1].name] = chainBinding([makeSynthNum(idx)]);
                       if (cb.fn.params[2]) iterFrame.bindings[cb.fn.params[2].name] = baseBind;
                       stack.push(iterFrame);
-                      if (cb.fn.isBlock) walkRange(cb.fn.bodyStart, cb.fn.bodyEnd);
+                      if (cb.fn.isBlock) walkRangeWithEffects(cb.fn.bodyStart, cb.fn.bodyEnd);
                       stack.pop();
                     }
                     i = cb.next; // past `)`
@@ -5126,7 +5162,7 @@
       }
     }
     };
-    walkRange(0, stop);
+    walkRangeWithEffects(0, stop);
 
     // Parse tokens[start, end) as a concat chain, expanding identifier
     // references, member paths, `[...].join(sep)`, and `.concat(...)` calls.
