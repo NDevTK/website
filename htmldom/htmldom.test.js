@@ -727,6 +727,26 @@ group('edge cases', () => {
 });
 
 // -----------------------------------------------------------------------
+// Class support
+// -----------------------------------------------------------------------
+group('classes', () => {
+  check('class constructor sets properties',
+    `class Foo { constructor(x) { this.x = x; } } var f = new Foo('hi'); document.body.innerHTML = f.x;`, 'hi');
+  check('class method with this',
+    `class Foo { constructor(x) { this.x = x; } greet() { return 'hello ' + this.x; } } var f = new Foo('world'); document.body.innerHTML = f.greet();`,
+    'hello world');
+  check('class method numeric',
+    `class P { constructor(a,b) { this.a=a; this.b=b; } sum() { return this.a + this.b; } } var p = new P(3,4); document.body.innerHTML = p.sum();`, '7');
+  check('class method returns HTML',
+    `class Item { constructor(name) { this.name=name; } render() { return '<li>'+this.name+'</li>'; } } var it = new Item('test'); document.body.innerHTML = it.render();`,
+    '<li>test</li>');
+  check('new inline property access',
+    `class C { constructor() { this.val='ok'; } } document.body.innerHTML = new C().val;`, 'ok');
+  check('class with multiple methods',
+    `class C { constructor(n) { this.n=n; } double() { return this.n*2; } label() { return 'n='+this.double(); } } document.body.innerHTML = new C(5).label();`, 'n=10');
+});
+
+// -----------------------------------------------------------------------
 // Template literal interpolation resolution
 // -----------------------------------------------------------------------
 group('template interpolation', () => {
