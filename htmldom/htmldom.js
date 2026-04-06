@@ -5896,6 +5896,8 @@
                   scriptOutput += indented;
                 }
                 cursor = srcEnd;
+                // Skip trailing semicolons/whitespace to avoid doubled `;`.
+                while (cursor < trimmed.length && (trimmed[cursor] === ';' || trimmed[cursor] === ' ')) cursor++;
               }
               scriptOutput += trimmed.slice(cursor);
               outputParts.push(scriptOutput);
@@ -5944,6 +5946,7 @@
           output += indented;
         }
         cursor = srcEnd;
+        while (cursor < trimmed.length && (trimmed[cursor] === ';' || trimmed[cursor] === ' ')) cursor++;
       }
       // Append remaining original source after the last innerHTML site.
       output += trimmed.slice(cursor);
