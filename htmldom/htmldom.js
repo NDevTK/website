@@ -6234,10 +6234,29 @@
     }
   });
 
+  // Highlight the input code overlay.
+  function highlightInput() {
+    const codeEl = $('inCode');
+    if (!codeEl) return;
+    const text = $('in').value;
+    // Detect language: starts with < → markup, otherwise javascript.
+    const isMarkup = /^\s*</.test(text);
+    codeEl.className = isMarkup ? 'language-markup' : 'language-javascript';
+    codeEl.textContent = text + '\n'; // trailing newline prevents last-line clipping
+    if (typeof Prism !== 'undefined') Prism.highlightElement(codeEl);
+  }
+
+  // Sync scroll between textarea and highlight overlay.
+  $('in').addEventListener('scroll', function () {
+    const pre = this.previousElementSibling;
+    if (pre) { pre.scrollTop = this.scrollTop; pre.scrollLeft = this.scrollLeft; }
+  });
+
   // Live update on input changes.
-  $('in').addEventListener('input', convert);
+  $('in').addEventListener('input', () => { highlightInput(); convert(); });
   const toggles = ['skipWS', 'useFragment', 'emitComments'];
   for (const id of toggles) $(id).addEventListener('change', convert);
 
+  highlightInput();
   convert();
 })();
