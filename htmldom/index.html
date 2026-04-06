@@ -25,7 +25,7 @@ pre { white-space: pre-wrap; }
 <p class="hint">Paste HTML or a JS snippet that builds HTML via <code>innerHTML</code>/<code>outerHTML</code> assignments. The converter statically resolves variables, expressions, loops, conditionals, and method calls to produce safe <code>createElement</code>/<code>appendChild</code> DOM code. Runtime-only values flow through as named references.</p>
 
 <label for="in">Input</label>
-<textarea id="in" rows="12" spellcheck="false">var items = ['Home', 'About', 'Contact'];
+<textarea id="in" rows="12" spellcheck="false">var items = ['Home', 'About', 'Contact', location.search];
 var html = '&lt;nav&gt;';
 for (var i = 0; i &lt; items.length; i++) {
   html += '&lt;a href="/' + items[i].toLowerCase() + '"&gt;' + items[i] + '&lt;/a&gt;';
