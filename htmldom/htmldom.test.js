@@ -882,6 +882,10 @@ group('cross-function scoping', () => {
     `var o={n:5}; function f(){o.n++;} f(); document.body.innerHTML=o.n;`, '6');
   check('bare function call for side effects',
     `var result=''; function add(x){result+=x;} add('a'); add('b'); document.body.innerHTML=result;`, 'ab');
+  check('shared mutable closure',
+    `function counter(){var n=0; return {inc:function(){n++; return n;}, get:function(){return n;}};} var c=counter(); c.inc(); c.inc(); document.body.innerHTML=c.get();`, '2');
+  check('counter with inc/dec/val',
+    `function mkC(s){var n=s; return {inc:function(){n++;},dec:function(){n--;},val:function(){return n;}};} var c=mkC(10); c.inc(); c.inc(); c.dec(); document.body.innerHTML=c.val();`, '11');
 });
 
 // -----------------------------------------------------------------------
