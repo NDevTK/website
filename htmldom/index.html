@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>HTML to DOM API Converter</title>
+<title>HTML/CSS to DOM API Converter</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="script-src 'self' 'inline-speculation-rules'; object-src 'none'; base-uri 'none';" />
 <style>
@@ -21,8 +21,8 @@ pre { white-space: pre-wrap; }
 </style>
 </head>
 <body>
-<h1>HTML &rarr; DOM API Converter</h1>
-<p class="hint">Paste HTML or a JS snippet that builds HTML via <code>innerHTML</code>/<code>outerHTML</code> assignments. The converter statically resolves variables, expressions, loops, conditionals, and method calls to produce safe <code>createElement</code>/<code>appendChild</code> DOM code. Runtime-only values flow through as named references.</p>
+<h1>HTML/CSS &rarr; DOM API Converter</h1>
+<p class="hint">Paste HTML or a JS snippet that builds HTML via <code>innerHTML</code>/<code>outerHTML</code> assignments. HTML is converted to safe <code>createElement</code>/<code>appendChild</code> calls, and inline <code>style</code> attributes are split into individual <code>style.setProperty()</code> calls. The JS resolver statically evaluates variables, expressions, loops, conditionals, and method calls. Runtime-only values flow through as named references.</p>
 
 <label for="in">Input</label>
 <textarea id="in" rows="12" spellcheck="false">var items = ['Home', 'About', 'Contact', location.search];
