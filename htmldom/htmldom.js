@@ -218,7 +218,12 @@
     if (!trimmed) return [];
     const tokens = tokenize(trimmed);
     const assigns = findAllHtmlAssignments(tokens);
-    return assigns.map((assign) => extractOneAssignment(tokens, assign));
+    return assigns.map((assign) => {
+      const result = extractOneAssignment(tokens, assign);
+      result.srcStart = assign.srcStart;
+      result.srcEnd = assign.srcEnd;
+      return result;
+    });
   }
 
   // Produce an { html, autoSubs, target, assignProp, assignOp, ... } record
@@ -348,10 +353,12 @@
       if (!trail) continue;
       const prop = trail[2];
       let target = trail[1];
+      let targetSrcStart = -1;
       if (target === '') {
         const r = reconstructTarget(tokens, i - 1);
         if (!r) continue;
-        target = r;
+        target = r.text;
+        targetSrcStart = r.srcStart;
       }
       let depth = 0;
       let rhsEnd = tokens.length;
@@ -364,7 +371,14 @@
           break;
         }
       }
-      out.push({ target, prop, op: t.char, rhsStart: i + 1, rhsEnd });
+      // Source character positions for the entire statement.
+      const srcStart = targetSrcStart >= 0 ? targetSrcStart : prev.start;
+      let srcEnd = rhsEnd < tokens.length ? tokens[rhsEnd].end : tokens[tokens.length - 1].end;
+      // Include trailing semicolon in the replaced range.
+      if (rhsEnd < tokens.length && tokens[rhsEnd].type === 'sep' && tokens[rhsEnd].char === ';') {
+        srcEnd = tokens[rhsEnd].end;
+      }
+      out.push({ target, prop, op: t.char, rhsStart: i + 1, rhsEnd, srcStart, srcEnd });
     }
     return out;
   }
@@ -398,7 +412,8 @@
     if (firstIdx > accessorIdx - 1) return null;
     const first = tokens[firstIdx];
     // Exclude the trailing .innerHTML/.outerHTML from the target slice.
-    return first._src.slice(first.start, startAccessor.start).trim() || null;
+    const text = first._src.slice(first.start, startAccessor.start).trim() || null;
+    return text ? { text, srcStart: first.start } : null;
   }
 
   const IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
@@ -5653,17 +5668,39 @@
   function convert() {
     try {
       const raw = $('in').value;
-      const blocks = [];
       const extractions = extractAllHTML(raw);
       if (extractions.length === 0) {
+        // No innerHTML sites — check for createElement-based DOM or raw HTML.
         const summary = summarizeDomConstruction(raw);
-        if (summary) blocks.push(summary);
-        else blocks.push(convertOne(raw, extractHTML(raw), false, false));
-      } else {
-        const multi = extractions.length > 1;
-        for (const ex of extractions) blocks.push(convertOne(raw, ex, multi, multi));
+        if (summary) { $('out').value = summary; return; }
+        $('out').value = convertOne(raw, extractHTML(raw), false, false) || '';
+        return;
       }
-      $('out').value = blocks.filter((b) => b).join('\n\n');
+      // Build the full rewritten script: original code with innerHTML
+      // assignments replaced inline by safe DOM API equivalents.
+      const trimmed = raw.trim();
+      let output = '';
+      let cursor = 0;
+      for (const ex of extractions) {
+        if (ex.srcStart === undefined) continue;
+        // Copy original source up to this innerHTML site.
+        output += trimmed.slice(cursor, ex.srcStart);
+        // Generate the DOM replacement block.
+        const domBlock = convertOne(raw, ex, false, false);
+        if (domBlock) {
+          // Detect indentation of the original line.
+          let lineStart = ex.srcStart;
+          while (lineStart > 0 && trimmed[lineStart - 1] !== '\n') lineStart--;
+          const indent = trimmed.slice(lineStart, ex.srcStart).match(/^(\s*)/)[1];
+          // Indent the replacement block to match.
+          const indented = domBlock.split('\n').map((line, i) => i === 0 ? line : indent + line).join('\n');
+          output += indented;
+        }
+        cursor = ex.srcEnd;
+      }
+      // Append remaining original source after the last innerHTML site.
+      output += trimmed.slice(cursor);
+      $('out').value = output;
     } catch (err) {
       $('out').value = '// Error: ' + err.message;
     }
