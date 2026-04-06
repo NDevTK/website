@@ -25,9 +25,10 @@ pre { white-space: pre-wrap; }
 <p class="hint">Paste HTML or a JS snippet that builds HTML via <code>innerHTML</code>/<code>outerHTML</code> assignments. HTML is converted to safe <code>createElement</code>/<code>appendChild</code> calls, and inline <code>style</code> attributes are split into individual <code>style.setProperty()</code> calls. The JS resolver statically evaluates variables, expressions, loops, conditionals, and method calls. Runtime-only values flow through as named references.</p>
 
 <label for="in">Input</label>
-<textarea id="in" rows="14" spellcheck="false">&lt;div style="position: fixed; z-index: -99; width: 100%; height: 100%"&gt;
+<textarea id="in" rows="15" spellcheck="false">&lt;div style="position: fixed; z-index: -99; width: 100%; height: 100%"&gt;
   &lt;iframe credentialless loading="lazy" id="background" title="background" sandbox="allow-scripts" frameborder="0" height="100%" width="100%" src="https://random.ndev.tk/"&gt;&lt;/iframe&gt;
 &lt;/div&gt;
+&lt;button onclick="alert('hello')"&gt;Greet&lt;/button&gt;
 &lt;script&gt;
 var items = ['Home', 'About', 'Contact', location.search];
 var html = '&lt;nav&gt;';
