@@ -24,73 +24,151 @@ Extracts the FIRST `X.innerHTML`/`X.outerHTML` assignment from
 - `target`, `assignProp`, `assignOp` — the LHS target (e.g.
   `document.body`), `'innerHTML'` or `'outerHTML'`, and `'='` or `'+='`.
 - `loops` — loop metadata when markers are present.
-- `loopVars` — per-loop-built-variable metadata (see below).
+- `loopVars` — per-loop-built-variable metadata.
 
 ### `extractAllHTML(input)` → `[extractHTML-result, ...]`
 
-Returns one result per `.innerHTML`/`.outerHTML` site in source order,
-scope-aware: each result's `loopVars` only contains entries in scope
-at that assignment site.
+Returns one result per `.innerHTML`/`.outerHTML` site in source order.
 
 ### `extractAllDOM(input)` → `{ elements, ops, roots, html }`
 
 Tracks virtual DOM state built via `document.createElement`,
 `getElementById`, `querySelector`, `createTextNode` plus subsequent
 `el.prop = ...`, `el.setAttribute(...)`, `el.appendChild(...)`, etc.
-Useful for scripts that build DOM through the API (no `innerHTML`).
 
 ## Supported JS subset
 
-Statically resolved:
+### Variables & scoping
 
-- `var` / `let` / `const` declarations with scope tracking
-  (block, function, arrow).
-- Reassignment order, shadowing, and a mutation pre-pass that
-  flags cross-function-mutated variables as runtime-reference.
-- String / template literal concatenation including `+` chains and
-  `+=` builders; template literal `${expr}` interpolation.
+- `var` / `let` / `const` with full scope tracking (block, function, arrow).
+- Reassignment, shadowing, and a mutation pre-pass that flags
+  cross-function-mutated variables as runtime-reference.
+- `var` hoists to function scope; `let`/`const` are block-scoped.
+
+### Literals & types
+
+- String literals (`'...'`, `"..."`), template literals (`` `...${expr}...` ``).
+- Number literals with full numeric type tracking (`jsType: 'number'`).
+- `true`, `false` (jsType `'boolean'`), `null` (jsType `'null'`),
+  `undefined` (jsType `'undefined'`), `Infinity`, `NaN`.
+- Regex literals (`/pattern/flags`) preserved for method evaluation.
+
+### Expressions
+
+- String / template literal concatenation including `+` chains,
+  `+=` builders, and `${expr}` interpolation.
 - Object/array literals with member access (`obj.a.b`, `arr[0]`,
   `obj['key']`). Spread `[...arr, x]` / `{...obj, k: v}`.
-- Destructuring: `var { a } = obj`, `var { a: b } = obj`, `var [x, y] = arr`.
+- Destructuring: `var { a } = obj`, `var { a: b, ...rest } = obj`,
+  `var [x, y = 'default'] = arr`, `var [a, ...r] = arr`.
 - Arithmetic / bitwise / comparison / logical / ternary / unary
-  expressions with operator precedence: `**` > `*`/`/`/`%` >
-  `-`/`+` > shifts > comparison > equality > `&` > `^` > `|` >
-  `&&` > `||`/`??` > ternary.
+  expressions with operator precedence.
 - `++`/`--` on known numeric bindings.
 - Optional chaining `?.` and nullish coalescing `??`.
-- Known builtins: `Math.floor/ceil/round/trunc/abs/sqrt/…`,
-  `Math.PI`/`E`/…, `parseInt`, `parseFloat`, `Number`, `String`,
-  `Boolean`, `isNaN`, `isFinite`.
-- String methods on known strings: `.toUpperCase/.toLowerCase/.trim`,
-  `.repeat(n)`, `.slice/.substring/.substr`, `.charAt`, `.indexOf/
-  .lastIndexOf`, `.includes/.startsWith/.endsWith`, `.padStart/
-  .padEnd`, `.split`, `.toString`.
-- Array methods: `.join(sep)`, `.slice`, `.indexOf`, `.includes`,
-  `.reverse`.
-- Function calls (arrow or `function` declaration) with parameter
-  binding and a return-expression inline. Default parameter values.
-- `for`/`while` loop body extraction with loop-counter shadowing.
+- Comma operator `(a, b, c)` returns last value.
+- `in` / `instanceof` as symbolic relational operators.
+- String equality/comparison (`===`, `!==`, `<`, `>`, etc.) folds
+  on known strings and numbers.
 
-Captured as opaque source references:
+### Type-aware + operator
 
-- Calls to unknown functions (`Math.random()`, `performance.now()`,
-  `fetch(...)`, array `.map(fn)`).
-- Bracket access with a non-literal key.
+- `1 + 2` = `3` (numeric addition).
+- `'1' + '2'` = `'12'` (string concatenation).
+- `'a' + 1` = `'a1'` (mixed → concatenation).
+- `true + 1` = `2` (boolean coerces to number).
+
+### Builtins (shadow-aware)
+
+All builtins check `isShadowed()` — if the user redefined `Math`,
+`parseInt`, etc., the builtin path is skipped and the user's binding
+is used instead.
+
+- `Math.floor/ceil/round/trunc/abs/sqrt/…`, `Math.PI`/`E`/…
+- `parseInt(str)`, `parseFloat(str)`, `Number(str)`, `Boolean(val)`,
+  `isNaN(val)`, `isFinite(val)`.
+- `String(val)`, `String.fromCharCode(n, ...)`, `String.fromCodePoint(n, ...)`.
+- `Object.keys/values/entries`, `Object.assign`, `Object.fromEntries`.
+- `JSON.stringify` / `JSON.parse` round-trip through known bindings.
+- `Array.isArray`, `Array.of`, `Array.from(iter, mapFn?)`.
+
+### String methods
+
+- `.toUpperCase/.toLowerCase/.trim/.trimStart/.trimEnd`
+- `.repeat(n)`, `.slice/.substring/.substr`, `.charAt`, `.at(n)`
+- `.indexOf/.lastIndexOf`, `.includes/.startsWith/.endsWith`
+- `.padStart/.padEnd`, `.split(sep)`, `.toString`
+- `.replace(str|regex, str)`, `.replaceAll(str|regex, str)`
+- `.match(regex)`, `.search(regex)` — with literal regex
+- `.charCodeAt(n)`, `.codePointAt(n)`
+
+### Number methods
+
+- `.toFixed(n)`, `.toString(radix)`, `.toPrecision(n)`, `.toExponential(n)`
+
+### Array methods
+
+- `.join(sep)`, `.slice`, `.indexOf`, `.includes`, `.reverse`, `.at(n)`
+- `.map(fn)`, `.filter(fn)`, `.forEach(fn)`, `.reduce(fn, init)`
+- `.find(fn)`, `.findIndex(fn)`, `.some(fn)`, `.every(fn)`, `.flatMap(fn)`
+- `.concat(arr, ...)`, `.flat(depth?)`, `.fill(val, start?, end?)`
+- `.sort()`, `.splice(start, del, ...items)`
+- Mutation at statement level: `.push`, `.pop`, `.shift`, `.unshift`,
+  `.splice`, `.fill`, `.sort`, `.reverse`
+
+### Regex methods
+
+- `regex.test(str)` on literal regex receivers.
+- String methods accept regex args: `.replace`, `.match`, `.search`, `.split`.
+
+### Functions
+
+- Arrow or `function` declaration with parameter binding and
+  return-expression inline. Default parameter values.
+- Spread in calls: `f(...args)` splices known arrays into arg list.
+- `instantiateFunctionBinding` preserves typed returns (array/object)
+  so `var [x,y] = f()` and `f().prop` work.
+
+### Control flow
+
+- `if`/`else` with concrete condition evaluation — walks only
+  the matching branch. Supports else-if chains.
+- `switch` with concrete discriminant walks matching case.
+- `try`/`catch`/`finally` — walks each block.
+- `for`/`while` loop simulation: evaluates condition, walks body,
+  repeats until condition becomes false or opaque. Handles `i++`,
+  `i--`, `i+=N`, `i-=N` steps and any deterministic termination.
+- `for-of`/`for-in` with known iterables: full body re-evaluation
+  per element via `walkRange()`, including destructuring patterns.
+- `do...while` loop support.
+
+### Assignments & mutations
+
+- `obj.x = v`, `obj.a.b = v`, `arr[i] = v`, `obj['k'] = v`.
+- Compound: `+=` (numeric fold or string concat), `-=`, `*=`, `/=`,
+  `%=`, `**=`, `|=`, `&=`, `^=`, `<<=`, `>>=`, `>>>=`.
+- Logical/nullish: `||=`, `&&=`, `??=`.
+
+### Module & keyword handling
+
+- `import` statements skipped.
+- `export` stripped from declarations, or entire statement skipped.
+- `with` statement body skipped (scope unpredictable).
+- `debugger` statement skipped.
+- `class` bodies walked for innerHTML assignments in methods.
+
+### typeof folding
+
+- `typeof 'hi'` → `'string'`, `typeof 5` → `'number'`,
+  `typeof true` → `'boolean'`, `typeof null` → `'object'`,
+  `typeof undefined` → `'undefined'`, `typeof []` → `'object'`,
+  `typeof function(){}` → `'function'`.
+- `typeof (3>2)` → `'boolean'` (comparison results are typed).
+
+### Captured as opaque references
+
+- Calls to unknown functions, bracket access with non-literal key.
 - Any expression the parser can't fold.
-
-## Output format: loop markers
-
-When the resolved HTML contains a `for`/`while`-built segment, the
-main `html` field wraps it with marker strings:
-
-```
-__HDLOOP0S__<a href="...">item</a> __HDLOOP0E__
-```
-
-The `loops` array carries each marker's `{ id, kind, headerSrc }`.
-The `convert()` step splits the HTML at these markers and emits a
-matching `for (header) { ... }` block around the DOM code for that
-segment.
+- `eval()`, `Symbol()`, `Proxy`, `Reflect` — always opaque.
 
 ## Testing
 
@@ -101,4 +179,4 @@ node htmldom/htmldom.test.js
 ```
 
 The harness loads `htmldom.js` with minimal DOM stubs, exposes the
-three extract functions, and runs inline assertions.
+three extract functions, and runs inline assertions. 357 tests.
