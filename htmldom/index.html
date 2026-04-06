@@ -4,9 +4,7 @@
 <meta charset="utf-8">
 <title>HTML/CSS to DOM API Converter</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="script-src 'self' https://cdnjs.cloudflare.com 'inline-speculation-rules'; style-src 'self' https://cdnjs.cloudflare.com 'unsafe-inline'; object-src 'none'; base-uri 'none';" />
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/6.65.7/codemirror.min.css">
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/6.65.7/theme/monokai.min.css">
+<meta http-equiv="Content-Security-Policy" content="script-src 'self' https://cdnjs.cloudflare.com blob: 'inline-speculation-rules'; style-src 'self' https://cdnjs.cloudflare.com 'unsafe-inline'; object-src 'none'; base-uri 'none'; worker-src blob:;" />
 <style>
 body { font-family: system-ui, sans-serif; margin: 1rem; max-width: 960px; background: #212529; color: #eee; }
 h1 { font-size: 1.4rem; }
@@ -17,7 +15,7 @@ button:focus { outline: 2px solid #fff; outline-offset: 2px; }
 code { background: #2a2e33; padding: 0.05rem 0.25rem; border-radius: 3px; font-size: 0.85em; }
 .hint { color: #aaa; font-size: 0.85rem; line-height: 1.5; }
 .hint code { color: #ddd; }
-.CodeMirror { border: 1px solid #444; font-size: 0.9rem; height: auto; }
+.editor-container { border: 1px solid #444; margin-top: 0.25rem; }
 </style>
 </head>
 <body>
@@ -25,19 +23,7 @@ code { background: #2a2e33; padding: 0.05rem 0.25rem; border-radius: 3px; font-s
 <p class="hint">Paste HTML or a JS snippet that builds HTML via <code>innerHTML</code>/<code>outerHTML</code> assignments. HTML is converted to safe <code>createElement</code>/<code>appendChild</code> calls, and inline <code>style</code> attributes are split into individual <code>style.setProperty()</code> calls. The JS resolver statically evaluates variables, expressions, loops, conditionals, and method calls. Runtime-only values flow through as named references.</p>
 
 <label>Input</label>
-<textarea id="in"><div style="position: fixed; z-index: -99; width: 100%; height: 100%">
-  <iframe credentialless loading="lazy" id="background" title="background" sandbox="allow-scripts" frameborder="0" height="100%" width="100%" src="https://random.ndev.tk/"></iframe>
-</div>
-<button onclick="alert('hello')">Greet</button>
-<script>
-var items = ['Home', 'About', 'Contact', location.search];
-var html = '<nav>';
-for (var i = 0; i < items.length; i++) {
-  html += '<a href="/' + items[i].toLowerCase() + '">' + items[i] + '</a>';
-}
-html += '</nav>';
-document.body.innerHTML = html;
-</script></textarea>
+<div id="inEditor" class="editor-container" style="height:300px"></div>
 
 <details style="margin-top:0.75rem;">
   <summary style="cursor:pointer; color:#aaa;">Output options</summary>
@@ -51,15 +37,57 @@ document.body.innerHTML = html;
 <button id="copy">Copy output</button>
 
 <label>Output</label>
-<textarea id="out" readonly></textarea>
+<div id="outEditor" class="editor-container" style="height:300px"></div>
 
 <p class="hint"><a href="/" style="color:#6ea8fe">&larr; Home</a></p>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/6.65.7/codemirror.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/6.65.7/mode/xml/xml.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/6.65.7/mode/javascript/javascript.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/6.65.7/mode/css/css.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/6.65.7/mode/htmlmixed/htmlmixed.min.js"></script>
-<script src="htmldom.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.52.2/min/vs/loader.min.js"></script>
+<script>
+  // Configure Monaco loader to use CDN
+  require.config({ paths: { vs: 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.52.2/min/vs' } });
+  require(['vs/editor/editor.main'], function () {
+    const defaultInput = '<div style="position: fixed; z-index: -99; width: 100%; height: 100%">\n  <iframe credentialless loading="lazy" id="background" title="background" sandbox="allow-scripts" frameborder="0" height="100%" width="100%" src="https://random.ndev.tk/"></iframe>\n</div>\n<button onclick="alert(\'hello\')">Greet</button>\n<script>\nvar items = [\'Home\', \'About\', \'Contact\', location.search];\nvar html = \'<nav>\';\nfor (var i = 0; i < items.length; i++) {\n  html += \'<a href="/\' + items[i].toLowerCase() + \'">\' + items[i] + \'</a>\';\n}\nhtml += \'</nav>\';\ndocument.body.innerHTML = html;\n<\/script>';
+
+    window._monacoIn = monaco.editor.create(document.getElementById('inEditor'), {
+      value: defaultInput,
+      language: 'html',
+      theme: 'vs-dark',
+      minimap: { enabled: false },
+      fontSize: 14,
+      lineNumbers: 'on',
+      scrollBeyondLastLine: false,
+      wordWrap: 'on',
+      automaticLayout: true,
+    });
+
+    window._monacoOut = monaco.editor.create(document.getElementById('outEditor'), {
+      value: '',
+      language: 'javascript',
+      theme: 'vs-dark',
+      minimap: { enabled: false },
+      fontSize: 14,
+      lineNumbers: 'on',
+      readOnly: true,
+      scrollBeyondLastLine: false,
+      wordWrap: 'on',
+      automaticLayout: true,
+    });
+
+    // Auto-detect language for input
+    window._monacoIn.onDidChangeModelContent(function () {
+      var text = window._monacoIn.getValue();
+      var model = window._monacoIn.getModel();
+      var lang = /^\s*</.test(text) ? 'html' : 'javascript';
+      if (model && monaco.editor.getModel(model.uri)) {
+        monaco.editor.setModelLanguage(model, lang);
+      }
+    });
+
+    // Load htmldom.js after Monaco is ready
+    var s = document.createElement('script');
+    s.src = 'htmldom.js';
+    document.body.appendChild(s);
+  });
+</script>
 </body>
 </html>
