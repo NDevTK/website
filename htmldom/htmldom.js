@@ -2041,9 +2041,6 @@
               } else if (bind.kind === 'object') {
                 bind = bind.props[keyText] || null;
                 resolved = true;
-              } else if (bind.kind === 'array' && /^\d+$/.test(keyText)) {
-                bind = bind.elems[parseInt(keyText, 10)] || null;
-                resolved = true;
               }
             }
           }
@@ -2364,13 +2361,9 @@
             }
             // method === 'filter': keep element when the callback's
             // return value is truthy (concrete only; unknowns bail).
-            const resChain = chainBinding(toks);
-            const n = chainAsNumber(resChain);
-            const s = n === null ? chainAsKnownString(resChain) : null;
-            const truthy = (n !== null && n !== 0) || (s !== null && s !== '' && s !== 'false' && s !== 'null' && s !== 'undefined' && s !== '0' && s !== 'NaN');
-            const falsy = n === 0 || s === '' || s === 'false' || s === 'null' || s === 'undefined' || s === '0' || s === 'NaN';
-            if (truthy) results.push(el);
-            else if (!falsy) return null;
+            const truth = evalTruthiness(chainBinding(toks));
+            if (truth === true) results.push(el);
+            else if (truth !== false) return null;
           }
           return { bind: arrayBinding(results), next: cb.next + 1 };
         }
@@ -2399,23 +2392,19 @@
             if (!el) return null;
             const toks = instantiateFunction(fn, [el, chainBinding([makeSynthStr(String(idx))])]);
             if (!toks) return null;
-            const resChain = chainBinding(toks);
-            const n = chainAsNumber(resChain);
-            const s = n === null ? chainAsKnownString(resChain) : null;
-            const truthy = (n !== null && n !== 0) || (s !== null && s !== '' && s !== 'false' && s !== 'null' && s !== 'undefined' && s !== '0' && s !== 'NaN');
-            const falsy = n === 0 || s === '' || s === 'false' || s === 'null' || s === 'undefined' || s === '0' || s === 'NaN';
+            const truth = evalTruthiness(chainBinding(toks));
             if (method === 'find') {
-              if (truthy) return { bind: el, next: cb.next + 1 };
-              if (!falsy) return null;
+              if (truth === true) return { bind: el, next: cb.next + 1 };
+              if (truth === null) return null;
             } else if (method === 'findIndex') {
-              if (truthy) return { bind: chainBinding([makeSynthStr(String(idx))]), next: cb.next + 1 };
-              if (!falsy) return null;
+              if (truth === true) return { bind: chainBinding([makeSynthNum(idx)]), next: cb.next + 1 };
+              if (truth === null) return null;
             } else if (method === 'some') {
-              if (truthy) return { bind: chainBinding([makeSynthStr('true')]), next: cb.next + 1 };
-              if (!falsy) return null;
+              if (truth === true) return { bind: chainBinding([makeSynthBool(true)]), next: cb.next + 1 };
+              if (truth === null) return null;
             } else if (method === 'every') {
-              if (falsy) return { bind: chainBinding([makeSynthStr('false')]), next: cb.next + 1 };
-              if (!truthy) return null;
+              if (truth === false) return { bind: chainBinding([makeSynthBool(false)]), next: cb.next + 1 };
+              if (truth === null) return null;
             }
           }
           if (method === 'find') return { bind: chainBinding([makeSynthStr('undefined')]), next: cb.next + 1 };
@@ -3536,13 +3525,15 @@
     const evalTruthiness = (b) => {
       if (!b) return null;
       if (b.kind !== 'chain') return true; // array/object/function/element always truthy
-      const cn = chainAsNumber(b);
-      if (cn !== null) return cn !== 0;
       const jt = b.toks && b.toks.length === 1 ? b.toks[0].jsType : null;
       if (jt === 'null' || jt === 'undefined') return false;
       if (jt === 'boolean') return b.toks[0].text === 'true';
+      if (jt === 'number') { const cn = chainAsNumber(b); return cn !== null ? cn !== 0 && !Number.isNaN(cn) : null; }
+      // Strings: only empty string is falsy. '0', 'false', 'NaN' are truthy.
       const cs = chainAsKnownString(b);
-      if (cs !== null) return cs !== '' && cs !== '0' && cs !== 'NaN';
+      if (cs !== null) return cs !== '';
+      const cn = chainAsNumber(b);
+      if (cn !== null) return cn !== 0 && !Number.isNaN(cn);
       return null;
     };
 
@@ -3550,14 +3541,9 @@
       if (!cond || cond.kind !== 'chain') return null;
       if (!ifT || ifT.kind !== 'chain') return null;
       if (!ifF || ifF.kind !== 'chain') return null;
-      const cNum = chainAsNumber(cond);
-      if (cNum !== null) return cNum ? ifT : ifF;
-      // Check for known boolean-ish strings.
-      if (cond.toks.length === 1 && cond.toks[0].type === 'str') {
-        const text = cond.toks[0].text;
-        if (text === 'true') return ifT;
-        if (text === 'false' || text === 'null' || text === 'undefined' || text === '') return ifF;
-      }
+      const truth = evalTruthiness(cond);
+      if (truth === true) return ifT;
+      if (truth === false) return ifF;
       const ct = chainAsExprText(cond);
       const tt = chainAsExprText(ifT);
       const ft = chainAsExprText(ifF);
@@ -3641,14 +3627,12 @@
       if (op === '+') return null;
       // Short-circuit logical/nullish operators using whichever concrete
       // value (number or string) the left-hand side has.
+      const lTruth = evalTruthiness(left);
       const lJsType = left.toks.length === 1 ? left.toks[0].jsType : null;
-      const lStr = lNum === null ? chainAsKnownString(left) : null;
-      const lTruthy = (lNum !== null && lNum !== 0) || (lStr !== null && lStr !== '' && lStr !== '0' && lStr !== 'NaN') || lJsType === 'boolean' && lNum === 1;
-      const lFalsy = lNum === 0 || lStr === '' || lStr === '0' || lStr === 'NaN' || lJsType === 'null' || lJsType === 'undefined';
       const lNullish = lJsType === 'null' || lJsType === 'undefined';
-      if (op === '&&') { if (lFalsy) return left; if (lTruthy) return right; }
-      else if (op === '||') { if (lTruthy) return left; if (lFalsy) return right; }
-      else if (op === '??') { if (lNullish) return right; if (lStr !== null || lNum !== null) return left; }
+      if (op === '&&') { if (lTruth === false) return left; if (lTruth === true) return right; }
+      else if (op === '||') { if (lTruth === true) return left; if (lTruth === false) return right; }
+      else if (op === '??') { if (lNullish) return right; if (!lNullish && lTruth !== null) return left; }
       // Symbolic: combine texts.
       const lt = chainAsExprText(left);
       const rt = chainAsExprText(right);
@@ -4891,20 +4875,12 @@
           const rhs = r ? r.binding : null;
           const cur = resolve(t.text);
           if (eqTok.char === '||=') {
-            // Assign if current is falsy.
-            const cn = cur && cur.kind === 'chain' ? chainAsNumber(cur) : null;
-            const cs = cn === null && cur ? chainAsKnownString(cur) : null;
-            const jt = cur && cur.kind === 'chain' && cur.toks.length === 1 ? cur.toks[0].jsType : null;
-            const falsy = cn === 0 || cs === '' || cs === '0' || cs === 'NaN' || jt === 'null' || jt === 'undefined';
-            const truthy = (cn !== null && cn !== 0) || (cs !== null && cs !== '' && cs !== '0' && cs !== 'NaN') || (cur && cur.kind !== 'chain');
-            if (falsy) assignName(t.text, rhs);
-            else if (!truthy) assignName(t.text, null);
-            // else: already truthy, no change.
+            const truth = evalTruthiness(cur);
+            if (truth === false) assignName(t.text, rhs);
+            else if (truth === null) assignName(t.text, null);
           } else if (eqTok.char === '&&=') {
-            const cn = cur && cur.kind === 'chain' ? chainAsNumber(cur) : null;
-            const cs = cn === null && cur ? chainAsKnownString(cur) : null;
-            const truthy = (cn !== null && cn !== 0) || (cs !== null && cs !== '' && cs !== '0' && cs !== 'NaN') || (cur && cur.kind !== 'chain');
-            if (truthy) assignName(t.text, rhs);
+            const truth = evalTruthiness(cur);
+            if (truth === true) assignName(t.text, rhs);
           } else if (eqTok.char === '??=') {
             const jt = cur && cur.kind === 'chain' && cur.toks.length === 1 ? cur.toks[0].jsType : null;
             const nullish = jt === 'null' || jt === 'undefined' || !cur;
