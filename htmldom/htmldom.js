@@ -458,8 +458,8 @@
   const chainBinding = (toks) => ({ kind: 'chain', toks });
   const objectBinding = (props) => ({ kind: 'object', props });
   const arrayBinding = (elems) => ({ kind: 'array', elems });
-  const functionBinding = (params, bodyStart, bodyEnd, isBlock) => ({
-    kind: 'function', params, bodyStart, bodyEnd, isBlock,
+  const functionBinding = (params, bodyStart, bodyEnd, isBlock, closure) => ({
+    kind: 'function', params, bodyStart, bodyEnd, isBlock, closure: closure || null,
   });
   // Class binding: tracks constructor (a functionBinding) and named methods.
   // `new ClassName(args)` invokes the constructor with `this` bound to a
@@ -593,7 +593,12 @@
   // `next` is the index after the param (points at `,` or `)`).
   function parseParamWithDefault(tokens, k, stop) {
     const nm = tokens[k];
-    if (!nm || nm.type !== 'other' || !IDENT_RE.test(nm.text)) return null;
+    if (!nm || nm.type !== 'other') return null;
+    // Rest parameter: `...name`
+    if (nm.text.startsWith('...') && IDENT_RE.test(nm.text.slice(3))) {
+      return { param: { name: nm.text.slice(3), rest: true }, next: k + 1 };
+    }
+    if (!IDENT_RE.test(nm.text)) return null;
     let j = k + 1;
     const sep = tokens[j];
     if (sep && sep.type === 'sep' && sep.char === '=') {
@@ -884,6 +889,16 @@
     // the pre-pass flagged as externally mutable, so reads of such names
     // consistently produce an opaque source reference rather than a
     // stale initial value.
+    // Snapshot all bindings currently in scope (for closures).
+    const captureScope = () => {
+      const merged = Object.create(null);
+      for (let i = 0; i < stack.length; i++) {
+        for (const name of Object.keys(stack[i].bindings)) {
+          merged[name] = stack[i].bindings[name];
+        }
+      }
+      return merged;
+    };
     const asRef = (name, value) => {
       if (externallyMutable && externallyMutable.has(name)) {
         return chainBinding([exprRef(name)]);
@@ -932,7 +947,8 @@
       for (let i = 1; i < parts.length && b; i++) {
         const p = parts[i];
         if (b.kind === 'object') {
-          const prop = b.props[p] || null;
+          // Missing property on a known object → undefined (not null).
+          const prop = p in b.props ? b.props[p] : chainBinding([makeSynthUndef()]);
           // Invoke getter on access.
           if (prop && prop.kind === 'getter') {
             stack.push({ bindings: Object.create(null), isFunction: true, thisBinding: b });
@@ -1135,10 +1151,19 @@
               const sep = tks[i];
               if (sep && sep.type === 'other' && sep.text === ':') {
                 i++;
-                const alias = tks[i];
-                if (!alias || alias.type !== 'other' || !IDENT_RE.test(alias.text)) return null;
-                name = alias.text;
-                i++;
+                // Value may be a nested destructuring pattern or a simple name.
+                const nested = tks[i];
+                if (nested && nested.type === 'open' && (nested.char === '{' || nested.char === '[')) {
+                  const sub = readDestructurePattern(i, stop);
+                  if (!sub) return null;
+                  name = sub.pattern; // nested pattern stored as name
+                  i = sub.next;
+                } else if (nested && nested.type === 'other' && IDENT_RE.test(nested.text)) {
+                  name = nested.text;
+                  i++;
+                } else {
+                  return null;
+                }
               } else {
                 name = key;
               }
@@ -1232,7 +1257,12 @@
           seen[key] = true;
           let val = props ? (props[key] || null) : null;
           if (val === null && dflt) val = resolveDefault(dflt);
-          bind(name, val);
+          // Nested destructuring: name is a pattern object, not a string.
+          if (typeof name === 'object' && name !== null && name.kind) {
+            applyPatternBindings(name, val, bind);
+          } else {
+            bind(name, val);
+          }
         }
         if (pattern.rest) {
           if (props) {
@@ -1396,30 +1426,50 @@
         } else {
           return null;
         }
-        // Method shorthand: `key(...) { ... }` — skip over the method body
-        // entirely and continue to the next property.
+        // Method shorthand: `key(...) { ... }` — parse as a functionBinding
+        // so `obj.method()` can invoke it.
         if (tks[i] && tks[i].type === 'open' && tks[i].char === '(') {
-          // Skip `(...)`
-          let d = 1; i++;
-          while (i < stop && d > 0) {
-            const tkk = tks[i];
-            if (tkk.type === 'open' && tkk.char === '(') d++;
-            else if (tkk.type === 'close' && tkk.char === ')') d--;
-            i++;
-          }
-          // Skip `{...}`
-          if (tks[i] && tks[i].type === 'open' && tks[i].char === '{') {
-            let bd = 1; i++;
-            while (i < stop && bd > 0) {
-              const tkk = tks[i];
-              if (tkk.type === 'open' && tkk.char === '{') bd++;
-              else if (tkk.type === 'close' && tkk.char === '}') bd--;
-              i++;
+          const params = [];
+          let p = i + 1;
+          if (tks[p] && tks[p].type === 'close' && tks[p].char === ')') { p++; }
+          else {
+            let ok = true;
+            while (p < stop) {
+              const pt = parseParamWithDefault(tks, p, stop);
+              if (!pt) { ok = false; break; }
+              params.push(pt.param);
+              p = pt.next;
+              if (tks[p] && tks[p].type === 'close' && tks[p].char === ')') { p++; break; }
+              if (tks[p] && tks[p].type === 'sep' && tks[p].char === ',') { p++; continue; }
+              ok = false; break;
+            }
+            if (!ok) {
+              // Can't parse params — skip the method body.
+              while (p < stop) {
+                const tkk = tks[p];
+                if (tkk.type === 'open') p++;
+                else if (tkk.type === 'close') break;
+                else p++;
+              }
+              i = p;
+              const sep = tks[i];
+              if (sep && sep.type === 'sep' && sep.char === ',') { i++; continue; }
+              break;
             }
           }
-          const sep = tks[i];
-          if (sep && sep.type === 'sep' && sep.char === ',') { i++; continue; }
-          break;
+          if (tks[p] && tks[p].type === 'open' && tks[p].char === '{') {
+            let bd = 1, bEnd = p + 1;
+            while (bEnd < stop && bd > 0) {
+              if (tks[bEnd].type === 'open' && tks[bEnd].char === '{') bd++;
+              else if (tks[bEnd].type === 'close' && tks[bEnd].char === '}') bd--;
+              bEnd++;
+            }
+            props[keyName] = functionBinding(params, p + 1, bEnd - 1, true);
+            i = bEnd;
+            const sep = tks[i];
+            if (sep && sep.type === 'sep' && sep.char === ',') { i++; continue; }
+            break;
+          }
         }
         // Shorthand property `{ name }` → `{ name: name }` (name is a
         // reference to a binding in scope).
@@ -1613,7 +1663,7 @@
         const body = readArrowBody(arrow.arrowNext, stop);
         if (!body) return null;
         return {
-          binding: functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock),
+          binding: functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock, stack.length > 1 ? captureScope() : null),
           next: body.next,
         };
       }
@@ -1656,6 +1706,10 @@
     const primitiveAsString = (text) => {
       if (/^-?\d+$/.test(text)) return text.replace(/^-?0+(?=\d)/, (m) => m.startsWith('-') ? '-' : '');
       if (/^-?\d*\.\d+$/.test(text)) return text;
+      // Hex (0x), octal (0o), binary (0b) literals.
+      if (/^0[xX][0-9a-fA-F]+$/.test(text)) return String(parseInt(text, 16));
+      if (/^0[oO][0-7]+$/.test(text)) return String(parseInt(text.slice(2), 8));
+      if (/^0[bB][01]+$/.test(text)) return String(parseInt(text.slice(2), 2));
       if (text === 'true' || text === 'false' || text === 'null' || text === 'undefined') return text;
       return null;
     };
@@ -1795,41 +1849,26 @@
         if (t.type === 'open' && t.char === '(' && bind && bind.kind === 'function') {
           const argRes = readCallArgBindings(next, stop);
           if (argRes) {
-            // Push frame with `this` = receiver and params bound.
+            // Set up this/super for method calls, then delegate to
+            // instantiateFunctionBinding which handles closures.
             const recCls = receiver && receiver.__class__ || null;
-            stack.push({ bindings: Object.create(null), isFunction: true, thisBinding: receiver || null, superClass: recCls && recCls.superClass || null });
-            const frame = stack[stack.length - 1];
-            for (let p = 0; p < bind.params.length; p++) {
-              frame.bindings[bind.params[p].name] = argRes.bindings[p] || null;
+            const savedThis = bind.closure ? null : receiver;
+            // Temporarily inject thisBinding into the function for method calls.
+            const origClosure = bind.closure;
+            if (receiver) {
+              const cls = Object.assign(Object.create(null), bind.closure || {});
+              bind = Object.assign({}, bind, { closure: cls });
+              // thisBinding handled by pushing a frame with this before instantiate.
             }
             let result = null;
-            const savedTks = tks; tks = tokens;
-            if (bind.isBlock) {
-              let fi = bind.bodyStart;
-              while (fi < bind.bodyEnd) {
-                const ft = tks[fi];
-                if (ft && ft.type === 'other' && ft.text === 'return') {
-                  const r = readValue(fi + 1, bind.bodyEnd, TERMS_TOP);
-                  if (r) result = r.binding;
-                  break;
-                }
-                if (ft && ft.type === 'open' && ft.char === '{') {
-                  let depth = 1; fi++;
-                  while (fi < bind.bodyEnd && depth > 0) {
-                    if (tks[fi].type === 'open' && tks[fi].char === '{') depth++;
-                    else if (tks[fi].type === 'close' && tks[fi].char === '}') depth--;
-                    fi++;
-                  }
-                  continue;
-                }
-                fi++;
-              }
+            if (receiver) {
+              stack.push({ bindings: Object.create(null), isFunction: true, thisBinding: receiver, superClass: recCls && recCls.superClass || null });
+              result = instantiateFunctionBinding(bind, argRes.bindings);
+              stack.pop();
             } else {
-              const r = readValue(bind.bodyStart, bind.bodyEnd, TERMS_NONE);
-              if (r) result = r.binding;
+              result = instantiateFunctionBinding(bind, argRes.bindings);
             }
-            tks = savedTks;
-            stack.pop();
+            bind = Object.assign({}, bind, { closure: origClosure });
             if (result) {
               receiver = null;
               bind = result;
@@ -2305,6 +2344,43 @@
       // Class expression: `class { ... }` or `class Name { ... }` in
       // expression position. Parse the same way as the statement-level
       // class handler but return the classBinding as a value.
+      // Function expression: `function(params) { body }` or
+      // `function name(params) { body }` in expression position.
+      if (t.type === 'other' && t.text === 'function') {
+        let j = k + 1;
+        // Optional name.
+        if (tks[j] && tks[j].type === 'other' && IDENT_RE.test(tks[j].text) &&
+            tks[j + 1] && tks[j + 1].type === 'open' && tks[j + 1].char === '(') j++;
+        if (tks[j] && tks[j].type === 'open' && tks[j].char === '(') {
+          const params = [];
+          let p = j + 1;
+          if (tks[p] && tks[p].type === 'close' && tks[p].char === ')') { p++; }
+          else {
+            let ok = true;
+            while (p < stop) {
+              const pt = parseParamWithDefault(tks, p, stop);
+              if (!pt) { ok = false; break; }
+              params.push(pt.param);
+              p = pt.next;
+              if (tks[p] && tks[p].type === 'close' && tks[p].char === ')') { p++; break; }
+              if (tks[p] && tks[p].type === 'sep' && tks[p].char === ',') { p++; continue; }
+              ok = false; break;
+            }
+            if (!ok) return null;
+          }
+          if (tks[p] && tks[p].type === 'open' && tks[p].char === '{') {
+            let d = 1, bEnd = p + 1;
+            while (bEnd < stop && d > 0) {
+              if (tks[bEnd].type === 'open' && tks[bEnd].char === '{') d++;
+              else if (tks[bEnd].type === 'close' && tks[bEnd].char === '}') d--;
+              bEnd++;
+            }
+            // Capture closure when created inside another function's scope.
+            const closure = stack.length > 1 ? captureScope() : null;
+            return { bind: functionBinding(params, p + 1, bEnd - 1, true, closure), next: bEnd };
+          }
+        }
+      }
       if (t.type === 'other' && t.text === 'class') {
         let j = k + 1;
         let className = null;
@@ -2568,14 +2644,28 @@
       // a real RegExp when used as an argument to .replace/.match/.test etc.
       if (t.type === 'regex') return { bind: chainBinding([t]), next: k + 1 };
       if (t.type === 'open' && t.char === '(') {
-        // Use comma-aware terms so the comma operator `(a, b, c)` stops
-        // at each `,`, letting us take the last sub-expression.
+        // Try readValue first to preserve typed bindings (function, array,
+        // object) that readConcatExpr would flatten to opaque tokens.
         const parenTerms = { sep: [','], close: [')'] };
+        const rv = readValue(k + 1, stop, parenTerms);
+        if (rv) {
+          let lastBind = rv.binding;
+          let pos = rv.next;
+          // Comma operator: evaluate all sub-expressions, keep the last.
+          while (tks[pos] && tks[pos].type === 'sep' && tks[pos].char === ',') {
+            const sub = readValue(pos + 1, stop, parenTerms);
+            if (!sub) break;
+            lastBind = sub.binding;
+            pos = sub.next;
+          }
+          const rp = tks[pos];
+          if (rp && rp.type === 'close' && rp.char === ')') return { bind: lastBind, next: pos + 1 };
+        }
+        // Fallback to readConcatExpr for complex concat chains.
         const r = readConcatExpr(k + 1, stop, parenTerms);
         if (!r) return null;
         let lastToks = r.toks;
         let pos = r.next;
-        // Comma operator: evaluate all sub-expressions, keep the last.
         while (tks[pos] && tks[pos].type === 'sep' && tks[pos].char === ',') {
           const sub = readConcatExpr(pos + 1, stop, parenTerms);
           if (!sub) break;
@@ -2967,12 +3057,14 @@
       tks = tokens;
       for (let p = 0; p < fn.params.length; p++) {
         const pi = fn.params[p];
+        if (pi.rest) {
+          frame.bindings[pi.name] = arrayBinding(argBindings.slice(p));
+          break;
+        }
         const a = argBindings[p];
         if (a) {
           frame.bindings[pi.name] = a;
         } else if (pi.defaultStart != null) {
-          // Evaluate the parameter's default expression in the current
-          // (call-site) scope so enclosing bindings can be referenced.
           const r = readConcatExpr(pi.defaultStart, pi.defaultEnd, TERMS_NONE);
           frame.bindings[pi.name] = (r && r.next === pi.defaultEnd) ? chainBinding(r.toks) : null;
         } else {
@@ -3017,12 +3109,19 @@
     // instead of raw tokens. Used by flatMap where the callback returns an
     // array literal that readConcatExpr can't represent as a token chain.
     const instantiateFunctionBinding = (fn, argBindings) => {
+      // If the function captured a closure, push its bindings first.
+      if (fn.closure) stack.push({ bindings: Object.assign(Object.create(null), fn.closure), isFunction: true });
       stack.push({ bindings: Object.create(null), isFunction: true });
       const frame = stack[stack.length - 1];
       const savedTks = tks;
       tks = tokens;
       for (let p = 0; p < fn.params.length; p++) {
         const pi = fn.params[p];
+        // Rest parameter: collect remaining args into an array.
+        if (pi.rest) {
+          frame.bindings[pi.name] = arrayBinding(argBindings.slice(p));
+          break;
+        }
         const a = argBindings[p];
         if (a) {
           frame.bindings[pi.name] = a;
@@ -3035,20 +3134,24 @@
       }
       let result = null;
       if (fn.isBlock) {
+        // Walk the body via the statement walker so declarations (var,
+        // function, class) are registered in the scope. Then scan for
+        // the top-level `return` expression and evaluate it.
+        walkRange(fn.bodyStart, fn.bodyEnd);
+        // After walking, scan for `return expr` at the top level.
         let i = fn.bodyStart;
         while (i < fn.bodyEnd) {
-          const t = tks[i];
-          if (t && t.type === 'other' && t.text === 'return') {
+          const ft = tks[i];
+          if (ft && ft.type === 'other' && ft.text === 'return') {
             const r = readValue(i + 1, fn.bodyEnd, TERMS_TOP);
             if (r) result = r.binding;
             break;
           }
-          if (t && t.type === 'open' && t.char === '{') {
+          if (ft && ft.type === 'open' && ft.char === '{') {
             let depth = 1; i++;
             while (i < fn.bodyEnd && depth > 0) {
-              const tk = tks[i];
-              if (tk.type === 'open' && tk.char === '{') depth++;
-              else if (tk.type === 'close' && tk.char === '}') depth--;
+              if (tks[i].type === 'open' && tks[i].char === '{') depth++;
+              else if (tks[i].type === 'close' && tks[i].char === '}') depth--;
               i++;
             }
             continue;
@@ -3061,6 +3164,7 @@
       }
       tks = savedTks;
       stack.pop();
+      if (fn.closure) stack.pop();
       return result;
     };
 
@@ -4231,7 +4335,7 @@
               k++;
             }
             if (depth === 0) {
-              declFunction(nameTok.text, functionBinding(params, j + 1, k - 1, true));
+              declFunction(nameTok.text, functionBinding(params, j + 1, k - 1, true, stack.length > 1 ? captureScope() : null));
               // Fall through to let the walker traverse the body in a new
               // function scope, so inner `var`/`let`/`const` and assignments
               // (including `this.innerHTML = ...` sites) remain visible to
