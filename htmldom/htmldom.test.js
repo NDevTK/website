@@ -744,6 +744,26 @@ group('classes', () => {
     `class C { constructor() { this.val='ok'; } } document.body.innerHTML = new C().val;`, 'ok');
   check('class with multiple methods',
     `class C { constructor(n) { this.n=n; } double() { return this.n*2; } label() { return 'n='+this.double(); } } document.body.innerHTML = new C(5).label();`, 'n=10');
+  check('super() in subclass constructor',
+    `class A{constructor(){this.x='a';}} class B extends A{constructor(){super();this.y='b';}} var b=new B(); document.body.innerHTML=b.x+b.y;`, 'ab');
+  check('super.method() call',
+    `class A{val(){return 'a';}} class B extends A{val(){return super.val()+'b';}} document.body.innerHTML=new B().val();`, 'ab');
+  check('class expression',
+    `var C=class{constructor(x){this.x=x;}}; document.body.innerHTML=new C('hi').x;`, 'hi');
+  check('named class expression',
+    `var C=class Foo{constructor(x){this.x=x;}}; document.body.innerHTML=new C('v').x;`, 'v');
+  check('inherited method',
+    `class A{greet(){return 'hi';}} class B extends A{} document.body.innerHTML=new B().greet();`, 'hi');
+});
+
+// -----------------------------------------------------------------------
+// Getters
+// -----------------------------------------------------------------------
+group('getters', () => {
+  check('simple getter',
+    `var o={get x(){return 'val';}}; document.body.innerHTML=o.x;`, 'val');
+  check('getter with this',
+    `var o={a:3,b:4,get sum(){return this.a+this.b;}}; document.body.innerHTML=o.sum;`, '7');
 });
 
 // -----------------------------------------------------------------------
