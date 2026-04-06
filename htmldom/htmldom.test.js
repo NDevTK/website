@@ -844,6 +844,18 @@ group('general JS', () => {
     `function f(x='def'){ return x; } document.body.innerHTML = f();`, 'def');
   check('logical OR default',
     `var x = null; var y = x || 'default'; document.body.innerHTML = y;`, 'default');
+  check('delete removes property',
+    `var o={a:1,b:2}; delete o.a; document.body.innerHTML=JSON.stringify(o);`, '{"b":2}');
+  check('destructuring assignment swap',
+    `var a=1,b=2; [a,b]=[b,a]; document.body.innerHTML=a+','+b;`, '2,1');
+  check('break exits loop',
+    `var s=''; for(var i=0;i<10;i++){if(i===3)break; s+=i;} document.body.innerHTML=s;`, '012');
+  check('continue skips iteration',
+    `var s=''; for(var i=0;i<5;i++){if(i===2)continue; s+=i;} document.body.innerHTML=s;`, '0134');
+  check('labeled continue outer',
+    `var r=''; outer: for(var i=0;i<3;i++){for(var j=0;j<3;j++){if(j===1)continue outer; r+=j;}} document.body.innerHTML=r;`, '000');
+  check('setter invoked on assignment',
+    `var o={_v:0,set v(x){this._v=x;}}; o.v=5; document.body.innerHTML=o._v;`, '5');
 });
 
 // -----------------------------------------------------------------------

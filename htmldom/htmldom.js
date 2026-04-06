@@ -3588,11 +3588,14 @@
     };
 
     let stop = Math.min(stopAt, tokens.length);
+    // walkRange returns a control flow signal: 'break', 'continue',
+    // 'break:label', 'continue:label', or undefined (normal completion).
     const walkRange = (startI, endI) => {
       const savedStop = stop;
       stop = endI;
-      walkRangeImpl(startI, endI);
+      const signal = walkRangeImpl(startI, endI);
       stop = savedStop;
+      return signal;
     };
     const walkRangeImpl = (startI, endI) => {
     for (let i = startI; i < endI; i++) {
@@ -3645,6 +3648,21 @@
         continue;
       }
 
+      // Destructuring assignment at statement level: `[a,b] = expr`.
+      if (t.type === 'open' && t.char === '[') {
+        const pat = readDestructurePattern(i, stop);
+        if (pat) {
+          const eqTok = tokens[pat.next];
+          if (eqTok && eqTok.type === 'sep' && eqTok.char === '=') {
+            const val = readValue(pat.next + 1, stop, TERMS_TOP);
+            const srcBinding = val ? val.binding : null;
+            applyPatternBindings(pat.pattern, srcBinding, (name, v) => assignName(name, v));
+            i = val ? val.next - 1 : skipExpr(pat.next + 1, stop) - 1;
+            continue;
+          }
+        }
+      }
+
       if (t.type !== 'other') continue;
 
       // `do { ... } while (cond);` — treat identically to a while loop for
@@ -3695,6 +3713,13 @@
       }
 
       if (t.text === 'for' || t.text === 'while') {
+        // Check for a label: `label: for(...)` — the previous two tokens
+        // would be `ident` `:` before the `for`/`while`.
+        let loopLabel = '';
+        if (i >= 2 && tokens[i - 1] && tokens[i - 1].type === 'other' && tokens[i - 1].text === ':' &&
+            tokens[i - 2] && tokens[i - 2].type === 'other' && IDENT_RE.test(tokens[i - 2].text)) {
+          loopLabel = tokens[i - 2].text;
+        }
         // Detect loop header and body range. The body is either a `{ ... }`
         // block or a single statement terminated by `;`.
         const openParen = tokens[i + 1];
@@ -3799,9 +3824,13 @@
                   });
                 }
                 stack.push(iterFrame);
-                walkRange(bodyStart, bodyEnd);
+                const sig = walkRange(bodyStart, bodyEnd);
                 const idx = stack.indexOf(iterFrame);
                 if (idx >= 0) stack.splice(idx, 1);
+                // Handle signal with label awareness.
+                if (sig === 'break' || (sig === 'break:' + loopLabel && loopLabel)) break;
+                if (sig === 'continue' || (sig === 'continue:' + loopLabel && loopLabel)) continue;
+                if (sig && (sig.startsWith('break:') || sig.startsWith('continue:'))) return sig;
               }
               i = bodyEnd - 1;
               continue;
@@ -3839,17 +3868,34 @@
                   if (firstTruth !== null) {
                     // Condition is concrete — simulate.
                     simulated = true;
+                    // Helper: interpret a signal in this loop's context.
+                    const handleSig = (sig) => {
+                      if (!sig) return 'ok';
+                      if (sig === 'break') return 'break';
+                      if (sig === 'continue') return 'continue';
+                      // Labeled: match against this loop's label.
+                      if (sig === 'break:' + loopLabel && loopLabel) return 'break';
+                      if (sig === 'continue:' + loopLabel && loopLabel) return 'continue';
+                      return sig; // propagate unmatched label
+                    };
                     if (firstTruth === true) {
-                      walkRange(bodyStart, bodyEnd);
-                      if (updateEnd > updateStart) walkRange(updateStart, updateEnd);
-                      // Continue iterating.
-                      while (true) {
-                        if (condEnd <= condStart) break;
-                        const condVal = readValue(condStart, condEnd, null);
-                        const concrete = evalTruthiness(condVal ? condVal.binding : null);
-                        if (concrete !== true) break; // false or opaque → stop
-                        walkRange(bodyStart, bodyEnd);
-                        if (updateEnd > updateStart) walkRange(updateStart, updateEnd);
+                      let brk = false;
+                      let action = handleSig(walkRange(bodyStart, bodyEnd));
+                      if (action === 'break') brk = true;
+                      else if (action !== 'ok' && action !== 'continue') return action; // propagate
+                      if (!brk) {
+                        if (action !== 'continue' && updateEnd > updateStart) walkRange(updateStart, updateEnd);
+                        if (action === 'continue' && updateEnd > updateStart) walkRange(updateStart, updateEnd);
+                        while (!brk) {
+                          if (condEnd <= condStart) break;
+                          const condVal = readValue(condStart, condEnd, null);
+                          const concrete = evalTruthiness(condVal ? condVal.binding : null);
+                          if (concrete !== true) break;
+                          action = handleSig(walkRange(bodyStart, bodyEnd));
+                          if (action === 'break') { brk = true; break; }
+                          if (action !== 'ok' && action !== 'continue') return action;
+                          if (updateEnd > updateStart) walkRange(updateStart, updateEnd);
+                        }
                       }
                     }
                     // else: firstTruth === false, zero iterations.
@@ -3864,12 +3910,25 @@
                 if (firstTruth !== null) {
                   simulated = true;
                   if (firstTruth === true) {
-                    walkRange(bodyStart, bodyEnd);
-                    while (true) {
+                    const handleSig2 = (sig) => {
+                      if (!sig) return 'ok';
+                      if (sig === 'break') return 'break';
+                      if (sig === 'continue') return 'continue';
+                      if (sig === 'break:' + loopLabel && loopLabel) return 'break';
+                      if (sig === 'continue:' + loopLabel && loopLabel) return 'continue';
+                      return sig;
+                    };
+                    let brk = false;
+                    let action = handleSig2(walkRange(bodyStart, bodyEnd));
+                    if (action === 'break') brk = true;
+                    else if (action !== 'ok' && action !== 'continue') return action;
+                    while (!brk) {
                       const condVal = readValue(condStart, condEnd, null);
                       const concrete = evalTruthiness(condVal ? condVal.binding : null);
                       if (concrete !== true) break;
-                      walkRange(bodyStart, bodyEnd);
+                      action = handleSig2(walkRange(bodyStart, bodyEnd));
+                      if (action === 'break') { brk = true; break; }
+                      if (action !== 'ok' && action !== 'continue') return action;
                     }
                   }
                 }
@@ -4005,22 +4064,19 @@
             }
 
             if (concrete === true) {
-              // Walk only the if-body.
-              walkRange(j + 1, ifEnd);
+              const sig = walkRange(j + 1, ifEnd);
+              if (sig) return sig; // propagate break/continue
               i = (elseEnd > 0 ? elseEnd : ifEnd) - 1;
               continue;
             }
             if (concrete === false) {
               if (elseStart >= 0) {
-                // For `else if`, resume at the `if` keyword so the walker
-                // processes the chained condition naturally.
                 if (elseEnd < 0) {
-                  // else-if chain: skip to the inner `if` and let the main
-                  // loop handle it.
                   i = elseStart - 1;
                   continue;
                 }
-                walkRange(elseStart, elseEnd);
+                const sig = walkRange(elseStart, elseEnd);
+                if (sig) return sig;
                 i = elseEnd - 1;
               } else {
                 i = ifEnd - 1;
@@ -4090,11 +4146,11 @@
               }
               const caseStart = matchStart >= 0 ? matchStart : defaultStart;
               if (caseStart >= 0) {
-                walkRange(caseStart, switchEnd - 1);
+                { const sig = walkRange(caseStart, switchEnd - 1); if (sig) return sig; }
               }
             } else {
               // Unknown discriminant: walk entire switch body.
-              walkRange(j + 2, switchEnd - 1);
+              { const sig = walkRange(j + 2, switchEnd - 1); if (sig) return sig; }
             }
             i = switchEnd - 1;
             continue;
@@ -4114,7 +4170,7 @@
             else if (tk.type === 'close' && tk.char === '}') d--;
             k++;
           }
-          walkRange(i + 1, k);
+          { const sig = walkRange(i + 1, k); if (sig) return sig; }
           let j = k;
           // catch block?
           if (tokens[j] && tokens[j].type === 'other' && tokens[j].text === 'catch') {
@@ -4189,6 +4245,15 @@
       }
       // `debugger;` — skip.
       if (t.text === 'debugger') continue;
+
+      // `break` / `continue` with optional label — return a signal so
+      // the enclosing loop simulation can act on it.
+      if (t.text === 'break' || t.text === 'continue') {
+        const next = tokens[i + 1];
+        const label = (next && next.type === 'other' && IDENT_RE.test(next.text) &&
+                       next.text !== 'case' && next.text !== 'default') ? next.text : '';
+        return label ? t.text + ':' + label : t.text;
+      }
 
       // `class Name { constructor() {} method() {} }` — parse into a
       // classBinding with constructor and methods as functionBindings.
@@ -4404,6 +4469,22 @@
       // walker. `export` is stripped: if it fronts a declaration we let the
       // walker see the underlying `const`/`let`/`var`/`function`, otherwise
       // skip to the statement terminator.
+      // `delete obj.prop` — remove the property from a known object binding.
+      if (t.text === 'delete') {
+        const target = tokens[i + 1];
+        if (target && target.type === 'other' && PATH_RE.test(target.text)) {
+          const dot = target.text.lastIndexOf('.');
+          const basePath = target.text.slice(0, dot);
+          const prop = target.text.slice(dot + 1);
+          const baseBind = resolvePath(basePath);
+          if (baseBind && baseBind.kind === 'object' && prop in baseBind.props) {
+            delete baseBind.props[prop];
+          }
+          i++;
+          continue;
+        }
+      }
+
       if (t.text === 'import') {
         let j = i + 1;
         while (j < stop) {
@@ -4625,7 +4706,21 @@
               if (!nxt || nxt.kind !== 'object') { ok = false; break; }
               cur = nxt;
             }
-            if (ok) cur.props[parts[parts.length - 1]] = val;
+            if (ok) {
+              const termKey = parts[parts.length - 1];
+              // Check for setter: stored as __set_propName by object literal parser.
+              const setter = cur.props['__set_' + termKey];
+              if (setter && setter.kind === 'function') {
+                // Invoke setter with `this` = the object.
+                stack.push({ bindings: Object.create(null), isFunction: true, thisBinding: cur });
+                const setFrame = stack[stack.length - 1];
+                if (setter.params[0]) setFrame.bindings[setter.params[0].name] = val;
+                walkRange(setter.bodyStart, setter.bodyEnd);
+                stack.pop();
+              } else {
+                cur.props[termKey] = val;
+              }
+            }
             i = skipExpr(i + 2, stop) - 1;
             continue;
           }
