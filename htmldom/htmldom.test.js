@@ -487,6 +487,54 @@ group('control flow', () => {
     `var x = 'z'; var r = ''; switch(x) { case 'a': r = 'A'; break; default: r = 'D'; } document.body.innerHTML = r;`, 'D');
   check('try-catch walks try body',
     `var a = 'init'; try { a = 'tried'; } catch(e) {} document.body.innerHTML = a;`, 'tried');
+  check('if true takes if-branch',
+    `var r=''; if(true){r='yes';}else{r='no';} document.body.innerHTML=r;`, 'yes');
+  check('if false takes else-branch',
+    `var r=''; if(false){r='yes';}else{r='no';} document.body.innerHTML=r;`, 'no');
+  check('if concrete equality',
+    `var x='a'; var r=''; if(x==='a'){r='A';}else{r='B';} document.body.innerHTML=r;`, 'A');
+  check('if null is falsy',
+    `var r=''; if(null){r='yes';}else{r='no';} document.body.innerHTML=r;`, 'no');
+  check('if 0 is falsy',
+    `var r=''; if(0){r='yes';}else{r='no';} document.body.innerHTML=r;`, 'no');
+  check('if object is truthy',
+    `var o={x:1}; var r=''; if(o){r='yes';} document.body.innerHTML=r;`, 'yes');
+  check('if false without else skips body',
+    `var r='init'; if(false){r='changed';} document.body.innerHTML=r;`, 'init');
+  check('else-if chain',
+    `var x=2; var r=''; if(x===1){r='one';}else if(x===2){r='two';}else{r='other';} document.body.innerHTML=r;`, 'two');
+  check('single-statement if body',
+    `var r='init'; if(true) r='yes'; document.body.innerHTML=r;`, 'yes');
+  check('do-while loop body is walked',
+    `var a='init'; do { a = 'done'; } while(false); document.body.innerHTML=a;`, 'done');
+});
+
+// -----------------------------------------------------------------------
+// Number methods
+// -----------------------------------------------------------------------
+group('number methods', () => {
+  check('toFixed',
+    `document.body.innerHTML = (3.14159).toFixed(2);`, '3.14');
+  check('toString with radix',
+    `document.body.innerHTML = (255).toString(16);`, 'ff');
+  check('toPrecision',
+    `document.body.innerHTML = (123.456).toPrecision(5);`, '123.46');
+});
+
+// -----------------------------------------------------------------------
+// Infinity / NaN literals
+// -----------------------------------------------------------------------
+group('Infinity and NaN', () => {
+  check('typeof Infinity',
+    `document.body.innerHTML = typeof Infinity;`, 'number');
+  check('typeof NaN',
+    `document.body.innerHTML = typeof NaN;`, 'number');
+  check('isFinite(Infinity)',
+    `document.body.innerHTML = isFinite(Infinity);`, 'false');
+  check('isNaN(NaN)',
+    `document.body.innerHTML = isNaN(NaN);`, 'true');
+  check('Infinity comparison',
+    `document.body.innerHTML = (Infinity > 999) ? 'yes' : 'no';`, 'yes');
 });
 
 // -----------------------------------------------------------------------
@@ -527,6 +575,88 @@ group('builtin shadowing', () => {
     `var obj = {length:'custom'}; document.body.innerHTML = obj.length;`, 'custom');
   check('.length on array gives count',
     `var a=[1,2,3]; document.body.innerHTML = a.length;`, '3');
+  check('String.fromCharCode folds',
+    `document.body.innerHTML = String.fromCharCode(65,66,67);`, 'ABC');
+});
+
+// -----------------------------------------------------------------------
+// Compound assignment operators
+// -----------------------------------------------------------------------
+group('compound assignments', () => {
+  check('-= subtracts',
+    `var a=10; a -= 3; document.body.innerHTML = a;`, '7');
+  check('*= multiplies',
+    `var a=5; a *= 4; document.body.innerHTML = a;`, '20');
+  check('/= divides',
+    `var a=20; a /= 4; document.body.innerHTML = a;`, '5');
+  check('||= assigns on falsy',
+    `var a=''; a ||= 'default'; document.body.innerHTML = a;`, 'default');
+  check('||= no-op on truthy',
+    `var a='existing'; a ||= 'default'; document.body.innerHTML = a;`, 'existing');
+  check('&&= assigns on truthy',
+    `var a='old'; a &&= 'new'; document.body.innerHTML = a;`, 'new');
+  check('??= assigns on null',
+    `var a=null; a ??= 'fallback'; document.body.innerHTML = a;`, 'fallback');
+  check('??= assigns on undefined',
+    `var a=undefined; a ??= 'fb'; document.body.innerHTML = a;`, 'fb');
+  check('??= no-op on value',
+    `var a='val'; a ??= 'fb'; document.body.innerHTML = a;`, 'val');
+});
+
+// -----------------------------------------------------------------------
+// Destructuring in for-of
+// -----------------------------------------------------------------------
+group('for-of destructuring', () => {
+  check('array destructuring in for-of',
+    `var r=''; for(var [k,v] of [['a',1],['b',2]]) r+=k+v; document.body.innerHTML=r;`, 'a1b2');
+  check('object destructuring in for-of',
+    `var r=''; for(var {name,age} of [{name:'A',age:1},{name:'B',age:2}]) r+=name+age; document.body.innerHTML=r;`, 'A1B2');
+});
+
+// -----------------------------------------------------------------------
+// Function return typed bindings (array/object)
+// -----------------------------------------------------------------------
+group('typed function returns', () => {
+  check('destructure array from function',
+    `function f(){return ['a','b'];} var [x,y]=f(); document.body.innerHTML=x+y;`, 'ab');
+  check('destructure object from function',
+    `function f(){return {a:'x',b:'y'};} var {a,b}=f(); document.body.innerHTML=a+b;`, 'xy');
+  check('member access on function return',
+    `function f(){return {html:'<p>hi</p>'};} document.body.innerHTML=f().html;`, '<p>hi</p>');
+  check('index access on function return',
+    `function f(){return ['a','b'];} document.body.innerHTML=f()[0];`, 'a');
+  check('method on function return',
+    `function wrap(x){return [x];} document.body.innerHTML=wrap('hi').join(',');`, 'hi');
+});
+
+// -----------------------------------------------------------------------
+// Spread in function calls
+// -----------------------------------------------------------------------
+group('spread args', () => {
+  check('spread array into function',
+    `function f(a,b,c){return a+b+c;} var args=['x','y','z']; document.body.innerHTML = f(...args);`, 'xyz');
+  check('mixed spread with regular args',
+    `function f(a,b,c,d){return a+b+c+d;} var r=['b','c']; document.body.innerHTML = f('a',...r,'d');`, 'abcd');
+});
+
+// -----------------------------------------------------------------------
+// Array.from on strings
+// -----------------------------------------------------------------------
+group('Array.from string', () => {
+  check('Array.from iterates characters',
+    `document.body.innerHTML = Array.from('abc').join(',');`, 'a,b,c');
+  check('Array.from string with mapFn',
+    `document.body.innerHTML = Array.from('abc', c => c.toUpperCase()).join('');`, 'ABC');
+});
+
+// -----------------------------------------------------------------------
+// Comma operator
+// -----------------------------------------------------------------------
+group('comma operator', () => {
+  check('returns last expression',
+    `document.body.innerHTML = (1, 2, 'three');`, 'three');
+  check('single expression in parens unchanged',
+    `document.body.innerHTML = ('hello');`, 'hello');
 });
 
 // -----------------------------------------------------------------------
