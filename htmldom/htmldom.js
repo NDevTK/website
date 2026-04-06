@@ -5888,6 +5888,7 @@
       useClassList: true,
       skipWhitespaceText: $('skipWS').checked,
       useFragment: $('useFragment').checked,
+      emitComments: $('emitComments').checked,
       subs
     };
 
@@ -5942,7 +5943,7 @@
     const parentRoot = parent.match(/^[A-Za-z_$][A-Za-z0-9_$]*/);
     if (parentRoot) used.add(parentRoot[0]);
 
-    if (autoSubs.length) {
+    if (opts.emitComments && autoSubs.length) {
       lines.push('// Auto-detected JS expressions from input:');
       for (const [ph, expr] of autoSubs) lines.push('//   ' + ph + ' -> ' + expr);
     }
@@ -5957,8 +5958,10 @@
     if (parentFromAssignment && assignOp === '=' && assignProp === 'innerHTML') {
       lines.push(target + '.replaceChildren();');
     } else if (parentFromAssignment && assignProp === 'outerHTML') {
-      lines.push('// Note: ' + target + '.outerHTML = ... replaces ' + target + ' itself;');
-      lines.push('//       call ' + target + '.replaceWith(...) or adjust as needed.');
+      if (opts.emitComments) {
+        lines.push('// Note: ' + target + '.outerHTML = ... replaces ' + target + ' itself;');
+        lines.push('//       call ' + target + '.replaceWith(...) or adjust as needed.');
+      }
     }
 
     let attachTarget = parent;
@@ -6037,7 +6040,7 @@
 
   // Live update on input changes.
   $('in').addEventListener('input', convert);
-  const toggles = ['skipWS', 'useFragment'];
+  const toggles = ['skipWS', 'useFragment', 'emitComments'];
   for (const id of toggles) $(id).addEventListener('change', convert);
 
   convert();
