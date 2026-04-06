@@ -404,6 +404,35 @@ group('for-of unrolling', () => {
 });
 
 // -----------------------------------------------------------------------
+// Bounded for/while loop simulation
+// -----------------------------------------------------------------------
+group('bounded loop simulation', () => {
+  check('for i<5 i++',
+    `var s=''; for(var i=0; i<5; i++) s += i; document.body.innerHTML = s;`, '01234');
+  check('for with array indexing',
+    `var a=['a','b','c']; var s=''; for(var i=0; i<a.length; i++) s += a[i]; document.body.innerHTML = s;`, 'abc');
+  check('for decrement',
+    `var s=''; for(var i=3; i>0; i--) s += i; document.body.innerHTML = s;`, '321');
+  check('for step +=2',
+    `var s=''; for(var i=0; i<10; i+=2) s += i+','; document.body.innerHTML = s;`, '0,2,4,6,8,');
+  check('while with counter',
+    `var s=''; var i=0; while(i<3) { s+=i; i++; } document.body.innerHTML = s;`, '012');
+  check('nested for loops',
+    `var s=''; for(var i=0;i<2;i++) for(var j=0;j<3;j++) s+=i+''+j+' '; document.body.innerHTML=s;`, '00 01 02 10 11 12 ');
+  check('for building HTML from array',
+    `var items=['a','b','c']; var html=''; for(var i=0;i<items.length;i++) html+='<li>'+items[i]+'</li>'; document.body.innerHTML=html;`,
+    '<li>a</li><li>b</li><li>c</li>');
+  check('while building from array',
+    `var parts=['head','body','foot']; var i=0; var h=''; while(i<parts.length) { h+='<'+parts[i]+'>'; i++; } document.body.innerHTML=h;`,
+    '<head><body><foot>');
+  check('for zero iterations',
+    `var s='init'; for(var i=0; i<0; i++) s='never'; document.body.innerHTML = s;`, 'init');
+  check('for with opaque bound falls to markers',
+    `var s=''; for(var i=0;i<n;i++) s+='x'; document.body.innerHTML=s;`,
+    { html: '__HDLOOP0S__x__HDLOOP0E__' });
+});
+
+// -----------------------------------------------------------------------
 // Array.* builtins
 // -----------------------------------------------------------------------
 group('Array builtins', () => {
@@ -657,6 +686,44 @@ group('comma operator', () => {
     `document.body.innerHTML = (1, 2, 'three');`, 'three');
   check('single expression in parens unchanged',
     `document.body.innerHTML = ('hello');`, 'hello');
+});
+
+// -----------------------------------------------------------------------
+// Regex-based string methods
+// -----------------------------------------------------------------------
+group('regex methods', () => {
+  check('replace with regex',
+    `var s='hello world'; document.body.innerHTML = s.replace(/o/g,'0');`, 'hell0 w0rld');
+  check('match with regex returns array',
+    `document.body.innerHTML = 'a1b2c3'.match(/[0-9]+/g).join(',');`, '1,2,3');
+  check('search with regex returns index',
+    `document.body.innerHTML = 'hello'.search(/ll/);`, '2');
+  check('regex.test on string true',
+    `document.body.innerHTML = /^[a-z]+$/.test('hello');`, 'true');
+  check('regex.test on string false',
+    `document.body.innerHTML = /^[0-9]+$/.test('hello');`, 'false');
+  check('split with regex',
+    `document.body.innerHTML = 'a-b-c'.split(/-/).join(',');`, 'a,b,c');
+  check('match returns null for no match',
+    `document.body.innerHTML = 'abc'.match(/xyz/);`, 'null');
+});
+
+// -----------------------------------------------------------------------
+// Edge-case hardening
+// -----------------------------------------------------------------------
+group('edge cases', () => {
+  check('bitwise |= compound assignment',
+    `var a=5; a |= 3; document.body.innerHTML = a;`, '7');
+  check('bitwise &= compound assignment',
+    `var a=7; a &= 5; document.body.innerHTML = a;`, '5');
+  check('bitwise ^= compound assignment',
+    `var a=7; a ^= 3; document.body.innerHTML = a;`, '4');
+  check('<<= shift assignment',
+    `var a=1; a <<= 3; document.body.innerHTML = a;`, '8');
+  check('with statement skipped',
+    `var r='ok'; with(obj) { r='bad'; } document.body.innerHTML = r;`, 'ok');
+  check('debugger skipped',
+    `debugger; var a='ok'; document.body.innerHTML = a;`, 'ok');
 });
 
 // -----------------------------------------------------------------------
@@ -936,10 +1003,9 @@ group('loops', () => {
   check('for loop with multi-part body',
     `var s=''; for (var i=0; i<n; i++) { s += '<a>'; s += '<b>'; } document.body.innerHTML=s;`,
     { html: '__HDLOOP0S__<a><b>__HDLOOP0E__' });
-  check('while loop',
+  check('while loop with known bound resolves fully',
     `var s=''; while (s.length < 10) s += 'x'; document.body.innerHTML=s;`,
-    { html: '__HDLOOP0S__x__HDLOOP0E__',
-      loops: [{ id: 0, kind: 'while', headerSrc: 's.length < 10' }] });
+    'xxxxxxxxxx');
   check('static prefix + loop + suffix',
     `var s='<header>'; for (var i=0; i<n; i++) s += '<item>'; s += '<footer>';
      document.body.innerHTML=s;`,
@@ -1256,8 +1322,7 @@ group('array.reduce', () => {
 // -----------------------------------------------------------------------
 group('regex literals', () => {
   check('regex in replace call',
-    `var s='abc'; document.body.innerHTML = s.replace(/b/g,'X');`,
-    { html: '__HDX0__', autoSubs: [['__HDX0__', "s.replace(/b/g,'X')"]] });
+    `var s='abc'; document.body.innerHTML = s.replace(/b/g,'X');`, 'aXc');
   check('regex variable does not crash',
     `var re=/abc/i; document.body.innerHTML = '<p>ok</p>';`, '<p>ok</p>');
 });

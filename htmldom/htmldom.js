@@ -440,7 +440,7 @@
     'repeat', 'slice', 'substring', 'substr', 'charAt', 'at', 'indexOf', 'lastIndexOf',
     'includes', 'startsWith', 'endsWith', 'padStart', 'padEnd', 'toString',
     'split', 'reverse', 'map', 'filter', 'forEach', 'reduce',
-    'replace', 'replaceAll', 'charCodeAt', 'codePointAt',
+    'replace', 'replaceAll', 'charCodeAt', 'codePointAt', 'match', 'search', 'test',
     'toFixed', 'toPrecision', 'toExponential', 'valueOf',
     'find', 'findIndex', 'some', 'every', 'flat', 'flatMap', 'fill', 'splice',
     'sort', 'keys', 'values', 'entries',
@@ -1692,11 +1692,51 @@
       }
       // Pure string methods on a known chain string: evaluate when all args
       // are concrete literals. Non-evaluatable cases return null.
+      // Regex `.test(str)` — receiver is a regex, argument is a string.
+      if (bind && bind.kind === 'chain' && method === 'test') {
+        const re = chainAsRegex(bind);
+        if (re) {
+          const args = readConcatArgs(parenIdx, stop);
+          if (args && args.args.length === 1) {
+            const argStr = chainAsKnownString(chainBinding(args.args[0]));
+            if (argStr !== null) {
+              return { bind: chainBinding([makeSynthBool(re.test(argStr))]), next: args.next };
+            }
+          }
+        }
+      }
       if (bind && bind.kind === 'chain') {
         const s = chainAsKnownString(bind);
         if (s !== null) {
           const args = readConcatArgs(parenIdx, stop);
           if (!args) return null;
+          // Check if any arg is a regex token (for replace/match/search/split).
+          const firstArgChain = args.args.length >= 1 ? chainBinding(args.args[0]) : null;
+          const firstArgRegex = firstArgChain ? chainAsRegex(firstArgChain) : null;
+          // Regex-based string methods.
+          if (firstArgRegex && (method === 'replace' || method === 'replaceAll' || method === 'match' || method === 'search' || method === 'split')) {
+            try {
+              if (method === 'replace' || method === 'replaceAll') {
+                const replStr = args.args.length >= 2 ? chainAsKnownString(chainBinding(args.args[1])) : null;
+                if (replStr !== null) {
+                  const result = s.replace(firstArgRegex, replStr);
+                  return { bind: chainBinding([makeSynthStr(result)]), next: args.next };
+                }
+              }
+              if (method === 'match') {
+                const m = s.match(firstArgRegex);
+                if (m === null) return { bind: chainBinding([makeSynthNull()]), next: args.next };
+                return { bind: arrayBinding(m.map((v) => chainBinding([makeSynthStr(v)]))), next: args.next };
+              }
+              if (method === 'search') {
+                return { bind: chainBinding([makeSynthNum(s.search(firstArgRegex))]), next: args.next };
+              }
+              if (method === 'split') {
+                const parts = s.split(firstArgRegex);
+                return { bind: arrayBinding(parts.map((p) => chainBinding([makeSynthStr(p)]))), next: args.next };
+              }
+            } catch (_) { return null; }
+          }
           const argVals = [];
           let allConcrete = true;
           for (const a of args.args) {
@@ -2110,7 +2150,9 @@
         return { bind: chainBinding([makeSynthNum(Number(t.text))]), next: k + 1 };
       }
       if (t.type === 'tmpl') return { bind: chainBinding([rewriteTemplate(t)]), next: k + 1 };
-      if (t.type === 'regex') return { bind: chainBinding([exprRef(t.text)]), next: k + 1 };
+      // Regex literal: preserve the token type so applyMethod can construct
+      // a real RegExp when used as an argument to .replace/.match/.test etc.
+      if (t.type === 'regex') return { bind: chainBinding([t]), next: k + 1 };
       if (t.type === 'open' && t.char === '(') {
         // Use comma-aware terms so the comma operator `(a, b, c)` stops
         // at each `,`, letting us take the last sub-expression.
@@ -2668,6 +2710,34 @@
 
     // Fold a ternary when the condition is a concrete value; otherwise emit
     // canonical symbolic text.
+    // Evaluate a binding's truthiness: returns true, false, or null (opaque).
+    // Parse a regex token's text (e.g. '/abc/gi') into a RegExp, or null.
+    const tokenToRegex = (tok) => {
+      if (!tok || tok.type !== 'regex') return null;
+      const m = /^\/(.*)\/([gimsuy]*)$/.exec(tok.text);
+      if (!m) return null;
+      try { return new RegExp(m[1], m[2]); } catch (_) { return null; }
+    };
+
+    // Try to extract a regex from a chain binding's single token.
+    const chainAsRegex = (chain) => {
+      if (!chain || chain.kind !== 'chain' || chain.toks.length !== 1) return null;
+      return tokenToRegex(chain.toks[0]);
+    };
+
+    const evalTruthiness = (b) => {
+      if (!b) return null;
+      if (b.kind !== 'chain') return true; // array/object/function/element always truthy
+      const cn = chainAsNumber(b);
+      if (cn !== null) return cn !== 0;
+      const jt = b.toks && b.toks.length === 1 ? b.toks[0].jsType : null;
+      if (jt === 'null' || jt === 'undefined') return false;
+      if (jt === 'boolean') return b.toks[0].text === 'true';
+      const cs = chainAsKnownString(b);
+      if (cs !== null) return cs !== '' && cs !== '0' && cs !== 'NaN';
+      return null;
+    };
+
     const combineTernary = (cond, ifT, ifF) => {
       if (!cond || cond.kind !== 'chain') return null;
       if (!ifT || ifT.kind !== 'chain') return null;
@@ -3155,6 +3225,79 @@
               i = bodyEnd - 1;
               continue;
             }
+            // Bounded C-style for-loop or while-loop simulation.
+            // Split the header at top-level `;` to get init/cond/update
+            // ranges for `for`, or use the whole header as the condition
+            // for `while`. Then simulate: evaluate cond → if concrete
+            // true, walk body (+ update for `for`), repeat. Bail to
+            // loop markers if the condition ever becomes opaque.
+            {
+              let simulated = false;
+              if (t.text === 'for') {
+                // Split header tokens[i+2..j) at top-level `;` separators.
+                const semis = [];
+                let sd = 0;
+                for (let h = i + 2; h < j; h++) {
+                  const tk = tokens[h];
+                  if (tk.type === 'open') sd++;
+                  else if (tk.type === 'close') sd--;
+                  else if (sd === 0 && tk.type === 'sep' && tk.char === ';') semis.push(h);
+                }
+                if (semis.length === 2) {
+                  const initStart = i + 2, initEnd = semis[0];
+                  const condStart = semis[0] + 1, condEnd = semis[1];
+                  const updateStart = semis[1] + 1, updateEnd = j;
+                  // Pre-check: evaluate init to set up counter, then test if
+                  // the condition is concrete. If not, skip simulation entirely
+                  // (don't dirty scope state).
+                  if (initEnd > initStart) walkRange(initStart, initEnd);
+                  const bodyStart = (tokens[j + 1] && tokens[j + 1].type === 'open' && tokens[j + 1].char === '{') ? j + 1 : j + 1;
+                  // First condition check — if opaque, bail before any body walk.
+                  const firstCond = condEnd > condStart ? readValue(condStart, condEnd, null) : null;
+                  const firstTruth = firstCond ? evalTruthiness(firstCond.binding) : null;
+                  if (firstTruth !== null) {
+                    // Condition is concrete — simulate.
+                    simulated = true;
+                    if (firstTruth === true) {
+                      walkRange(bodyStart, bodyEnd);
+                      if (updateEnd > updateStart) walkRange(updateStart, updateEnd);
+                      // Continue iterating.
+                      while (true) {
+                        if (condEnd <= condStart) break;
+                        const condVal = readValue(condStart, condEnd, null);
+                        const concrete = evalTruthiness(condVal ? condVal.binding : null);
+                        if (concrete !== true) break; // false or opaque → stop
+                        walkRange(bodyStart, bodyEnd);
+                        if (updateEnd > updateStart) walkRange(updateStart, updateEnd);
+                      }
+                    }
+                    // else: firstTruth === false, zero iterations.
+                  }
+                  // If firstTruth === null (opaque), simulated stays false → fall to markers.
+                }
+              } else if (t.text === 'while') {
+                const condStart = i + 2, condEnd = j;
+                const bodyStart = (tokens[j + 1] && tokens[j + 1].type === 'open' && tokens[j + 1].char === '{') ? j + 1 : j + 1;
+                const firstCond = readValue(condStart, condEnd, null);
+                const firstTruth = firstCond ? evalTruthiness(firstCond.binding) : null;
+                if (firstTruth !== null) {
+                  simulated = true;
+                  if (firstTruth === true) {
+                    walkRange(bodyStart, bodyEnd);
+                    while (true) {
+                      const condVal = readValue(condStart, condEnd, null);
+                      const concrete = evalTruthiness(condVal ? condVal.binding : null);
+                      if (concrete !== true) break;
+                      walkRange(bodyStart, bodyEnd);
+                    }
+                  }
+                }
+              }
+              if (simulated) {
+                i = bodyEnd - 1;
+                continue;
+              }
+            }
             const id = nextLoopId++;
             loopInfo[id] = { kind: t.text, headerSrc };
             // Extract loop variables from the init clause (`var/let/const X`)
@@ -3213,26 +3356,7 @@
           if (j < stop) {
             // Evaluate the condition.
             const condVal = readValue(i + 2, j, null);
-            let concrete = null; // true, false, or null (unknown)
-            if (condVal && condVal.binding) {
-              const b = condVal.binding;
-              // Non-chain bindings (array/object/function/element) are always truthy.
-              if (b.kind !== 'chain') {
-                concrete = true;
-              } else {
-                const cn = chainAsNumber(b);
-                if (cn !== null) concrete = cn !== 0;
-                else {
-                  const jt = b.toks && b.toks.length === 1 ? b.toks[0].jsType : null;
-                  if (jt === 'null' || jt === 'undefined') concrete = false;
-                  else if (jt === 'boolean') concrete = b.toks[0].text === 'true';
-                  else {
-                    const cs = chainAsKnownString(b);
-                    if (cs !== null) concrete = cs !== '' && cs !== '0' && cs !== 'NaN';
-                  }
-                }
-              }
-            }
+            const concrete = condVal ? evalTruthiness(condVal.binding) : null;
             // Determine if-body range.
             const bodyTok = tokens[j + 1];
             let ifEnd;
@@ -3456,6 +3580,35 @@
         }
       }
 
+      // `with (expr) { body }` — skip the body entirely since `with`
+      // makes scope resolution unpredictable.
+      if (t.text === 'with') {
+        const wp = tokens[i + 1];
+        if (wp && wp.type === 'open' && wp.char === '(') {
+          let dp = 1, j = i + 2;
+          while (j < stop && dp > 0) {
+            const tk = tokens[j];
+            if (tk.type === 'open' && tk.char === '(') dp++;
+            else if (tk.type === 'close' && tk.char === ')') dp--;
+            j++;
+          }
+          const bodyTok = tokens[j];
+          if (bodyTok && bodyTok.type === 'open' && bodyTok.char === '{') {
+            let d = 1, k = j + 1;
+            while (k < stop && d > 0) {
+              const tk = tokens[k];
+              if (tk.type === 'open' && tk.char === '{') d++;
+              else if (tk.type === 'close' && tk.char === '}') d--;
+              k++;
+            }
+            i = k - 1;
+            continue;
+          }
+        }
+      }
+      // `debugger;` — skip.
+      if (t.text === 'debugger') continue;
+
       if (t.text === 'function') {
         // Try to capture a function declaration: `function NAME(params) { body }`.
         const nameTok = tokens[i + 1];
@@ -3619,9 +3772,16 @@
           const cur = resolve(t.text);
           let combined = null;
           if (cur && cur.kind === 'chain' && rhs && rhs.kind === 'chain') {
-            const loopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
-            const tagged = loopId !== null ? tagWithLoop(rhs.toks, loopId) : rhs.toks;
-            combined = chainBinding([...cur.toks, SYNTH_PLUS, ...tagged]);
+            // Numeric fold: if both sides are numbers, add instead of concat.
+            const ln = chainAsNumber(cur);
+            const rn = chainAsNumber(rhs);
+            if (ln !== null && rn !== null) {
+              combined = chainBinding([makeSynthNum(ln + rn)]);
+            } else {
+              const loopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
+              const tagged = loopId !== null ? tagWithLoop(rhs.toks, loopId) : rhs.toks;
+              combined = chainBinding([...cur.toks, SYNTH_PLUS, ...tagged]);
+            }
           }
           assignName(t.text, combined);
           if (loopStack.length > 0) loopStack[loopStack.length - 1].modifiedVars.add(t.text);
@@ -3657,7 +3817,8 @@
           continue;
         }
         // Arithmetic compound assignments: `-=`, `*=`, `/=`, `%=`, `**=`.
-        if (eqTok && eqTok.type === 'sep' && /^[-*/%]+=?$|^\*\*=$/.test(eqTok.char) && eqTok.char !== '+=') {
+        const ARITH_COMPOUND = new Set(['-=', '*=', '/=', '%=', '**=', '|=', '&=', '^=', '<<=', '>>=', '>>>=']);
+        if (eqTok && eqTok.type === 'sep' && ARITH_COMPOUND.has(eqTok.char)) {
           const r = readValue(i + 2, stop, TERMS_TOP);
           const rhs = r ? r.binding : null;
           const cur = resolve(t.text);
@@ -3671,6 +3832,12 @@
               case '/=': v = ln / rn; break;
               case '%=': v = ln % rn; break;
               case '**=': v = ln ** rn; break;
+              case '|=': v = ln | rn; break;
+              case '&=': v = ln & rn; break;
+              case '^=': v = ln ^ rn; break;
+              case '<<=': v = ln << rn; break;
+              case '>>=': v = ln >> rn; break;
+              case '>>>=': v = ln >>> rn; break;
               default: v = null;
             }
             if (v !== null) assignName(t.text, chainBinding([makeSynthNum(v)]));
