@@ -600,7 +600,7 @@
   // bindings hold named or indexed child bindings (each itself a chain,
   // object, or array) so member access and destructuring can walk into them.
   const chainBinding = (toks) => ({ kind: 'chain', toks });
-  const objectBinding = (props) => ({ kind: 'object', props });
+  const objectBinding = (props) => ({ kind: 'object', props, accessors: Object.create(null), classRef: null });
   const arrayBinding = (elems) => ({ kind: 'array', elems });
   const functionBinding = (params, bodyStart, bodyEnd, isBlock, closure) => ({
     kind: 'function', params, bodyStart, bodyEnd, isBlock, closure: closure || null,
@@ -1091,16 +1091,15 @@
       for (let i = 1; i < parts.length && b; i++) {
         const p = parts[i];
         if (b.kind === 'object') {
-          // Missing property on a known object → undefined (not null).
-          const prop = p in b.props ? b.props[p] : chainBinding([makeSynthUndef()]);
-          // Invoke getter on access.
-          if (prop && prop.kind === 'getter') {
+          // Check for getter in accessors map.
+          const accessor = b.accessors && b.accessors[p];
+          if (accessor && accessor.get) {
             stack.push({ bindings: Object.create(null), isFunction: true, thisBinding: b });
-            const result = instantiateFunctionBinding(prop.fn, []);
+            b = instantiateFunctionBinding(accessor.get, []);
             stack.pop();
-            b = result;
           } else {
-            b = prop;
+            // Missing property on a known object → undefined (not null).
+            b = p in b.props ? b.props[p] : chainBinding([makeSynthUndef()]);
           }
         } else if (p === 'length' && b.kind === 'array') {
           b = chainBinding([makeSynthNum(b.elems.length)]);
@@ -1523,13 +1522,12 @@
                   bEnd++;
                 }
                 const fn = functionBinding(params, p + 1, bEnd - 1, true);
-                if (accessorKind === 'get') {
-                  // Store as getter marker; invoked at property access time.
-                  props[keyName] = { kind: 'getter', fn };
-                } else {
-                  // Setter: store as a special marker for write-time invocation.
-                  props['__set_' + keyName] = fn;
-                }
+                // Store accessor on the object's accessors map (not in props).
+                // Getters are invoked on read; setters on write.
+                if (!props.__pendingAccessors) props.__pendingAccessors = Object.create(null);
+                if (!props.__pendingAccessors[keyName]) props.__pendingAccessors[keyName] = {};
+                if (accessorKind === 'get') props.__pendingAccessors[keyName].get = fn;
+                else props.__pendingAccessors[keyName].set = fn;
                 i = bEnd;
                 const sep = tks[i];
                 if (sep && sep.type === 'sep' && sep.char === ',') { i++; continue; }
@@ -1646,7 +1644,15 @@
       }
       const close = tks[i];
       if (!close || close.type !== 'close' || close.char !== '}') return null;
-      return { binding: objectBinding(props), next: i + 1 };
+      const obj = objectBinding(props);
+      // Move pending accessors from props to the dedicated accessors map.
+      if (props.__pendingAccessors) {
+        for (const name of Object.keys(props.__pendingAccessors)) {
+          obj.accessors[name] = props.__pendingAccessors[name];
+        }
+        delete props.__pendingAccessors;
+      }
+      return { binding: obj, next: i + 1 };
     };
 
     // Read an array literal `[ v, v, ... ]`. Returns { binding, next } or null.
@@ -1955,13 +1961,13 @@
           for (const p of propSegs) {
             if (!cur) break;
             if (cur.kind === 'object') {
-              const prop = cur.props[p] || null;
-              if (prop && prop.kind === 'getter') {
+              const accessor = cur.accessors && cur.accessors[p];
+              if (accessor && accessor.get) {
                 stack.push({ bindings: Object.create(null), isFunction: true, thisBinding: cur });
-                cur = instantiateFunctionBinding(prop.fn, []);
+                cur = instantiateFunctionBinding(accessor.get, []);
                 stack.pop();
               } else {
-                cur = prop;
+                cur = cur.props[p] || null;
               }
             } else if (p === 'length' && cur.kind === 'array') {
               cur = chainBinding([makeSynthNum(cur.elems.length)]);
@@ -2011,24 +2017,9 @@
           if (argRes) {
             // Set up this/super for method calls, then delegate to
             // instantiateFunctionBinding which handles closures.
-            const recCls = receiver && receiver.__class__ || null;
+            const recCls = receiver && receiver.classRef || null;
             const savedThis = bind.closure ? null : receiver;
-            // Temporarily inject thisBinding into the function for method calls.
-            const origClosure = bind.closure;
-            if (receiver) {
-              const cls = Object.assign(Object.create(null), bind.closure || {});
-              bind = Object.assign({}, bind, { closure: cls });
-              // thisBinding handled by pushing a frame with this before instantiate.
-            }
-            let result = null;
-            if (receiver) {
-              stack.push({ bindings: Object.create(null), isFunction: true, thisBinding: receiver, superClass: recCls && recCls.superClass || null });
-              result = instantiateFunctionBinding(bind, argRes.bindings);
-              stack.pop();
-            } else {
-              result = instantiateFunctionBinding(bind, argRes.bindings);
-            }
-            bind = Object.assign({}, bind, { closure: origClosure });
+            const result = instantiateFunctionBinding(bind, argRes.bindings, receiver || null, recCls && recCls.superClass || null);
             if (result) {
               receiver = null;
               bind = result;
@@ -2694,34 +2685,7 @@
             if (parenTok && parenTok.type === 'open' && parenTok.char === '(') {
               const argRes = readCallArgBindings(parenOff, stop);
               if (argRes) {
-                stack.push({ bindings: Object.create(null), isFunction: true, thisBinding: thisObj, superClass: superCls.superClass || null });
-                const frame = stack[stack.length - 1];
-                for (let p = 0; p < fn.params.length; p++) {
-                  frame.bindings[fn.params[p].name] = argRes.bindings[p] || null;
-                }
-                let result = null;
-                const savedTks = tks; tks = tokens;
-                let fi = fn.bodyStart;
-                while (fi < fn.bodyEnd) {
-                  const ft = tks[fi];
-                  if (ft && ft.type === 'other' && ft.text === 'return') {
-                    const r = readValue(fi + 1, fn.bodyEnd, TERMS_TOP);
-                    if (r) result = r.binding;
-                    break;
-                  }
-                  if (ft && ft.type === 'open' && ft.char === '{') {
-                    let depth = 1; fi++;
-                    while (fi < fn.bodyEnd && depth > 0) {
-                      if (tks[fi].type === 'open' && tks[fi].char === '{') depth++;
-                      else if (tks[fi].type === 'close' && tks[fi].char === '}') depth--;
-                      fi++;
-                    }
-                    continue;
-                  }
-                  fi++;
-                }
-                tks = savedTks;
-                stack.pop();
+                const result = instantiateFunctionBinding(fn, argRes.bindings, thisObj, superCls.superClass || null);
                 if (result) return { bind: result, next: argRes.next };
               }
             }
@@ -2746,7 +2710,7 @@
               for (const mn of Object.keys(cls.methods)) props[mn] = cls.methods[mn];
               const instance = objectBinding(props);
               // Store class ref on instance for super method resolution.
-              instance.__class__ = cls;
+              instance.classRef = cls;
               // Run constructor with `this` = instance.
               if (cls.ctor) {
                 stack.push({ bindings: Object.create(null), isFunction: true, thisBinding: instance, superClass: cls.superClass || null });
@@ -3138,43 +3102,8 @@
                 if (fn && fn.kind === 'function') {
                   const argRes = readCallArgBindings(k + 1, stop);
                   if (argRes) {
-                    // Push frame with `this` = receiver.
-                    const rcls = receiver && receiver.__class__ || null;
-                    stack.push({ bindings: Object.create(null), isFunction: true, thisBinding: receiver, superClass: rcls && rcls.superClass || null });
-                    const frame = stack[stack.length - 1];
-                    for (let p = 0; p < fn.params.length; p++) {
-                      frame.bindings[fn.params[p].name] = argRes.bindings[p] || null;
-                    }
-                    let result = null;
-                    if (fn.isBlock) {
-                      const savedTks = tks; tks = tokens;
-                      let fi = fn.bodyStart;
-                      while (fi < fn.bodyEnd) {
-                        const ft = tks[fi];
-                        if (ft && ft.type === 'other' && ft.text === 'return') {
-                          const r = readValue(fi + 1, fn.bodyEnd, TERMS_TOP);
-                          if (r) result = r.binding;
-                          break;
-                        }
-                        if (ft && ft.type === 'open' && ft.char === '{') {
-                          let depth = 1; fi++;
-                          while (fi < fn.bodyEnd && depth > 0) {
-                            if (tks[fi].type === 'open' && tks[fi].char === '{') depth++;
-                            else if (tks[fi].type === 'close' && tks[fi].char === '}') depth--;
-                            fi++;
-                          }
-                          continue;
-                        }
-                        fi++;
-                      }
-                      tks = savedTks;
-                    } else {
-                      const savedTks = tks; tks = tokens;
-                      const r = readValue(fn.bodyStart, fn.bodyEnd, TERMS_NONE);
-                      if (r) result = r.binding;
-                      tks = savedTks;
-                    }
-                    stack.pop();
+                    const rcls = receiver && receiver.classRef || null;
+                    const result = instantiateFunctionBinding(fn, argRes.bindings, receiver, rcls && rcls.superClass || null);
                     if (result) return { bind: result, next: argRes.next };
                   }
                 }
@@ -3296,10 +3225,11 @@
     // Like instantiateFunction but returns a typed binding (array/object/chain)
     // instead of raw tokens. Used by flatMap where the callback returns an
     // array literal that readConcatExpr can't represent as a token chain.
-    const instantiateFunctionBinding = (fn, argBindings) => {
-      // If the function captured a closure, push its bindings first.
+    // Unified function invocation: pushes closure + frame with this/super,
+    // binds params (including rest), evaluates body, pops frames, returns result.
+    const instantiateFunctionBinding = (fn, argBindings, thisObj, superClass) => {
       if (fn.closure) stack.push({ bindings: Object.assign(Object.create(null), fn.closure), isFunction: true });
-      stack.push({ bindings: Object.create(null), isFunction: true });
+      stack.push({ bindings: Object.create(null), isFunction: true, thisBinding: thisObj || null, superClass: superClass || null });
       const frame = stack[stack.length - 1];
       const savedTks = tks;
       tks = tokens;
@@ -4894,14 +4824,13 @@
             }
             if (ok) {
               const termKey = parts[parts.length - 1];
-              // Check for setter: stored as __set_propName by object literal parser.
-              const setter = cur.props['__set_' + termKey];
-              if (setter && setter.kind === 'function') {
-                // Invoke setter with `this` = the object.
+              // Check for setter in accessors map.
+              const accessor = cur.accessors && cur.accessors[termKey];
+              if (accessor && accessor.set && accessor.set.kind === 'function') {
                 stack.push({ bindings: Object.create(null), isFunction: true, thisBinding: cur });
                 const setFrame = stack[stack.length - 1];
-                if (setter.params[0]) setFrame.bindings[setter.params[0].name] = val;
-                walkRange(setter.bodyStart, setter.bodyEnd);
+                if (accessor.set.params[0]) setFrame.bindings[accessor.set.params[0].name] = val;
+                walkRange(accessor.set.bodyStart, accessor.set.bodyEnd);
                 stack.pop();
               } else {
                 cur.props[termKey] = val;
