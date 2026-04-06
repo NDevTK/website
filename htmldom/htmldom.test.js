@@ -856,6 +856,14 @@ group('general JS', () => {
     `var r=''; outer: for(var i=0;i<3;i++){for(var j=0;j<3;j++){if(j===1)continue outer; r+=j;}} document.body.innerHTML=r;`, '000');
   check('setter invoked on assignment',
     `var o={_v:0,set v(x){this._v=x;}}; o.v=5; document.body.innerHTML=o._v;`, '5');
+  check('numeric separator',
+    `document.body.innerHTML = 1_000_000;`, '1000000');
+  check('hex with separator',
+    `document.body.innerHTML = 0xFF_FF;`, '65535');
+  check('chained assignment',
+    `var a,b; a=b='val'; document.body.innerHTML=a+b;`, 'valval');
+  check('tagged template',
+    `function tag(s,...v){return s[0]+v[0]+s[1];} document.body.innerHTML=tag\`a\${'B'}c\`;`, 'aBc');
 });
 
 // -----------------------------------------------------------------------

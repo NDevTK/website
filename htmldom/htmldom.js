@@ -1667,6 +1667,18 @@
           next: body.next,
         };
       }
+      // Assignment expression: `ident = expr` returns the assigned value.
+      // Handles chained assignment: `a = b = "val"`.
+      if (t.type === 'other' && IDENT_RE.test(t.text)) {
+        const eqTok = tks[k + 1];
+        if (eqTok && eqTok.type === 'sep' && eqTok.char === '=') {
+          const rhs = readValue(k + 2, stop, terms);
+          if (rhs) {
+            assignName(t.text, rhs.binding);
+            return rhs; // assignment expression returns the assigned value
+          }
+        }
+      }
       // Try the expression as an arithmetic expression with postfix
       // accessors. This folds arithmetic/bitwise/logical/comparison/ternary
       // ops while preserving typed bindings (array/object/function) when
@@ -1704,12 +1716,14 @@
 
     // Detect a primitive literal token and return its string form, or null.
     const primitiveAsString = (text) => {
-      if (/^-?\d+$/.test(text)) return text.replace(/^-?0+(?=\d)/, (m) => m.startsWith('-') ? '-' : '');
-      if (/^-?\d*\.\d+$/.test(text)) return text;
+      // Strip numeric separators: 1_000_000 → 1000000
+      const stripped = text.indexOf('_') >= 0 ? text.replace(/_/g, '') : text;
+      if (/^-?\d+$/.test(stripped)) return stripped.replace(/^-?0+(?=\d)/, (m) => m.startsWith('-') ? '-' : '');
+      if (/^-?\d*\.\d+$/.test(stripped)) return stripped;
       // Hex (0x), octal (0o), binary (0b) literals.
-      if (/^0[xX][0-9a-fA-F]+$/.test(text)) return String(parseInt(text, 16));
-      if (/^0[oO][0-7]+$/.test(text)) return String(parseInt(text.slice(2), 8));
-      if (/^0[bB][01]+$/.test(text)) return String(parseInt(text.slice(2), 2));
+      if (/^0[xX][0-9a-fA-F_]+$/.test(stripped)) return String(parseInt(stripped, 16));
+      if (/^0[oO][0-7_]+$/.test(stripped)) return String(parseInt(stripped.slice(2), 8));
+      if (/^0[bB][01_]+$/.test(stripped)) return String(parseInt(stripped.slice(2), 2));
       if (text === 'true' || text === 'false' || text === 'null' || text === 'undefined') return text;
       return null;
     };
@@ -1881,6 +1895,34 @@
           break;
         }
         break;
+      }
+      // Tagged template: `func`a${x}b`` — invoke the function with
+      // [strings, ...values] where strings is the static parts array
+      // and values are the interpolated expressions.
+      if (next < stop && bind && bind.kind === 'function' && tks[next] && tks[next].type === 'tmpl') {
+        const tmpl = tks[next];
+        const strings = [];
+        const values = [];
+        for (const part of tmpl.parts) {
+          if (part.kind === 'text') {
+            strings.push(chainBinding([makeSynthStr(decodeJsString(part.raw, '`'))]));
+          } else if (part.kind === 'expr') {
+            const exprSrc = part.expr || part.raw || '';
+            const exprToks = tokenize(exprSrc);
+            const savedTks = tks;
+            tks = exprToks;
+            const val = readValue(0, exprToks.length, TERMS_NONE);
+            tks = savedTks;
+            values.push(val ? val.binding : chainBinding([exprRef(exprSrc)]));
+          }
+        }
+        // Build args: [stringsArray, ...values]
+        const args = [arrayBinding(strings), ...values];
+        const result = instantiateFunctionBinding(bind, args);
+        if (result) {
+          bind = result;
+          next = next + 1;
+        }
       }
       return { bind, next };
     };
