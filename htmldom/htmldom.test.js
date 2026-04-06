@@ -227,8 +227,7 @@ group('object property access', () => {
   check('obj.prop with concat',
     `var obj = { a: '<a>', b: '<b>' }; document.body.innerHTML = obj.a + obj.b;`, '<a><b>');
   check('unknown prop',
-    `var obj = { html: '<a>' }; document.body.innerHTML = obj.missing;`,
-    { html: '__HDX0__', autoSubs: [['__HDX0__', 'obj.missing']] });
+    `var obj = { html: '<a>' }; document.body.innerHTML = obj.missing;`, 'undefined');
   check('quoted keys',
     `var obj = { "html": '<a>' }; document.body.innerHTML = obj.html;`, '<a>');
 });
@@ -803,6 +802,48 @@ group('real-world patterns', () => {
      if(isAdmin) html+='<span class="badge">Admin</span>';
      html+='</div>'; document.body.innerHTML=html;`,
     '<div><span>Alice</span><span class="badge">Admin</span></div>');
+});
+
+// -----------------------------------------------------------------------
+// General JS patterns
+// -----------------------------------------------------------------------
+group('general JS', () => {
+  check('hex literal',
+    `document.body.innerHTML = 0xFF;`, '255');
+  check('binary literal',
+    `document.body.innerHTML = 0b1010;`, '10');
+  check('octal literal',
+    `document.body.innerHTML = 0o77;`, '63');
+  check('IIFE',
+    `var r = (function(){ return 'iife'; })(); document.body.innerHTML = r;`, 'iife');
+  check('arrow IIFE',
+    `var r = (() => 'val')(); document.body.innerHTML = r;`, 'val');
+  check('closure',
+    `function make(x){ return function(){ return x; }; } var f = make('hi'); document.body.innerHTML = f();`, 'hi');
+  check('nested function with closure',
+    `function outer(){ var x = 'o'; function inner(){ return x; } return inner(); } document.body.innerHTML = outer();`, 'o');
+  check('curried arrow',
+    `var add = x => y => x + y; document.body.innerHTML = add('a')('b');`, 'ab');
+  check('rest parameters',
+    `function f(...args){ return args.join(','); } document.body.innerHTML = f('a','b','c');`, 'a,b,c');
+  check('rest with leading params',
+    `function f(a, b, ...rest){ return rest.join(','); } document.body.innerHTML = f(1,2,3,4,5);`, '3,4,5');
+  check('nested destructuring',
+    `var {a:{b}} = {a:{b:'deep'}}; document.body.innerHTML = b;`, 'deep');
+  check('deeply nested destructuring',
+    `var {a:{b:{c}}} = {a:{b:{c:'v'}}}; document.body.innerHTML = c;`, 'v');
+  check('object method shorthand callable',
+    `var o = { greet(){ return 'hi'; } }; document.body.innerHTML = o.greet();`, 'hi');
+  check('missing property is undefined',
+    `var o = {}; document.body.innerHTML = o.x ?? 'fb';`, 'fb');
+  check('double negation',
+    `document.body.innerHTML = !!1 ? 't' : 'f';`, 't');
+  check('string method chaining',
+    `document.body.innerHTML = '  Hello World  '.trim().toLowerCase().replace(' ','-');`, 'hello-world');
+  check('default parameter',
+    `function f(x='def'){ return x; } document.body.innerHTML = f();`, 'def');
+  check('logical OR default',
+    `var x = null; var y = x || 'default'; document.body.innerHTML = y;`, 'default');
 });
 
 // -----------------------------------------------------------------------
