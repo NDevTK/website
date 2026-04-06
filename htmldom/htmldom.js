@@ -623,10 +623,50 @@
     };
     for (let i = 0; i < tokens.length; i++) {
       const t = tokens[i];
-      if (t.type === 'other' && t.text === 'function') { pendingFnBrace = true; continue; }
+      if (t.type === 'other' && t.text === 'function') {
+        // Don't increment depth for function callbacks inside array method
+        // calls like `.forEach(function`, `.map(function` — these are
+        // synchronous and their mutations are deterministic.
+        const prev = tokens[i - 1];
+        const prev2 = tokens[i - 2];
+        const isSyncCallback = prev && prev.type === 'open' && prev.char === '(' &&
+          prev2 && prev2.type === 'other' && /\.(forEach|map|filter|reduce|some|every|find|findIndex|flatMap)$/.test(prev2.text);
+        if (!isSyncCallback) pendingFnBrace = true;
+        continue;
+      }
       if (t.type === 'other' && t.text === '=>') {
         const nt = tokens[i + 1];
-        if (nt && nt.type === 'open' && nt.char === '{') pendingFnBrace = true;
+        if (nt && nt.type === 'open' && nt.char === '{') {
+          // Don't increment depth for arrow callbacks inside sync array
+          // methods. Scan back past the arrow params to find the `(` from
+          // the method call. Pattern: `.forEach(x => {` or `.map((a,b) => {`.
+          let isSyncCb = false;
+          let back = i - 1;
+          // Skip past arrow params: either a single ident or `(params)`.
+          if (tokens[back] && tokens[back].type === 'close' && tokens[back].char === ')') {
+            let pd = 1; back--;
+            while (back >= 0 && pd > 0) {
+              if (tokens[back].type === 'close' && tokens[back].char === ')') pd++;
+              else if (tokens[back].type === 'open' && tokens[back].char === '(') pd--;
+              if (pd > 0) back--;
+            }
+            // back is at the `(` of params.
+          }
+          // back - 1 should be the `(` of the method call, back - 2 the method path.
+          if (tokens[back - 1] && tokens[back - 1].type === 'open' && tokens[back - 1].char === '(' &&
+              tokens[back - 2] && tokens[back - 2].type === 'other' &&
+              /\.(forEach|map|filter|reduce|some|every|find|findIndex|flatMap)$/.test(tokens[back - 2].text)) {
+            isSyncCb = true;
+          }
+          // Also single-param: `.forEach(x => {` — back is at x, back-1 is `(`, back-2 is method.
+          if (!isSyncCb && tokens[back] && tokens[back].type === 'other' && IDENT_RE.test(tokens[back].text) &&
+              tokens[back - 1] && tokens[back - 1].type === 'open' && tokens[back - 1].char === '(' &&
+              tokens[back - 2] && tokens[back - 2].type === 'other' &&
+              /\.(forEach|map|filter|reduce|some|every|find|findIndex|flatMap)$/.test(tokens[back - 2].text)) {
+            isSyncCb = true;
+          }
+          if (!isSyncCb) pendingFnBrace = true;
+        }
         continue;
       }
       if (t.type === 'open' && t.char === '{') {
@@ -1497,6 +1537,50 @@
     // Given the token index just after `=>`, determine the body range.
     // Returns { bodyStart, bodyEnd, isBlock } or null. For expression bodies,
     // the body extends up to the first top-level `,`/`;`/stop terminator.
+    // Parse a callback: either an arrow function OR `function(params) { body }`.
+    // Returns { fn: functionBinding, next } or null.
+    const peekCallback = (k, stop) => {
+      // Try arrow first.
+      const arrow = peekArrow(k, stop);
+      if (arrow) {
+        const body = readArrowBody(arrow.arrowNext, stop);
+        if (body) return { fn: functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock), next: body.next };
+      }
+      // Try `function(params) { body }`.
+      const t = tks[k];
+      if (t && t.type === 'other' && t.text === 'function') {
+        const lp = tks[k + 1];
+        if (lp && lp.type === 'open' && lp.char === '(') {
+          const params = [];
+          let p = k + 2;
+          if (tks[p] && tks[p].type === 'close' && tks[p].char === ')') { p++; }
+          else {
+            let ok = true;
+            while (p < stop) {
+              const pt = parseParamWithDefault(tks, p, stop);
+              if (!pt) { ok = false; break; }
+              params.push(pt.param);
+              p = pt.next;
+              if (tks[p] && tks[p].type === 'close' && tks[p].char === ')') { p++; break; }
+              if (tks[p] && tks[p].type === 'sep' && tks[p].char === ',') { p++; continue; }
+              ok = false; break;
+            }
+            if (!ok) return null;
+          }
+          if (tks[p] && tks[p].type === 'open' && tks[p].char === '{') {
+            let d = 1, bEnd = p + 1;
+            while (bEnd < stop && d > 0) {
+              if (tks[bEnd].type === 'open' && tks[bEnd].char === '{') d++;
+              else if (tks[bEnd].type === 'close' && tks[bEnd].char === '}') d--;
+              bEnd++;
+            }
+            return { fn: functionBinding(params, p + 1, bEnd - 1, true), next: bEnd };
+          }
+        }
+      }
+      return null;
+    };
+
     const readArrowBody = (arrowNext, stop) => {
       const t = tks[arrowNext];
       if (!t) return null;
@@ -1924,15 +2008,25 @@
         if (method === 'map' || method === 'filter' || method === 'forEach') {
           const lp = tks[parenIdx];
           if (!lp || lp.type !== 'open' || lp.char !== '(') return null;
-          const arrow = peekArrow(parenIdx + 1, stop);
-          if (!arrow) return null;
-          const body = readArrowBody(arrow.arrowNext, stop);
-          if (!body) return null;
-          const rp = tks[body.next];
+          const cb = peekCallback(parenIdx + 1, stop);
+          if (!cb) return null;
+          const rp = tks[cb.next];
           if (!rp || rp.type !== 'close' || rp.char !== ')') return null;
-          const fn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock);
+          const fn = cb.fn;
           if (method === 'forEach') {
-            return { bind: chainBinding([makeSynthStr('undefined')]), next: body.next + 1 };
+            // Walk body per element for side effects (e.g. html += item).
+            for (let idx = 0; idx < bind.elems.length; idx++) {
+              const el = bind.elems[idx];
+              if (!el) continue;
+              const iterFrame = { bindings: Object.create(null), isFunction: true };
+              if (fn.params[0]) iterFrame.bindings[fn.params[0].name] = el;
+              if (fn.params[1]) iterFrame.bindings[fn.params[1].name] = chainBinding([makeSynthNum(idx)]);
+              if (fn.params[2]) iterFrame.bindings[fn.params[2].name] = bind;
+              stack.push(iterFrame);
+              if (fn.isBlock) walkRange(fn.bodyStart, fn.bodyEnd);
+              stack.pop();
+            }
+            return { bind: chainBinding([makeSynthStr('undefined')]), next: cb.next + 1 };
           }
           const results = [];
           for (const el of bind.elems) {
@@ -1953,19 +2047,17 @@
             if (truthy) results.push(el);
             else if (!falsy) return null;
           }
-          return { bind: arrayBinding(results), next: body.next + 1 };
+          return { bind: arrayBinding(results), next: cb.next + 1 };
         }
         // Callback-based: find, findIndex, some, every, flatMap.
         if (method === 'find' || method === 'findIndex' || method === 'some' || method === 'every' || method === 'flatMap') {
           const lp = tks[parenIdx];
           if (!lp || lp.type !== 'open' || lp.char !== '(') return null;
-          const arrow = peekArrow(parenIdx + 1, stop);
-          if (!arrow) return null;
-          const body = readArrowBody(arrow.arrowNext, stop);
-          if (!body) return null;
-          const rp = tks[body.next];
+          const cb = peekCallback(parenIdx + 1, stop);
+          if (!cb) return null;
+          const rp = tks[cb.next];
           if (!rp || rp.type !== 'close' || rp.char !== ')') return null;
-          const fn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock);
+          const fn = cb.fn;
           if (method === 'flatMap') {
             const out = [];
             for (const el of bind.elems) {
@@ -1975,7 +2067,7 @@
               if (r.kind === 'array') { for (const e of r.elems) out.push(e); }
               else out.push(r);
             }
-            return { bind: arrayBinding(out), next: body.next + 1 };
+            return { bind: arrayBinding(out), next: cb.next + 1 };
           }
           for (let idx = 0; idx < bind.elems.length; idx++) {
             const el = bind.elems[idx];
@@ -1988,23 +2080,23 @@
             const truthy = (n !== null && n !== 0) || (s !== null && s !== '' && s !== 'false' && s !== 'null' && s !== 'undefined' && s !== '0' && s !== 'NaN');
             const falsy = n === 0 || s === '' || s === 'false' || s === 'null' || s === 'undefined' || s === '0' || s === 'NaN';
             if (method === 'find') {
-              if (truthy) return { bind: el, next: body.next + 1 };
+              if (truthy) return { bind: el, next: cb.next + 1 };
               if (!falsy) return null;
             } else if (method === 'findIndex') {
-              if (truthy) return { bind: chainBinding([makeSynthStr(String(idx))]), next: body.next + 1 };
+              if (truthy) return { bind: chainBinding([makeSynthStr(String(idx))]), next: cb.next + 1 };
               if (!falsy) return null;
             } else if (method === 'some') {
-              if (truthy) return { bind: chainBinding([makeSynthStr('true')]), next: body.next + 1 };
+              if (truthy) return { bind: chainBinding([makeSynthStr('true')]), next: cb.next + 1 };
               if (!falsy) return null;
             } else if (method === 'every') {
-              if (falsy) return { bind: chainBinding([makeSynthStr('false')]), next: body.next + 1 };
+              if (falsy) return { bind: chainBinding([makeSynthStr('false')]), next: cb.next + 1 };
               if (!truthy) return null;
             }
           }
-          if (method === 'find') return { bind: chainBinding([makeSynthStr('undefined')]), next: body.next + 1 };
-          if (method === 'findIndex') return { bind: chainBinding([makeSynthStr('-1')]), next: body.next + 1 };
-          if (method === 'some') return { bind: chainBinding([makeSynthStr('false')]), next: body.next + 1 };
-          if (method === 'every') return { bind: chainBinding([makeSynthStr('true')]), next: body.next + 1 };
+          if (method === 'find') return { bind: chainBinding([makeSynthStr('undefined')]), next: cb.next + 1 };
+          if (method === 'findIndex') return { bind: chainBinding([makeSynthStr('-1')]), next: cb.next + 1 };
+          if (method === 'some') return { bind: chainBinding([makeSynthStr('false')]), next: cb.next + 1 };
+          if (method === 'every') return { bind: chainBinding([makeSynthStr('true')]), next: cb.next + 1 };
         }
         // `.reduce(fn, init)` — two-arg reducer: invoke the callback
         // per element with (accumulator, element) and thread the
@@ -2012,17 +2104,15 @@
         if (method === 'reduce') {
           const lp = tks[parenIdx];
           if (!lp || lp.type !== 'open' || lp.char !== '(') return null;
-          const arrow = peekArrow(parenIdx + 1, stop);
-          if (!arrow || arrow.params.length !== 2) return null;
-          const body = readArrowBody(arrow.arrowNext, stop);
-          if (!body) return null;
-          const sep = tks[body.next];
+          const cb = peekCallback(parenIdx + 1, stop);
+          if (!cb || cb.fn.params.length !== 2) return null;
+          const sep = tks[cb.next];
           if (!sep || sep.type !== 'sep' || sep.char !== ',') return null;
-          const init = readConcatExpr(body.next + 1, stop, { sep: [], close: [')'] });
+          const init = readConcatExpr(cb.next + 1, stop, { sep: [], close: [')'] });
           if (!init) return null;
           const rp = tks[init.next];
           if (!rp || rp.type !== 'close' || rp.char !== ')') return null;
-          const fn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock);
+          const fn = cb.fn;
           let accBind = chainBinding(init.toks);
           for (const el of bind.elems) {
             if (!el) return null;
@@ -4480,6 +4570,32 @@
                 }
                 i = argResult.next - 1;
                 continue;
+              }
+            }
+            // forEach at statement level: walk callback body per element
+            // for side effects (e.g. `arr.forEach(function(x) { html += x; })`).
+            if (baseBind && baseBind.kind === 'array' && method === 'forEach') {
+              const lp = tokens[i + 1];
+              if (lp && lp.type === 'open' && lp.char === '(') {
+                const cb = peekCallback(i + 2, stop);
+                if (cb) {
+                  const rp = tks[cb.next];
+                  if (rp && rp.type === 'close' && rp.char === ')') {
+                    for (let idx = 0; idx < baseBind.elems.length; idx++) {
+                      const el = baseBind.elems[idx];
+                      if (!el) continue;
+                      const iterFrame = { bindings: Object.create(null), isFunction: false };
+                      if (cb.fn.params[0]) iterFrame.bindings[cb.fn.params[0].name] = el;
+                      if (cb.fn.params[1]) iterFrame.bindings[cb.fn.params[1].name] = chainBinding([makeSynthNum(idx)]);
+                      if (cb.fn.params[2]) iterFrame.bindings[cb.fn.params[2].name] = baseBind;
+                      stack.push(iterFrame);
+                      if (cb.fn.isBlock) walkRange(cb.fn.bodyStart, cb.fn.bodyEnd);
+                      stack.pop();
+                    }
+                    i = cb.next; // past `)`
+                    continue;
+                  }
+                }
               }
             }
           }

@@ -767,6 +767,45 @@ group('getters', () => {
 });
 
 // -----------------------------------------------------------------------
+// Real-world patterns (from GitHub search)
+// -----------------------------------------------------------------------
+group('real-world patterns', () => {
+  check('SparrowCI autocomplete: substr in if inside for',
+    `var arr=['alpha','beta','gamma']; var val='al'; var html='';
+     for(var i=0;i<arr.length;i++){
+       if(arr[i].substr(0,val.length).toUpperCase()==val.toUpperCase()){
+         html+='<strong>'+arr[i].substr(0,val.length)+'</strong>';
+         html+=arr[i].substr(val.length);
+       }
+     } document.body.innerHTML=html;`,
+    "<strong>al</strong>pha");
+  check('wikidata-osm: concat link from variables',
+    `var type='way'; var id=12345; var link='<li><a href="https://osm.org/'+type+'/'+id+'">OSM</a></li>'; document.body.innerHTML=link;`,
+    '<li><a href="https://osm.org/way/12345">OSM</a></li>');
+  check('nn.js: iteration status in for loop',
+    `var iterations=3; var html=''; for(var iter=0;iter<iterations;iter++) html+='Iter '+(iter+1)+' of '+iterations+'<br>'; document.body.innerHTML=html;`,
+    'Iter 1 of 3<br>Iter 2 of 3<br>Iter 3 of 3<br>');
+  check('table builder from object array',
+    `var data=[{name:'Alice',age:30},{name:'Bob',age:25}]; var html='<table>';
+     for(var i=0;i<data.length;i++) html+='<tr><td>'+data[i].name+'</td><td>'+data[i].age+'</td></tr>';
+     html+='</table>'; document.body.innerHTML=html;`,
+    '<table><tr><td>Alice</td><td>30</td></tr><tr><td>Bob</td><td>25</td></tr></table>');
+  check('map with function keyword',
+    `var items=['Home','About']; document.body.innerHTML='<ul>'+items.map(function(item){return '<li>'+item+'</li>';}).join('')+'</ul>';`,
+    '<ul><li>Home</li><li>About</li></ul>');
+  check('forEach with function keyword (side effects)',
+    `var colors=['red','green','blue']; var html=''; colors.forEach(function(color,i){html+='<div>'+(i+1)+'. '+color+'</div>';}); document.body.innerHTML=html;`,
+    '<div>1. red</div><div>2. green</div><div>3. blue</div>');
+  check('forEach with arrow (side effects)',
+    `var a=['x','y','z']; var h=''; a.forEach(c=>{h+=c;}); document.body.innerHTML=h;`, 'xyz');
+  check('conditional HTML building with if',
+    `var isAdmin=true; var name='Alice'; var html='<div>'; html+='<span>'+name+'</span>';
+     if(isAdmin) html+='<span class="badge">Admin</span>';
+     html+='</div>'; document.body.innerHTML=html;`,
+    '<div><span>Alice</span><span class="badge">Admin</span></div>');
+});
+
+// -----------------------------------------------------------------------
 // Template literal interpolation resolution
 // -----------------------------------------------------------------------
 group('template interpolation', () => {
