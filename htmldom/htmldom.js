@@ -892,7 +892,16 @@
       for (let i = 1; i < parts.length && b; i++) {
         const p = parts[i];
         if (b.kind === 'object') {
-          b = b.props[p] || null;
+          const prop = b.props[p] || null;
+          // Invoke getter on access.
+          if (prop && prop.kind === 'getter') {
+            stack.push({ bindings: Object.create(null), isFunction: true, thisBinding: b });
+            const result = instantiateFunctionBinding(prop.fn, []);
+            stack.pop();
+            b = result;
+          } else {
+            b = prop;
+          }
         } else if (p === 'length' && b.kind === 'array') {
           b = chainBinding([makeSynthNum(b.elems.length)]);
         } else if (p === 'length' && b.kind === 'chain') {
@@ -1268,10 +1277,56 @@
           if (IDENT_RE.test(tk.text)) {
             // `get`/`set`/`async` prefix on a method definition — skip the
             // leading keyword and treat the following name as the key.
-            if ((tk.text === 'get' || tk.text === 'set' || tk.text === 'async') &&
+            if ((tk.text === 'get' || tk.text === 'set') &&
                 tks[i + 1] && tks[i + 1].type === 'other' && IDENT_RE.test(tks[i + 1].text) &&
                 tks[i + 2] && tks[i + 2].type === 'open' && tks[i + 2].char === '(') {
-              i++; // skip prefix
+              const accessorKind = tk.text;
+              i++; // skip get/set
+              keyName = tks[i].text;
+              i++;
+              // Parse params and body into a functionBinding.
+              const params = [];
+              let p = i + 1;
+              if (tks[p] && tks[p].type === 'close' && tks[p].char === ')') { p++; }
+              else {
+                let ok = true;
+                while (p < stop) {
+                  const pt = parseParamWithDefault(tks, p, stop);
+                  if (!pt) { ok = false; break; }
+                  params.push(pt.param);
+                  p = pt.next;
+                  if (tks[p] && tks[p].type === 'close' && tks[p].char === ')') { p++; break; }
+                  if (tks[p] && tks[p].type === 'sep' && tks[p].char === ',') { p++; continue; }
+                  ok = false; break;
+                }
+                if (!ok) { i = p; continue; }
+              }
+              if (tks[p] && tks[p].type === 'open' && tks[p].char === '{') {
+                let bd = 1, bEnd = p + 1;
+                while (bEnd < stop && bd > 0) {
+                  if (tks[bEnd].type === 'open' && tks[bEnd].char === '{') bd++;
+                  else if (tks[bEnd].type === 'close' && tks[bEnd].char === '}') bd--;
+                  bEnd++;
+                }
+                const fn = functionBinding(params, p + 1, bEnd - 1, true);
+                if (accessorKind === 'get') {
+                  // Store as getter marker; invoked at property access time.
+                  props[keyName] = { kind: 'getter', fn };
+                } else {
+                  // Setter: store as a special marker for write-time invocation.
+                  props['__set_' + keyName] = fn;
+                }
+                i = bEnd;
+                const sep = tks[i];
+                if (sep && sep.type === 'sep' && sep.char === ',') { i++; continue; }
+                break;
+              }
+              continue;
+            }
+            if (tk.text === 'async' &&
+                tks[i + 1] && tks[i + 1].type === 'other' && IDENT_RE.test(tks[i + 1].text) &&
+                tks[i + 2] && tks[i + 2].type === 'open' && tks[i + 2].char === '(') {
+              i++; // skip async
               keyName = tks[i].text;
               i++;
             } else {
@@ -1604,7 +1659,14 @@
           for (const p of propSegs) {
             if (!cur) break;
             if (cur.kind === 'object') {
-              cur = cur.props[p] || null;
+              const prop = cur.props[p] || null;
+              if (prop && prop.kind === 'getter') {
+                stack.push({ bindings: Object.create(null), isFunction: true, thisBinding: cur });
+                cur = instantiateFunctionBinding(prop.fn, []);
+                stack.pop();
+              } else {
+                cur = prop;
+              }
             } else if (p === 'length' && cur.kind === 'array') {
               cur = chainBinding([makeSynthNum(cur.elems.length)]);
             } else if (p === 'length' && cur.kind === 'chain') {
@@ -1650,7 +1712,8 @@
           const argRes = readCallArgBindings(next, stop);
           if (argRes) {
             // Push frame with `this` = receiver and params bound.
-            stack.push({ bindings: Object.create(null), isFunction: true, thisBinding: receiver || null });
+            const recCls = receiver && receiver.__class__ || null;
+            stack.push({ bindings: Object.create(null), isFunction: true, thisBinding: receiver || null, superClass: recCls && recCls.superClass || null });
             const frame = stack[stack.length - 1];
             for (let p = 0; p < bind.params.length; p++) {
               frame.bindings[bind.params[p].name] = argRes.bindings[p] || null;
@@ -2149,6 +2212,168 @@
       if (!t) return null;
       // `new X(args)` / `new X.Y` / `new X` — absorb the constructor call
       // and its arguments as a single opaque expression reference.
+      // Class expression: `class { ... }` or `class Name { ... }` in
+      // expression position. Parse the same way as the statement-level
+      // class handler but return the classBinding as a value.
+      if (t.type === 'other' && t.text === 'class') {
+        let j = k + 1;
+        let className = null;
+        if (tks[j] && tks[j].type === 'other' && IDENT_RE.test(tks[j].text) &&
+            !(tks[j].text === 'extends') /* don't consume extends as name */) {
+          className = tks[j].text;
+          j++;
+        }
+        let superClass = null;
+        if (tks[j] && tks[j].type === 'other' && tks[j].text === 'extends') {
+          j++;
+          if (tks[j] && tks[j].type === 'other' && IDENT_OR_PATH_RE.test(tks[j].text)) {
+            superClass = resolvePath(tks[j].text) || null;
+            j++;
+          }
+        }
+        if (tks[j] && tks[j].type === 'open' && tks[j].char === '{') {
+          // Skip over the class body to find the closing `}`.
+          let d = 1, bodyEnd = j + 1;
+          while (bodyEnd < stop && d > 0) {
+            const tk = tks[bodyEnd];
+            if (tk.type === 'open' && tk.char === '{') d++;
+            else if (tk.type === 'close' && tk.char === '}') d--;
+            bodyEnd++;
+          }
+          // Reuse the statement-level class body parser by temporarily
+          // switching to walk the class body (same as the walker does).
+          // For simplicity, create a minimal classBinding from the body.
+          let ctor = null;
+          const methods = Object.create(null);
+          let m = j + 1;
+          while (m < bodyEnd - 1) {
+            const mtk = tks[m];
+            if (!mtk) break;
+            if (mtk.type === 'sep' && mtk.char === ';') { m++; continue; }
+            let isStatic = false;
+            if (mtk.type === 'other' && mtk.text === 'static') { isStatic = true; m++; }
+            if (tks[m] && tks[m].type === 'other' && tks[m].text === 'async') m++;
+            if (tks[m] && tks[m].type === 'op' && tks[m].text === '*') m++;
+            if (tks[m] && tks[m].type === 'other' && (tks[m].text === 'get' || tks[m].text === 'set')) {
+              if (tks[m + 1] && tks[m + 1].type === 'other' && IDENT_RE.test(tks[m + 1].text) &&
+                  tks[m + 2] && tks[m + 2].type === 'open' && tks[m + 2].char === '(') m++;
+            }
+            const nameTk = tks[m];
+            if (!nameTk || nameTk.type !== 'other' || !IDENT_RE.test(nameTk.text)) {
+              let sd = 0;
+              while (m < bodyEnd - 1) {
+                const sk = tks[m];
+                if (sk.type === 'open') sd++;
+                else if (sk.type === 'close') { if (sd === 0) break; sd--; }
+                else if (sd === 0 && sk.type === 'sep' && sk.char === ';') break;
+                m++;
+              }
+              if (tks[m] && (tks[m].type === 'close' || (tks[m].type === 'sep' && tks[m].char === ';'))) m++;
+              continue;
+            }
+            const methodName = nameTk.text;
+            m++;
+            if (tks[m] && tks[m].type === 'open' && tks[m].char === '(') {
+              const params = [];
+              let p = m + 1;
+              if (tks[p] && tks[p].type === 'close' && tks[p].char === ')') { p++; }
+              else {
+                let ok = true;
+                while (p < bodyEnd - 1) {
+                  const pt = parseParamWithDefault(tokens, p, bodyEnd - 1);
+                  if (!pt) { ok = false; break; }
+                  params.push(pt.param);
+                  p = pt.next;
+                  if (tks[p] && tks[p].type === 'close' && tks[p].char === ')') { p++; break; }
+                  if (tks[p] && tks[p].type === 'sep' && tks[p].char === ',') { p++; continue; }
+                  ok = false; break;
+                }
+                if (!ok) { m = p; continue; }
+              }
+              if (tks[p] && tks[p].type === 'open' && tks[p].char === '{') {
+                let md = 1, mEnd = p + 1;
+                while (mEnd < bodyEnd && md > 0) {
+                  if (tks[mEnd].type === 'open' && tks[mEnd].char === '{') md++;
+                  else if (tks[mEnd].type === 'close' && tks[mEnd].char === '}') md--;
+                  mEnd++;
+                }
+                const fn = functionBinding(params, p + 1, mEnd - 1, true);
+                if (methodName === 'constructor' && !isStatic) ctor = fn;
+                else if (!isStatic) methods[methodName] = fn;
+                m = mEnd;
+                continue;
+              }
+            }
+            let sd = 0;
+            while (m < bodyEnd - 1) {
+              const sk = tks[m];
+              if (sk.type === 'open') sd++;
+              else if (sk.type === 'close') { if (sd === 0) break; sd--; }
+              else if (sd === 0 && sk.type === 'sep' && sk.char === ';') break;
+              m++;
+            }
+            if (tks[m] && (tks[m].type === 'close' || (tks[m].type === 'sep' && tks[m].char === ';'))) m++;
+          }
+          return { bind: classBinding(className, ctor, methods, superClass), next: bodyEnd };
+        }
+      }
+      // `super.method(args)` in expression context — resolve via superClass.
+      // `super.val` is tokenized as one PATH_RE token 'super.val'.
+      if (t.type === 'other' && (t.text === 'super' || t.text.startsWith('super.'))) {
+        const methodName = t.text.includes('.') ? t.text.slice(t.text.indexOf('.') + 1) : null;
+        const dotTok = !methodName ? tks[k + 1] : null;
+        const resolvedMethod = methodName || (dotTok && dotTok.type === 'other' && /^\.[A-Za-z_$]/.test(dotTok.text) ? dotTok.text.slice(1) : null);
+        if (resolvedMethod) {
+          let thisObj = null, superCls = null;
+          for (let si = stack.length - 1; si >= 0; si--) {
+            if (stack[si].isFunction && stack[si].thisBinding) {
+              thisObj = stack[si].thisBinding;
+              superCls = stack[si].superClass || null;
+              break;
+            }
+          }
+          if (superCls && superCls.kind === 'class' && superCls.methods[resolvedMethod]) {
+            const fn = superCls.methods[resolvedMethod];
+            // Paren is at k+1 when super.method is one token, k+2 when two.
+            const parenOff = methodName ? k + 1 : k + 2;
+            const parenTok = tks[parenOff];
+            if (parenTok && parenTok.type === 'open' && parenTok.char === '(') {
+              const argRes = readCallArgBindings(parenOff, stop);
+              if (argRes) {
+                stack.push({ bindings: Object.create(null), isFunction: true, thisBinding: thisObj, superClass: superCls.superClass || null });
+                const frame = stack[stack.length - 1];
+                for (let p = 0; p < fn.params.length; p++) {
+                  frame.bindings[fn.params[p].name] = argRes.bindings[p] || null;
+                }
+                let result = null;
+                const savedTks = tks; tks = tokens;
+                let fi = fn.bodyStart;
+                while (fi < fn.bodyEnd) {
+                  const ft = tks[fi];
+                  if (ft && ft.type === 'other' && ft.text === 'return') {
+                    const r = readValue(fi + 1, fn.bodyEnd, TERMS_TOP);
+                    if (r) result = r.binding;
+                    break;
+                  }
+                  if (ft && ft.type === 'open' && ft.char === '{') {
+                    let depth = 1; fi++;
+                    while (fi < fn.bodyEnd && depth > 0) {
+                      if (tks[fi].type === 'open' && tks[fi].char === '{') depth++;
+                      else if (tks[fi].type === 'close' && tks[fi].char === '}') depth--;
+                      fi++;
+                    }
+                    continue;
+                  }
+                  fi++;
+                }
+                tks = savedTks;
+                stack.pop();
+                if (result) return { bind: result, next: argRes.next };
+              }
+            }
+          }
+        }
+      }
       if (t.type === 'other' && t.text === 'new') {
         // Try to resolve `new ClassName(args)` when ClassName is a known
         // class binding. Creates a fresh object, runs the constructor
@@ -2166,9 +2391,11 @@
               }
               for (const mn of Object.keys(cls.methods)) props[mn] = cls.methods[mn];
               const instance = objectBinding(props);
+              // Store class ref on instance for super method resolution.
+              instance.__class__ = cls;
               // Run constructor with `this` = instance.
               if (cls.ctor) {
-                stack.push({ bindings: Object.create(null), isFunction: true, thisBinding: instance });
+                stack.push({ bindings: Object.create(null), isFunction: true, thisBinding: instance, superClass: cls.superClass || null });
                 const frame = stack[stack.length - 1];
                 for (let p = 0; p < cls.ctor.params.length; p++) {
                   const pi = cls.ctor.params[p];
@@ -2544,7 +2771,8 @@
                   const argRes = readCallArgBindings(k + 1, stop);
                   if (argRes) {
                     // Push frame with `this` = receiver.
-                    stack.push({ bindings: Object.create(null), isFunction: true, thisBinding: receiver });
+                    const rcls = receiver && receiver.__class__ || null;
+                    stack.push({ bindings: Object.create(null), isFunction: true, thisBinding: receiver, superClass: rcls && rcls.superClass || null });
                     const frame = stack[stack.length - 1];
                     for (let p = 0; p < fn.params.length; p++) {
                       frame.bindings[fn.params[p].name] = argRes.bindings[p] || null;
@@ -3934,6 +4162,35 @@
         const next = tokens[i + 1];
         if (next && next.type === 'open' && next.char === '{') pendingFunctionBrace = true;
         continue;
+      }
+
+      // `super(args)` — invoke parent constructor with same `this`.
+      // `super.method(args)` — call parent method with same `this`.
+      if (t.text === 'super') {
+        // Find the nearest constructor frame with thisBinding + superClass.
+        let thisObj = null, superCls = null;
+        for (let si = stack.length - 1; si >= 0; si--) {
+          if (stack[si].isFunction && stack[si].thisBinding) {
+            thisObj = stack[si].thisBinding;
+            superCls = stack[si].superClass || null;
+            break;
+          }
+        }
+        const paren = tokens[i + 1];
+        if (paren && paren.type === 'open' && paren.char === '(' && thisObj && superCls && superCls.kind === 'class' && superCls.ctor) {
+          const argRes = readCallArgBindings(i + 1, stop);
+          if (argRes) {
+            stack.push({ bindings: Object.create(null), isFunction: true, thisBinding: thisObj, superClass: superCls.superClass || null });
+            const frame = stack[stack.length - 1];
+            for (let p = 0; p < superCls.ctor.params.length; p++) {
+              frame.bindings[superCls.ctor.params[p].name] = argRes.bindings[p] || null;
+            }
+            walkRange(superCls.ctor.bodyStart, superCls.ctor.bodyEnd);
+            stack.pop();
+            i = argRes.next - 1;
+            continue;
+          }
+        }
       }
 
       // Skip ES-module `import` statements entirely — their bindings are

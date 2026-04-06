@@ -154,7 +154,27 @@ is used instead.
 - `export` stripped from declarations, or entire statement skipped.
 - `with` statement body skipped (scope unpredictable).
 - `debugger` statement skipped.
-- `class` bodies walked for innerHTML assignments in methods.
+- `class` declarations parsed into classBindings with constructor +
+  methods. Class bodies still walked for innerHTML assignments.
+
+### Classes
+
+- `class Name { constructor(x) { this.x = x; } method() {} }`
+  parsed into `classBinding` with constructor and named methods.
+- `new ClassName(args)` creates instance: runs constructor with
+  `this` bound to fresh object, attaches methods.
+- `this.prop` resolves via scope frame `thisBinding`.
+- Instance methods invoked with `this` bound to receiver.
+- Methods can call other methods on `this`.
+- `extends SuperClass`: inherited methods, `super()` in
+  constructors, `super.method()` calls.
+- Class expressions: `var C = class { ... }`.
+
+### Getters
+
+- `{ get x() { return val; } }` — getter invoked on property
+  access, including with `this` binding for computed getters.
+- Getter result cached as the property value at parse time.
 
 ### typeof folding
 
@@ -179,4 +199,4 @@ node htmldom/htmldom.test.js
 ```
 
 The harness loads `htmldom.js` with minimal DOM stubs, exposes the
-three extract functions, and runs inline assertions. 357 tests.
+three extract functions, and runs inline assertions. 370+ tests.
