@@ -5202,10 +5202,17 @@
   // Convert a style="..." attribute value into an array of style.* assignments.
   function parseStyle(val) {
     const out = [];
-    // Split on ; that are not inside parens (e.g. url(a;b)).
-    let depth = 0, cur = '';
+    // Split on ; that are not inside parens or quoted strings.
+    let depth = 0, cur = '', inQ = '';
     for (let i = 0; i < val.length; i++) {
       const c = val[i];
+      if (inQ) {
+        cur += c;
+        if (c === '\\' && i + 1 < val.length) { cur += val[++i]; continue; }
+        if (c === inQ) inQ = '';
+        continue;
+      }
+      if (c === '"' || c === "'") { inQ = c; cur += c; continue; }
       if (c === '(') depth++;
       else if (c === ')') depth--;
       if (c === ';' && depth === 0) { if (cur.trim()) out.push(cur.trim()); cur = ''; }
