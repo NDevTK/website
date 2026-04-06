@@ -441,6 +441,7 @@
     'includes', 'startsWith', 'endsWith', 'padStart', 'padEnd', 'toString',
     'split', 'reverse', 'map', 'filter', 'forEach', 'reduce',
     'replace', 'replaceAll', 'charCodeAt', 'codePointAt',
+    'toFixed', 'toPrecision', 'toExponential', 'valueOf',
     'find', 'findIndex', 'some', 'every', 'flat', 'flatMap', 'fill', 'splice',
     'sort', 'keys', 'values', 'entries',
   ]);
@@ -1659,6 +1660,36 @@
         }
         return { bind: chainBinding(out), next: parenIdx + 3 };
       }
+      // Number methods on a known numeric chain: .toFixed, .toString(radix),
+      // .toPrecision, .toExponential.
+      if (bind && bind.kind === 'chain') {
+        const num = chainAsNumber(bind);
+        if (num !== null && (method === 'toFixed' || method === 'toString' || method === 'toPrecision' || method === 'toExponential' || method === 'valueOf')) {
+          const args = readConcatArgs(parenIdx, stop);
+          if (!args) return null;
+          const argVals = [];
+          let allConcrete = true;
+          for (const a of args.args) {
+            const ch = chainBinding(a);
+            const n = chainAsNumber(ch);
+            if (n !== null) { argVals.push(n); continue; }
+            allConcrete = false; break;
+          }
+          if (allConcrete) {
+            let result;
+            try {
+              switch (method) {
+                case 'toFixed': result = num.toFixed(...argVals); break;
+                case 'toString': result = num.toString(...argVals); break;
+                case 'toPrecision': result = num.toPrecision(...argVals); break;
+                case 'toExponential': result = num.toExponential(...argVals); break;
+                case 'valueOf': result = String(num); break;
+              }
+            } catch (_) { return null; }
+            if (result !== undefined) return { bind: chainBinding([makeSynthStr(result)]), next: args.next };
+          }
+        }
+      }
       // Pure string methods on a known chain string: evaluate when all args
       // are concrete literals. Non-evaluatable cases return null.
       if (bind && bind.kind === 'chain') {
@@ -2081,11 +2112,23 @@
       if (t.type === 'tmpl') return { bind: chainBinding([rewriteTemplate(t)]), next: k + 1 };
       if (t.type === 'regex') return { bind: chainBinding([exprRef(t.text)]), next: k + 1 };
       if (t.type === 'open' && t.char === '(') {
-        const r = readConcatExpr(k + 1, stop, { sep: [], close: [')'] });
+        // Use comma-aware terms so the comma operator `(a, b, c)` stops
+        // at each `,`, letting us take the last sub-expression.
+        const parenTerms = { sep: [','], close: [')'] };
+        const r = readConcatExpr(k + 1, stop, parenTerms);
         if (!r) return null;
-        const rp = tks[r.next];
+        let lastToks = r.toks;
+        let pos = r.next;
+        // Comma operator: evaluate all sub-expressions, keep the last.
+        while (tks[pos] && tks[pos].type === 'sep' && tks[pos].char === ',') {
+          const sub = readConcatExpr(pos + 1, stop, parenTerms);
+          if (!sub) break;
+          lastToks = sub.toks;
+          pos = sub.next;
+        }
+        const rp = tks[pos];
         if (!rp || rp.type !== 'close' || rp.char !== ')') return null;
-        return { bind: chainBinding(r.toks), next: r.next + 1 };
+        return { bind: chainBinding(lastToks), next: pos + 1 };
       }
       if (t.type === 'open' && t.char === '[') {
         const a = readArrayLit(k, stop);
@@ -2103,6 +2146,8 @@
       if (t.text === 'false') return { bind: chainBinding([makeSynthBool(false)]), next: k + 1 };
       if (t.text === 'null') return { bind: chainBinding([makeSynthNull()]), next: k + 1 };
       if (t.text === 'undefined') return { bind: chainBinding([makeSynthUndef()]), next: k + 1 };
+      if (t.text === 'Infinity') return { bind: chainBinding([makeSynthNum(Infinity)]), next: k + 1 };
+      if (t.text === 'NaN') return { bind: chainBinding([makeSynthNum(NaN)]), next: k + 1 };
       const lit = primitiveAsString(t.text);
       if (lit !== null) return { bind: chainBinding([makeSynthNum(Number(lit))]), next: k + 1 };
       // Identifier/path, possibly with attached .concat/.join method call.
@@ -2236,6 +2281,24 @@
               }
               return { bind: arrayBinding(out), next: argRes.next };
             }
+            // Array.from('string') — iterate characters.
+            if (src && src.kind === 'chain') {
+              const s = chainAsKnownString(src);
+              if (s !== null) {
+                let out = Array.from(s).map((ch) => chainBinding([makeSynthStr(ch)]));
+                if (mapFn && mapFn.kind === 'function') {
+                  const mapped = [];
+                  for (let idx = 0; idx < out.length; idx++) {
+                    const el = out[idx];
+                    const r = instantiateFunctionBinding(mapFn, [el, chainBinding([makeSynthNum(idx)])]);
+                    if (!r) return null;
+                    mapped.push(r);
+                  }
+                  out = mapped;
+                }
+                return { bind: arrayBinding(out), next: argRes.next };
+              }
+            }
             // Array.from({length: n}) with optional mapFn.
             if (src && src.kind === 'object') {
               const lenB = src.props.length;
@@ -2284,6 +2347,28 @@
           if (args) {
             const r = DOM_FACTORIES[t.text](args.args, k, args.next, t);
             if (r) return r;
+          }
+        }
+        // `String.fromCharCode(n, ...)` / `String.fromCodePoint(n, ...)`
+        if (isCall && (t.text === 'String.fromCharCode' || t.text === 'String.fromCodePoint') && !isShadowed(t.text)) {
+          const args = readConcatArgs(k + 1, stop);
+          if (args) {
+            const nums = [];
+            let allNum = true;
+            for (const a of args.args) {
+              const ch = chainBinding(a);
+              const n = chainAsNumber(ch);
+              if (n === null) { allNum = false; break; }
+              nums.push(n);
+            }
+            if (allNum) {
+              try {
+                const result = t.text === 'String.fromCharCode'
+                  ? String.fromCharCode(...nums)
+                  : String.fromCodePoint(...nums);
+                return { bind: chainBinding([makeSynthStr(result)]), next: args.next };
+              } catch (_) { /* fall through */ }
+            }
           }
         }
         // `String(x)` coerces any literal to its string form.
@@ -2348,12 +2433,14 @@
         }
         if (b) {
           // Call syntax: `name(args)` where name resolves to a function binding.
+          // Use instantiateFunctionBinding so typed returns (array, object)
+          // are preserved — not flattened to a token chain.
           if (b.kind === 'function' && isCall) {
-            const args = readConcatArgs(k + 1, stop);
-            if (!args) return null;
-            const toks = instantiateFunction(b, args.args.map((a) => chainBinding(a)));
-            if (!toks) return null;
-            return { bind: chainBinding(toks), next: args.next };
+            const argRes = readCallArgBindings(k + 1, stop);
+            if (!argRes) return null;
+            const result = instantiateFunctionBinding(b, argRes.bindings);
+            if (!result) return null;
+            return { bind: result, next: argRes.next };
           }
           return { bind: b, next: k + 1 };
         }
@@ -2762,6 +2849,21 @@
       const maybeRp = tks[i];
       if (maybeRp && maybeRp.type === 'close' && maybeRp.char === ')') return { bindings, next: i + 1 };
       while (i < stop) {
+        // Spread argument: `...expr` — resolve expr and splice array elements.
+        const spreadTok = tks[i];
+        if (spreadTok && spreadTok.type === 'other' && spreadTok.text.startsWith('...')) {
+          const name = spreadTok.text.slice(3);
+          const resolved = IDENT_RE.test(name) ? resolve(name) : null;
+          if (resolved && resolved.kind === 'array') {
+            for (const el of resolved.elems) bindings.push(el);
+            i++;
+            const sep = tks[i];
+            if (sep && sep.type === 'sep' && sep.char === ',') { i++; continue; }
+            break;
+          }
+          // Can't resolve spread — bail.
+          return null;
+        }
         const v = readValue(i, stop, TERMS_ARG);
         if (!v) return null;
         bindings.push(v.binding);
@@ -2894,6 +2996,53 @@
 
       if (t.type !== 'other') continue;
 
+      // `do { ... } while (cond);` — treat identically to a while loop for
+      // loop-marker purposes. The body is always a `{ ... }` block. We push
+      // a loop frame, walk the body via the normal block handling, and set
+      // bodyEnd past the `while(cond);` trailer so the loop-pop pops at the
+      // right position.
+      if (t.text === 'do') {
+        const bodyOpen = tokens[i + 1];
+        if (bodyOpen && bodyOpen.type === 'open' && bodyOpen.char === '{') {
+          let d = 1, k = i + 2;
+          while (k < stop && d > 0) {
+            const tk = tokens[k];
+            if (tk.type === 'open' && tk.char === '{') d++;
+            else if (tk.type === 'close' && tk.char === '}') d--;
+            k++;
+          }
+          // k is now past the `}`. Expect `while (cond) ;`.
+          const whTok = tokens[k];
+          if (whTok && whTok.type === 'other' && whTok.text === 'while') {
+            const wp = tokens[k + 1];
+            if (wp && wp.type === 'open' && wp.char === '(') {
+              let dp = 1, j = k + 2;
+              while (j < stop && dp > 0) {
+                const tk = tokens[j];
+                if (tk.type === 'open' && tk.char === '(') dp++;
+                else if (tk.type === 'close' && tk.char === ')') dp--;
+                j++;
+              }
+              // j past `)`. Skip optional `;`.
+              if (tokens[j] && tokens[j].type === 'sep' && tokens[j].char === ';') j++;
+              const headerFirst = tokens[k + 2];
+              const headerLast = tokens[j - 2]; // before `)` and optional `;`
+              const headerSrc = headerFirst ? headerFirst._src.slice(headerFirst.start, headerLast.end) : '/* do-while */';
+              const id = nextLoopId++;
+              loopInfo[id] = { kind: 'do', headerSrc };
+              const loopFrame = { bindings: Object.create(null), isFunction: false };
+              stack.push(loopFrame);
+              loopStack.push({
+                id, kind: 'do', headerSrc, bodyEnd: j, frame: loopFrame,
+                modifiedVars: new Set(), unrollVar: null, unrollElems: null,
+              });
+              // Let the walker enter the `{` naturally on the next iteration.
+              continue;
+            }
+          }
+        }
+      }
+
       if (t.text === 'for' || t.text === 'while') {
         // Detect loop header and body range. The body is either a `{ ... }`
         // block or a single statement terminated by `;`.
@@ -2938,42 +3087,68 @@
             // array/object binding, re-walk the body once per element with
             // NAME bound to that element — a full static unroll with no
             // loop markers in the output.
-            let unrollVar = null;
+            let unrollVar = null;     // simple ident loop var
+            let unrollPattern = null; // destructuring pattern
             let unrollElems = null;
             {
               let h = i + 2;
               if (tokens[h] && tokens[h].type === 'other' && (tokens[h].text === 'var' || tokens[h].text === 'let' || tokens[h].text === 'const')) h++;
-              const nameTok = tokens[h];
-              const kwTok = tokens[h + 1];
-              if (nameTok && nameTok.type === 'other' && IDENT_RE.test(nameTok.text) &&
-                  kwTok && kwTok.type === 'other' && (kwTok.text === 'of' || kwTok.text === 'in')) {
-                const iterRes = readValue(h + 2, j, null);
-                if (iterRes && iterRes.binding) {
-                  const b = iterRes.binding;
-                  if (kwTok.text === 'of' && b.kind === 'array') {
-                    unrollVar = nameTok.text;
-                    unrollElems = b.elems.slice();
-                  } else if (kwTok.text === 'in' && b.kind === 'object') {
-                    unrollVar = nameTok.text;
-                    unrollElems = Object.keys(b.props).map((k) => chainBinding([makeSynthStr(k)]));
+              // Check for destructuring pattern: `[k, v] of ...` or `{a, b} of ...`
+              const maybeDestructure = tokens[h] && tokens[h].type === 'open' && (tokens[h].char === '[' || tokens[h].char === '{');
+              if (maybeDestructure) {
+                const pat = readDestructurePattern(h, j);
+                if (pat) {
+                  const kwTok = tokens[pat.next];
+                  if (kwTok && kwTok.type === 'other' && (kwTok.text === 'of' || kwTok.text === 'in')) {
+                    const iterRes = readValue(pat.next + 1, j, null);
+                    if (iterRes && iterRes.binding) {
+                      const b = iterRes.binding;
+                      if (kwTok.text === 'of' && b.kind === 'array') {
+                        unrollPattern = pat.pattern;
+                        unrollElems = b.elems.slice();
+                      } else if (kwTok.text === 'in' && b.kind === 'object') {
+                        unrollPattern = pat.pattern;
+                        unrollElems = Object.keys(b.props).map((k) => chainBinding([makeSynthStr(k)]));
+                      }
+                    }
+                  }
+                }
+              }
+              // Simple identifier: `x of ...`
+              if (!unrollPattern) {
+                const nameTok = tokens[h];
+                const kwTok = tokens[h + 1];
+                if (nameTok && nameTok.type === 'other' && IDENT_RE.test(nameTok.text) &&
+                    kwTok && kwTok.type === 'other' && (kwTok.text === 'of' || kwTok.text === 'in')) {
+                  const iterRes = readValue(h + 2, j, null);
+                  if (iterRes && iterRes.binding) {
+                    const b = iterRes.binding;
+                    if (kwTok.text === 'of' && b.kind === 'array') {
+                      unrollVar = nameTok.text;
+                      unrollElems = b.elems.slice();
+                    } else if (kwTok.text === 'in' && b.kind === 'object') {
+                      unrollVar = nameTok.text;
+                      unrollElems = Object.keys(b.props).map((k) => chainBinding([makeSynthStr(k)]));
+                    }
                   }
                 }
               }
             }
-            if (unrollVar && unrollElems) {
-              // Body range: for `{ ... }` body, skip past the braces so the
-              // inner walk re-enters block scope naturally via the open-`{`
-              // handler. For single-statement body, walk the whole stmt.
+            if ((unrollVar || unrollPattern) && unrollElems) {
               const bodyIsBlock = tokens[j + 1] && tokens[j + 1].type === 'open' && tokens[j + 1].char === '{';
               const bodyStart = bodyIsBlock ? j + 1 : j + 1;
               for (const elem of unrollElems) {
                 if (elem === null) { i = bodyEnd - 1; break; }
                 const iterFrame = { bindings: Object.create(null), isFunction: false };
-                iterFrame.bindings[unrollVar] = elem;
+                if (unrollVar) {
+                  iterFrame.bindings[unrollVar] = elem;
+                } else {
+                  applyPatternBindings(unrollPattern, elem, (name, val) => {
+                    iterFrame.bindings[name] = val;
+                  });
+                }
                 stack.push(iterFrame);
                 walkRange(bodyStart, bodyEnd);
-                // Pop in case walker left the frame dangling (block-`{`
-                // would have already popped it if body was a block).
                 const idx = stack.indexOf(iterFrame);
                 if (idx >= 0) stack.splice(idx, 1);
               }
@@ -3019,6 +3194,142 @@
       // `switch (expr) { case ... }` — when the discriminant is a concrete
       // value, walk only the matching case's body. Otherwise walk the entire
       // switch body and let the variable-tracking accumulate normally.
+      // `if (cond) { ... } else if (...) { ... } else { ... }` — when the
+      // condition is a concrete truthy/falsy value, walk only the matching
+      // branch. When opaque, walk all branches so every binding mutation
+      // is visible (existing implicit behavior via block scope handling).
+      if (t.text === 'if') {
+        const lp = tokens[i + 1];
+        if (lp && lp.type === 'open' && lp.char === '(') {
+          // Find closing `)`.
+          let depth = 1, j = i + 2;
+          while (j < stop && depth > 0) {
+            const tk = tokens[j];
+            if (tk.type === 'open' && tk.char === '(') depth++;
+            else if (tk.type === 'close' && tk.char === ')') depth--;
+            if (depth === 0) break;
+            j++;
+          }
+          if (j < stop) {
+            // Evaluate the condition.
+            const condVal = readValue(i + 2, j, null);
+            let concrete = null; // true, false, or null (unknown)
+            if (condVal && condVal.binding) {
+              const b = condVal.binding;
+              // Non-chain bindings (array/object/function/element) are always truthy.
+              if (b.kind !== 'chain') {
+                concrete = true;
+              } else {
+                const cn = chainAsNumber(b);
+                if (cn !== null) concrete = cn !== 0;
+                else {
+                  const jt = b.toks && b.toks.length === 1 ? b.toks[0].jsType : null;
+                  if (jt === 'null' || jt === 'undefined') concrete = false;
+                  else if (jt === 'boolean') concrete = b.toks[0].text === 'true';
+                  else {
+                    const cs = chainAsKnownString(b);
+                    if (cs !== null) concrete = cs !== '' && cs !== '0' && cs !== 'NaN';
+                  }
+                }
+              }
+            }
+            // Determine if-body range.
+            const bodyTok = tokens[j + 1];
+            let ifEnd;
+            if (bodyTok && bodyTok.type === 'open' && bodyTok.char === '{') {
+              let d = 1, k = j + 2;
+              while (k < stop && d > 0) {
+                const tk = tokens[k];
+                if (tk.type === 'open' && tk.char === '{') d++;
+                else if (tk.type === 'close' && tk.char === '}') d--;
+                k++;
+              }
+              ifEnd = k;
+            } else {
+              // Single-statement body.
+              let sd = 0, k = j + 1;
+              while (k < stop) {
+                const tk = tokens[k];
+                if (tk.type === 'open') sd++;
+                else if (tk.type === 'close') sd--;
+                else if (sd === 0 && tk.type === 'sep' && tk.char === ';') { k++; break; }
+                k++;
+              }
+              ifEnd = k;
+            }
+            // Determine else-body range (if present).
+            let elseStart = -1, elseEnd = -1;
+            const elseTok = tokens[ifEnd];
+            if (elseTok && elseTok.type === 'other' && elseTok.text === 'else') {
+              const afterElse = tokens[ifEnd + 1];
+              if (afterElse && afterElse.type === 'other' && afterElse.text === 'if') {
+                // `else if (...)` — the else body is the entire if-chain
+                // from here; let it be walked naturally when we resume at
+                // elseStart (which points at the `if` keyword).
+                elseStart = ifEnd + 1;
+                // Scan to find the end of the else-if chain.
+                let k = ifEnd + 1;
+                // We need to skip the if(...){...} [else ...] recursively.
+                // Simplest: just set elseEnd = stop and let walkRange handle it.
+                // Actually, for concrete=true we skip the else entirely, for
+                // concrete=false we resume at `if` and let the walker process it.
+                elseEnd = -1; // Will be determined by the inner `if` handling.
+              } else if (afterElse && afterElse.type === 'open' && afterElse.char === '{') {
+                elseStart = ifEnd + 1;
+                let d = 1, k = ifEnd + 2;
+                while (k < stop && d > 0) {
+                  const tk = tokens[k];
+                  if (tk.type === 'open' && tk.char === '{') d++;
+                  else if (tk.type === 'close' && tk.char === '}') d--;
+                  k++;
+                }
+                elseEnd = k;
+              } else {
+                // Single-statement else.
+                elseStart = ifEnd + 1;
+                let sd = 0, k = ifEnd + 1;
+                while (k < stop) {
+                  const tk = tokens[k];
+                  if (tk.type === 'open') sd++;
+                  else if (tk.type === 'close') sd--;
+                  else if (sd === 0 && tk.type === 'sep' && tk.char === ';') { k++; break; }
+                  k++;
+                }
+                elseEnd = k;
+              }
+            }
+
+            if (concrete === true) {
+              // Walk only the if-body.
+              walkRange(j + 1, ifEnd);
+              i = (elseEnd > 0 ? elseEnd : ifEnd) - 1;
+              continue;
+            }
+            if (concrete === false) {
+              if (elseStart >= 0) {
+                // For `else if`, resume at the `if` keyword so the walker
+                // processes the chained condition naturally.
+                if (elseEnd < 0) {
+                  // else-if chain: skip to the inner `if` and let the main
+                  // loop handle it.
+                  i = elseStart - 1;
+                  continue;
+                }
+                walkRange(elseStart, elseEnd);
+                i = elseEnd - 1;
+              } else {
+                i = ifEnd - 1;
+              }
+              continue;
+            }
+            // Unknown condition: walk both branches so all mutations are
+            // visible. This is the default behavior — just let the walker
+            // continue into the if-body naturally, and after the if-body
+            // it'll hit `else` and process that too.
+          }
+        }
+      }
+
       if (t.text === 'switch') {
         const lp = tokens[i + 1];
         if (lp && lp.type === 'open' && lp.char === '(') {
@@ -3313,6 +3624,60 @@
             combined = chainBinding([...cur.toks, SYNTH_PLUS, ...tagged]);
           }
           assignName(t.text, combined);
+          if (loopStack.length > 0) loopStack[loopStack.length - 1].modifiedVars.add(t.text);
+          i = skipExpr(i + 2, stop) - 1;
+          continue;
+        }
+        // Logical/nullish compound assignment: `||=`, `&&=`, `??=`.
+        if (eqTok && eqTok.type === 'sep' && (eqTok.char === '||=' || eqTok.char === '&&=' || eqTok.char === '??=')) {
+          const r = readValue(i + 2, stop, TERMS_TOP);
+          const rhs = r ? r.binding : null;
+          const cur = resolve(t.text);
+          if (eqTok.char === '||=') {
+            // Assign if current is falsy.
+            const cn = cur && cur.kind === 'chain' ? chainAsNumber(cur) : null;
+            const cs = cn === null && cur ? chainAsKnownString(cur) : null;
+            const jt = cur && cur.kind === 'chain' && cur.toks.length === 1 ? cur.toks[0].jsType : null;
+            const falsy = cn === 0 || cs === '' || cs === '0' || cs === 'NaN' || jt === 'null' || jt === 'undefined';
+            const truthy = (cn !== null && cn !== 0) || (cs !== null && cs !== '' && cs !== '0' && cs !== 'NaN') || (cur && cur.kind !== 'chain');
+            if (falsy) assignName(t.text, rhs);
+            else if (!truthy) assignName(t.text, null);
+            // else: already truthy, no change.
+          } else if (eqTok.char === '&&=') {
+            const cn = cur && cur.kind === 'chain' ? chainAsNumber(cur) : null;
+            const cs = cn === null && cur ? chainAsKnownString(cur) : null;
+            const truthy = (cn !== null && cn !== 0) || (cs !== null && cs !== '' && cs !== '0' && cs !== 'NaN') || (cur && cur.kind !== 'chain');
+            if (truthy) assignName(t.text, rhs);
+          } else if (eqTok.char === '??=') {
+            const jt = cur && cur.kind === 'chain' && cur.toks.length === 1 ? cur.toks[0].jsType : null;
+            const nullish = jt === 'null' || jt === 'undefined' || !cur;
+            if (nullish) assignName(t.text, rhs);
+          }
+          i = skipExpr(i + 2, stop) - 1;
+          continue;
+        }
+        // Arithmetic compound assignments: `-=`, `*=`, `/=`, `%=`, `**=`.
+        if (eqTok && eqTok.type === 'sep' && /^[-*/%]+=?$|^\*\*=$/.test(eqTok.char) && eqTok.char !== '+=') {
+          const r = readValue(i + 2, stop, TERMS_TOP);
+          const rhs = r ? r.binding : null;
+          const cur = resolve(t.text);
+          const ln = cur && cur.kind === 'chain' ? chainAsNumber(cur) : null;
+          const rn = rhs && rhs.kind === 'chain' ? chainAsNumber(rhs) : null;
+          if (ln !== null && rn !== null) {
+            let v;
+            switch (eqTok.char) {
+              case '-=': v = ln - rn; break;
+              case '*=': v = ln * rn; break;
+              case '/=': v = ln / rn; break;
+              case '%=': v = ln % rn; break;
+              case '**=': v = ln ** rn; break;
+              default: v = null;
+            }
+            if (v !== null) assignName(t.text, chainBinding([makeSynthNum(v)]));
+            else assignName(t.text, null);
+          } else {
+            assignName(t.text, null);
+          }
           if (loopStack.length > 0) loopStack[loopStack.length - 1].modifiedVars.add(t.text);
           i = skipExpr(i + 2, stop) - 1;
           continue;
@@ -3741,9 +4106,10 @@
       if (c === ',' || c === ';') { push({ type: 'sep', char: c, start: i, end: i + 1 }); i++; continue; }
       if (c === ':') { push({ type: 'other', text: ':', start: i, end: i + 1 }); i++; continue; }
       if (c === '?') {
-        // Multi-char tokens starting with '?': `??` (nullish coalescing)
-        // and `?.` (optional chaining; ignore `?.<digit>` which is a
-        // ternary followed by a decimal number).
+        // Multi-char tokens starting with '?': `??=` (nullish assign),
+        // `??` (nullish coalescing), `?.` (optional chaining; ignore
+        // `?.<digit>` which is a ternary followed by a decimal number).
+        if (src[i + 1] === '?' && src[i + 2] === '=') { push({ type: 'sep', char: '??=', start: i, end: i + 3 }); i += 3; continue; }
         if (src[i + 1] === '?') { push({ type: 'op', text: '??', start: i, end: i + 2 }); i += 2; continue; }
         if (src[i + 1] === '.' && !/[0-9]/.test(src[i + 2] || '')) {
           push({ type: 'op', text: '?.', start: i, end: i + 2 }); i += 2; continue;
