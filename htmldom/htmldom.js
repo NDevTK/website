@@ -5547,22 +5547,13 @@
   function convertOne(raw, result, multi, emitTitle) {
     const { html, autoSubs, target, assignProp, assignOp } = result;
     const loops = result.loops || [];
-    const subStr = $('subStr').value;
-    const subVar = $('subVar').value.trim();
     const subs = [];
-    // Manual substitution first (so it wins on exact matches).
-    if (subStr && subVar && isValidIdent(subVar)) {
-      subs.push([subStr, subVar]);
-    }
     // Auto subs extracted from JS concatenation / template interpolation.
     for (const s of autoSubs) subs.push(s);
 
     let parent = 'document.body';
     let parentFromAssignment = false;
-    if ($('parentVar').checked) {
-      const p = $('parentName').value.trim();
-      if (p) parent = p;
-    } else if (target) {
+    if (target) {
       // `el.outerHTML = ...` replaces `el` itself, so new nodes land in
       // `el.parentNode`. `el.innerHTML = ...` replaces `el`'s children.
       parent = assignProp === 'outerHTML' ? target + '.parentNode' : target;
@@ -5611,9 +5602,6 @@
     const parentRoot = parent.match(/^[A-Za-z_$][A-Za-z0-9_$]*/);
     if (parentRoot) used.add(parentRoot[0]);
 
-    if (subStr && subVar && isValidIdent(subVar)) {
-      lines.push('// Assumes: const ' + subVar + ' = ' + JSON.stringify(subStr) + ';');
-    }
     if (autoSubs.length) {
       lines.push('// Auto-detected JS expressions from input:');
       for (const [ph, expr] of autoSubs) lines.push('//   ' + ph + ' -> ' + expr);
@@ -5697,9 +5685,8 @@
   });
 
   // Live update on input changes.
-  const inputs = ['in', 'subStr', 'subVar', 'parentName'];
-  for (const id of inputs) $(id).addEventListener('input', convert);
-  const toggles = ['useProps', 'splitStyle', 'eventsAsListeners', 'textShortcut', 'useClassList', 'skipWS', 'useFragment', 'parentVar'];
+  $('in').addEventListener('input', convert);
+  const toggles = ['useProps', 'splitStyle', 'eventsAsListeners', 'textShortcut', 'useClassList', 'skipWS', 'useFragment'];
   for (const id of toggles) $(id).addEventListener('change', convert);
 
   convert();

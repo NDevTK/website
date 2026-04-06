@@ -10,16 +10,13 @@ body { font-family: system-ui, sans-serif; margin: 1rem; max-width: 960px; backg
 h1 { font-size: 1.4rem; }
 label { display: block; margin-top: 0.75rem; font-weight: bold; }
 textarea { width: 100%; box-sizing: border-box; font-family: ui-monospace, Consolas, monospace; font-size: 0.9rem; background: #111; color: #eee; border: 1px solid #444; padding: 0.5rem; }
-input[type=text] { width: 100%; box-sizing: border-box; font-family: ui-monospace, Consolas, monospace; background: #111; color: #eee; border: 1px solid #444; padding: 0.35rem; }
-textarea:focus, input[type=text]:focus { outline: 2px solid #6ea8fe; outline-offset: -1px; border-color: #6ea8fe; }
+textarea:focus { outline: 2px solid #6ea8fe; outline-offset: -1px; border-color: #6ea8fe; }
 button { margin-top: 0.75rem; padding: 0.4rem 0.9rem; background: #317EFB; color: #fff; border: 0; border-radius: 4px; cursor: pointer; }
 button:hover { background: #2568d4; }
 button:focus { outline: 2px solid #fff; outline-offset: 2px; }
 code { background: #2a2e33; padding: 0.05rem 0.25rem; border-radius: 3px; font-size: 0.85em; }
 .hint { color: #aaa; font-size: 0.85rem; line-height: 1.5; }
 .hint code { color: #ddd; }
-.row { display: flex; gap: 0.5rem; align-items: center; }
-.row input[type=text] { flex: 1; }
 pre { white-space: pre-wrap; }
 </style>
 </head>
@@ -36,25 +33,18 @@ for (var i = 0; i &lt; items.length; i++) {
 html += '&lt;/nav&gt;';
 document.body.innerHTML = html;</textarea>
 
-<label for="subStr">Replace string with variable reference (optional)</label>
-<div class="row">
-  <input type="text" id="subStr" placeholder="string to replace, e.g. https://random.ndev.tk/">
-  <input type="text" id="subVar" placeholder="variable name, e.g. BG_URL" style="max-width:220px">
-</div>
-
-<fieldset style="margin-top:0.75rem; border:1px solid #444; padding:0.5rem 0.75rem;">
-  <legend style="padding:0 0.4rem; color:#aaa;">Options</legend>
-  <label><input type="checkbox" id="useProps" checked> Prefer IDL properties (e.g. <code>el.src=</code>) over <code>setAttribute</code></label>
-  <label><input type="checkbox" id="splitStyle" checked> Split <code>style=""</code> into <code>style.setProperty()</code> calls</label>
-  <label><input type="checkbox" id="eventsAsListeners" checked> Convert <code>onclick=""</code> to <code>addEventListener()</code></label>
-  <label><input type="checkbox" id="textShortcut" checked> Use <code>textContent</code> for single text-only children</label>
-  <label><input type="checkbox" id="useClassList" checked> Use <code>classList.add()</code> for multiple classes</label>
-  <label><input type="checkbox" id="skipWS"> Skip whitespace-only text nodes</label>
-  <label><input type="checkbox" id="useFragment"> Wrap multiple roots in <code>DocumentFragment</code></label>
-</fieldset>
-
-<label><input type="checkbox" id="parentVar"> Parent is a variable other than <code>document.body</code></label>
-<div class="row"><input type="text" id="parentName" placeholder="parent variable (default: document.body)"></div>
+<details style="margin-top:0.75rem;">
+  <summary style="cursor:pointer; color:#aaa;">Output options</summary>
+  <div style="margin-top:0.5rem; padding:0.5rem; border:1px solid #444; border-radius:4px;">
+    <label><input type="checkbox" id="useProps" checked> Prefer IDL properties over <code>setAttribute</code></label>
+    <label><input type="checkbox" id="splitStyle" checked> Split <code>style</code> into <code>style.setProperty()</code></label>
+    <label><input type="checkbox" id="eventsAsListeners" checked> Convert inline events to <code>addEventListener()</code></label>
+    <label><input type="checkbox" id="textShortcut" checked> Use <code>textContent</code> for text-only children</label>
+    <label><input type="checkbox" id="useClassList" checked> Use <code>classList.add()</code> for multiple classes</label>
+    <label><input type="checkbox" id="skipWS"> Skip whitespace-only text nodes</label>
+    <label><input type="checkbox" id="useFragment"> Wrap multiple roots in <code>DocumentFragment</code></label>
+  </div>
+</details>
 
 <button id="go">Convert</button>
 <button id="copy">Copy output</button>
