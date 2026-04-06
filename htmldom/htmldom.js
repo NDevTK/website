@@ -5932,7 +5932,7 @@
 
   function convert() {
     try {
-      const raw = (typeof window !== 'undefined' && window._cmEditor) ? window._cmEditor.getValue() : ($('in') ? $('in').value : '');
+      const raw = (typeof window !== 'undefined' && window._monacoIn) ? window._monacoIn.getValue() : ($('in') ? $('in').value : '');
 
       // If input is HTML (starts with <), split into HTML portions and
       // <script> blocks. Convert HTML to DOM API, process script blocks
@@ -6252,8 +6252,8 @@
   let lastOutput = '';
   function setOutput(text) {
     lastOutput = text;
-    if (typeof window !== 'undefined' && window._cmOut) {
-      window._cmOut.setValue(text);
+    if (typeof window !== 'undefined' && window._monacoOut) {
+      window._monacoOut.setValue(text);
     } else if ($('out')) {
       $('out').value = text;
     }
@@ -6267,34 +6267,12 @@
     } catch (_) {}
   });
 
-  // Initialize CodeMirror on the input textarea.
-  if (typeof CodeMirror !== 'undefined' && $('in')) {
-    const cm = CodeMirror.fromTextArea($('in'), {
-      mode: 'htmlmixed',
-      theme: 'monokai',
-      lineNumbers: true,
-      indentUnit: 2,
-      tabSize: 2,
-      indentWithTabs: false,
-      lineWrapping: true,
-      viewportMargin: Infinity,
-    });
-    window._cmEditor = cm;
-    cm.on('change', convert);
+  // Monaco editors are initialized by index.html before this script loads.
+  // Hook up the input change listener.
+  if (typeof window !== 'undefined' && window._monacoIn) {
+    window._monacoIn.onDidChangeModelContent(convert);
   } else if ($('in')) {
     $('in').addEventListener('input', convert);
-  }
-
-  // Initialize CodeMirror on the output textarea (read-only).
-  if (typeof CodeMirror !== 'undefined' && $('out')) {
-    window._cmOut = CodeMirror.fromTextArea($('out'), {
-      mode: 'javascript',
-      theme: 'monokai',
-      lineNumbers: true,
-      readOnly: true,
-      lineWrapping: true,
-      viewportMargin: Infinity,
-    });
   }
 
   const toggles = ['skipWS', 'useFragment', 'emitComments'];
