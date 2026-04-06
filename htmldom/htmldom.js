@@ -5498,22 +5498,22 @@
   }
 
   function convert() {
-    const raw = $('in').value;
-    const blocks = [];
-    const extractions = extractAllHTML(raw);
-    if (extractions.length === 0) {
-      // No innerHTML/outerHTML assignments — if the script builds DOM
-      // via createElement/appendChild, summarize what it constructs;
-      // otherwise fall back to the single-input extractor for raw
-      // HTML snippets.
-      const summary = summarizeDomConstruction(raw);
-      if (summary) blocks.push(summary);
-      else blocks.push(convertOne(raw, extractHTML(raw), false, false));
-    } else {
-      const multi = extractions.length > 1;
-      for (const ex of extractions) blocks.push(convertOne(raw, ex, multi, multi));
+    try {
+      const raw = $('in').value;
+      const blocks = [];
+      const extractions = extractAllHTML(raw);
+      if (extractions.length === 0) {
+        const summary = summarizeDomConstruction(raw);
+        if (summary) blocks.push(summary);
+        else blocks.push(convertOne(raw, extractHTML(raw), false, false));
+      } else {
+        const multi = extractions.length > 1;
+        for (const ex of extractions) blocks.push(convertOne(raw, ex, multi, multi));
+      }
+      $('out').value = blocks.filter((b) => b).join('\n\n');
+    } catch (err) {
+      $('out').value = '// Error: ' + err.message;
     }
-    $('out').value = blocks.filter((b) => b).join('\n\n');
   }
 
   // Summarize the DOM tree the script constructs via createElement /
