@@ -222,6 +222,12 @@
       const result = extractOneAssignment(tokens, assign);
       result.srcStart = assign.srcStart;
       result.srcEnd = assign.srcEnd;
+      // Find the full build region (variable declaration through innerHTML).
+      const region = findBuildRegion(tokens, assign);
+      if (region) {
+        result.srcStart = region.regionStart;
+        result.srcEnd = region.regionEnd;
+      }
       return result;
     });
   }
@@ -378,9 +384,132 @@
       if (rhsEnd < tokens.length && tokens[rhsEnd].type === 'sep' && tokens[rhsEnd].char === ';') {
         srcEnd = tokens[rhsEnd].end;
       }
-      out.push({ target, prop, op: t.char, rhsStart: i + 1, rhsEnd, srcStart, srcEnd });
+      out.push({ target, prop, op: t.char, rhsStart: i + 1, rhsEnd, srcStart, srcEnd, eqIdx: i });
     }
     return out;
+  }
+
+  // Given an innerHTML assignment and the full token list, find the "build
+  // region" — the contiguous span of source code that exists solely to
+  // construct the value assigned to innerHTML. This includes:
+  //   - The declaration of the build variable (`var html = ''`)
+  //   - All `+=` / `=` mutations to it (`html += '<div>'`)
+  //   - Loops whose body ONLY mutates the build variable
+  //   - The innerHTML assignment itself
+  // Returns { regionStart, regionEnd } (source char positions) or null.
+  function findBuildRegion(tokens, assign) {
+    // Identify the build variable: the RHS of innerHTML must be a simple
+    // identifier reference for us to trace it.
+    const rhsToks = [];
+    for (let j = assign.rhsStart; j < assign.rhsEnd; j++) rhsToks.push(tokens[j]);
+    // Simple case: `el.innerHTML = varName;`
+    if (rhsToks.length !== 1 || rhsToks[0].type !== 'other') return null;
+    const buildVar = rhsToks[0].text;
+    if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(buildVar)) return null;
+
+    // Scan backwards from the innerHTML assignment to find all statements
+    // that write to buildVar. Track statement boundaries via `;` and `{`/`}`.
+    const assignTokIdx = assign.eqIdx; // index of `=`/`+=` in tokens
+    // Collect token-index ranges of statements that write to buildVar.
+    // A "statement" here is everything between consecutive `;`/`{`/`}` boundaries.
+    const stmtRanges = []; // [{start, end, writesBuildVar, writesOther, isBuildVarDecl}]
+
+    // First, split all tokens before the innerHTML assignment into statements.
+    // We work with the target token (prev of `=`) index.
+    const targetTokIdx = assignTokIdx - 1;
+    let stmtStart = 0;
+    const allStmts = [];
+    let braceDepth = 0;
+    let parenDepth = 0;
+    for (let j = 0; j <= targetTokIdx; j++) {
+      const tk = tokens[j];
+      if (tk.type === 'open' && tk.char === '{') braceDepth++;
+      if (tk.type === 'close' && tk.char === '}') {
+        braceDepth--;
+        if (braceDepth < 0) braceDepth = 0;
+        // End of a block at depth 0 is a statement boundary.
+        if (braceDepth === 0 && parenDepth === 0) {
+          allStmts.push({ tokStart: stmtStart, tokEnd: j + 1 });
+          stmtStart = j + 1;
+          continue;
+        }
+      }
+      if (tk.type === 'open' && tk.char === '(') parenDepth++;
+      if (tk.type === 'close' && tk.char === ')') {
+        parenDepth--;
+        if (parenDepth < 0) parenDepth = 0;
+      }
+      // `;` is a statement boundary only at depth 0 in both braces and parens.
+      if (braceDepth === 0 && parenDepth === 0 && tk.type === 'sep' && tk.char === ';') {
+        allStmts.push({ tokStart: stmtStart, tokEnd: j + 1 });
+        stmtStart = j + 1;
+      }
+    }
+
+    // Now scan backwards from the innerHTML assignment. For each statement,
+    // check if it writes to buildVar and ONLY to buildVar (no other side effects
+    // that matter). Stop at the first statement that doesn't involve buildVar.
+    let regionTokStart = -1;
+    for (let s = allStmts.length - 1; s >= 0; s--) {
+      const stmt = allStmts[s];
+      const stmtTokens = tokens.slice(stmt.tokStart, stmt.tokEnd);
+      // Check if this statement writes to buildVar.
+      let writesBuildVar = false;
+      let isBuildVarDecl = false;
+      let isLoopWritingBuildVar = false;
+
+      for (let j = 0; j < stmtTokens.length; j++) {
+        const tk = stmtTokens[j];
+        if (tk.type === 'other' && tk.text === buildVar) {
+          const next = stmtTokens[j + 1];
+          if (next && next.type === 'sep' && (next.char === '=' || next.char === '+=')) {
+            writesBuildVar = true;
+          }
+        }
+        // Check for `var/let/const buildVar`
+        if (tk.type === 'other' && (tk.text === 'var' || tk.text === 'let' || tk.text === 'const')) {
+          const nm = stmtTokens[j + 1];
+          if (nm && nm.type === 'other' && nm.text === buildVar) {
+            writesBuildVar = true;
+            isBuildVarDecl = true;
+          }
+        }
+        // Check for `for` / `while` loop containing buildVar writes.
+        if (tk.type === 'other' && (tk.text === 'for' || tk.text === 'while')) {
+          // Scan the entire statement for buildVar writes.
+          for (let k = j; k < stmtTokens.length; k++) {
+            if (stmtTokens[k].type === 'other' && stmtTokens[k].text === buildVar) {
+              const nx = stmtTokens[k + 1];
+              if (nx && nx.type === 'sep' && (nx.char === '=' || nx.char === '+=')) {
+                isLoopWritingBuildVar = true;
+                writesBuildVar = true;
+              }
+            }
+          }
+        }
+      }
+
+      if (!writesBuildVar) break; // stop — this statement doesn't touch buildVar
+      regionTokStart = stmt.tokStart;
+      if (isBuildVarDecl) break; // found the declaration — stop here
+    }
+
+    if (regionTokStart < 0) return null;
+
+    // Verify: is buildVar used AFTER the innerHTML assignment for anything
+    // other than innerHTML? If so, don't remove the build code.
+    const afterInnerHTML = assign.rhsEnd < tokens.length ? assign.rhsEnd + 1 : tokens.length;
+    for (let j = afterInnerHTML; j < tokens.length; j++) {
+      const tk = tokens[j];
+      if (tk.type === 'other' && tk.text === buildVar) {
+        // Used elsewhere — don't remove build code.
+        return null;
+      }
+      if (tk.type === 'other' && tk.text.endsWith('.' + buildVar)) return null;
+    }
+
+    const regionStart = tokens[regionTokStart].start;
+    return { regionStart, regionEnd: assign.srcEnd };
   }
 
   // Given the token index of the trailing `.innerHTML`/`.outerHTML` accessor,
