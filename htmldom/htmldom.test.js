@@ -867,6 +867,24 @@ group('general JS', () => {
 });
 
 // -----------------------------------------------------------------------
+// Cross-function variable scoping
+// -----------------------------------------------------------------------
+group('cross-function scoping', () => {
+  check('function modifies outer var',
+    `var x='before'; function f(){x='after';} f(); document.body.innerHTML=x;`, 'after');
+  check('multiple calls accumulate',
+    `var count=0; function inc(){count++;} inc(); inc(); inc(); document.body.innerHTML=count;`, '3');
+  check('let block scoping inside function',
+    `var r=''; function f(){let x='a'; if(true){let x='b'; r+=x;} r+=x;} f(); document.body.innerHTML=r;`, 'ba');
+  check('method call with this increments',
+    `var o={n:0, inc:function(){this.n++;}}; o.inc(); o.inc(); document.body.innerHTML=o.n;`, '2');
+  check('path increment this.n++',
+    `var o={n:5}; function f(){o.n++;} f(); document.body.innerHTML=o.n;`, '6');
+  check('bare function call for side effects',
+    `var result=''; function add(x){result+=x;} add('a'); add('b'); document.body.innerHTML=result;`, 'ab');
+});
+
+// -----------------------------------------------------------------------
 // Template literal interpolation resolution
 // -----------------------------------------------------------------------
 group('template interpolation', () => {
