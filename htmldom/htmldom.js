@@ -5972,15 +5972,15 @@
             }
           }
         }
-        $('out').value = outputParts.join('\n');
+        setOutput(outputParts.join('\n'));
         return;
       }
 
       const extractions = extractAllHTML(raw);
       if (extractions.length === 0) {
         const summary = summarizeDomConstruction(raw);
-        if (summary) { $('out').value = summary; return; }
-        $('out').value = convertOne(raw, extractHTML(raw), false, false) || '';
+        if (summary) { setOutput(summary); return; }
+        setOutput(convertOne(raw, extractHTML(raw), false, false) || '');
         return;
       }
       // Build the full rewritten script: original code with innerHTML
@@ -6018,9 +6018,9 @@
       }
       // Append remaining original source after the last innerHTML site.
       output += trimmed.slice(cursor);
-      $('out').value = output;
+      setOutput(output);
     } catch (err) {
-      $('out').value = '// Error: ' + err.message;
+      setOutput('// Error: ' + err.message);
     }
   }
 
@@ -6213,6 +6213,15 @@
       block = '// === ' + target + '.' + assignProp + ' ' + assignOp + ' ... ===\n' + block;
     }
     return block;
+  }
+
+  function setOutput(text) {
+    $('out').value = text;
+    const codeEl = $('outCode');
+    if (codeEl) {
+      codeEl.textContent = text;
+      if (typeof Prism !== 'undefined') Prism.highlightElement(codeEl);
+    }
   }
 
   $('copy').addEventListener('click', async () => {
