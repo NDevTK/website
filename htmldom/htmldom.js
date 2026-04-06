@@ -1837,28 +1837,6 @@
               next = r.next;
               continue;
             }
-            // Method couldn't fold — produce symbolic text using the
-            // resolved base (e.g. `location.search.toLowerCase()` instead
-            // of `items[i].toLowerCase()`). Absorb the `(args)` suffix.
-            const baseText = cur ? chainAsExprText(cur) : null;
-            if (baseText !== null) {
-              const lp = tks[next + 1];
-              if (lp && lp.type === 'open' && lp.char === '(') {
-                let d = 1, j = next + 2;
-                while (j < stop && d > 0) {
-                  if (tks[j].type === 'open' && tks[j].char === '(') d++;
-                  else if (tks[j].type === 'close' && tks[j].char === ')') d--;
-                  j++;
-                }
-                // Build symbolic: base.method(originalArgs)
-                const argsFirst = tks[next + 2];
-                const argsLast = tks[j - 2]; // before closing )
-                const argsSrc = (j - 2 > next + 1 && argsFirst) ? argsFirst._src.slice(argsFirst.start, argsLast.end) : '';
-                bind = chainBinding([exprRef(baseText + '.' + lastSeg + '(' + argsSrc + ')')]);
-                next = j;
-                continue;
-              }
-            }
             break;
           }
           // Track receiver for `this` binding in subsequent call.
@@ -2961,25 +2939,6 @@
               if (prefBind) {
                 const r = applyMethod(prefBind, method, k + 1, stop);
                 if (r) return { bind: r.bind, next: r.next };
-                // Method couldn't fold — produce symbolic text using the
-                // resolved prefix (e.g. `location.search.toLowerCase()`
-                // instead of `items[i].toLowerCase()`).
-                const baseText = chainAsExprText(prefBind);
-                if (baseText !== null) {
-                  const lp = tks[k + 1];
-                  if (lp && lp.type === 'open' && lp.char === '(') {
-                    let d = 1, j = k + 2;
-                    while (j < stop && d > 0) {
-                      if (tks[j].type === 'open' && tks[j].char === '(') d++;
-                      else if (tks[j].type === 'close' && tks[j].char === ')') d--;
-                      j++;
-                    }
-                    const argsFirst = tks[k + 2];
-                    const argsLast = tks[j - 2];
-                    const argsSrc = (j - 2 > k + 1 && argsFirst) ? argsFirst._src.slice(argsFirst.start, argsLast.end) : '';
-                    return { bind: chainBinding([exprRef(baseText + '.' + method + '(' + argsSrc + ')')]), next: j };
-                  }
-                }
               }
             }
             // Method call on an object/instance: `obj.method(args)` where
@@ -3242,6 +3201,16 @@
       if (parsed) {
         const boundary = skipOperand(parsed.next, stop, terms);
         if (boundary === parsed.next) return { toks: parsed.bind.toks.slice(), next: parsed.next };
+        // parseArithExpr resolved partially (e.g. `items[i]` → `location.search`)
+        // but there are trailing suffixes it couldn't consume (e.g. `.toLowerCase()`).
+        // Use the resolved text + the raw remaining suffix source.
+        const resolvedText = chainAsExprText(parsed.bind);
+        if (resolvedText !== null && boundary > parsed.next) {
+          const suffFirst = tks[parsed.next];
+          const suffLast = tks[boundary - 1];
+          const suffSrc = suffFirst._src.slice(suffFirst.start, suffLast.end);
+          return { toks: [exprRef(resolvedText + suffSrc)], next: boundary };
+        }
       }
       const end = skipOperand(k, stop, terms);
       if (end === k) return null;
