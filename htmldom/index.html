@@ -23,7 +23,7 @@ code { background: #2a2e33; padding: 0.05rem 0.25rem; border-radius: 3px; font-s
 <p class="hint">Paste HTML or a JS snippet that builds HTML via <code>innerHTML</code>/<code>outerHTML</code> assignments. HTML is converted to safe <code>createElement</code>/<code>appendChild</code> calls, and inline <code>style</code> attributes are split into individual <code>style.setProperty()</code> calls. The JS resolver statically evaluates variables, expressions, loops, conditionals, and method calls. Runtime-only values flow through as named references.</p>
 
 <label>Input</label>
-<div id="inEditor" class="editor-container" style="height:300px"></div>
+<div id="inEditor" class="editor-container"></div>
 
 <details style="margin-top:0.75rem;">
   <summary style="cursor:pointer; color:#aaa;">Output options</summary>
@@ -37,7 +37,7 @@ code { background: #2a2e33; padding: 0.05rem 0.25rem; border-radius: 3px; font-s
 <button id="copy">Copy output</button>
 
 <label>Output</label>
-<div id="outEditor" class="editor-container" style="height:300px"></div>
+<div id="outEditor" class="editor-container"></div>
 
 <p class="hint"><a href="/" style="color:#6ea8fe">&larr; Home</a></p>
 
