@@ -5723,13 +5723,33 @@
       subs
     };
 
-    const doc = new DOMParser().parseFromString(html, 'text/html');
+    // Table-context elements (<tr>, <td>, <th>, <thead>, etc.) are invalid
+    // outside a <table> and get stripped by DOMParser. Wrap them so they parse
+    // correctly, then extract the inner nodes.
+    let tableWrap = null;
+    const trimmed = html.trimStart();
+    if (/^<(tr|td|th|thead|tbody|tfoot|caption|colgroup|col)\b/i.test(trimmed)) {
+      tableWrap = 'table';
+    } else if (/^<(li)\b/i.test(trimmed)) {
+      tableWrap = 'ul';
+    } else if (/^<(dt|dd)\b/i.test(trimmed)) {
+      tableWrap = 'dl';
+    } else if (/^<(option|optgroup)\b/i.test(trimmed)) {
+      tableWrap = 'select';
+    }
+    const parseHtml = tableWrap ? '<' + tableWrap + '>' + html + '</' + tableWrap + '>' : html;
+    const doc = new DOMParser().parseFromString(parseHtml, 'text/html');
     const roots = [];
-    if (doc.head) for (const n of doc.head.childNodes) roots.push(n);
-    if (doc.body) {
+    if (tableWrap) {
+      // Extract from the wrapper element.
+      const wrapper = doc.body ? doc.body.querySelector(tableWrap) : null;
+      if (wrapper) for (const n of wrapper.childNodes) roots.push(n);
+    } else if (doc.head) {
+      for (const n of doc.head.childNodes) roots.push(n);
+    }
+    if (!tableWrap && doc.body) {
       for (const n of doc.body.childNodes) roots.push(n);
-    } else if (doc.documentElement) {
-      // e.g. <frameset> replaces body in HTML5 parser output.
+    } else if (!tableWrap && doc.documentElement) {
       for (const n of doc.documentElement.childNodes) {
         if (n !== doc.head) roots.push(n);
       }
@@ -5787,9 +5807,21 @@
     const segments = loops.length ? splitLoopSegments(html) : null;
     if (segments && segments.length) {
       for (const seg of segments) {
-        const segDoc = new DOMParser().parseFromString(seg.html, 'text/html');
+        const segTrimmed = seg.html.trimStart();
+        let segWrap = null;
+        if (/^<(tr|td|th|thead|tbody|tfoot|caption|colgroup|col)\b/i.test(segTrimmed)) segWrap = 'table';
+        else if (/^<(li)\b/i.test(segTrimmed)) segWrap = 'ul';
+        else if (/^<(dt|dd)\b/i.test(segTrimmed)) segWrap = 'dl';
+        else if (/^<(option|optgroup)\b/i.test(segTrimmed)) segWrap = 'select';
+        const segParseHtml = segWrap ? '<' + segWrap + '>' + seg.html + '</' + segWrap + '>' : seg.html;
+        const segDoc = new DOMParser().parseFromString(segParseHtml, 'text/html');
         const segNodes = [];
-        if (segDoc.body) for (const n of segDoc.body.childNodes) segNodes.push(n);
+        if (segWrap) {
+          const w = segDoc.body ? segDoc.body.querySelector(segWrap) : null;
+          if (w) for (const n of w.childNodes) segNodes.push(n);
+        } else if (segDoc.body) {
+          for (const n of segDoc.body.childNodes) segNodes.push(n);
+        }
         const segRoots = opts.skipWhitespaceText
           ? segNodes.filter((n) => !(n.nodeType === 3 && /^\s*$/.test(n.nodeValue)))
           : segNodes;
