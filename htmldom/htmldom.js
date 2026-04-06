@@ -1832,10 +1832,34 @@
           }
           if (isMethodCall) {
             const r = applyMethod(cur, lastSeg, next + 1, stop);
-            if (!r) break;
-            bind = r.bind;
-            next = r.next;
-            continue;
+            if (r) {
+              bind = r.bind;
+              next = r.next;
+              continue;
+            }
+            // Method couldn't fold — produce symbolic text using the
+            // resolved base (e.g. `location.search.toLowerCase()` instead
+            // of `items[i].toLowerCase()`). Absorb the `(args)` suffix.
+            const baseText = cur ? chainAsExprText(cur) : null;
+            if (baseText !== null) {
+              const lp = tks[next + 1];
+              if (lp && lp.type === 'open' && lp.char === '(') {
+                let d = 1, j = next + 2;
+                while (j < stop && d > 0) {
+                  if (tks[j].type === 'open' && tks[j].char === '(') d++;
+                  else if (tks[j].type === 'close' && tks[j].char === ')') d--;
+                  j++;
+                }
+                // Build symbolic: base.method(originalArgs)
+                const argsFirst = tks[next + 2];
+                const argsLast = tks[j - 2]; // before closing )
+                const argsSrc = (j - 2 > next + 1 && argsFirst) ? argsFirst._src.slice(argsFirst.start, argsLast.end) : '';
+                bind = chainBinding([exprRef(baseText + '.' + lastSeg + '(' + argsSrc + ')')]);
+                next = j;
+                continue;
+              }
+            }
+            break;
           }
           // Track receiver for `this` binding in subsequent call.
           if (bind && (bind.kind === 'object' || bind.kind === 'element')) receiver = bind;
@@ -2937,6 +2961,25 @@
               if (prefBind) {
                 const r = applyMethod(prefBind, method, k + 1, stop);
                 if (r) return { bind: r.bind, next: r.next };
+                // Method couldn't fold — produce symbolic text using the
+                // resolved prefix (e.g. `location.search.toLowerCase()`
+                // instead of `items[i].toLowerCase()`).
+                const baseText = chainAsExprText(prefBind);
+                if (baseText !== null) {
+                  const lp = tks[k + 1];
+                  if (lp && lp.type === 'open' && lp.char === '(') {
+                    let d = 1, j = k + 2;
+                    while (j < stop && d > 0) {
+                      if (tks[j].type === 'open' && tks[j].char === '(') d++;
+                      else if (tks[j].type === 'close' && tks[j].char === ')') d--;
+                      j++;
+                    }
+                    const argsFirst = tks[k + 2];
+                    const argsLast = tks[j - 2];
+                    const argsSrc = (j - 2 > k + 1 && argsFirst) ? argsFirst._src.slice(argsFirst.start, argsLast.end) : '';
+                    return { bind: chainBinding([exprRef(baseText + '.' + method + '(' + argsSrc + ')')]), next: j };
+                  }
+                }
               }
             }
             // Method call on an object/instance: `obj.method(args)` where
@@ -3463,7 +3506,7 @@
     };
 
     const chainAsExprText = (chain) => {
-      if (chain.toks.length !== 1) return null;
+      if (!chain || !chain.toks || chain.toks.length !== 1) return null;
       const t = chain.toks[0];
       if (t.type === 'str') {
         // Quote literal strings; bare numbers flow as-is.
