@@ -222,12 +222,8 @@
       const result = extractOneAssignment(tokens, assign);
       result.srcStart = assign.srcStart;
       result.srcEnd = assign.srcEnd;
-      // Find the full build region (variable declaration through innerHTML).
-      const region = findBuildRegion(tokens, assign);
-      if (region) {
-        result.srcStart = region.regionStart;
-        result.srcEnd = region.regionEnd;
-      }
+      result._assign = assign;
+      result._tokens = tokens;
       return result;
     });
   }
@@ -397,12 +393,17 @@
   //   - Loops whose body ONLY mutates the build variable
   //   - The innerHTML assignment itself
   // Returns { regionStart, regionEnd } (source char positions) or null.
-  function findBuildRegion(tokens, assign) {
+  function findBuildRegion(tokens, assign, replacementCode) {
+    // Variables referenced in the replacement output must NOT be removed.
+    const referencedInReplacement = new Set();
+    if (replacementCode) {
+      const refTokens = replacementCode.match(/[A-Za-z_$][A-Za-z0-9_$]*/g);
+      if (refTokens) for (const t of refTokens) referencedInReplacement.add(t);
+    }
     const rhsToks = [];
     for (let j = assign.rhsStart; j < assign.rhsEnd; j++) rhsToks.push(tokens[j]);
-    if (rhsToks.length !== 1 || rhsToks[0].type !== 'other') return null;
-    const buildVar = rhsToks[0].text;
-    if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(buildVar)) return null;
+    const hasBuildVar = rhsToks.length === 1 && rhsToks[0].type === 'other' && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(rhsToks[0].text);
+    const buildVar = hasBuildVar ? rhsToks[0].text : null;
 
     const assignTokIdx = assign.eqIdx;
     const targetTokIdx = assignTokIdx - 1;
@@ -431,7 +432,10 @@
     let stmtStart = blockStart;
     let braceDepth = 0;
     let parenDepth = 0;
-    for (let j = blockStart; j <= targetTokIdx; j++) {
+    // Scan through rhsEnd (not just targetTokIdx) so the innerHTML
+    // statement itself is included in allStmts.
+    const scanEnd = assign.rhsEnd < tokens.length ? assign.rhsEnd : tokens.length - 1;
+    for (let j = blockStart; j <= scanEnd; j++) {
       const tk = tokens[j];
       if (tk.type === 'open' && tk.char === '{') braceDepth++;
       if (tk.type === 'close' && tk.char === '}') {
@@ -456,7 +460,13 @@
 
     // Scan backwards to find the build region.
     let regionTokStart = -1;
-    for (let s = allStmts.length - 1; s >= 0; s--) {
+    if (!buildVar) {
+      // No build variable — still check for helper declarations
+      // immediately before the innerHTML that are only used in the RHS
+      // and not in the replacement output.
+      regionTokStart = -1; // will be extended by transitive scan below
+    }
+    for (let s = allStmts.length - 1; s >= 0 && buildVar; s--) {
       const stmt = allStmts[s];
       const stmtTokens = tokens.slice(stmt.tokStart, stmt.tokEnd);
       let writesBuildVar = false;
@@ -494,7 +504,22 @@
       if (isBuildVarDecl) break;
     }
 
-    if (regionTokStart < 0) return null;
+    if (regionTokStart < 0 && buildVar) return null;
+    // For inline innerHTML expressions (no build var), set region to the
+    // innerHTML statement itself so the transitive scanner can extend upward.
+    if (regionTokStart < 0) {
+      // Find the statement containing the innerHTML assignment.
+      // Use srcStart to match by source position since the target
+      // expression may span multiple tokens before .innerHTML.
+      const assignCharStart = assign.srcStart;
+      for (const stmt of allStmts) {
+        if (tokens[stmt.tokStart].start <= assignCharStart && tokens[stmt.tokEnd - 1].end >= assignCharStart) {
+          regionTokStart = stmt.tokStart;
+          break;
+        }
+      }
+      if (regionTokStart < 0) return null;
+    }
 
     // Find enclosing block end for scope-limited checks.
     let blockEnd = tokens.length;
@@ -559,8 +584,9 @@
         // (including this statement itself) and not after?
         let allDead = true;
         for (const name of declNames) {
+          // Keep alive if the replacement code references this variable.
+          if (referencedInReplacement.has(name)) { allDead = false; break; }
           if (!deadIdents.has(name) && name !== buildVar) { allDead = false; break; }
-          // Also check if used after the innerHTML site in the same scope.
           for (let j = assign.rhsEnd + 1; j < blockEnd; j++) {
             if (tokens[j].type === 'other' && tokens[j].text === name) { allDead = false; break; }
           }
@@ -575,13 +601,17 @@
 
     // Verify: is buildVar used AFTER the innerHTML assignment within the
     // same scope? If so, don't remove the build code.
-    for (let j = assign.rhsEnd + 1; j < blockEnd; j++) {
-      const tk = tokens[j];
-      if (tk.type === 'other' && tk.text === buildVar) return null;
-      if (tk.type === 'other' && tk.text.endsWith('.' + buildVar)) return null;
+    if (buildVar) {
+      for (let j = assign.rhsEnd + 1; j < blockEnd; j++) {
+        const tk = tokens[j];
+        if (tk.type === 'other' && tk.text === buildVar) return null;
+        if (tk.type === 'other' && tk.text.endsWith('.' + buildVar)) return null;
+      }
     }
 
+    // Only return a region if we actually extended beyond the innerHTML statement.
     const regionStart = tokens[regionTokStart].start;
+    if (regionStart >= assign.srcStart) return null;
     return { regionStart, regionEnd: assign.srcEnd };
   }
 
@@ -5814,20 +5844,30 @@
       let cursor = 0;
       for (const ex of extractions) {
         if (ex.srcStart === undefined) continue;
-        // Copy original source up to this innerHTML site.
-        output += trimmed.slice(cursor, ex.srcStart);
-        // Generate the DOM replacement block.
+        // Generate the DOM replacement block first.
         const domBlock = convertOne(raw, ex, false, false);
+        // Now compute the build region, passing the replacement output
+        // so variables it references aren't removed as dead code.
+        let srcStart = ex.srcStart;
+        let srcEnd = ex.srcEnd;
+        if (ex._assign && ex._tokens) {
+          const region = findBuildRegion(ex._tokens, ex._assign, domBlock || '');
+          if (region) {
+            srcStart = region.regionStart;
+            srcEnd = region.regionEnd;
+          }
+        }
+        // Copy original source up to this site.
+        output += trimmed.slice(cursor, srcStart);
         if (domBlock) {
-          // Detect indentation of the original line.
-          let lineStart = ex.srcStart;
+          let lineStart = srcStart;
           while (lineStart > 0 && trimmed[lineStart - 1] !== '\n') lineStart--;
-          const indent = trimmed.slice(lineStart, ex.srcStart).match(/^(\s*)/)[1];
+          const indent = trimmed.slice(lineStart, srcStart).match(/^(\s*)/)[1];
           // Indent the replacement block to match.
           const indented = domBlock.split('\n').map((line, i) => i === 0 ? line : indent + line).join('\n');
           output += indented;
         }
-        cursor = ex.srcEnd;
+        cursor = srcEnd;
       }
       // Append remaining original source after the last innerHTML site.
       output += trimmed.slice(cursor);
