@@ -5673,7 +5673,6 @@
     return block;
   }
 
-  $('go').addEventListener('click', convert);
   $('copy').addEventListener('click', async () => {
     try {
       await navigator.clipboard.writeText($('out').value);
