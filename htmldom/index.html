@@ -20,14 +20,17 @@ code { background: #2a2e33; padding: 0.05rem 0.25rem; border-radius: 3px; font-s
 .hint code { color: #ddd; }
 #outPre { background: #1d1f21; border: 1px solid #444; border-radius: 4px; padding: 0.5rem; max-height: 500px; overflow: auto; font-size: 0.9rem; }
 #outPre code { background: none; padding: 0; font-size: inherit; }
+#inPre { background: #111; border: 1px solid #444; border-radius: 0; padding: 0.5rem; min-height: 200px; max-height: 400px; overflow: auto; font-size: 0.9rem; }
+#inPre:focus { outline: 2px solid #6ea8fe; outline-offset: -1px; border-color: #6ea8fe; }
+#inPre code { background: none; padding: 0; font-size: inherit; white-space: pre-wrap; word-wrap: break-word; }
 </style>
 </head>
 <body>
 <h1>HTML/CSS &rarr; DOM API Converter</h1>
 <p class="hint">Paste HTML or a JS snippet that builds HTML via <code>innerHTML</code>/<code>outerHTML</code> assignments. HTML is converted to safe <code>createElement</code>/<code>appendChild</code> calls, and inline <code>style</code> attributes are split into individual <code>style.setProperty()</code> calls. The JS resolver statically evaluates variables, expressions, loops, conditionals, and method calls. Runtime-only values flow through as named references.</p>
 
-<label for="in">Input</label>
-<textarea id="in" rows="15" spellcheck="false">&lt;div style="position: fixed; z-index: -99; width: 100%; height: 100%"&gt;
+<label>Input</label>
+<pre id="inPre" contenteditable="true" spellcheck="false"><code id="inCode" class="language-markup">&lt;div style="position: fixed; z-index: -99; width: 100%; height: 100%"&gt;
   &lt;iframe credentialless loading="lazy" id="background" title="background" sandbox="allow-scripts" frameborder="0" height="100%" width="100%" src="https://random.ndev.tk/"&gt;&lt;/iframe&gt;
 &lt;/div&gt;
 &lt;button onclick="alert('hello')"&gt;Greet&lt;/button&gt;
@@ -39,7 +42,7 @@ for (var i = 0; i &lt; items.length; i++) {
 }
 html += '&lt;/nav&gt;';
 document.body.innerHTML = html;
-&lt;/script&gt;</textarea>
+&lt;/script&gt;</code></pre>
 
 <details style="margin-top:0.75rem;">
   <summary style="cursor:pointer; color:#aaa;">Output options</summary>
