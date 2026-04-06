@@ -6215,8 +6215,9 @@
     return block;
   }
 
+  let lastOutput = '';
   function setOutput(text) {
-    $('out').value = text;
+    lastOutput = text;
     const codeEl = $('outCode');
     if (codeEl) {
       codeEl.textContent = text;
@@ -6226,12 +6227,10 @@
 
   $('copy').addEventListener('click', async () => {
     try {
-      await navigator.clipboard.writeText($('out').value);
+      await navigator.clipboard.writeText(lastOutput);
       $('copy').textContent = 'Copied!';
       setTimeout(() => { $('copy').textContent = 'Copy output'; }, 1200);
-    } catch (e) {
-      $('out').select();
-    }
+    } catch (_) {}
   });
 
   // Save and restore cursor position in contenteditable.
@@ -6285,8 +6284,20 @@
     clearTimeout(highlightTimer);
     highlightTimer = setTimeout(highlightInput, 300);
   });
-  // Paste as plain text to avoid HTML formatting.
   if ($('inPre')) {
+    // Enter inserts a plain newline, not a <div> or <br>.
+    $('inPre').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        document.execCommand('insertText', false, '\n');
+      }
+      // Tab inserts two spaces.
+      if (e.key === 'Tab') {
+        e.preventDefault();
+        document.execCommand('insertText', false, '  ');
+      }
+    });
+    // Paste as plain text to avoid HTML formatting.
     $('inPre').addEventListener('paste', (e) => {
       e.preventDefault();
       const text = e.clipboardData.getData('text/plain');
