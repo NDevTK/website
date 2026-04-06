@@ -1148,12 +1148,7 @@
       }
       return merged;
     };
-    const asRef = (name, value) => {
-      if (externallyMutable && externallyMutable.has(name)) {
-        return chainBinding([exprRef(name)]);
-      }
-      return value;
-    };
+    const asRef = (name, value) => value;
     const declBlock = (name, value) => { topBlock().bindings[name] = asRef(name, value); };
     const declFunction = (name, value) => {
       for (let i = stack.length - 1; i >= 0; i--) {
@@ -3869,6 +3864,44 @@
         continue;
       }
 
+      // Bare function call at statement level: `fn()`, `fn(args)`,
+      // `obj.method()`. Invoke for side effects (e.g. modifying outer vars).
+      if (t.type === 'other' && IDENT_RE.test(t.text)) {
+        const callParen = tokens[i + 1];
+        if (callParen && callParen.type === 'open' && callParen.char === '(') {
+          const fn = resolve(t.text);
+          if (fn && fn.kind === 'function') {
+            const argRes = readCallArgBindings(i + 1, stop);
+            if (argRes) {
+              instantiateFunctionBinding(fn, argRes.bindings);
+              i = argRes.next - 1;
+              continue;
+            }
+          }
+        }
+      }
+      // Bare method call: `obj.method()` at statement level.
+      if (t.type === 'other' && PATH_RE.test(t.text)) {
+        const callParen = tokens[i + 1];
+        if (callParen && callParen.type === 'open' && callParen.char === '(') {
+          const dot = t.text.lastIndexOf('.');
+          const base = t.text.slice(0, dot);
+          const method = t.text.slice(dot + 1);
+          const baseBind = resolvePath(base);
+          if (baseBind && baseBind.kind === 'object') {
+            const fn = baseBind.props[method];
+            if (fn && fn.kind === 'function') {
+              const argRes = readCallArgBindings(i + 1, stop);
+              if (argRes) {
+                instantiateFunctionBinding(fn, argRes.bindings, baseBind, baseBind.classRef && baseBind.classRef.superClass || null);
+                i = argRes.next - 1;
+                continue;
+              }
+            }
+          }
+        }
+      }
+
       // Destructuring assignment at statement level: `[a,b] = expr`.
       if (t.type === 'open' && t.char === '[') {
         const pat = readDestructurePattern(i, stop);
@@ -4634,13 +4667,11 @@
             }
             if (depth === 0) {
               declFunction(nameTok.text, functionBinding(params, j + 1, k - 1, true, stack.length > 1 ? captureScope() : null));
-              // Fall through to let the walker traverse the body in a new
-              // function scope, so inner `var`/`let`/`const` and assignments
-              // (including `this.innerHTML = ...` sites) remain visible to
-              // parseRange while staying isolated from the outer scope.
-              pendingFunctionBrace = true;
-              pendingFunctionParams = params;
-              i = j - 1;
+              // Skip past the function body — it will be walked when
+              // the function is actually called (via instantiateFunctionBinding).
+              // innerHTML sites inside function bodies are found by the
+              // token-level scanner (findAllHtmlAssignments), not the walker.
+              i = k - 1;
               continue;
             }
           }
@@ -4943,6 +4974,31 @@
             }
             i = skipExpr(i + 2, stop) - 1;
             continue;
+          }
+        }
+        // Path increment/decrement: `obj.n++`, `this.count--`.
+        if (eqTok && eqTok.type === 'op' && (eqTok.text === '++' || eqTok.text === '--')) {
+          const parts = t.text.split('.');
+          const baseBind = resolve(parts[0]);
+          if (baseBind && baseBind.kind === 'object') {
+            let cur = baseBind;
+            let ok = true;
+            for (let p = 1; p < parts.length - 1; p++) {
+              const nxt = cur.props[parts[p]];
+              if (!nxt || nxt.kind !== 'object') { ok = false; break; }
+              cur = nxt;
+            }
+            if (ok) {
+              const key = parts[parts.length - 1];
+              const val = cur.props[key];
+              const n = val && val.kind === 'chain' ? chainAsNumber(val) : null;
+              if (n !== null) {
+                const delta = eqTok.text === '++' ? 1 : -1;
+                cur.props[key] = chainBinding([makeSynthNum(n + delta)]);
+              }
+              i++;
+              continue;
+            }
           }
         }
         // Path method call: `el.appendChild(child)`, `el.setAttribute(...)`.
