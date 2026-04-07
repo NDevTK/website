@@ -2274,31 +2274,41 @@
       }
       let result = null;
       if (fn.isBlock) {
-        // Look for a top-level `return <expr>;` in the block.
-        // bodyStart may point to the `{`; skip it.
-        let i = fn.bodyStart;
-        if (tks[i] && tks[i].type === 'open' && tks[i].char === '{') i++;
-        const scanEnd = (tks[fn.bodyEnd - 1] && tks[fn.bodyEnd - 1].type === 'close' && tks[fn.bodyEnd - 1].char === '}') ? fn.bodyEnd - 1 : fn.bodyEnd;
-        while (i < scanEnd) {
-          const t = tks[i];
+        // Walk the function body to process var declarations, assignments,
+        // and control flow. This ensures inner `var html` declarations are
+        // bound in the function frame, not resolved from outer scope.
+        let bodyStart = fn.bodyStart;
+        let bodyEnd = fn.bodyEnd;
+        if (tks[bodyStart] && tks[bodyStart].type === 'open' && tks[bodyStart].char === '{') bodyStart++;
+        if (tks[bodyEnd - 1] && tks[bodyEnd - 1].type === 'close' && tks[bodyEnd - 1].char === '}') bodyEnd--;
+        // Save and disable trackBuildVar inside inlined functions —
+        // inner functions' variables are not build vars.
+        const savedTrackBuildVar = trackBuildVar;
+        const savedTrackDepth = trackBuildVarDepth;
+        trackBuildVar = null;
+        walkRange(bodyStart, bodyEnd);
+        trackBuildVar = savedTrackBuildVar;
+        trackBuildVarDepth = savedTrackDepth;
+        // Find the return value: look for `return` at the top level of
+        // the function body and resolve the returned expression.
+        let ri = bodyStart;
+        while (ri < bodyEnd) {
+          const t = tks[ri];
           if (t && t.type === 'other' && t.text === 'return') {
-            const r = readConcatExpr(i + 1, fn.bodyEnd, TERMS_TOP);
+            const r = readConcatExpr(ri + 1, bodyEnd, TERMS_TOP);
             if (r) result = r.toks;
             break;
           }
-          // Skip over nested blocks so `return` inside a nested function
-          // doesn't match.
           if (t && t.type === 'open' && t.char === '{') {
-            let depth = 1; i++;
-            while (i < scanEnd && depth > 0) {
-              const tk = tks[i];
-              if (tk.type === 'open' && tk.char === '{') depth++;
-              else if (tk.type === 'close' && tk.char === '}') depth--;
-              i++;
+            let depth = 1; ri++;
+            while (ri < bodyEnd && depth > 0) {
+              if (tks[ri].type === 'open' && tks[ri].char === '{') depth++;
+              else if (tks[ri].type === 'close' && tks[ri].char === '}') depth--;
+              ri++;
             }
             continue;
           }
-          i++;
+          ri++;
         }
       } else {
         const r = readConcatExpr(fn.bodyStart, fn.bodyEnd, TERMS_NONE);
