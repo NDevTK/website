@@ -83,8 +83,8 @@
     'line', 'polyline', 'polygon', 'text', 'tspan', 'textpath', 'image',
     'pattern', 'mask', 'clippath', 'lineargradient', 'radialgradient', 'stop',
     'filter', 'feblend', 'fecolormatrix', 'fecomposite', 'fegaussianblur',
-    'femerge', 'femergenode', 'feoffset', 'foreignobject', 'marker', 'title',
-    'desc', 'view', 'switch', 'a', 'animate', 'animatemotion', 'animatetransform'
+    'femerge', 'femergenode', 'feoffset', 'foreignobject', 'marker',
+    'desc', 'view', 'switch', 'animate', 'animatemotion', 'animatetransform'
   ]);
 
   function $(id) { return document.getElementById(id); }
@@ -224,7 +224,14 @@
     if (!trimmed) return [];
     const tokens = tokenize(trimmed);
     const assigns = findAllHtmlAssignments(tokens);
-    return assigns.map((assign) => extractOneAssignment(tokens, assign));
+    return assigns.map((assign) => {
+      const result = extractOneAssignment(tokens, assign);
+      result.srcStart = assign.srcStart;
+      result.srcEnd = assign.srcEnd;
+      result._assign = assign;
+      result._tokens = tokens;
+      return result;
+    });
   }
 
   // Produce an { html, autoSubs, target, assignProp, assignOp, ... } record
@@ -338,7 +345,13 @@
           break;
         }
       }
-      out.push({ target, prop, op: t.char, rhsStart: i + 1, rhsEnd });
+      // Source character positions for the entire statement.
+      const srcStart = prev.start;
+      let srcEnd = rhsEnd < tokens.length ? tokens[rhsEnd].end : tokens[tokens.length - 1].end;
+      if (rhsEnd < tokens.length && tokens[rhsEnd].type === 'sep' && tokens[rhsEnd].char === ';') {
+        srcEnd = tokens[rhsEnd].end;
+      }
+      out.push({ target, prop, op: t.char, rhsStart: i + 1, rhsEnd, srcStart, srcEnd, eqIdx: i });
     }
     return out;
   }
@@ -3185,17 +3198,97 @@
   function convert() {
     try {
       const raw = (typeof window !== 'undefined' && window._monacoIn) ? window._monacoIn.getValue() : ($('in') ? $('in').value : '');
-      const blocks = [];
+
+      // If input starts with HTML, split into HTML portions and <script>
+      // blocks. Convert HTML to DOM API, process script blocks for
+      // innerHTML replacements, preserve non-innerHTML script code as-is.
+      if (/^\s*</.test(raw)) {
+        const scriptRe = /<script\b[^>]*>([\s\S]*?)<\/script>/gi;
+        let lastIdx = 0;
+        const parts = [];
+        let m;
+        while ((m = scriptRe.exec(raw)) !== null) {
+          if (m.index > lastIdx) parts.push({ kind: 'html', text: raw.slice(lastIdx, m.index) });
+          parts.push({ kind: 'script', text: m[1] });
+          lastIdx = scriptRe.lastIndex;
+        }
+        if (lastIdx < raw.length) parts.push({ kind: 'html', text: raw.slice(lastIdx) });
+        if (parts.length === 0) parts.push({ kind: 'html', text: raw });
+
+        const outputParts = [];
+        const sharedUsed = new Set();
+        for (const part of parts) {
+          if (part.kind === 'html') {
+            const htmlTrimmed = part.text.trim();
+            if (!htmlTrimmed) continue;
+            const result = extractHTML(htmlTrimmed);
+            const block = convertOne(htmlTrimmed, result, false, false, sharedUsed);
+            if (block) outputParts.push(block);
+          } else {
+            // Process script content: extract innerHTML sites and rewrite
+            // them inline; preserve surrounding code as-is.
+            const jsCode = part.text;
+            const extractions = extractAllHTML(jsCode);
+            if (extractions.length === 0) {
+              outputParts.push(jsCode);
+            } else {
+              const trimmed = jsCode;
+              let scriptOutput = '';
+              let cursor = 0;
+              for (const ex of extractions) {
+                if (ex.srcStart === undefined) continue;
+                const domBlock = convertOne(jsCode, ex, false, false);
+                let srcStart = ex.srcStart;
+                let srcEnd = ex.srcEnd;
+                scriptOutput += trimmed.slice(cursor, srcStart);
+                if (domBlock) {
+                  let lineStart = srcStart;
+                  while (lineStart > 0 && trimmed[lineStart - 1] !== '\n') lineStart--;
+                  const indent = trimmed.slice(lineStart, srcStart).match(/^(\s*)/)[1];
+                  const indented = domBlock.split('\n').map((line, i) => i === 0 ? line : indent + line).join('\n');
+                  scriptOutput += indented;
+                }
+                cursor = srcEnd;
+                while (cursor < trimmed.length && (trimmed[cursor] === ';' || trimmed[cursor] === ' ')) cursor++;
+              }
+              scriptOutput += trimmed.slice(cursor);
+              outputParts.push(scriptOutput);
+            }
+          }
+        }
+        setOutput(outputParts.join('\n'));
+        return;
+      }
+
+      // Pure JS input (no leading <).
       const extractions = extractAllHTML(raw);
       if (extractions.length === 0) {
         const summary = summarizeDomConstruction(raw);
-        if (summary) blocks.push(summary);
-        else blocks.push(convertOne(raw, extractHTML(raw), false, false));
-      } else {
-        const multi = extractions.length > 1;
-        for (const ex of extractions) blocks.push(convertOne(raw, ex, multi, multi));
+        if (summary) { setOutput(summary); return; }
+        setOutput(convertOne(raw, extractHTML(raw), false, false) || '');
+        return;
       }
-      setOutput(blocks.filter((b) => b).join('\n\n'));
+      // Inline rewriting: preserve original code, replace innerHTML sites.
+      const trimmed = raw.trim();
+      let output = '';
+      let cursor = 0;
+      for (const ex of extractions) {
+        if (ex.srcStart === undefined) continue;
+        const domBlock = convertOne(raw, ex, false, false);
+        let srcStart = ex.srcStart;
+        let srcEnd = ex.srcEnd;
+        output += trimmed.slice(cursor, srcStart);
+        if (domBlock) {
+          let lineStart = srcStart;
+          while (lineStart > 0 && trimmed[lineStart - 1] !== '\n') lineStart--;
+          const indent = trimmed.slice(lineStart, srcStart).match(/^(\s*)/)[1];
+          output += domBlock.split('\n').map((line, i) => i === 0 ? line : indent + line).join('\n');
+        }
+        cursor = srcEnd;
+        while (cursor < trimmed.length && (trimmed[cursor] === ';' || trimmed[cursor] === ' ')) cursor++;
+      }
+      output += trimmed.slice(cursor);
+      setOutput(output);
     } catch (err) {
       setOutput('// Error: ' + err.message);
     }
@@ -3764,7 +3857,7 @@
 
   // Produce the DOM-API code block for a single innerHTML/outerHTML
   // extraction. `multi` toggles the leading target-divider comment.
-  function convertOne(raw, result, multi, emitTitle) {
+  function convertOne(raw, result, multi, emitTitle, sharedUsed) {
     const { target, assignProp, assignOp } = result;
 
     let parent = 'document.body';
@@ -3786,7 +3879,7 @@
     };
 
     const lines = [];
-    const used = new Set();
+    const used = sharedUsed || new Set();
 
     // Reserve the parent target identifier root.
     const parentRoot = parent.match(/^[A-Za-z_$][A-Za-z0-9_$]*/);
