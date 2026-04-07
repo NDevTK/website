@@ -351,10 +351,12 @@
       if (!trail) continue;
       const prop = trail[2];
       let target = trail[1];
-      if (target === '') {
+      let targetSrcStart = -1;
+      if (target === '' || target.startsWith('.')) {
         const r = reconstructTarget(tokens, i - 1);
         if (!r) continue;
-        target = r;
+        // Combine reconstructed base with any remaining prefix.
+        target = target.startsWith('.') ? r + target : r;
       }
       let depth = 0;
       let rhsEnd = tokens.length;
@@ -3365,6 +3367,38 @@
             }
             i = switchEnd - 1;
             continue;
+          }
+        }
+      }
+
+      // `do { ... } while (cond);`
+      if (t.text === 'do') {
+        const bodyOpen = tokens[i + 1];
+        if (bodyOpen && bodyOpen.type === 'open' && bodyOpen.char === '{') {
+          const bodyEnd = findBlockEnd(i + 1);
+          // Find `while (cond);` after the body.
+          const whTok = tokens[bodyEnd];
+          if (whTok && whTok.type === 'other' && whTok.text === 'while') {
+            const wp = tokens[bodyEnd + 1];
+            if (wp && wp.type === 'open' && wp.char === '(') {
+              const wcp = findCloseParen(bodyEnd + 1);
+              let doEnd = wcp;
+              if (tokens[doEnd] && tokens[doEnd].type === 'sep' && tokens[doEnd].char === ';') doEnd++;
+              const headerFirst = tokens[bodyEnd + 2];
+              const headerLast = tokens[wcp - 2];
+              const headerSrc = headerFirst ? headerFirst._src.slice(headerFirst.start, headerLast.end) : '/* do-while */';
+              const id = nextLoopId++;
+              loopInfo[id] = { kind: 'do', headerSrc };
+              const loopFrame = { bindings: Object.create(null), isFunction: false };
+              stack.push(loopFrame);
+              loopStack.push({
+                id, kind: 'do', headerSrc, bodyEnd: doEnd, frame: loopFrame,
+                modifiedVars: new Set(),
+              });
+              walkRange(i + 1, bodyEnd);
+              i = doEnd - 1;
+              continue;
+            }
           }
         }
       }
