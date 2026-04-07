@@ -547,101 +547,404 @@
     return { regionStart, regionEnd: assign.srcEnd, buildVar, allStmts, regionTokStart, blockEnd };
   }
 
-  // Rewrite a build region statement-by-statement: replace each
-  // `buildVar +=` with DOM API code, remove the buildVar declaration
-  // and the innerHTML assignment, preserve everything else (loop
-  // structures, variable assignments, if statements, etc.).
-  // Returns the rewritten source string or null if not applicable.
-  function rewriteBuildRegion(source, tokens, assign, region, resolveAndConvert, target, assignOp) {
-    const { buildVar, allStmts, regionTokStart } = region;
+  // In-place rewriting: walk a build region statement by statement,
+  // converting each `buildVar +=` to DOM API code while preserving
+  // all surrounding logic (loops, ifs, try/catch, switch, counters,
+  // flags, etc.) verbatim. Uses a resumable scope walker so each
+  // RHS is resolved with full scope state at that point.
+  //
+  // Returns the rewritten source region string, or null if not applicable.
+  function rewriteInPlace(tokens, src, assign, region, target, assignOp, sharedUsed) {
+    const { buildVar, regionStart, regionEnd } = region;
     if (!buildVar) return null;
 
-    // Find all `buildVar +=` sites within the region source. Each one
-    // is an independent innerHTML-like site: its RHS is a concat chain
-    // that gets converted to DOM API code. The surrounding control flow
-    // (for/while/if) is preserved from the original source.
-    const regionSrc = source.slice(region.regionStart, region.regionEnd);
-    const regionOffset = region.regionStart;
+    const externallyMutable = scanMutations(tokens);
+    const state = buildScopeState(tokens, region.regionTokStart || 0, externallyMutable);
 
-    // Scan statements within the region and build replacement actions.
-    const actions = []; // { start, end, replacement } in source coords
+    // Convert a resolved chain to DOM API code.
+    const chainToDom = (chain, parentTarget) => {
+      if (!chain || !chain.length) return '';
+      const result = { chainTokens: chain, target: null, assignProp: null, assignOp: null };
+      return convertOne('', result, false, false, sharedUsed, parentTarget) || '';
+    };
 
-    for (const stmt of allStmts) {
-      if (stmt.tokStart < regionTokStart) continue;
-      const sStart = tokens[stmt.tokStart].start;
-      const sEnd = tokens[stmt.tokEnd - 1].end;
-      const stmtTokens = tokens.slice(stmt.tokStart, stmt.tokEnd);
+    // Batch: accumulate contiguous buildVar += chains, flush when a
+    // non-build statement or control flow boundary is hit.
+    let batch = []; // array of chain token arrays
+    const flushBatch = () => {
+      if (!batch.length) return '';
+      // Concatenate all batched chains with SYNTH_PLUS.
+      const combined = [];
+      for (let i = 0; i < batch.length; i++) {
+        if (i > 0) combined.push(SYNTH_PLUS);
+        for (const t of batch[i]) combined.push(t);
+      }
+      batch = [];
+      return chainToDom(combined, target);
+    };
 
-      // buildVar declaration: `var html = '...'` — replace with replaceChildren
-      // (or convert non-empty initializer).
-      for (let j = 0; j < stmtTokens.length; j++) {
-        if (stmtTokens[j].type === 'other' && (stmtTokens[j].text === 'var' || stmtTokens[j].text === 'let' || stmtTokens[j].text === 'const')) {
-          const nm = stmtTokens[j + 1];
+    // Find the end of a simple statement: next `;` at depth 0.
+    const findStmtEnd = (tokIdx, limit) => {
+      let depth = 0;
+      for (let k = tokIdx; k < limit; k++) {
+        const tk = tokens[k];
+        if (tk.type === 'open') depth++;
+        else if (tk.type === 'close') {
+          if (depth === 0) return k;
+          depth--;
+        }
+        else if (depth === 0 && tk.type === 'sep' && tk.char === ';') return k + 1;
+      }
+      return limit;
+    };
+
+    // Find the end of a block: matching `}` from a `{`.
+    const findBlockEnd = (openIdx, limit) => {
+      let depth = 1, k = openIdx + 1;
+      while (k < limit && depth > 0) {
+        if (tokens[k].type === 'open' && tokens[k].char === '{') depth++;
+        else if (tokens[k].type === 'close' && tokens[k].char === '}') depth--;
+        k++;
+      }
+      return k;
+    };
+
+    // Find matching `)` from `(`.
+    const findCloseParen = (openIdx, limit) => {
+      let depth = 1, k = openIdx + 1;
+      while (k < limit && depth > 0) {
+        if (tokens[k].type === 'open' && tokens[k].char === '(') depth++;
+        else if (tokens[k].type === 'close' && tokens[k].char === ')') depth--;
+        k++;
+      }
+      return k;
+    };
+
+    // Recursive descent: rewrite a token range, returning output string.
+    const rewriteRange = (start, end) => {
+      let out = '';
+      let i = start;
+
+      while (i < end) {
+        const t = tokens[i];
+        if (!t) { i++; continue; }
+
+        // Skip whitespace tokens (there aren't any — tokenizer skips them)
+        // but handle open/close braces for block scoping.
+        if (t.type === 'open' && t.char === '{') {
+          out += flushBatch();
+          out += '{\n';
+          const blockEnd = findBlockEnd(i, end);
+          out += rewriteRange(i + 1, blockEnd - 1);
+          out += '}';
+          i = blockEnd;
+          continue;
+        }
+
+        // var/let/const declaration
+        if (t.type === 'other' && (t.text === 'var' || t.text === 'let' || t.text === 'const')) {
+          const nm = tokens[i + 1];
           if (nm && nm.type === 'other' && nm.text === buildVar) {
-            const eq = stmtTokens[j + 2];
+            // buildVar declaration — convert to replaceChildren + init content.
+            state.advanceTo(i);
+            const stmtEnd = findStmtEnd(i, end);
+            // Find the initializer.
+            const eq = tokens[i + 2];
             if (eq && eq.type === 'sep' && eq.char === '=') {
-              const initTok = stmtTokens[j + 3];
-              const isEmpty = initTok && initTok.type === 'str' && initTok.text === '';
-              if (isEmpty) {
-                const preamble = (assignOp === '=') ? target + '.replaceChildren();' : '';
-                actions.push({ start: sStart, end: sEnd, replacement: preamble });
-              } else {
-                // Non-empty init — resolve and convert.
-                const initStart = stmt.tokStart + j + 3;
-                const initEnd = stmt.tokEnd - 1; // before ;
-                const preamble = (assignOp === '=') ? target + '.replaceChildren();\n' : '';
-                const domBlock = resolveAndConvert(initStart, initEnd, target);
-                actions.push({ start: sStart, end: sEnd, replacement: preamble + (domBlock || '') });
+              const initChain = state.parseRange(i + 3, stmtEnd - 1); // exclude ;
+              out += flushBatch();
+              if (assignOp === '=') out += target + '.replaceChildren();\n';
+              if (initChain && initChain.length) {
+                // Non-empty init — check if it's just ''.
+                const isEmpty = initChain.length === 1 && initChain[0].type === 'str' && initChain[0].text === '';
+                if (!isEmpty) out += chainToDom(initChain, target) + '\n';
               }
             } else {
-              actions.push({ start: sStart, end: sEnd, replacement: (assignOp === '=') ? target + '.replaceChildren();' : '' });
+              out += flushBatch();
+              if (assignOp === '=') out += target + '.replaceChildren();\n';
             }
-            break;
+            i = stmtEnd;
+            continue;
           }
+          // Non-build var decl — preserve and advance scope.
+          const stmtEnd = findStmtEnd(i, end);
+          state.advanceTo(stmtEnd);
+          out += flushBatch();
+          out += src.slice(t.start, tokens[stmtEnd - 1].end) + '\n';
+          i = stmtEnd;
+          continue;
         }
-      }
 
-      // innerHTML assignment: remove.
-      if (stmt.tokStart <= assign.eqIdx && stmt.tokEnd > assign.eqIdx) {
-        if (!actions.some(a => a.start === sStart)) {
-          actions.push({ start: sStart, end: sEnd, replacement: '' });
-        }
-        continue;
-      }
-
-      // buildVar += expr: convert RHS.
-      for (let j = 0; j < stmtTokens.length; j++) {
-        if (stmtTokens[j].type === 'other' && stmtTokens[j].text === buildVar) {
-          const eq = stmtTokens[j + 1];
+        // buildVar += expr
+        if (t.type === 'other' && t.text === buildVar) {
+          const eq = tokens[i + 1];
           if (eq && eq.type === 'sep' && eq.char === '+=') {
-            const rhsStart = stmt.tokStart + j + 2;
-            const rhsEnd = stmt.tokEnd - 1; // before ;
-            const domBlock = resolveAndConvert(rhsStart, rhsEnd, target);
-            if (!actions.some(a => a.start === sStart)) {
-              actions.push({ start: sStart, end: sEnd, replacement: domBlock || '' });
-            }
-            break;
+            state.advanceTo(i + 2);
+            const stmtEnd = findStmtEnd(i + 2, end);
+            const rhsEnd = (tokens[stmtEnd - 1] && tokens[stmtEnd - 1].type === 'sep' && tokens[stmtEnd - 1].char === ';') ? stmtEnd - 1 : stmtEnd;
+            const chain = state.parseRange(i + 2, rhsEnd);
+            if (chain) batch.push(chain);
+            i = stmtEnd;
+            continue;
+          }
+          // buildVar = expr (reassignment, e.g. html = "<p>...")
+          if (eq && eq.type === 'sep' && eq.char === '=') {
+            state.advanceTo(i + 2);
+            const stmtEnd = findStmtEnd(i + 2, end);
+            const rhsEnd = (tokens[stmtEnd - 1] && tokens[stmtEnd - 1].type === 'sep' && tokens[stmtEnd - 1].char === ';') ? stmtEnd - 1 : stmtEnd;
+            const chain = state.parseRange(i + 2, rhsEnd);
+            out += flushBatch();
+            if (chain) out += chainToDom(chain, target) + '\n';
+            i = stmtEnd;
+            continue;
           }
         }
+
+        // innerHTML assignment itself — remove.
+        if (t.type === 'other' && t.text === assign.target + '.' + assign.prop) {
+          const stmtEnd = findStmtEnd(i, end);
+          out += flushBatch();
+          i = stmtEnd;
+          continue;
+        }
+        // Also catch reconstructed target: check by source position.
+        if (t.start === assign.srcStart || (i === assign.eqIdx - 1)) {
+          const stmtEnd = findStmtEnd(i, end);
+          out += flushBatch();
+          i = stmtEnd;
+          continue;
+        }
+
+        // for / while / do — preserve structure, recurse into body.
+        if (t.type === 'other' && (t.text === 'for' || t.text === 'while')) {
+          out += flushBatch();
+          const lp = tokens[i + 1];
+          if (lp && lp.type === 'open' && lp.char === '(') {
+            const cp = findCloseParen(i + 1, end);
+            state.advanceTo(cp);
+            // Emit header verbatim.
+            out += src.slice(t.start, tokens[cp - 1].end) + ' ';
+            const bodyTok = tokens[cp];
+            if (bodyTok && bodyTok.type === 'open' && bodyTok.char === '{') {
+              const blockEnd = findBlockEnd(cp, end);
+              out += '{\n' + rewriteRange(cp + 1, blockEnd - 1) + '}\n';
+              i = blockEnd;
+            } else {
+              const stmtEnd = findStmtEnd(cp, end);
+              out += rewriteRange(cp, stmtEnd);
+              i = stmtEnd;
+            }
+            continue;
+          }
+        }
+
+        // do { ... } while (...)
+        if (t.type === 'other' && t.text === 'do') {
+          out += flushBatch();
+          const bodyTok = tokens[i + 1];
+          if (bodyTok && bodyTok.type === 'open' && bodyTok.char === '{') {
+            const blockEnd = findBlockEnd(i + 1, end);
+            out += 'do {\n' + rewriteRange(i + 2, blockEnd - 1) + '}';
+            // Expect `while (cond);`
+            const whTok = tokens[blockEnd];
+            if (whTok && whTok.type === 'other' && whTok.text === 'while') {
+              const stmtEnd = findStmtEnd(blockEnd, end);
+              state.advanceTo(stmtEnd);
+              out += ' ' + src.slice(whTok.start, tokens[stmtEnd - 1].end) + '\n';
+              i = stmtEnd;
+            } else {
+              i = blockEnd;
+            }
+            continue;
+          }
+        }
+
+        // if / else if / else — preserve structure, recurse into bodies.
+        if (t.type === 'other' && t.text === 'if') {
+          out += flushBatch();
+          const lp = tokens[i + 1];
+          if (lp && lp.type === 'open' && lp.char === '(') {
+            const cp = findCloseParen(i + 1, end);
+            state.advanceTo(cp);
+            out += src.slice(t.start, tokens[cp - 1].end) + ' ';
+            const bodyTok = tokens[cp];
+            let ifEnd;
+            if (bodyTok && bodyTok.type === 'open' && bodyTok.char === '{') {
+              const blockEnd = findBlockEnd(cp, end);
+              out += '{\n' + rewriteRange(cp + 1, blockEnd - 1) + '}';
+              ifEnd = blockEnd;
+            } else {
+              const stmtEnd = findStmtEnd(cp, end);
+              out += rewriteRange(cp, stmtEnd);
+              ifEnd = stmtEnd;
+            }
+            // else / else if
+            const elseTok = tokens[ifEnd];
+            if (elseTok && elseTok.type === 'other' && elseTok.text === 'else') {
+              const afterElse = tokens[ifEnd + 1];
+              if (afterElse && afterElse.type === 'other' && afterElse.text === 'if') {
+                out += ' else ';
+                // Recurse — the next iteration handles the `if`.
+                i = ifEnd + 1;
+                continue;
+              }
+              if (afterElse && afterElse.type === 'open' && afterElse.char === '{') {
+                const blockEnd = findBlockEnd(ifEnd + 1, end);
+                out += ' else {\n' + rewriteRange(ifEnd + 2, blockEnd - 1) + '}\n';
+                i = blockEnd;
+              } else {
+                const stmtEnd = findStmtEnd(ifEnd + 1, end);
+                out += ' else ' + rewriteRange(ifEnd + 1, stmtEnd);
+                i = stmtEnd;
+              }
+            } else {
+              out += '\n';
+              i = ifEnd;
+            }
+            continue;
+          }
+        }
+
+        // try / catch / finally — preserve structure, recurse.
+        if (t.type === 'other' && t.text === 'try') {
+          out += flushBatch();
+          const bodyTok = tokens[i + 1];
+          if (bodyTok && bodyTok.type === 'open' && bodyTok.char === '{') {
+            const blockEnd = findBlockEnd(i + 1, end);
+            out += 'try {\n' + rewriteRange(i + 2, blockEnd - 1) + '}';
+            let k = blockEnd;
+            // catch
+            if (tokens[k] && tokens[k].type === 'other' && tokens[k].text === 'catch') {
+              const catchLp = tokens[k + 1];
+              if (catchLp && catchLp.type === 'open' && catchLp.char === '(') {
+                const catchCp = findCloseParen(k + 1, end);
+                state.advanceTo(catchCp);
+                out += ' catch' + src.slice(catchLp.start, tokens[catchCp - 1].end) + ' ';
+                const catchBody = tokens[catchCp];
+                if (catchBody && catchBody.type === 'open' && catchBody.char === '{') {
+                  const catchEnd = findBlockEnd(catchCp, end);
+                  out += '{\n' + rewriteRange(catchCp + 1, catchEnd - 1) + '}';
+                  k = catchEnd;
+                }
+              } else if (catchLp && catchLp.type === 'open' && catchLp.char === '{') {
+                // catch without params
+                const catchEnd = findBlockEnd(k + 1, end);
+                out += ' catch {\n' + rewriteRange(k + 2, catchEnd - 1) + '}';
+                k = catchEnd;
+              }
+            }
+            // finally
+            if (tokens[k] && tokens[k].type === 'other' && tokens[k].text === 'finally') {
+              const finBody = tokens[k + 1];
+              if (finBody && finBody.type === 'open' && finBody.char === '{') {
+                const finEnd = findBlockEnd(k + 1, end);
+                out += ' finally {\n' + rewriteRange(k + 2, finEnd - 1) + '}';
+                k = finEnd;
+              }
+            }
+            out += '\n';
+            i = k;
+            continue;
+          }
+        }
+
+        // switch — preserve structure, recurse into case bodies.
+        if (t.type === 'other' && t.text === 'switch') {
+          out += flushBatch();
+          const lp = tokens[i + 1];
+          if (lp && lp.type === 'open' && lp.char === '(') {
+            const cp = findCloseParen(i + 1, end);
+            state.advanceTo(cp);
+            out += src.slice(t.start, tokens[cp - 1].end) + ' ';
+            const bodyTok = tokens[cp];
+            if (bodyTok && bodyTok.type === 'open' && bodyTok.char === '{') {
+              const switchEnd = findBlockEnd(cp, end);
+              // Walk case/default bodies inside the switch.
+              out += '{\n' + rewriteRange(cp + 1, switchEnd - 1) + '}\n';
+              i = switchEnd;
+              continue;
+            }
+          }
+        }
+
+        // case / default labels inside switch — preserve verbatim.
+        if (t.type === 'other' && (t.text === 'case' || t.text === 'default')) {
+          out += flushBatch();
+          // Emit up to the `:`.
+          let k = i + 1;
+          while (k < end && !(tokens[k].type === 'other' && tokens[k].text === ':')) k++;
+          if (k < end) k++; // past the `:`
+          state.advanceTo(k);
+          out += src.slice(t.start, tokens[k - 1].end) + '\n';
+          i = k;
+          continue;
+        }
+
+        // break / continue — preserve.
+        if (t.type === 'other' && (t.text === 'break' || t.text === 'continue')) {
+          out += flushBatch();
+          const stmtEnd = findStmtEnd(i, end);
+          out += src.slice(t.start, tokens[stmtEnd - 1].end) + '\n';
+          i = stmtEnd;
+          continue;
+        }
+
+        // return — preserve.
+        if (t.type === 'other' && t.text === 'return') {
+          out += flushBatch();
+          const stmtEnd = findStmtEnd(i, end);
+          out += src.slice(t.start, tokens[stmtEnd - 1].end) + '\n';
+          i = stmtEnd;
+          continue;
+        }
+
+        // function declaration — preserve entirely.
+        if (t.type === 'other' && t.text === 'function') {
+          out += flushBatch();
+          // Find the function body end.
+          let k = i + 1;
+          // Skip name and params.
+          while (k < end && !(tokens[k].type === 'open' && tokens[k].char === '{')) k++;
+          if (k < end) {
+            const blockEnd = findBlockEnd(k, end);
+            state.advanceTo(blockEnd);
+            out += src.slice(t.start, tokens[blockEnd - 1].end) + '\n';
+            i = blockEnd;
+          } else {
+            i++;
+          }
+          continue;
+        }
+
+        // Any other statement — advance scope and preserve verbatim.
+        const stmtEnd = findStmtEnd(i, end);
+        if (stmtEnd > i) {
+          state.advanceTo(stmtEnd);
+          out += flushBatch();
+          out += src.slice(t.start, tokens[stmtEnd - 1].end) + '\n';
+          i = stmtEnd;
+        } else {
+          i++;
+        }
       }
+
+      // Flush any remaining batch.
+      const remaining = flushBatch();
+      if (remaining) out += remaining + '\n';
+      return out;
+    };
+
+    // Find the token range for the build region.
+    let regionTokStart = 0;
+    let regionTokEnd = tokens.length;
+    for (let k = 0; k < tokens.length; k++) {
+      if (tokens[k].start >= regionStart) { regionTokStart = k; break; }
+    }
+    for (let k = tokens.length - 1; k >= 0; k--) {
+      if (tokens[k].end <= regionEnd) { regionTokEnd = k + 1; break; }
     }
 
-    if (actions.length === 0) return null;
-
-    // Apply in reverse source order.
-    actions.sort((a, b) => b.start - a.start);
-    let result = source;
-    for (const { start, end, replacement } of actions) {
-      // Detect indent from the original line.
-      let lineStart = start;
-      while (lineStart > 0 && result[lineStart - 1] !== '\n') lineStart--;
-      const indent = result.slice(lineStart, start).match(/^(\s*)/)[1];
-      const indented = replacement.split('\n').map((l, i) => i === 0 ? l : indent + l).join('\n');
-      result = result.slice(0, start) + indented + result.slice(end);
-    }
-    // Clean up trailing whitespace on empty replacement lines.
-    result = result.replace(/\n\s*\n\s*\n/g, '\n\n');
-    return result;
+    return rewriteRange(regionTokStart, regionTokEnd);
   }
 
   // Given the token index of the trailing `.innerHTML`/`.outerHTML` accessor,
@@ -2869,7 +3172,7 @@
       return r ? r.toks : null;
     };
 
-    const stop = Math.min(stopAt, tokens.length);
+    let stop = Math.min(stopAt, tokens.length);
     const walkRange = (startI, endI) => {
     for (let i = startI; i < endI; i++) {
       // Pop any loops whose body we've walked past (and their shadow frames).
@@ -3501,6 +3804,15 @@
     };
     walkRange(0, stop);
 
+    // Advance the scope walker to a new stop position, processing all
+    // tokens between the current stop and the new one. This allows
+    // the caller to incrementally build scope state for each statement
+    // in a build region.
+    const advanceTo = (newStop) => {
+      const ns = Math.min(newStop, tokens.length);
+      if (ns > stop) { walkRange(stop, ns); stop = ns; }
+    };
+
     // Parse tokens[start, end) as a concat chain, expanding identifier
     // references, member paths, `[...].join(sep)`, and `.concat(...)` calls.
     // Returns the flat chain tokens (alternating operand / plus) or null.
@@ -3514,7 +3826,7 @@
       for (let i = stack.length - 1; i >= 0; i--) if (name in stack[i].bindings) return true;
       return false;
     };
-    return { resolve, resolvePath, parseRange, rewriteTemplate, loopInfo, loopVars, inScope, domElements, domOps };
+    return { resolve, resolvePath, parseRange, rewriteTemplate, advanceTo, loopInfo, loopVars, inScope, domElements, domOps };
   }
 
   function hasBinding(stack, name) {
@@ -3919,6 +4231,23 @@
         const target = ex.target || 'document.body';
         const assignOp = ex.assignOp || '=';
 
+        // Try in-place rewriting first — preserves all surrounding code.
+        if (ex._assign && ex._tokens) {
+          const domBlock = convertOne(raw, ex, false, false, sharedUsed);
+          const region = findBuildRegion(ex._tokens, ex._assign, domBlock || '');
+          if (region && region.buildVar) {
+            const rewritten = rewriteInPlace(ex._tokens, trimmed, ex._assign, region, target, assignOp, sharedUsed);
+            if (rewritten !== null) {
+              output += trimmed.slice(cursor, region.regionStart);
+              output += rewritten;
+              cursor = region.regionEnd;
+              while (cursor < trimmed.length && (trimmed[cursor] === ';' || trimmed[cursor] === ' ' || trimmed[cursor] === '\n')) cursor++;
+              continue;
+            }
+          }
+        }
+
+        // Fallback: chain-based conversion.
         const domBlock = convertOne(raw, ex, false, false, sharedUsed);
         let srcStart = ex.srcStart;
         let srcEnd = ex.srcEnd;
