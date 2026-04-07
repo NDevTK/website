@@ -240,7 +240,12 @@
     const target = assign.target;
     const assignProp = assign.prop;
     const assignOp = assign.op;
-    const r = resolveIdentifiers(tokens, assign.rhsStart, assign.rhsEnd);
+    // Determine the build variable (if the RHS is a single identifier).
+    const rhsToks = [];
+    for (let j = assign.rhsStart; j < assign.rhsEnd; j++) rhsToks.push(tokens[j]);
+    const isBuildVar = rhsToks.length === 1 && rhsToks[0].type === 'other' && IDENT_RE.test(rhsToks[0].text);
+    const buildVar = isBuildVar ? rhsToks[0].text : null;
+    const r = resolveIdentifiers(tokens, assign.rhsStart, assign.rhsEnd, buildVar);
     if (r.parsed) {
       // Recursively expand loopVar references. Multiple loopVars may
       // share the same name (nested loops modifying the same build var).
@@ -547,405 +552,6 @@
     return { regionStart, regionEnd: assign.srcEnd, buildVar, allStmts, regionTokStart, blockEnd };
   }
 
-  // In-place rewriting: walk a build region statement by statement,
-  // converting each `buildVar +=` to DOM API code while preserving
-  // all surrounding logic (loops, ifs, try/catch, switch, counters,
-  // flags, etc.) verbatim. Uses a resumable scope walker so each
-  // RHS is resolved with full scope state at that point.
-  //
-  // Returns the rewritten source region string, or null if not applicable.
-  function rewriteInPlace(tokens, src, assign, region, target, assignOp, sharedUsed) {
-    const { buildVar, regionStart, regionEnd } = region;
-    if (!buildVar) return null;
-
-    const externallyMutable = scanMutations(tokens);
-    const state = buildScopeState(tokens, region.regionTokStart || 0, externallyMutable);
-
-    // Convert a resolved chain to DOM API code.
-    const chainToDom = (chain, parentTarget) => {
-      if (!chain || !chain.length) return '';
-      const result = { chainTokens: chain, target: null, assignProp: null, assignOp: null };
-      return convertOne('', result, false, false, sharedUsed, parentTarget) || '';
-    };
-
-    // Batch: accumulate contiguous buildVar += chains, flush when a
-    // non-build statement or control flow boundary is hit.
-    let batch = []; // array of chain token arrays
-    const flushBatch = () => {
-      if (!batch.length) return '';
-      // Concatenate all batched chains with SYNTH_PLUS.
-      const combined = [];
-      for (let i = 0; i < batch.length; i++) {
-        if (i > 0) combined.push(SYNTH_PLUS);
-        for (const t of batch[i]) combined.push(t);
-      }
-      batch = [];
-      return chainToDom(combined, target);
-    };
-
-    // Find the end of a simple statement: next `;` at depth 0.
-    const findStmtEnd = (tokIdx, limit) => {
-      let depth = 0;
-      for (let k = tokIdx; k < limit; k++) {
-        const tk = tokens[k];
-        if (tk.type === 'open') depth++;
-        else if (tk.type === 'close') {
-          if (depth === 0) return k;
-          depth--;
-        }
-        else if (depth === 0 && tk.type === 'sep' && tk.char === ';') return k + 1;
-      }
-      return limit;
-    };
-
-    // Find the end of a block: matching `}` from a `{`.
-    const findBlockEnd = (openIdx, limit) => {
-      let depth = 1, k = openIdx + 1;
-      while (k < limit && depth > 0) {
-        if (tokens[k].type === 'open' && tokens[k].char === '{') depth++;
-        else if (tokens[k].type === 'close' && tokens[k].char === '}') depth--;
-        k++;
-      }
-      return k;
-    };
-
-    // Find matching `)` from `(`.
-    const findCloseParen = (openIdx, limit) => {
-      let depth = 1, k = openIdx + 1;
-      while (k < limit && depth > 0) {
-        if (tokens[k].type === 'open' && tokens[k].char === '(') depth++;
-        else if (tokens[k].type === 'close' && tokens[k].char === ')') depth--;
-        k++;
-      }
-      return k;
-    };
-
-    // Recursive descent: rewrite a token range, returning output string.
-    const rewriteRange = (start, end) => {
-      let out = '';
-      let i = start;
-
-      while (i < end) {
-        const t = tokens[i];
-        if (!t) { i++; continue; }
-
-        // Skip whitespace tokens (there aren't any — tokenizer skips them)
-        // but handle open/close braces for block scoping.
-        if (t.type === 'open' && t.char === '{') {
-          out += flushBatch();
-          out += '{\n';
-          const blockEnd = findBlockEnd(i, end);
-          out += rewriteRange(i + 1, blockEnd - 1);
-          out += '}';
-          i = blockEnd;
-          continue;
-        }
-
-        // var/let/const declaration
-        if (t.type === 'other' && (t.text === 'var' || t.text === 'let' || t.text === 'const')) {
-          const nm = tokens[i + 1];
-          if (nm && nm.type === 'other' && nm.text === buildVar) {
-            // buildVar declaration — convert to replaceChildren + init content.
-            state.advanceTo(i);
-            const stmtEnd = findStmtEnd(i, end);
-            // Find the initializer.
-            const eq = tokens[i + 2];
-            if (eq && eq.type === 'sep' && eq.char === '=') {
-              const initChain = state.parseRange(i + 3, stmtEnd - 1); // exclude ;
-              out += flushBatch();
-              if (assignOp === '=') out += target + '.replaceChildren();\n';
-              if (initChain && initChain.length) {
-                // Non-empty init — check if it's just ''.
-                const isEmpty = initChain.length === 1 && initChain[0].type === 'str' && initChain[0].text === '';
-                if (!isEmpty) out += chainToDom(initChain, target) + '\n';
-              }
-            } else {
-              out += flushBatch();
-              if (assignOp === '=') out += target + '.replaceChildren();\n';
-            }
-            i = stmtEnd;
-            continue;
-          }
-          // Non-build var decl — preserve and advance scope.
-          const stmtEnd = findStmtEnd(i, end);
-          state.advanceTo(stmtEnd);
-          out += flushBatch();
-          out += src.slice(t.start, tokens[stmtEnd - 1].end) + '\n';
-          i = stmtEnd;
-          continue;
-        }
-
-        // buildVar += expr
-        if (t.type === 'other' && t.text === buildVar) {
-          const eq = tokens[i + 1];
-          if (eq && eq.type === 'sep' && eq.char === '+=') {
-            state.advanceTo(i + 2);
-            const stmtEnd = findStmtEnd(i + 2, end);
-            const rhsEnd = (tokens[stmtEnd - 1] && tokens[stmtEnd - 1].type === 'sep' && tokens[stmtEnd - 1].char === ';') ? stmtEnd - 1 : stmtEnd;
-            const chain = state.parseRange(i + 2, rhsEnd);
-            if (chain) batch.push(chain);
-            i = stmtEnd;
-            continue;
-          }
-          // buildVar = expr (reassignment, e.g. html = "<p>...")
-          if (eq && eq.type === 'sep' && eq.char === '=') {
-            state.advanceTo(i + 2);
-            const stmtEnd = findStmtEnd(i + 2, end);
-            const rhsEnd = (tokens[stmtEnd - 1] && tokens[stmtEnd - 1].type === 'sep' && tokens[stmtEnd - 1].char === ';') ? stmtEnd - 1 : stmtEnd;
-            const chain = state.parseRange(i + 2, rhsEnd);
-            out += flushBatch();
-            if (chain) out += chainToDom(chain, target) + '\n';
-            i = stmtEnd;
-            continue;
-          }
-        }
-
-        // innerHTML assignment itself — remove.
-        if (t.type === 'other' && t.text === assign.target + '.' + assign.prop) {
-          const stmtEnd = findStmtEnd(i, end);
-          out += flushBatch();
-          i = stmtEnd;
-          continue;
-        }
-        // Also catch reconstructed target: check by source position.
-        if (t.start === assign.srcStart || (i === assign.eqIdx - 1)) {
-          const stmtEnd = findStmtEnd(i, end);
-          out += flushBatch();
-          i = stmtEnd;
-          continue;
-        }
-
-        // for / while / do — preserve structure, recurse into body.
-        if (t.type === 'other' && (t.text === 'for' || t.text === 'while')) {
-          out += flushBatch();
-          const lp = tokens[i + 1];
-          if (lp && lp.type === 'open' && lp.char === '(') {
-            const cp = findCloseParen(i + 1, end);
-            state.advanceTo(cp);
-            // Emit header verbatim.
-            out += src.slice(t.start, tokens[cp - 1].end) + ' ';
-            const bodyTok = tokens[cp];
-            if (bodyTok && bodyTok.type === 'open' && bodyTok.char === '{') {
-              const blockEnd = findBlockEnd(cp, end);
-              out += '{\n' + rewriteRange(cp + 1, blockEnd - 1) + '}\n';
-              i = blockEnd;
-            } else {
-              const stmtEnd = findStmtEnd(cp, end);
-              out += rewriteRange(cp, stmtEnd);
-              i = stmtEnd;
-            }
-            continue;
-          }
-        }
-
-        // do { ... } while (...)
-        if (t.type === 'other' && t.text === 'do') {
-          out += flushBatch();
-          const bodyTok = tokens[i + 1];
-          if (bodyTok && bodyTok.type === 'open' && bodyTok.char === '{') {
-            const blockEnd = findBlockEnd(i + 1, end);
-            out += 'do {\n' + rewriteRange(i + 2, blockEnd - 1) + '}';
-            // Expect `while (cond);`
-            const whTok = tokens[blockEnd];
-            if (whTok && whTok.type === 'other' && whTok.text === 'while') {
-              const stmtEnd = findStmtEnd(blockEnd, end);
-              state.advanceTo(stmtEnd);
-              out += ' ' + src.slice(whTok.start, tokens[stmtEnd - 1].end) + '\n';
-              i = stmtEnd;
-            } else {
-              i = blockEnd;
-            }
-            continue;
-          }
-        }
-
-        // if / else if / else — preserve structure, recurse into bodies.
-        if (t.type === 'other' && t.text === 'if') {
-          out += flushBatch();
-          const lp = tokens[i + 1];
-          if (lp && lp.type === 'open' && lp.char === '(') {
-            const cp = findCloseParen(i + 1, end);
-            state.advanceTo(cp);
-            out += src.slice(t.start, tokens[cp - 1].end) + ' ';
-            const bodyTok = tokens[cp];
-            let ifEnd;
-            if (bodyTok && bodyTok.type === 'open' && bodyTok.char === '{') {
-              const blockEnd = findBlockEnd(cp, end);
-              out += '{\n' + rewriteRange(cp + 1, blockEnd - 1) + '}';
-              ifEnd = blockEnd;
-            } else {
-              const stmtEnd = findStmtEnd(cp, end);
-              out += rewriteRange(cp, stmtEnd);
-              ifEnd = stmtEnd;
-            }
-            // else / else if
-            const elseTok = tokens[ifEnd];
-            if (elseTok && elseTok.type === 'other' && elseTok.text === 'else') {
-              const afterElse = tokens[ifEnd + 1];
-              if (afterElse && afterElse.type === 'other' && afterElse.text === 'if') {
-                out += ' else ';
-                // Recurse — the next iteration handles the `if`.
-                i = ifEnd + 1;
-                continue;
-              }
-              if (afterElse && afterElse.type === 'open' && afterElse.char === '{') {
-                const blockEnd = findBlockEnd(ifEnd + 1, end);
-                out += ' else {\n' + rewriteRange(ifEnd + 2, blockEnd - 1) + '}\n';
-                i = blockEnd;
-              } else {
-                const stmtEnd = findStmtEnd(ifEnd + 1, end);
-                out += ' else ' + rewriteRange(ifEnd + 1, stmtEnd);
-                i = stmtEnd;
-              }
-            } else {
-              out += '\n';
-              i = ifEnd;
-            }
-            continue;
-          }
-        }
-
-        // try / catch / finally — preserve structure, recurse.
-        if (t.type === 'other' && t.text === 'try') {
-          out += flushBatch();
-          const bodyTok = tokens[i + 1];
-          if (bodyTok && bodyTok.type === 'open' && bodyTok.char === '{') {
-            const blockEnd = findBlockEnd(i + 1, end);
-            out += 'try {\n' + rewriteRange(i + 2, blockEnd - 1) + '}';
-            let k = blockEnd;
-            // catch
-            if (tokens[k] && tokens[k].type === 'other' && tokens[k].text === 'catch') {
-              const catchLp = tokens[k + 1];
-              if (catchLp && catchLp.type === 'open' && catchLp.char === '(') {
-                const catchCp = findCloseParen(k + 1, end);
-                state.advanceTo(catchCp);
-                out += ' catch' + src.slice(catchLp.start, tokens[catchCp - 1].end) + ' ';
-                const catchBody = tokens[catchCp];
-                if (catchBody && catchBody.type === 'open' && catchBody.char === '{') {
-                  const catchEnd = findBlockEnd(catchCp, end);
-                  out += '{\n' + rewriteRange(catchCp + 1, catchEnd - 1) + '}';
-                  k = catchEnd;
-                }
-              } else if (catchLp && catchLp.type === 'open' && catchLp.char === '{') {
-                // catch without params
-                const catchEnd = findBlockEnd(k + 1, end);
-                out += ' catch {\n' + rewriteRange(k + 2, catchEnd - 1) + '}';
-                k = catchEnd;
-              }
-            }
-            // finally
-            if (tokens[k] && tokens[k].type === 'other' && tokens[k].text === 'finally') {
-              const finBody = tokens[k + 1];
-              if (finBody && finBody.type === 'open' && finBody.char === '{') {
-                const finEnd = findBlockEnd(k + 1, end);
-                out += ' finally {\n' + rewriteRange(k + 2, finEnd - 1) + '}';
-                k = finEnd;
-              }
-            }
-            out += '\n';
-            i = k;
-            continue;
-          }
-        }
-
-        // switch — preserve structure, recurse into case bodies.
-        if (t.type === 'other' && t.text === 'switch') {
-          out += flushBatch();
-          const lp = tokens[i + 1];
-          if (lp && lp.type === 'open' && lp.char === '(') {
-            const cp = findCloseParen(i + 1, end);
-            state.advanceTo(cp);
-            out += src.slice(t.start, tokens[cp - 1].end) + ' ';
-            const bodyTok = tokens[cp];
-            if (bodyTok && bodyTok.type === 'open' && bodyTok.char === '{') {
-              const switchEnd = findBlockEnd(cp, end);
-              // Walk case/default bodies inside the switch.
-              out += '{\n' + rewriteRange(cp + 1, switchEnd - 1) + '}\n';
-              i = switchEnd;
-              continue;
-            }
-          }
-        }
-
-        // case / default labels inside switch — preserve verbatim.
-        if (t.type === 'other' && (t.text === 'case' || t.text === 'default')) {
-          out += flushBatch();
-          // Emit up to the `:`.
-          let k = i + 1;
-          while (k < end && !(tokens[k].type === 'other' && tokens[k].text === ':')) k++;
-          if (k < end) k++; // past the `:`
-          state.advanceTo(k);
-          out += src.slice(t.start, tokens[k - 1].end) + '\n';
-          i = k;
-          continue;
-        }
-
-        // break / continue — preserve.
-        if (t.type === 'other' && (t.text === 'break' || t.text === 'continue')) {
-          out += flushBatch();
-          const stmtEnd = findStmtEnd(i, end);
-          out += src.slice(t.start, tokens[stmtEnd - 1].end) + '\n';
-          i = stmtEnd;
-          continue;
-        }
-
-        // return — preserve.
-        if (t.type === 'other' && t.text === 'return') {
-          out += flushBatch();
-          const stmtEnd = findStmtEnd(i, end);
-          out += src.slice(t.start, tokens[stmtEnd - 1].end) + '\n';
-          i = stmtEnd;
-          continue;
-        }
-
-        // function declaration — preserve entirely.
-        if (t.type === 'other' && t.text === 'function') {
-          out += flushBatch();
-          // Find the function body end.
-          let k = i + 1;
-          // Skip name and params.
-          while (k < end && !(tokens[k].type === 'open' && tokens[k].char === '{')) k++;
-          if (k < end) {
-            const blockEnd = findBlockEnd(k, end);
-            state.advanceTo(blockEnd);
-            out += src.slice(t.start, tokens[blockEnd - 1].end) + '\n';
-            i = blockEnd;
-          } else {
-            i++;
-          }
-          continue;
-        }
-
-        // Any other statement — advance scope and preserve verbatim.
-        const stmtEnd = findStmtEnd(i, end);
-        if (stmtEnd > i) {
-          state.advanceTo(stmtEnd);
-          out += flushBatch();
-          out += src.slice(t.start, tokens[stmtEnd - 1].end) + '\n';
-          i = stmtEnd;
-        } else {
-          i++;
-        }
-      }
-
-      // Flush any remaining batch.
-      const remaining = flushBatch();
-      if (remaining) out += remaining + '\n';
-      return out;
-    };
-
-    // Find the token range for the build region.
-    let regionTokStart = 0;
-    let regionTokEnd = tokens.length;
-    for (let k = 0; k < tokens.length; k++) {
-      if (tokens[k].start >= regionStart) { regionTokStart = k; break; }
-    }
-    for (let k = tokens.length - 1; k >= 0; k--) {
-      if (tokens[k].end <= regionEnd) { regionTokEnd = k + 1; break; }
-    }
-
-    return rewriteRange(regionTokStart, regionTokEnd);
-  }
 
   // Given the token index of the trailing `.innerHTML`/`.outerHTML` accessor,
   // walk backward collecting balanced `()` / `[]` groups and preceding
@@ -1214,7 +820,7 @@
     return externallyMutable;
   }
 
-  function buildScopeState(tokens, stopAt, externallyMutable) {
+  function buildScopeState(tokens, stopAt, externallyMutable, trackBuildVarInit) {
     const stack = [{ bindings: Object.create(null), isFunction: true }];
     let pendingFunctionBrace = false;
     let pendingFunctionParams = null;
@@ -1227,6 +833,9 @@
     // Variables whose final value was built inside a loop, captured on
     // loop exit. Each entry: { name, loop: {id,kind,headerSrc}, chain }.
     const loopVars = [];
+    // When set, non-build statements inject 'preserve' tokens into this
+    // variable's chain so the emitter outputs them at the right position.
+    let trackBuildVar = trackBuildVarInit || null;
     let nextLoopId = 0;
     // Swappable token array for the inner parsing functions. The main scope
     // walker always uses `tokens` directly. Helpers like `evalExprSrc` can
@@ -3681,24 +3290,23 @@
           if (tokens[j] && tokens[j].type === 'sep' && tokens[j].char === ',') { j++; continue; }
           break;
         }
-        // Inside a loop body, preserve var declarations for non-build
-        // variables so the emitter outputs them.
-        if (loopStack.length > 0) {
-          const entry = loopStack[loopStack.length - 1];
-          const first = tokens[i]; // the var/let/const keyword
+        // Preserve var declarations for non-build variables.
+        if (trackBuildVar) {
+          const first = tokens[i];
           const last = tokens[j - 1];
-          // Check if ANY name in this declaration is the build var.
           let declaresBuildVar = false;
           for (let d = i + 1; d < j; d++) {
-            if (tokens[d].type === 'other' && entry.modifiedVars.has(tokens[d].text)) { declaresBuildVar = true; break; }
+            if (tokens[d].type === 'other' && tokens[d].text === trackBuildVar) { declaresBuildVar = true; break; }
           }
           if (!declaresBuildVar && first && last) {
-            const stmtSrc = first._src.slice(first.start, last.end);
-            for (const bv of entry.modifiedVars) {
-              const cur = resolve(bv);
-              if (cur && cur.kind === 'chain') {
-                assignName(bv, chainBinding([...cur.toks, SYNTH_PLUS, { type: 'preserve', text: stmtSrc, loopId: entry.id }]));
-              }
+            const bv = trackBuildVar;
+            const cur = resolve(bv);
+            if (cur && cur.kind === 'chain') {
+              const stmtSrc = first._src.slice(first.start, last.end);
+              const loopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
+              const preserveTok = { type: 'preserve', text: stmtSrc };
+              if (loopId !== null) preserveTok.loopId = loopId;
+              assignName(bv, chainBinding([...cur.toks, SYNTH_PLUS, preserveTok]));
             }
           }
         }
@@ -3714,21 +3322,19 @@
           const stmtEndIdx = skipExpr(i + 2, stop);
           const r = readValue(i + 2, stop, TERMS_TOP);
           assignName(t.text, r ? r.binding : null);
-          // Inside a loop body, preserve non-build-var assignments in
-          // the build var's chain so the emitter outputs them.
-          if (loopStack.length > 0) {
-            const entry = loopStack[loopStack.length - 1];
-            if (!entry.modifiedVars.has(t.text)) {
+          // Preserve non-build-var assignments in the build var's chain
+          // so the emitter outputs them at the correct position.
+          if (trackBuildVar && t.text !== trackBuildVar) {
+            const bv = trackBuildVar;
+            const cur = resolve(bv);
+            if (cur && cur.kind === 'chain') {
               const first = tokens[i];
               const last = tokens[stmtEndIdx - 1];
               const stmtSrc = first._src.slice(first.start, last.end);
-              for (const bv of entry.modifiedVars) {
-                const cur = resolve(bv);
-                if (cur && cur.kind === 'chain') {
-                  const preserveTok = { type: 'preserve', text: stmtSrc, loopId: entry.id };
-                  assignName(bv, chainBinding([...cur.toks, SYNTH_PLUS, preserveTok]));
-                }
-              }
+              const loopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
+              const preserveTok = { type: 'preserve', text: stmtSrc };
+              if (loopId !== null) preserveTok.loopId = loopId;
+              assignName(bv, chainBinding([...cur.toks, SYNTH_PLUS, preserveTok]));
             }
           }
           i = stmtEndIdx - 1;
@@ -3753,11 +3359,23 @@
         if (eqTok && eqTok.type === 'op' && (eqTok.text === '++' || eqTok.text === '--')) {
           const cur = resolve(t.text);
           const n = cur && cur.kind === 'chain' ? chainAsNumber(cur) : null;
-          if (n !== null) {
+          if (n !== null && loopStack.length === 0) {
             const delta = eqTok.text === '++' ? 1 : -1;
             assignName(t.text, chainBinding([makeSynthStr(String(n + delta))]));
           } else {
-            assignName(t.text, null);
+            assignName(t.text, chainBinding([exprRef(t.text)]));
+          }
+          // Preserve as non-build statement.
+          if (trackBuildVar && t.text !== trackBuildVar) {
+            const bv = trackBuildVar;
+            const bCur = resolve(bv);
+            if (bCur && bCur.kind === 'chain') {
+              const stmtSrc = t.text + eqTok.text;
+              const loopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
+              const preserveTok = { type: 'preserve', text: stmtSrc };
+              if (loopId !== null) preserveTok.loopId = loopId;
+              assignName(bv, chainBinding([...bCur.toks, SYNTH_PLUS, preserveTok]));
+            }
           }
           if (loopStack.length > 0) loopStack[loopStack.length - 1].modifiedVars.add(t.text);
           i = i + 1;
@@ -3826,7 +3444,8 @@
       for (let i = stack.length - 1; i >= 0; i--) if (name in stack[i].bindings) return true;
       return false;
     };
-    return { resolve, resolvePath, parseRange, rewriteTemplate, advanceTo, loopInfo, loopVars, inScope, domElements, domOps };
+    const setTrackBuildVar = (name) => { trackBuildVar = name; };
+    return { resolve, resolvePath, parseRange, rewriteTemplate, advanceTo, setTrackBuildVar, loopInfo, loopVars, inScope, domElements, domOps };
   }
 
   function hasBinding(stack, name) {
@@ -3839,9 +3458,9 @@
   // paths, `.join(sep)`, `.concat(...)`, and template interpolation); if that
   // fails, falls back to per-identifier substitution so downstream chain
   // detection can still find partial matches.
-  function resolveIdentifiers(tokens, startIdx, endIdx) {
+  function resolveIdentifiers(tokens, startIdx, endIdx, buildVar) {
     const externallyMutable = scanMutations(tokens);
-    const state = buildScopeState(tokens, startIdx, externallyMutable);
+    const state = buildScopeState(tokens, startIdx, externallyMutable, buildVar);
     const full = state.parseRange(startIdx, endIdx);
     if (full) return { tokens: full, parsed: true, loopInfo: state.loopInfo, loopVars: state.loopVars, inScope: state.inScope };
     const out = [];
@@ -4231,23 +3850,8 @@
         const target = ex.target || 'document.body';
         const assignOp = ex.assignOp || '=';
 
-        // Try in-place rewriting first — preserves all surrounding code.
-        if (ex._assign && ex._tokens) {
-          const domBlock = convertOne(raw, ex, false, false, sharedUsed);
-          const region = findBuildRegion(ex._tokens, ex._assign, domBlock || '');
-          if (region && region.buildVar) {
-            const rewritten = rewriteInPlace(ex._tokens, trimmed, ex._assign, region, target, assignOp, sharedUsed);
-            if (rewritten !== null) {
-              output += trimmed.slice(cursor, region.regionStart);
-              output += rewritten;
-              cursor = region.regionEnd;
-              while (cursor < trimmed.length && (trimmed[cursor] === ';' || trimmed[cursor] === ' ' || trimmed[cursor] === '\n')) cursor++;
-              continue;
-            }
-          }
-        }
-
-        // Fallback: chain-based conversion.
+        // Chain-based conversion (the chain now carries preserve tokens
+        // for all non-build statements).
         const domBlock = convertOne(raw, ex, false, false, sharedUsed);
         let srcStart = ex.srcStart;
         let srcEnd = ex.srcEnd;
