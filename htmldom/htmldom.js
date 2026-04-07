@@ -2773,13 +2773,8 @@
     };
 
     const stop = Math.min(stopAt, tokens.length);
-    // Skip regions: after a taken if/else branch, skip the remaining branches.
-    const skipRegions = [];  // [{from, to}] sorted by from
-    for (let i = 0; i < stop; i++) {
-      // Check skip regions.
-      while (skipRegions.length && i >= skipRegions[0].from) {
-        i = skipRegions.shift().to;
-      }
+    const walkRange = (startI, endI) => {
+    for (let i = startI; i < endI; i++) {
       // Pop any loops whose body we've walked past (and their shadow frames).
       // For each variable modified during the loop, capture its final chain
       // as a loopVar entry AND replace its binding with a single reference
@@ -2956,20 +2951,16 @@
               }
             }
             if (concrete === true) {
-              // Walk only if-body via the main loop; skip else chain.
-              if (elseEnd > 0) {
-                skipRegions.push({ from: ifEnd, to: elseEnd });
-              }
-              i = j; // resume at `)`, main loop enters `{` naturally
+              // Walk only if-body; skip else chain.
+              walkRange(j + 1, ifEnd);
+              i = (elseEnd > 0 ? elseEnd : ifEnd) - 1;
               continue;
             } else if (concrete === false) {
               // Skip if-body; walk else-body (if present).
               if (elseStart > 0) {
-                skipRegions.push({ from: j + 1, to: elseStart });
-                i = j; // resume, skip region will jump past if-body
-              } else {
-                i = ifEnd - 1; // no else, skip entire if
+                walkRange(elseStart, elseEnd);
               }
+              i = (elseEnd > 0 ? elseEnd : ifEnd) - 1;
               continue;
             }
             // Opaque condition: snapshot bindings, walk both branches,
@@ -2984,29 +2975,10 @@
                   if (!(name in snapshot)) snapshot[name] = stack[si].bindings[name];
                 }
               }
-              // Walk if-body.
-              const ifBodyStart = (bodyTok && bodyTok.type === 'open' && bodyTok.char === '{') ? j + 2 : j + 1;
-              const ifBodyEnd = (bodyTok && bodyTok.type === 'open' && bodyTok.char === '{') ? ifEnd - 1 : ifEnd;
-              for (let wi = ifBodyStart; wi < ifBodyEnd; wi++) {
-                // Process each token via the main walker logic — but we can't
-                // easily recurse. Instead, just handle the common case:
-                // `buildVar += expr;`
-                const wt = tokens[wi];
-                if (wt && wt.type === 'other' && IDENT_RE.test(wt.text)) {
-                  const weq = tokens[wi + 1];
-                  if (weq && weq.type === 'sep' && weq.char === '+=') {
-                    const wr = readValue(wi + 2, stop, TERMS_TOP);
-                    const wCur = resolve(wt.text);
-                    if (wCur && wCur.kind === 'chain' && wr && wr.binding && wr.binding.kind === 'chain') {
-                      const loopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
-                      const tagged = loopId !== null ? tagWithLoop(wr.binding.toks, loopId) : wr.binding.toks;
-                      assignName(wt.text, chainBinding([...wCur.toks, SYNTH_PLUS, ...tagged]));
-                      if (loopStack.length > 0) loopStack[loopStack.length - 1].modifiedVars.add(wt.text);
-                    }
-                    wi = skipExpr(wi + 2, stop) - 1;
-                  }
-                }
-              }
+              // Walk if-body using the full walker; capture loopVars created.
+              const lvBefore = loopVars.length;
+              walkRange(j + 1, ifEnd);
+              const ifLoopVars = loopVars.splice(lvBefore);
               // Capture if-branch bindings.
               const ifBindings = Object.create(null);
               for (let si = stack.length - 1; si >= 0; si--) {
@@ -3018,27 +2990,11 @@
               for (const name in snapshot) {
                 assignName(name, snapshot[name]);
               }
+              const lvBefore2 = loopVars.length;
               if (elseStart > 0 && elseEnd > elseStart) {
-                const elseBodyStart = (tokens[elseStart] && tokens[elseStart].type === 'open' && tokens[elseStart].char === '{') ? elseStart + 1 : elseStart;
-                const elseBodyEnd = (tokens[elseStart] && tokens[elseStart].type === 'open' && tokens[elseStart].char === '{') ? elseEnd - 1 : elseEnd;
-                for (let wi = elseBodyStart; wi < elseBodyEnd; wi++) {
-                  const wt = tokens[wi];
-                  if (wt && wt.type === 'other' && IDENT_RE.test(wt.text)) {
-                    const weq = tokens[wi + 1];
-                    if (weq && weq.type === 'sep' && weq.char === '+=') {
-                      const wr = readValue(wi + 2, stop, TERMS_TOP);
-                      const wCur = resolve(wt.text);
-                      if (wCur && wCur.kind === 'chain' && wr && wr.binding && wr.binding.kind === 'chain') {
-                        const loopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
-                        const tagged = loopId !== null ? tagWithLoop(wr.binding.toks, loopId) : wr.binding.toks;
-                        assignName(wt.text, chainBinding([...wCur.toks, SYNTH_PLUS, ...tagged]));
-                        if (loopStack.length > 0) loopStack[loopStack.length - 1].modifiedVars.add(wt.text);
-                      }
-                      wi = skipExpr(wi + 2, stop) - 1;
-                    }
-                  }
-                }
+                walkRange(elseStart, elseEnd);
               }
+              const elseLoopVars = loopVars.splice(lvBefore2);
               // Merge: for any binding that differs between branches,
               // produce a cond token.
               const elseBindings = Object.create(null);
@@ -3047,19 +3003,44 @@
                   if (!(name in elseBindings)) elseBindings[name] = stack[si].bindings[name];
                 }
               }
+              // Helper: expand loopVars into a binding's chain to get
+              // the full content including loop iterations.
+              const expandWithLVs = (bind, branchLVs) => {
+                if (!bind || bind.kind !== 'chain') return bind ? bind.toks : [];
+                const lvMap = Object.create(null);
+                for (const lv of branchLVs) {
+                  if (!lvMap[lv.name]) lvMap[lv.name] = [];
+                  lvMap[lv.name].push(lv);
+                }
+                const expand = (toks) => {
+                  const out = [];
+                  for (const t of toks) {
+                    if (t.type === 'other' && IDENT_RE.test(t.text) && lvMap[t.text] && lvMap[t.text].length) {
+                      const lv = lvMap[t.text].pop();
+                      for (const vt of expand(lv.chain)) out.push(vt);
+                      lvMap[t.text].push(lv);
+                    } else {
+                      out.push(t);
+                    }
+                  }
+                  return out;
+                };
+                return expand(bind.toks);
+              };
               for (const name in ifBindings) {
                 const ifB = ifBindings[name];
                 const elB = elseBindings[name] || snapshot[name];
-                if (ifB === elB) continue;
-                if (!ifB || !elB || ifB.kind !== 'chain' || elB.kind !== 'chain') continue;
-                if (JSON.stringify(ifB.toks) === JSON.stringify(elB.toks)) continue;
-                // Build variable was mutated differently in each branch.
-                // The if-branch appended tokens beyond the snapshot; those
-                // tokens are the conditional content.
+                if (!ifB || ifB.kind !== 'chain') continue;
+                if (!elB || elB.kind !== 'chain') continue;
+                // Expand loopVars in each branch to get full content.
+                const ifFull = expandWithLVs(ifB, ifLoopVars);
+                const elFull = expandWithLVs(elB, elseLoopVars);
+                if (JSON.stringify(ifFull) === JSON.stringify(elFull)) continue;
                 const snapB = snapshot[name];
                 if (snapB && snapB.kind === 'chain') {
-                  const ifExtra = ifB.toks.slice(snapB.toks.length);
-                  const elExtra = elB.toks.slice(snapB.toks.length);
+                  const snapFull = snapB.toks;
+                  const ifExtra = ifFull.slice(snapFull.length);
+                  const elExtra = elFull.slice(snapFull.length);
                   // Strip leading SYNTH_PLUS from extras.
                   const stripPlus = (arr) => (arr.length && arr[0].type === 'plus') ? arr.slice(1) : arr;
                   const condTok = {
@@ -3379,6 +3360,8 @@
         }
       }
     }
+    };
+    walkRange(0, stop);
 
     // Parse tokens[start, end) as a concat chain, expanding identifier
     // references, member paths, `[...].join(sep)`, and `.concat(...)` calls.
