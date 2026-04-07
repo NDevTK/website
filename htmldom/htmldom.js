@@ -4191,7 +4191,7 @@
               if (extractions.length === 0) {
                 outputParts.push(jsCode);
               } else {
-                const trimmed = jsCode;
+                const trimmed = jsCode.trim();
                 let scriptOutput = '';
                 let cursor = 0;
                 for (const ex of extractions) {
