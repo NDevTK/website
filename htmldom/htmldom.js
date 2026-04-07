@@ -3382,65 +3382,87 @@
       // blocks. Convert HTML to DOM API, process script blocks for
       // innerHTML replacements, preserve non-innerHTML script code as-is.
       if (/^\s*</.test(raw)) {
-        const scriptRe = /<script\b[^>]*>([\s\S]*?)<\/script>/gi;
-        let lastIdx = 0;
-        const parts = [];
-        let m;
-        while ((m = scriptRe.exec(raw)) !== null) {
-          if (m.index > lastIdx) parts.push({ kind: 'html', text: raw.slice(lastIdx, m.index) });
-          parts.push({ kind: 'script', text: m[1] });
-          lastIdx = scriptRe.lastIndex;
+        // Strip document structure (<!DOCTYPE>, <html>, <head>, <body>)
+        // and split into head-content vs body-content regions, then
+        // split each region into HTML portions and <script> blocks.
+        let processed = raw;
+        // Remove DOCTYPE.
+        processed = processed.replace(/<!DOCTYPE[^>]*>/i, '');
+        // Remove <html ...> and </html>.
+        processed = processed.replace(/<\/?html[^>]*>/gi, '');
+
+        // Split into head and body regions.
+        let headContent = '';
+        let bodyContent = processed;
+        const headMatch = processed.match(/<head[^>]*>([\s\S]*?)<\/head>/i);
+        if (headMatch) {
+          headContent = headMatch[1];
+          bodyContent = processed.slice(0, headMatch.index) + processed.slice(headMatch.index + headMatch[0].length);
         }
-        if (lastIdx < raw.length) parts.push({ kind: 'html', text: raw.slice(lastIdx) });
-        if (parts.length === 0) parts.push({ kind: 'html', text: raw });
+        // Remove <body ...> and </body> from body content.
+        bodyContent = bodyContent.replace(/<\/?body[^>]*>/gi, '');
+
+        const processRegion = (html, parentTarget, outputParts, sharedUsed) => {
+          const scriptRe = /<script\b[^>]*>([\s\S]*?)<\/script>/gi;
+          let lastIdx = 0;
+          const parts = [];
+          let m;
+          while ((m = scriptRe.exec(html)) !== null) {
+            if (m.index > lastIdx) parts.push({ kind: 'html', text: html.slice(lastIdx, m.index) });
+            parts.push({ kind: 'script', text: m[1] });
+            lastIdx = scriptRe.lastIndex;
+          }
+          if (lastIdx < html.length) parts.push({ kind: 'html', text: html.slice(lastIdx) });
+
+          for (const part of parts) {
+            if (part.kind === 'html') {
+              const htmlTrimmed = part.text.trim();
+              if (!htmlTrimmed) continue;
+              const result = extractHTML(htmlTrimmed);
+              const block = convertOne(htmlTrimmed, result, false, false, sharedUsed, parentTarget);
+              if (block) outputParts.push(block);
+            } else {
+              const jsCode = part.text;
+              const extractions = extractAllHTML(jsCode);
+              if (extractions.length === 0) {
+                outputParts.push(jsCode);
+              } else {
+                const trimmed = jsCode;
+                let scriptOutput = '';
+                let cursor = 0;
+                for (const ex of extractions) {
+                  if (ex.srcStart === undefined) continue;
+                  const domBlock = convertOne(jsCode, ex, false, false);
+                  let srcStart = ex.srcStart;
+                  let srcEnd = ex.srcEnd;
+                  if (ex._assign && ex._tokens) {
+                    const region = findBuildRegion(ex._tokens, ex._assign, domBlock || '');
+                    if (region) { srcStart = region.regionStart; srcEnd = region.regionEnd; }
+                  }
+                  let pre = trimmed.slice(cursor, srcStart);
+                  if (domBlock && pre.length && !pre.endsWith('\n')) pre += '\n';
+                  scriptOutput += pre;
+                  if (domBlock) {
+                    let lineStart = srcStart;
+                    while (lineStart > 0 && trimmed[lineStart - 1] !== '\n') lineStart--;
+                    const indent = trimmed.slice(lineStart, srcStart).match(/^(\s*)/)[1];
+                    const indented = domBlock.split('\n').map((line, i) => i === 0 ? line : indent + line).join('\n');
+                    scriptOutput += indented;
+                  }
+                  cursor = srcEnd;
+                  while (cursor < trimmed.length && (trimmed[cursor] === ';' || trimmed[cursor] === ' ' || trimmed[cursor] === '\n')) cursor++;
+                }
+                scriptOutput += trimmed.slice(cursor);
+                outputParts.push(scriptOutput);
+              }
+            }
+          }
+        };
 
         const outputParts = [];
         const sharedUsed = new Set();
-        for (const part of parts) {
-          if (part.kind === 'html') {
-            const htmlTrimmed = part.text.trim();
-            if (!htmlTrimmed) continue;
-            const result = extractHTML(htmlTrimmed);
-            const block = convertOne(htmlTrimmed, result, false, false, sharedUsed);
-            if (block) outputParts.push(block);
-          } else {
-            // Process script content: extract innerHTML sites and rewrite
-            // them inline; preserve surrounding code as-is.
-            const jsCode = part.text;
-            const extractions = extractAllHTML(jsCode);
-            if (extractions.length === 0) {
-              outputParts.push(jsCode);
-            } else {
-              const trimmed = jsCode;
-              let scriptOutput = '';
-              let cursor = 0;
-              for (const ex of extractions) {
-                if (ex.srcStart === undefined) continue;
-                const domBlock = convertOne(jsCode, ex, false, false);
-                let srcStart = ex.srcStart;
-                let srcEnd = ex.srcEnd;
-                if (ex._assign && ex._tokens) {
-                  const region = findBuildRegion(ex._tokens, ex._assign, domBlock || '');
-                  if (region) { srcStart = region.regionStart; srcEnd = region.regionEnd; }
-                }
-                let pre = trimmed.slice(cursor, srcStart);
-                if (domBlock && pre.length && !pre.endsWith('\n')) pre += '\n';
-                scriptOutput += pre;
-                if (domBlock) {
-                  let lineStart = srcStart;
-                  while (lineStart > 0 && trimmed[lineStart - 1] !== '\n') lineStart--;
-                  const indent = trimmed.slice(lineStart, srcStart).match(/^(\s*)/)[1];
-                  const indented = domBlock.split('\n').map((line, i) => i === 0 ? line : indent + line).join('\n');
-                  scriptOutput += indented;
-                }
-                cursor = srcEnd;
-                while (cursor < trimmed.length && (trimmed[cursor] === ';' || trimmed[cursor] === ' ' || trimmed[cursor] === '\n')) cursor++;
-              }
-              scriptOutput += trimmed.slice(cursor);
-              outputParts.push(scriptOutput);
-            }
-          }
-        }
+        if (headContent.trim()) processRegion(headContent, 'document.head', outputParts, sharedUsed);
+        if (bodyContent.trim()) processRegion(bodyContent, 'document.body', outputParts, sharedUsed);
         setOutput(outputParts.join('\n'));
         return;
       }
@@ -4048,10 +4070,10 @@
 
   // Produce the DOM-API code block for a single innerHTML/outerHTML
   // extraction. `multi` toggles the leading target-divider comment.
-  function convertOne(raw, result, multi, emitTitle, sharedUsed) {
+  function convertOne(raw, result, multi, emitTitle, sharedUsed, parentOverride) {
     const { target, assignProp, assignOp } = result;
 
-    let parent = 'document.body';
+    let parent = parentOverride || 'document.body';
     let parentFromAssignment = false;
     if (target) {
       parent = assignProp === 'outerHTML' ? target + '.parentNode' : target;
