@@ -14,8 +14,10 @@
   // Monaco web workers need a special proxy for cross-origin CDN loading.
   window.MonacoEnvironment = {
     getWorkerUrl: function () {
-      var js = 'self.MonacoEnvironment = { baseUrl: "' + CDN + '/" }; importScripts("' + CDN + '/base/worker/workerMain.js");';
-      return URL.createObjectURL(new Blob([js], { type: 'text/javascript' }));
+      return 'data:text/javascript;charset=utf-8,' + encodeURIComponent(
+        'self.MonacoEnvironment = { baseUrl: "' + CDN + '/" };' +
+        'importScripts("' + CDN + '/base/worker/workerMain.js");'
+      );
     }
   };
 
