@@ -264,9 +264,14 @@
         for (const t of toks) {
           if (t.type === 'other' && IDENT_RE.test(t.text) && lvByName[t.text] && lvByName[t.text].length) {
             const lv = lvByName[t.text].pop();
-            const expanded = expandChain(lv.chain);
-            for (const vt of expanded) out.push(vt);
-            lvByName[t.text].push(lv); // restore for potential sibling refs
+            for (const vt of expandChain(lv.chain)) out.push(vt);
+            lvByName[t.text].push(lv);
+          } else if (t.type === 'cond') {
+            out.push({ type: 'cond', condExpr: t.condExpr, ifTrue: expandChain(t.ifTrue), ifFalse: expandChain(t.ifFalse), loopId: t.loopId });
+          } else if (t.type === 'trycatch') {
+            out.push({ type: 'trycatch', tryBody: expandChain(t.tryBody), catchBody: expandChain(t.catchBody), catchParam: t.catchParam, loopId: t.loopId });
+          } else if (t.type === 'switch') {
+            out.push({ type: 'switch', discExpr: t.discExpr, branches: t.branches.map(br => ({ label: br.label, caseExpr: br.caseExpr, chain: expandChain(br.chain) })), loopId: t.loopId });
           } else {
             out.push(t);
           }
