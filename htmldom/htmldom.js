@@ -683,6 +683,10 @@
     // variable's chain so the emitter outputs them at the right position.
     // trackBuildVar can be a string (single build var) or a Set (multiple).
     let trackBuildVar = null;
+    // The function scope depth where the build var was declared. Preserve
+    // tokens are only injected at this depth — inner functions with their
+    // own local `html` var are not affected.
+    let trackBuildVarDepth = -1;
     if (trackBuildVarInit) {
       if (Array.isArray(trackBuildVarInit)) {
         trackBuildVar = new Set(trackBuildVarInit);
@@ -690,6 +694,12 @@
         trackBuildVar = new Set([trackBuildVarInit]);
       }
     }
+    // Count function scope depth (number of isFunction frames on the stack).
+    const funcDepth = () => {
+      let d = 0;
+      for (let si = 0; si < stack.length; si++) if (stack[si].isFunction) d++;
+      return d;
+    };
     let buildVarDeclStart = -1;
     let nextLoopId = 0;
     // Swappable token array for the inner parsing functions. The main scope
@@ -2986,7 +2996,7 @@
             }
             // Condition too complex to represent — preserve the entire
             // if/else as raw source so no code is silently dropped.
-            if (trackBuildVar) {
+            if (trackBuildVar && (trackBuildVarDepth < 0 || funcDepth() === trackBuildVarDepth)) {
               const ifStmtEnd = elseEnd > 0 ? elseEnd : ifEnd;
               const first = tokens[i];
               const last = tokens[ifStmtEnd - 1];
@@ -3477,8 +3487,11 @@
           }
           if (hasInit) {
             declBind(nameTok.text, value);
-            if (trackBuildVar && trackBuildVar.has(nameTok.text) && buildVarDeclStart < 0) {
+            if (trackBuildVar && trackBuildVar.has(nameTok.text)) {
+              // Always update — later declarations (closer to the innerHTML
+              // assignment) take precedence over earlier ones in outer scopes.
               buildVarDeclStart = tokens[i].start;
+              trackBuildVarDepth = funcDepth();
             }
           } else {
             if (kind === 'var') {
@@ -3491,8 +3504,9 @@
           if (tokens[j] && tokens[j].type === 'sep' && tokens[j].char === ',') { j++; continue; }
           break;
         }
-        // Preserve var declarations for non-build variables.
-        if (trackBuildVar) {
+        // Preserve var declarations for non-build variables
+        // (only at the same function scope depth as the build var).
+        if (trackBuildVar && (trackBuildVarDepth < 0 || funcDepth() === trackBuildVarDepth)) {
           const first = tokens[i];
           const last = tokens[j - 1];
           let declaresBuildVar = false;
@@ -3526,7 +3540,7 @@
           assignName(t.text, r ? r.binding : null);
           // Preserve non-build-var assignments in the build var's chain
           // so the emitter outputs them at the correct position.
-          if (trackBuildVar && !trackBuildVar.has(t.text)) {
+          if (trackBuildVar && !trackBuildVar.has(t.text) && (trackBuildVarDepth < 0 || funcDepth() === trackBuildVarDepth)) {
             for (const bv of trackBuildVar) {
               const cur = resolve(bv);
               if (cur && cur.kind === 'chain') {
@@ -3569,7 +3583,7 @@
             assignName(t.text, chainBinding([exprRef(t.text)]));
           }
           // Preserve as non-build statement.
-          if (trackBuildVar && !trackBuildVar.has(t.text)) {
+          if (trackBuildVar && !trackBuildVar.has(t.text) && (trackBuildVarDepth < 0 || funcDepth() === trackBuildVarDepth)) {
             for (const bv of trackBuildVar) {
               const bCur = resolve(bv);
               if (bCur && bCur.kind === 'chain') {
@@ -3999,48 +4013,63 @@
           }
           if (lastIdx < html.length) parts.push({ kind: 'html', text: html.slice(lastIdx) });
 
+          // Separate HTML parts from script parts.
+          const htmlParts = [];
+          const scriptParts = [];
           for (const part of parts) {
-            if (part.kind === 'html') {
-              const htmlTrimmed = part.text.trim();
-              if (!htmlTrimmed) continue;
-              const result = extractHTML(htmlTrimmed);
-              const block = convertOne(htmlTrimmed, result, false, false, sharedUsed, parentTarget);
-              if (block) outputParts.push(block);
+            if (part.kind === 'html') htmlParts.push(part);
+            else scriptParts.push(part);
+          }
+
+          // Convert HTML parts.
+          for (const part of htmlParts) {
+            const htmlTrimmed = part.text.trim();
+            if (!htmlTrimmed) continue;
+            const result = extractHTML(htmlTrimmed);
+            const block = convertOne(htmlTrimmed, result, false, false, sharedUsed, parentTarget);
+            if (block) outputParts.push(block);
+          }
+
+          // Combine all script blocks into one for cross-file scope,
+          // then split the output back by tracking separator positions.
+          if (scriptParts.length > 0) {
+            // Build combined JS with separators we can split on later.
+            const separator = '\n/*__BLOCK_SEP__*/\n';
+            const combinedJs = scriptParts.map(p => p.text).join(separator);
+            const extractions = extractAllHTML(combinedJs);
+            if (extractions.length === 0) {
+              // No innerHTML — output each block as-is.
+              for (const part of scriptParts) outputParts.push(part.text);
             } else {
-              const jsCode = part.text;
-              const extractions = extractAllHTML(jsCode);
-              if (extractions.length === 0) {
-                outputParts.push(jsCode);
-              } else {
-                const trimmed = jsCode.trim();
-                let scriptOutput = '';
-                let cursor = 0;
-                for (const ex of extractions) {
-                  if (ex.srcStart === undefined) continue;
-                  const domBlock = convertOne(jsCode, ex, false, false);
-                  let srcStart = ex.srcStart;
-                  let srcEnd = ex.srcEnd;
-                  if (ex.buildVarDeclStart >= 0) {
-                    srcStart = ex.buildVarDeclStart;
-                  }
-                  let pre = trimmed.slice(cursor, srcStart);
-                  // Trim trailing blank lines but keep the last newline.
-                  pre = pre.replace(/\n\s*$/, '\n');
-                  scriptOutput += pre;
-                  if (domBlock) {
-                    let lineStart = srcStart;
-                    while (lineStart > 0 && trimmed[lineStart - 1] !== '\n') lineStart--;
-                    const indent = trimmed.slice(lineStart, srcStart).match(/^(\s*)/)[1];
-                    const indented = domBlock.split('\n').map((line, i) => i === 0 ? indent + line : indent + line).join('\n');
-                    scriptOutput += indented;
-                    if (!indented.endsWith('\n')) scriptOutput += '\n';
-                  }
-                  cursor = srcEnd;
-                  while (cursor < trimmed.length && (trimmed[cursor] === ';' || trimmed[cursor] === ' ' || trimmed[cursor] === '\n')) cursor++;
+              const trimmed = combinedJs.trim();
+              let scriptOutput = '';
+              let cursor = 0;
+              for (const ex of extractions) {
+                if (ex.srcStart === undefined) continue;
+                const domBlock = convertOne(combinedJs, ex, false, false, sharedUsed);
+                let srcStart = ex.srcStart;
+                let srcEnd = ex.srcEnd;
+                if (ex.buildVarDeclStart >= 0) {
+                  srcStart = ex.buildVarDeclStart;
                 }
-                scriptOutput += trimmed.slice(cursor);
-                outputParts.push(scriptOutput);
+                let pre = trimmed.slice(cursor, srcStart);
+                pre = pre.replace(/\n\s*$/, '\n');
+                scriptOutput += pre;
+                if (domBlock) {
+                  let lineStart = srcStart;
+                  while (lineStart > 0 && trimmed[lineStart - 1] !== '\n') lineStart--;
+                  const indent = trimmed.slice(lineStart, srcStart).match(/^(\s*)/)[1];
+                  const indented = domBlock.split('\n').map((line) => indent + line).join('\n');
+                  scriptOutput += indented;
+                  if (!indented.endsWith('\n')) scriptOutput += '\n';
+                }
+                cursor = srcEnd;
+                while (cursor < trimmed.length && (trimmed[cursor] === ';' || trimmed[cursor] === ' ' || trimmed[cursor] === '\n')) cursor++;
               }
+              scriptOutput += trimmed.slice(cursor);
+              // Remove block separators from output.
+              scriptOutput = scriptOutput.replace(/\n\/\*__BLOCK_SEP__\*\/\n/g, '\n');
+              outputParts.push(scriptOutput);
             }
           }
         };

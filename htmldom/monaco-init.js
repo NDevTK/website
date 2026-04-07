@@ -77,5 +77,101 @@
     var s = document.createElement('script');
     s.src = 'htmldom.js';
     document.body.appendChild(s);
+
+    // --- File System Access API: folder selection ---
+
+    // Stored file contents from the opened folder.
+    var folderFiles = null; // { name: content } map
+
+    // Recursively read all .html, .htm, .js files from a directory handle.
+    async function readFolderRecursive(dirHandle, prefix) {
+      var files = {};
+      for await (var entry of dirHandle.values()) {
+        var path = prefix ? prefix + '/' + entry.name : entry.name;
+        if (entry.kind === 'file') {
+          if (/\.(html?|js)$/i.test(entry.name)) {
+            var file = await entry.getFile();
+            files[path] = await file.text();
+          }
+        } else if (entry.kind === 'directory' && entry.name !== 'node_modules' && entry.name !== '.git') {
+          var sub = await readFolderRecursive(entry, path);
+          for (var k in sub) files[k] = sub[k];
+        }
+      }
+      return files;
+    }
+
+    // Resolve <script src="..."> references in an HTML file to build a
+    // combined source with all scripts inlined in order. This gives the
+    // converter full cross-file scope.
+    function resolveScriptSrcs(htmlContent, htmlPath, files) {
+      var dir = htmlPath.indexOf('/') >= 0 ? htmlPath.slice(0, htmlPath.lastIndexOf('/')) : '';
+      return htmlContent.replace(/<script\s+src="([^"]+)"[^>]*><\/script>/gi, function(match, src) {
+        var resolved = dir ? dir + '/' + src : src;
+        // Normalize path (handle ../ etc.)
+        var parts = resolved.split('/');
+        var normalized = [];
+        for (var i = 0; i < parts.length; i++) {
+          if (parts[i] === '..') { normalized.pop(); }
+          else if (parts[i] !== '.') { normalized.push(parts[i]); }
+        }
+        var key = normalized.join('/');
+        if (files[key]) {
+          return '<script>\n' + files[key] + '\n<\/script>';
+        }
+        return match; // keep original if file not found
+      });
+    }
+
+    // Populate the file selector dropdown.
+    function populateFileSelect(files) {
+      var sel = document.getElementById('fileSelect');
+      sel.innerHTML = '<option value="">-- Select a file --</option>';
+      var names = Object.keys(files).sort();
+      for (var i = 0; i < names.length; i++) {
+        var opt = document.createElement('option');
+        opt.value = names[i];
+        opt.textContent = names[i];
+        sel.appendChild(opt);
+      }
+      sel.style.display = names.length ? '' : 'none';
+    }
+
+    // When a file is selected, load it into the editor with scripts resolved.
+    document.getElementById('fileSelect').addEventListener('change', function() {
+      var name = this.value;
+      if (!name || !folderFiles) return;
+      var content = folderFiles[name];
+      if (/\.html?$/i.test(name)) {
+        content = resolveScriptSrcs(content, name, folderFiles);
+      }
+      window._monacoIn.setValue(content);
+    });
+
+    // Open folder button.
+    document.getElementById('openFolder').addEventListener('click', async function() {
+      if (!window.showDirectoryPicker) {
+        alert('File System Access API not supported in this browser.');
+        return;
+      }
+      try {
+        var dirHandle = await window.showDirectoryPicker({ mode: 'read' });
+        document.getElementById('folderName').textContent = dirHandle.name;
+        folderFiles = await readFolderRecursive(dirHandle, '');
+        populateFileSelect(folderFiles);
+
+        // Auto-select the first HTML file.
+        var htmlFiles = Object.keys(folderFiles).filter(function(n) { return /\.html?$/i.test(n); });
+        if (htmlFiles.length) {
+          var sel = document.getElementById('fileSelect');
+          sel.value = htmlFiles[0];
+          sel.dispatchEvent(new Event('change'));
+        }
+      } catch (e) {
+        if (e.name !== 'AbortError') {
+          console.error('Failed to read folder:', e);
+        }
+      }
+    });
   });
 })();
