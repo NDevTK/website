@@ -810,6 +810,31 @@
         const next = tokens[i + 1];
         if (next && next.type === 'sep' && /^[-+*/%]?=$/.test(next.char)) noteMut(t.text);
         if (next && next.type === 'op' && (next.text === '++' || next.text === '--')) noteMut(t.text);
+        // `arr[i] = ...` mutates arr.
+        if (next && next.type === 'open' && next.char === '[') {
+          let d = 1, j = i + 2;
+          while (j < tokens.length && d > 0) {
+            if (tokens[j].type === 'open' && tokens[j].char === '[') d++;
+            else if (tokens[j].type === 'close' && tokens[j].char === ']') d--;
+            j++;
+          }
+          const eq = tokens[j];
+          if (eq && eq.type === 'sep' && eq.char === '=') noteMut(t.text);
+        }
+      }
+      // `arr.push(...)` / `obj.foo = ...` — the path token carries the base
+      // name as its prefix.
+      if (t.type === 'other' && PATH_RE.test(t.text)) {
+        const dot = t.text.indexOf('.');
+        const base = t.text.slice(0, dot);
+        const rest = t.text.slice(dot + 1);
+        const next = tokens[i + 1];
+        if (next && next.type === 'sep' && /^[-+*/%]?=$/.test(next.char)) noteMut(base);
+        if (next && next.type === 'open' && next.char === '(') {
+          const lastDot = rest.lastIndexOf('.');
+          const method = lastDot >= 0 ? rest.slice(lastDot + 1) : rest;
+          if (/^(push|pop|shift|unshift|splice|sort|reverse|fill|copyWithin)$/.test(method)) noteMut(base);
+        }
       }
     }
     const externallyMutable = new Set();
@@ -3049,18 +3074,41 @@
                 const snapB = snapshot[name];
                 if (snapB && snapB.kind === 'chain') {
                   const snapFull = snapB.toks;
-                  const ifExtra = ifFull.slice(snapFull.length);
-                  const elExtra = elFull.slice(snapFull.length);
-                  // Strip leading SYNTH_PLUS from extras.
                   const stripPlus = (arr) => (arr.length && arr[0].type === 'plus') ? arr.slice(1) : arr;
-                  const currentLoopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
-                  const condTok = {
-                    type: 'cond', condExpr,
-                    ifTrue: stripPlus(ifExtra),
-                    ifFalse: stripPlus(elExtra),
+                  // Check if each branch starts with the snapshot prefix
+                  // (appended via +=) or is a full replacement (via =).
+                  const startsWithSnap = (full) => {
+                    if (full.length < snapFull.length) return false;
+                    for (let s = 0; s < snapFull.length; s++) {
+                      if (JSON.stringify(full[s]) !== JSON.stringify(snapFull[s])) return false;
+                    }
+                    return true;
                   };
-                  if (currentLoopId !== null) condTok.loopId = currentLoopId;
-                  assignName(name, chainBinding([...snapB.toks, SYNTH_PLUS, condTok]));
+                  const ifAppended = startsWithSnap(ifFull);
+                  const elAppended = startsWithSnap(elFull);
+                  const ifExtra = ifAppended ? stripPlus(ifFull.slice(snapFull.length)) : ifFull;
+                  const elExtra = elAppended ? stripPlus(elFull.slice(snapFull.length)) : elFull;
+                  const currentLoopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
+                  if (!ifAppended || !elAppended) {
+                    // At least one branch did `html = ...` (full replacement).
+                    // Emit as a ternary: the whole value depends on the condition.
+                    const condTok = {
+                      type: 'cond', condExpr,
+                      ifTrue: ifFull,
+                      ifFalse: elFull,
+                    };
+                    if (currentLoopId !== null) condTok.loopId = currentLoopId;
+                    // The chain IS the cond — no snapshot prefix.
+                    assignName(name, chainBinding([condTok]));
+                  } else {
+                    const condTok = {
+                      type: 'cond', condExpr,
+                      ifTrue: ifExtra,
+                      ifFalse: elExtra,
+                    };
+                    if (currentLoopId !== null) condTok.loopId = currentLoopId;
+                    assignName(name, chainBinding([...snapB.toks, SYNTH_PLUS, condTok]));
+                  }
                   if (loopStack.length > 0) loopStack[loopStack.length - 1].modifiedVars.add(name);
                 }
               }
@@ -3079,6 +3127,238 @@
             }
             // Fallback: couldn't parse condition — skip entire if/else.
             i = (elseEnd > 0 ? elseEnd : ifEnd) - 1;
+            continue;
+          }
+        }
+      }
+
+      // Helpers for finding matching braces/parens in the token stream.
+      const findBlockEnd = (openIdx) => {
+        let d = 1, k = openIdx + 1;
+        while (k < stop && d > 0) {
+          if (tokens[k].type === 'open' && tokens[k].char === '{') d++;
+          else if (tokens[k].type === 'close' && tokens[k].char === '}') d--;
+          k++;
+        }
+        return k;
+      };
+      const findCloseParen = (openIdx) => {
+        let d = 1, k = openIdx + 1;
+        while (k < stop && d > 0) {
+          if (tokens[k].type === 'open' && tokens[k].char === '(') d++;
+          else if (tokens[k].type === 'close' && tokens[k].char === ')') d--;
+          k++;
+        }
+        return k;
+      };
+
+      // `try { ... } catch(e) { ... } finally { ... }` — walk each block
+      // with snapshot/restore so build-var mutations become cond tokens
+      // (try-branch vs catch-branch). The finally block runs unconditionally.
+      if (t.text === 'try') {
+        const tryOpen = tokens[i + 1];
+        if (tryOpen && tryOpen.type === 'open' && tryOpen.char === '{') {
+          const tryEnd = findBlockEnd(i + 1);
+          let catchStart = -1, catchEnd = -1, catchParam = '';
+          let finallyStart = -1, finallyEnd = -1;
+          let k = tryEnd;
+          // catch
+          if (tokens[k] && tokens[k].type === 'other' && tokens[k].text === 'catch') {
+            const cp = tokens[k + 1];
+            if (cp && cp.type === 'open' && cp.char === '(') {
+              const cpEnd = findCloseParen(k + 1);
+              catchParam = tokens[k + 2] ? tokens[k + 2].text : 'e';
+              const catchOpen = tokens[cpEnd];
+              if (catchOpen && catchOpen.type === 'open' && catchOpen.char === '{') {
+                catchStart = cpEnd;
+                catchEnd = findBlockEnd(cpEnd);
+                k = catchEnd;
+              }
+            } else if (cp && cp.type === 'open' && cp.char === '{') {
+              catchStart = k + 1;
+              catchEnd = findBlockEnd(k + 1);
+              k = catchEnd;
+            }
+          }
+          // finally
+          if (tokens[k] && tokens[k].type === 'other' && tokens[k].text === 'finally') {
+            const finOpen = tokens[k + 1];
+            if (finOpen && finOpen.type === 'open' && finOpen.char === '{') {
+              finallyStart = k + 1;
+              finallyEnd = findBlockEnd(k + 1);
+              k = finallyEnd;
+            }
+          }
+          // Snapshot, walk try body.
+          const snapshot = Object.create(null);
+          for (let si = stack.length - 1; si >= 0; si--) {
+            for (const name in stack[si].bindings) {
+              if (!(name in snapshot)) snapshot[name] = stack[si].bindings[name];
+            }
+          }
+          const lvBefore = loopVars.length;
+          walkRange(i + 1, tryEnd);
+          const tryLoopVars = loopVars.splice(lvBefore);
+          const tryBindings = Object.create(null);
+          for (let si = stack.length - 1; si >= 0; si--) {
+            for (const name in stack[si].bindings) {
+              if (!(name in tryBindings)) tryBindings[name] = stack[si].bindings[name];
+            }
+          }
+          // Restore and walk catch body.
+          for (const name in snapshot) assignName(name, snapshot[name]);
+          const lvBefore2 = loopVars.length;
+          if (catchStart >= 0) walkRange(catchStart, catchEnd);
+          const catchLoopVars = loopVars.splice(lvBefore2);
+          const catchBindings = Object.create(null);
+          for (let si = stack.length - 1; si >= 0; si--) {
+            for (const name in stack[si].bindings) {
+              if (!(name in catchBindings)) catchBindings[name] = stack[si].bindings[name];
+            }
+          }
+          // Merge build var: try = one branch, catch = other.
+          const expandWithLVs = (bind, branchLVs) => {
+            if (!bind || bind.kind !== 'chain') return bind ? bind.toks : [];
+            const lvMap = Object.create(null);
+            for (const lv of branchLVs) {
+              if (!lvMap[lv.name]) lvMap[lv.name] = [];
+              lvMap[lv.name].push(lv);
+            }
+            const expand = (toks) => {
+              const out = [];
+              for (const ct of toks) {
+                if (ct.type === 'other' && IDENT_RE.test(ct.text) && lvMap[ct.text] && lvMap[ct.text].length) {
+                  const lv = lvMap[ct.text].pop();
+                  for (const vt of expand(lv.chain)) out.push(vt);
+                  lvMap[ct.text].push(lv);
+                } else out.push(ct);
+              }
+              return out;
+            };
+            return expand(bind.toks);
+          };
+          for (const name in tryBindings) {
+            if (!tryBindings[name] || tryBindings[name].kind !== 'chain') continue;
+            const tryB = tryBindings[name];
+            const catchB = catchBindings[name] || snapshot[name];
+            if (!catchB || catchB.kind !== 'chain') continue;
+            const tryFull = expandWithLVs(tryB, tryLoopVars);
+            const catchFull = expandWithLVs(catchB, catchLoopVars);
+            if (JSON.stringify(tryFull) === JSON.stringify(catchFull)) continue;
+            const snapB = snapshot[name];
+            if (snapB && snapB.kind === 'chain') {
+              if (name === trackBuildVar) {
+                const tryExtra = tryFull.slice(snapB.toks.length);
+                const catchExtra = catchFull.slice(snapB.toks.length);
+                const stripPlus = (arr) => (arr.length && arr[0].type === 'plus') ? arr.slice(1) : arr;
+                // Use a 'trycatch' token that the parser/emitter handles.
+                const tryCatchTok = { type: 'trycatch', tryBody: stripPlus(tryExtra), catchBody: stripPlus(catchExtra), catchParam };
+                assignName(name, chainBinding([...snapB.toks, SYNTH_PLUS, tryCatchTok]));
+              } else {
+                assignName(name, chainBinding([exprRef(name)]));
+              }
+            }
+          }
+          // Walk finally body unconditionally (it always runs).
+          if (finallyStart >= 0) walkRange(finallyStart, finallyEnd);
+          i = k - 1;
+          continue;
+        }
+      }
+
+      // `switch (expr) { case ...: ... }` — walk each case body with
+      // snapshot/restore so build-var mutations become a 'switchcase' token.
+      if (t.text === 'switch') {
+        const lp = tokens[i + 1];
+        if (lp && lp.type === 'open' && lp.char === '(') {
+          const cp = findCloseParen(i + 1);
+          // Read the discriminant expression.
+          const discVal = readValue(i + 2, cp - 1, null);
+          const discExpr = discVal ? chainAsExprText(discVal.binding) : null;
+          const bodyOpen = tokens[cp];
+          if (bodyOpen && bodyOpen.type === 'open' && bodyOpen.char === '{') {
+            const switchEnd = findBlockEnd(cp);
+            // Find case/default labels and their body ranges.
+            const cases = [];
+            let depth = 0;
+            for (let j = cp + 1; j < switchEnd - 1; j++) {
+              const tk = tokens[j];
+              if (tk.type === 'open' && tk.char === '{') depth++;
+              if (tk.type === 'close' && tk.char === '}') depth--;
+              if (depth > 0) continue;
+              if (tk.type === 'other' && (tk.text === 'case' || tk.text === 'default')) {
+                // Find the colon.
+                let colonIdx = j + 1;
+                while (colonIdx < switchEnd - 1 && !(tokens[colonIdx].type === 'other' && tokens[colonIdx].text === ':')) colonIdx++;
+                const label = tk.text === 'default' ? 'default' : null;
+                const caseExpr = tk.text === 'case' ? (function() {
+                  const v = readValue(j + 1, colonIdx, null);
+                  return v ? chainAsExprText(v.binding) : null;
+                })() : null;
+                cases.push({ label, caseExpr, bodyStart: colonIdx + 1, bodyEnd: -1, srcStart: tk.start });
+              }
+            }
+            // Set body ends: each case runs until the next case/default or switchEnd.
+            for (let c = 0; c < cases.length; c++) {
+              cases[c].bodyEnd = c + 1 < cases.length ? cases[c + 1].srcStart : switchEnd - 1;
+              // Find token index for bodyEnd position.
+              for (let j = cases[c].bodyStart; j < switchEnd; j++) {
+                if (tokens[j].start >= (c + 1 < cases.length ? cases[c + 1].srcStart : tokens[switchEnd - 2].start)) {
+                  cases[c].bodyEnd = j;
+                  break;
+                }
+              }
+            }
+            // Snapshot and walk each case.
+            const snapshot = Object.create(null);
+            for (let si = stack.length - 1; si >= 0; si--) {
+              for (const name in stack[si].bindings) {
+                if (!(name in snapshot)) snapshot[name] = stack[si].bindings[name];
+              }
+            }
+            const caseResults = [];
+            for (const cs of cases) {
+              // Restore snapshot.
+              for (const name in snapshot) assignName(name, snapshot[name]);
+              walkRange(cs.bodyStart, cs.bodyEnd);
+              const bindings = Object.create(null);
+              for (let si = stack.length - 1; si >= 0; si--) {
+                for (const name in stack[si].bindings) {
+                  if (!(name in bindings)) bindings[name] = stack[si].bindings[name];
+                }
+              }
+              caseResults.push({ label: cs.label, caseExpr: cs.caseExpr, bindings });
+            }
+            // Merge: produce a switchcase token for the build var.
+            if (trackBuildVar) {
+              const snapB = snapshot[trackBuildVar];
+              if (snapB && snapB.kind === 'chain') {
+                const branches = [];
+                for (const cr of caseResults) {
+                  const b = cr.bindings[trackBuildVar];
+                  if (b && b.kind === 'chain') {
+                    const extra = b.toks.slice(snapB.toks.length);
+                    const stripPlus = (arr) => (arr.length && arr[0].type === 'plus') ? arr.slice(1) : arr;
+                    branches.push({ label: cr.label, caseExpr: cr.caseExpr, chain: stripPlus(extra) });
+                  }
+                }
+                if (branches.length) {
+                  const switchTok = { type: 'switch', discExpr: discExpr || '/* switch */', branches };
+                  assignName(trackBuildVar, chainBinding([...snapB.toks, SYNTH_PLUS, switchTok]));
+                }
+              }
+            }
+            // Non-build vars: make opaque.
+            for (const cr of caseResults) {
+              for (const name in cr.bindings) {
+                if (name === trackBuildVar) continue;
+                const b = cr.bindings[name];
+                if (b && snapshot[name] && JSON.stringify(b) !== JSON.stringify(snapshot[name])) {
+                  assignName(name, chainBinding([exprRef(name)]));
+                }
+              }
+            }
+            i = switchEnd - 1;
             continue;
           }
         }
@@ -3970,6 +4250,12 @@
       if (toks.length === 1 && toks[0].type === 'preserve') {
         return { kind: 'preserve', text: toks[0].text, loopId };
       }
+      if (toks.length === 1 && toks[0].type === 'trycatch') {
+        return { kind: 'trycatch', tryBody: toks[0].tryBody, catchBody: toks[0].catchBody, catchParam: toks[0].catchParam, loopId };
+      }
+      if (toks.length === 1 && toks[0].type === 'switch') {
+        return { kind: 'switch', discExpr: toks[0].discExpr, branches: toks[0].branches, loopId };
+      }
       if (toks.length === 1 && (toks[0].type === 'cond' || toks[0].type === 'iter')) {
         return Object.assign({ kind: toks[0].type, loopId }, toks[0]);
       }
@@ -4191,7 +4477,7 @@
         if (t.type === 'str') parts.push(JSON.stringify(t.text));
         else if (t.type === 'other') parts.push(t.text);
         else if (t.type === 'cond') parts.push('(' + t.condExpr + ' ? ' + chainToksAsExpr(t.ifTrue) + ' : ' + chainToksAsExpr(t.ifFalse) + ')');
-        else if (t.type === 'preserve') { /* skip — side-effect statements don't produce values */ }
+        else if (t.type === 'preserve' || t.type === 'trycatch' || t.type === 'switch') { /* skip — control flow tokens don't produce values */ }
       }
       return parts.join(' + ') || '""';
     };
@@ -4207,6 +4493,24 @@
         } else {
           // Non-TEXT context — fall back to expression.
           feedExpr(op.iterExpr + '.map(function(' + op.paramName + ') { return ' + chainToksAsExpr(op.perElemChain) + '; }).join(\'\')', op.loopId);
+        }
+      }
+      else if (op.kind === 'trycatch') {
+        if (state === TEXT) {
+          flushText();
+          const tryNodes = parseChainToVNodes(op.tryBody);
+          const catchNodes = parseChainToVNodes(op.catchBody);
+          addChild({ kind: 'trycatch', tryBody: tryNodes, catchBody: catchNodes, catchParam: op.catchParam, loopId: op.loopId });
+        }
+      }
+      else if (op.kind === 'switch') {
+        if (state === TEXT) {
+          flushText();
+          const branches = op.branches.map(br => ({
+            label: br.label, caseExpr: br.caseExpr,
+            nodes: parseChainToVNodes(br.chain),
+          }));
+          addChild({ kind: 'switch', discExpr: op.discExpr, branches, loopId: op.loopId });
         }
       }
       else if (op.kind === 'preserve') {
@@ -4281,6 +4585,39 @@
       const v = makeVar('text', used);
       lines.push('const ' + v + ' = document.createTextNode(' + jsStr(text).code + ');');
       lines.push(parentVar + '.appendChild(' + v + ');');
+      return;
+    }
+
+    if (node.kind === 'trycatch') {
+      const tryLines = [];
+      const catchLines = [];
+      const tryUsed = new Set(used);
+      const catchUsed = new Set(used);
+      emitVNodes(node.tryBody, parentVar, tryLines, tryUsed, opts, loopInfoMap, loopIds, nsCtx);
+      emitVNodes(node.catchBody, parentVar, catchLines, catchUsed, opts, loopInfoMap, loopIds, nsCtx);
+      lines.push('try {');
+      for (const l of tryLines) lines.push('  ' + l);
+      lines.push('} catch(' + (node.catchParam || 'e') + ') {');
+      for (const l of catchLines) lines.push('  ' + l);
+      lines.push('}');
+      return;
+    }
+
+    if (node.kind === 'switch') {
+      lines.push('switch (' + node.discExpr + ') {');
+      for (const br of node.branches) {
+        if (br.label === 'default') {
+          lines.push('  default:');
+        } else {
+          lines.push('  case ' + br.caseExpr + ':');
+        }
+        const caseLines = [];
+        const caseUsed = new Set(used);
+        emitVNodes(br.nodes, parentVar, caseLines, caseUsed, opts, loopInfoMap, loopIds, nsCtx);
+        for (const l of caseLines) lines.push('    ' + l);
+        lines.push('    break;');
+      }
+      lines.push('}');
       return;
     }
 
