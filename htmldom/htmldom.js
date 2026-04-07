@@ -57,6 +57,12 @@
     'itemscope', 'inert'
   ]);
 
+  // HTML void elements that have no closing tag.
+  const VOID_ELEMENTS = new Set([
+    'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input',
+    'link', 'meta', 'param', 'source', 'track', 'wbr'
+  ]);
+
   // Attributes that should always go through setAttribute (non-reflected, legacy, or namespaced).
   const FORCE_ATTR = new Set([
     'credentialless', 'sandbox', 'frameborder', 'marginwidth', 'marginheight',
@@ -218,14 +224,7 @@
     if (!trimmed) return [];
     const tokens = tokenize(trimmed);
     const assigns = findAllHtmlAssignments(tokens);
-    return assigns.map((assign) => {
-      const result = extractOneAssignment(tokens, assign);
-      result.srcStart = assign.srcStart;
-      result.srcEnd = assign.srcEnd;
-      result._assign = assign;
-      result._tokens = tokens;
-      return result;
-    });
+    return assigns.map((assign) => extractOneAssignment(tokens, assign));
   }
 
   // Produce an { html, autoSubs, target, assignProp, assignOp, ... } record
@@ -240,10 +239,7 @@
       // loop-built variable's binding with a single name-reference token
       // on loop exit, and here the main chain's references to those vars
       // get expanded back to their loopVar chains (which keep their
-      // loop-body tags) so the materializer emits matching loop markers.
-      // References to OTHER loop-built vars inside those expanded chains
-      // stay as autoSubs placeholders; the caller can emit their
-      // pre-computation loops separately via the loopVars output.
+      // loop-body tags) so the direct parser emits matching loop wrappers.
       const lvMap = Object.create(null);
       if (r.loopVars) for (const lv of r.loopVars) lvMap[lv.name] = lv;
       const mainTokens = [];
@@ -254,38 +250,18 @@
           mainTokens.push(t);
         }
       }
-      const m = materializeFlatChain(mainTokens, r.loopInfo);
-      if (r.loopVars && r.loopVars.length && r.inScope) {
-        const kept = r.loopVars.filter((lv) => r.inScope(lv.name));
-        if (kept.length) {
-          m.loopVars = kept.map((lv) => {
-            const stripped = stripLoopTag(lv.chain, lv.loop.id);
-            const mv = materializeFlatChain(stripped, r.loopInfo);
-            return Object.assign({ name: lv.name, loop: lv.loop }, mv);
-          });
-        }
-      }
-      return Object.assign(m, { target, assignProp, assignOp });
+      return { target, assignProp, assignOp, chainTokens: mainTokens, loopInfoMap: r.loopInfo };
     }
-    const chain = findBestConcatChain(r.tokens);
-    if (chain) return Object.assign(chain, { target, assignProp, assignOp });
-    let best = null;
-    for (const t of r.tokens) {
-      if (t.type === 'str' || t.type === 'tmpl') {
-        const { html, autoSubs } = materializeStringToken(t, 0);
-        if (/</.test(html) && (!best || html.length > best.html.length)) {
-          best = { html, autoSubs };
-        }
-      }
-    }
-    if (best) return Object.assign(best, { target, assignProp, assignOp });
-    return { html: '', autoSubs: [], target, assignProp, assignOp };
+    // Resolver returned the RHS tokens with per-identifier substitution but
+    // couldn't parse the full expression as a concat chain. Return the
+    // resolved tokens directly — they'll go through parseChainToVNodes.
+    return { target, assignProp, assignOp, chainTokens: r.tokens };
   }
 
   function extractHTML(input) {
     const trimmed = input.trim();
-    if (!trimmed) return { html: '', autoSubs: [], target: null };
-    if (trimmed.startsWith('<')) return { html: trimmed, autoSubs: [], target: null };
+    if (!trimmed) return { target: null, assignProp: null, assignOp: null, chainTokens: [] };
+    if (trimmed.startsWith('<')) return { target: null, assignProp: null, assignOp: null, chainTokens: [{ type: 'str', text: trimmed }] };
 
     const tokens = tokenize(trimmed);
 
@@ -296,37 +272,28 @@
     const assignProp = assign ? assign.prop : null;
     const assignOp = assign ? assign.op : null;
 
-    // Resolve identifier references inside the RHS using the binding state at
-    // the assignment site (honoring var/let/const scope, shadowing, and
-    // reassignment order). When parsing succeeds we materialize the concat
-    // chain directly so even single-operand results (including pure opaque
-    // references) become a valid { html, autoSubs } pair.
-    let searchTokens;
+    // Resolve identifier references inside the RHS using the scope state at
+    // the assignment site.
     if (assign) {
       return extractOneAssignment(tokens, assign);
     }
-    searchTokens = tokens;
 
-    const chain = findBestConcatChain(searchTokens);
-    if (chain) return Object.assign(chain, { target, assignProp, assignOp });
-
-    // Fallback: pick the single string/template literal with the most HTML-ish
-    // content.
-    let best = null;
-    for (const t of searchTokens) {
-      if (t.type === 'str' || t.type === 'tmpl') {
-        const { html, autoSubs } = materializeStringToken(t, 0);
-        if (/</.test(html) && (!best || html.length > best.html.length)) {
-          best = { html, autoSubs };
-        }
+    // No innerHTML assignment — resolve the entire input as an expression.
+    // Only attempt resolution if the input contains potential HTML (< or
+    // string concatenation with +).
+    const hasHtmlHint = tokens.some(t =>
+      (t.type === 'str' && /</.test(t.text)) ||
+      (t.type === 'tmpl') ||
+      (t.type === 'plus'));
+    if (hasHtmlHint) {
+      const r = resolveIdentifiers(tokens, 0, tokens.length);
+      if (r.parsed) {
+        return { target, assignProp, assignOp, chainTokens: r.tokens, loopInfoMap: r.loopInfo };
       }
+      return { target, assignProp, assignOp, chainTokens: r.tokens };
     }
-    if (best) return Object.assign(best, { target, assignProp, assignOp });
-    // If an assignment target was identified but its RHS held no HTML,
-    // don't fall back to scanning the whole input — that would graft
-    // unrelated HTML from elsewhere (e.g. `x='<iframe>'`) onto the target.
-    if (assign) return { html: '', autoSubs: [], target, assignProp, assignOp };
-    return { html: trimmed, autoSubs: [], target: null, assignProp: null, assignOp: null };
+    // Plain text / non-HTML — pass through as-is.
+    return { target: null, assignProp: null, assignOp: null, chainTokens: [{ type: 'str', text: trimmed }] };
   }
 
   // Find the first top-level `<expr>.innerHTML = ...` / `.outerHTML = ...` /
@@ -355,12 +322,10 @@
       if (!trail) continue;
       const prop = trail[2];
       let target = trail[1];
-      let targetSrcStart = -1;
       if (target === '') {
         const r = reconstructTarget(tokens, i - 1);
         if (!r) continue;
-        target = r.text;
-        targetSrcStart = r.srcStart;
+        target = r;
       }
       let depth = 0;
       let rhsEnd = tokens.length;
@@ -373,248 +338,9 @@
           break;
         }
       }
-      // Source character positions for the entire statement.
-      const srcStart = targetSrcStart >= 0 ? targetSrcStart : prev.start;
-      let srcEnd = rhsEnd < tokens.length ? tokens[rhsEnd].end : tokens[tokens.length - 1].end;
-      // Include trailing semicolon in the replaced range.
-      if (rhsEnd < tokens.length && tokens[rhsEnd].type === 'sep' && tokens[rhsEnd].char === ';') {
-        srcEnd = tokens[rhsEnd].end;
-      }
-      out.push({ target, prop, op: t.char, rhsStart: i + 1, rhsEnd, srcStart, srcEnd, eqIdx: i });
+      out.push({ target, prop, op: t.char, rhsStart: i + 1, rhsEnd });
     }
     return out;
-  }
-
-  // Given an innerHTML assignment and the full token list, find the "build
-  // region" — the contiguous span of source code that exists solely to
-  // construct the value assigned to innerHTML. This includes:
-  //   - The declaration of the build variable (`var html = ''`)
-  //   - All `+=` / `=` mutations to it (`html += '<div>'`)
-  //   - Loops whose body ONLY mutates the build variable
-  //   - The innerHTML assignment itself
-  // Returns { regionStart, regionEnd } (source char positions) or null.
-  function findBuildRegion(tokens, assign, replacementCode) {
-    // Variables referenced in the replacement output must NOT be removed.
-    const referencedInReplacement = new Set();
-    if (replacementCode) {
-      const refTokens = replacementCode.match(/[A-Za-z_$][A-Za-z0-9_$]*/g);
-      if (refTokens) for (const t of refTokens) referencedInReplacement.add(t);
-    }
-    const rhsToks = [];
-    for (let j = assign.rhsStart; j < assign.rhsEnd; j++) rhsToks.push(tokens[j]);
-    const hasBuildVar = rhsToks.length === 1 && rhsToks[0].type === 'other' && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(rhsToks[0].text);
-    const buildVar = hasBuildVar ? rhsToks[0].text : null;
-
-    const assignTokIdx = assign.eqIdx;
-    const targetTokIdx = assignTokIdx - 1;
-
-    // Find the enclosing block start: walk backwards from the innerHTML
-    // site to find the `{` that opens the containing block (function body,
-    // if-body, loop body, or file scope). Track depth so nested blocks
-    // are skipped.
-    let blockStart = 0;
-    {
-      let depth = 0;
-      for (let j = targetTokIdx - 1; j >= 0; j--) {
-        const tk = tokens[j];
-        if (tk.type === 'close' && tk.char === '}') depth++;
-        if (tk.type === 'open' && tk.char === '{') {
-          if (depth === 0) { blockStart = j + 1; break; }
-          depth--;
-        }
-      }
-    }
-
-    // Split tokens[blockStart..targetTokIdx] into statements within this
-    // block. Respects brace depth (for nested blocks/loops) and paren
-    // depth (for `for(;;)` headers).
-    const allStmts = [];
-    let stmtStart = blockStart;
-    let braceDepth = 0;
-    let parenDepth = 0;
-    // Scan through rhsEnd (not just targetTokIdx) so the innerHTML
-    // statement itself is included in allStmts.
-    const scanEnd = assign.rhsEnd < tokens.length ? assign.rhsEnd : tokens.length - 1;
-    for (let j = blockStart; j <= scanEnd; j++) {
-      const tk = tokens[j];
-      if (tk.type === 'open' && tk.char === '{') braceDepth++;
-      if (tk.type === 'close' && tk.char === '}') {
-        braceDepth--;
-        if (braceDepth < 0) braceDepth = 0;
-        if (braceDepth === 0 && parenDepth === 0) {
-          allStmts.push({ tokStart: stmtStart, tokEnd: j + 1 });
-          stmtStart = j + 1;
-          continue;
-        }
-      }
-      if (tk.type === 'open' && tk.char === '(') parenDepth++;
-      if (tk.type === 'close' && tk.char === ')') {
-        parenDepth--;
-        if (parenDepth < 0) parenDepth = 0;
-      }
-      if (braceDepth === 0 && parenDepth === 0 && tk.type === 'sep' && tk.char === ';') {
-        allStmts.push({ tokStart: stmtStart, tokEnd: j + 1 });
-        stmtStart = j + 1;
-      }
-    }
-
-    // Scan backwards to find the build region.
-    let regionTokStart = -1;
-    if (!buildVar) {
-      // No build variable — still check for helper declarations
-      // immediately before the innerHTML that are only used in the RHS
-      // and not in the replacement output.
-      regionTokStart = -1; // will be extended by transitive scan below
-    }
-    for (let s = allStmts.length - 1; s >= 0 && buildVar; s--) {
-      const stmt = allStmts[s];
-      // Skip the innerHTML statement itself — it's being replaced, not a build stmt.
-      if (stmt.tokStart <= targetTokIdx && stmt.tokEnd > targetTokIdx) continue;
-      const stmtTokens = tokens.slice(stmt.tokStart, stmt.tokEnd);
-      let writesBuildVar = false;
-      let isBuildVarDecl = false;
-
-      for (let j = 0; j < stmtTokens.length; j++) {
-        const tk = stmtTokens[j];
-        if (tk.type === 'other' && tk.text === buildVar) {
-          const next = stmtTokens[j + 1];
-          if (next && next.type === 'sep' && (next.char === '=' || next.char === '+=')) {
-            writesBuildVar = true;
-          }
-        }
-        if (tk.type === 'other' && (tk.text === 'var' || tk.text === 'let' || tk.text === 'const')) {
-          const nm = stmtTokens[j + 1];
-          if (nm && nm.type === 'other' && nm.text === buildVar) {
-            writesBuildVar = true;
-            isBuildVarDecl = true;
-          }
-        }
-        if (tk.type === 'other' && (tk.text === 'for' || tk.text === 'while' || tk.text === 'do')) {
-          for (let k = j; k < stmtTokens.length; k++) {
-            if (stmtTokens[k].type === 'other' && stmtTokens[k].text === buildVar) {
-              const nx = stmtTokens[k + 1];
-              if (nx && nx.type === 'sep' && (nx.char === '=' || nx.char === '+=')) {
-                writesBuildVar = true;
-              }
-            }
-          }
-        }
-      }
-
-      if (!writesBuildVar) break;
-      regionTokStart = stmt.tokStart;
-      if (isBuildVarDecl) break;
-    }
-
-    if (regionTokStart < 0 && buildVar) return null;
-    // For inline innerHTML expressions (no build var), set region to the
-    // innerHTML statement itself so the transitive scanner can extend upward.
-    if (regionTokStart < 0) {
-      // Find the statement containing the innerHTML assignment.
-      // Use srcStart to match by source position since the target
-      // expression may span multiple tokens before .innerHTML.
-      const assignCharStart = assign.srcStart;
-      for (const stmt of allStmts) {
-        if (tokens[stmt.tokStart].start <= assignCharStart && tokens[stmt.tokEnd - 1].end >= assignCharStart) {
-          regionTokStart = stmt.tokStart;
-          break;
-        }
-      }
-      if (regionTokStart < 0) return null;
-    }
-
-    // Find enclosing block end for scope-limited checks.
-    let blockEnd = tokens.length;
-    {
-      let depth = 0;
-      for (let j = assign.rhsEnd; j < tokens.length; j++) {
-        const tk = tokens[j];
-        if (tk.type === 'open' && tk.char === '{') depth++;
-        if (tk.type === 'close' && tk.char === '}') {
-          if (depth === 0) { blockEnd = j; break; }
-          depth--;
-        }
-      }
-    }
-
-    // Extend the region upward transitively: any statement immediately
-    // before the region that declares or mutates a variable ONLY used
-    // within the dead region is also dead. Repeat until no more
-    // statements can be absorbed (handles chains like var url → var text
-    // → while(text...) → for(...s+=...) → innerHTML = s).
-    //
-    // Collect all identifiers referenced within the current dead region.
-    const collectIdents = (start, end) => {
-      const ids = new Set();
-      for (let j = start; j < end; j++) {
-        if (tokens[j].type === 'other' && IDENT_RE.test(tokens[j].text)) ids.add(tokens[j].text);
-      }
-      return ids;
-    };
-    let changed = true;
-    while (changed) {
-      changed = false;
-      const deadIdents = collectIdents(regionTokStart, assign.rhsEnd);
-      for (let s = allStmts.length - 1; s >= 0; s--) {
-        const stmt = allStmts[s];
-        if (stmt.tokStart >= regionTokStart) continue;
-        if (stmt.tokEnd !== regionTokStart) continue;
-        // Find what this statement declares or primarily writes to.
-        const stmtTokens = tokens.slice(stmt.tokStart, stmt.tokEnd);
-        let declNames = [];
-        for (let j = 0; j < stmtTokens.length; j++) {
-          const tk = stmtTokens[j];
-          if (tk.type === 'other' && (tk.text === 'var' || tk.text === 'let' || tk.text === 'const')) {
-            const nm = stmtTokens[j + 1];
-            if (nm && nm.type === 'other' && IDENT_RE.test(nm.text)) declNames.push(nm.text);
-          }
-        }
-        // Also catch loops (for/while/do) that only mutate dead-region vars.
-        let isLoop = stmtTokens.some(tk => tk.type === 'other' && (tk.text === 'for' || tk.text === 'while' || tk.text === 'do'));
-        if (isLoop) {
-          // All identifiers written in this loop.
-          for (let j = 0; j < stmtTokens.length; j++) {
-            const tk = stmtTokens[j];
-            if (tk.type === 'other' && IDENT_RE.test(tk.text)) {
-              const nx = stmtTokens[j + 1];
-              if (nx && nx.type === 'sep' && (nx.char === '=' || nx.char === '+=')) declNames.push(tk.text);
-            }
-          }
-        }
-        if (declNames.length === 0) break;
-        // Check: are ALL declared names only used within the dead region
-        // (including this statement itself) and not after?
-        let allDead = true;
-        for (const name of declNames) {
-          // Keep alive if the replacement code references this variable.
-          if (referencedInReplacement.has(name)) { allDead = false; break; }
-          if (!deadIdents.has(name) && name !== buildVar) { allDead = false; break; }
-          for (let j = assign.rhsEnd + 1; j < blockEnd; j++) {
-            if (tokens[j].type === 'other' && tokens[j].text === name) { allDead = false; break; }
-          }
-          if (!allDead) break;
-        }
-        if (!allDead) break;
-        regionTokStart = stmt.tokStart;
-        changed = true;
-        break; // restart scan with extended region
-      }
-    }
-
-    // Verify: is buildVar used AFTER the innerHTML assignment within the
-    // same scope? If so, don't remove the build code.
-    if (buildVar) {
-      for (let j = assign.rhsEnd + 1; j < blockEnd; j++) {
-        const tk = tokens[j];
-        if (tk.type === 'other' && tk.text === buildVar) return null;
-        if (tk.type === 'other' && tk.text.endsWith('.' + buildVar)) return null;
-      }
-    }
-
-    // Only return a region if we actually extended beyond the innerHTML statement.
-    const regionStart = tokens[regionTokStart].start;
-    if (regionStart >= assign.srcStart) return null;
-    return { regionStart, regionEnd: assign.srcEnd };
   }
 
   // Given the token index of the trailing `.innerHTML`/`.outerHTML` accessor,
@@ -646,8 +372,7 @@
     if (firstIdx > accessorIdx - 1) return null;
     const first = tokens[firstIdx];
     // Exclude the trailing .innerHTML/.outerHTML from the target slice.
-    const text = first._src.slice(first.start, startAccessor.start).trim() || null;
-    return text ? { text, srcStart: first.start } : null;
+    return first._src.slice(first.start, startAccessor.start).trim() || null;
   }
 
   const IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
@@ -686,13 +411,9 @@
   const KNOWN_METHODS = new Set([
     'concat', 'join',
     'toUpperCase', 'toLowerCase', 'trim', 'trimStart', 'trimEnd', 'trimLeft', 'trimRight',
-    'repeat', 'slice', 'substring', 'substr', 'charAt', 'at', 'indexOf', 'lastIndexOf',
+    'repeat', 'slice', 'substring', 'substr', 'charAt', 'indexOf', 'lastIndexOf',
     'includes', 'startsWith', 'endsWith', 'padStart', 'padEnd', 'toString',
     'split', 'reverse', 'map', 'filter', 'forEach', 'reduce',
-    'replace', 'replaceAll', 'charCodeAt', 'codePointAt', 'match', 'search', 'test',
-    'toFixed', 'toPrecision', 'toExponential', 'valueOf',
-    'find', 'findIndex', 'some', 'every', 'flat', 'flatMap', 'fill', 'splice',
-    'sort', 'keys', 'values', 'entries',
   ]);
 
   const MATH_CONSTANTS = {
@@ -705,16 +426,10 @@
   // bindings hold named or indexed child bindings (each itself a chain,
   // object, or array) so member access and destructuring can walk into them.
   const chainBinding = (toks) => ({ kind: 'chain', toks });
-  const objectBinding = (props) => ({ kind: 'object', props, accessors: Object.create(null), classRef: null });
+  const objectBinding = (props) => ({ kind: 'object', props });
   const arrayBinding = (elems) => ({ kind: 'array', elems });
-  const functionBinding = (params, bodyStart, bodyEnd, isBlock, closure) => ({
-    kind: 'function', params, bodyStart, bodyEnd, isBlock, closure: closure || null,
-  });
-  // Class binding: tracks constructor (a functionBinding) and named methods.
-  // `new ClassName(args)` invokes the constructor with `this` bound to a
-  // fresh object; method calls on instances look up methods here.
-  const classBinding = (name, ctor, methods, superClass) => ({
-    kind: 'class', name, ctor, methods, superClass,
+  const functionBinding = (params, bodyStart, bodyEnd, isBlock) => ({
+    kind: 'function', params, bodyStart, bodyEnd, isBlock,
   });
   // Virtual DOM element binding factories. Each `buildScopeState` invocation
   // maintains its own element-id counter via a closure (see below). The
@@ -749,24 +464,6 @@
   const makeSynthStr = (text) => ({
     type: 'str', quote: "'", raw: text, text, start: 0, end: 0, _src: '',
   });
-  // Like makeSynthStr but for numeric values — no quote wrapper, so
-  // chainAsNumber recognises them as numeric rather than string.
-  const makeSynthNum = (n) => ({
-    type: 'str', quote: '', raw: String(n), text: String(n), start: 0, end: 0, _src: '', jsType: 'number',
-  });
-  // Boolean token — `jsType: 'boolean'` lets typeof fold correctly and
-  // allows truthiness checks to work reliably.  JS coerces true→1,
-  // false→0 in arithmetic, so chainAsNumber can fold these.
-  const makeSynthBool = (v) => ({
-    type: 'str', quote: '', raw: String(v), text: String(v), start: 0, end: 0, _src: '', jsType: 'boolean',
-  });
-  // null / undefined tokens.
-  const makeSynthNull = () => ({
-    type: 'str', quote: '', raw: 'null', text: 'null', start: 0, end: 0, _src: '', jsType: 'null',
-  });
-  const makeSynthUndef = () => ({
-    type: 'str', quote: '', raw: 'undefined', text: 'undefined', start: 0, end: 0, _src: '', jsType: 'undefined',
-  });
 
   // Clone operand tokens, applying a `loopId` tag to operands that don't
   // already carry one. Plus tokens pass through unchanged. Existing tags
@@ -778,19 +475,6 @@
       if (t.type === 'plus') return t;
       if ('loopId' in t) return t;
       return Object.assign({}, t, { loopId });
-    });
-  }
-
-  // Clone operand tokens, removing a specific `loopId` tag (e.g. when a
-  // chain is captured as a loopVar and the outer loop is already implied
-  // by the loopVar entry — we don't want double-wrapping markers).
-  function stripLoopTag(toks, loopId) {
-    return toks.map((t) => {
-      if (t.type === 'plus') return t;
-      if (t.loopId !== loopId) return t;
-      const copy = Object.assign({}, t);
-      delete copy.loopId;
-      return copy;
     });
   }
 
@@ -842,12 +526,7 @@
   // `next` is the index after the param (points at `,` or `)`).
   function parseParamWithDefault(tokens, k, stop) {
     const nm = tokens[k];
-    if (!nm || nm.type !== 'other') return null;
-    // Rest parameter: `...name`
-    if (nm.text.startsWith('...') && IDENT_RE.test(nm.text.slice(3))) {
-      return { param: { name: nm.text.slice(3), rest: true }, next: k + 1 };
-    }
-    if (!IDENT_RE.test(nm.text)) return null;
+    if (!nm || nm.type !== 'other' || !IDENT_RE.test(nm.text)) return null;
     let j = k + 1;
     const sep = tokens[j];
     if (sep && sep.type === 'sep' && sep.char === '=') {
@@ -877,50 +556,10 @@
     };
     for (let i = 0; i < tokens.length; i++) {
       const t = tokens[i];
-      if (t.type === 'other' && t.text === 'function') {
-        // Don't increment depth for function callbacks inside array method
-        // calls like `.forEach(function`, `.map(function` — these are
-        // synchronous and their mutations are deterministic.
-        const prev = tokens[i - 1];
-        const prev2 = tokens[i - 2];
-        const isSyncCallback = prev && prev.type === 'open' && prev.char === '(' &&
-          prev2 && prev2.type === 'other' && /\.(forEach|map|filter|reduce|some|every|find|findIndex|flatMap)$/.test(prev2.text);
-        if (!isSyncCallback) pendingFnBrace = true;
-        continue;
-      }
+      if (t.type === 'other' && t.text === 'function') { pendingFnBrace = true; continue; }
       if (t.type === 'other' && t.text === '=>') {
         const nt = tokens[i + 1];
-        if (nt && nt.type === 'open' && nt.char === '{') {
-          // Don't increment depth for arrow callbacks inside sync array
-          // methods. Scan back past the arrow params to find the `(` from
-          // the method call. Pattern: `.forEach(x => {` or `.map((a,b) => {`.
-          let isSyncCb = false;
-          let back = i - 1;
-          // Skip past arrow params: either a single ident or `(params)`.
-          if (tokens[back] && tokens[back].type === 'close' && tokens[back].char === ')') {
-            let pd = 1; back--;
-            while (back >= 0 && pd > 0) {
-              if (tokens[back].type === 'close' && tokens[back].char === ')') pd++;
-              else if (tokens[back].type === 'open' && tokens[back].char === '(') pd--;
-              if (pd > 0) back--;
-            }
-            // back is at the `(` of params.
-          }
-          // back - 1 should be the `(` of the method call, back - 2 the method path.
-          if (tokens[back - 1] && tokens[back - 1].type === 'open' && tokens[back - 1].char === '(' &&
-              tokens[back - 2] && tokens[back - 2].type === 'other' &&
-              /\.(forEach|map|filter|reduce|some|every|find|findIndex|flatMap)$/.test(tokens[back - 2].text)) {
-            isSyncCb = true;
-          }
-          // Also single-param: `.forEach(x => {` — back is at x, back-1 is `(`, back-2 is method.
-          if (!isSyncCb && tokens[back] && tokens[back].type === 'other' && IDENT_RE.test(tokens[back].text) &&
-              tokens[back - 1] && tokens[back - 1].type === 'open' && tokens[back - 1].char === '(' &&
-              tokens[back - 2] && tokens[back - 2].type === 'other' &&
-              /\.(forEach|map|filter|reduce|some|every|find|findIndex|flatMap)$/.test(tokens[back - 2].text)) {
-            isSyncCb = true;
-          }
-          if (!isSyncCb) pendingFnBrace = true;
-        }
+        if (nt && nt.type === 'open' && nt.char === '{') pendingFnBrace = true;
         continue;
       }
       if (t.type === 'open' && t.char === '{') {
@@ -961,33 +600,6 @@
         const next = tokens[i + 1];
         if (next && next.type === 'sep' && /^[-+*/%]?=$/.test(next.char)) noteMut(t.text);
         if (next && next.type === 'op' && (next.text === '++' || next.text === '--')) noteMut(t.text);
-        // `arr[i] = ...` / `obj[k] = ...` mutates arr/obj.
-        if (next && next.type === 'open' && next.char === '[') {
-          let d = 1; let j = i + 2;
-          while (j < tokens.length && d > 0) {
-            const tk = tokens[j];
-            if (tk.type === 'open' && tk.char === '[') d++;
-            else if (tk.type === 'close' && tk.char === ']') d--;
-            if (d > 0) j++;
-          }
-          const eq = tokens[j + 1];
-          if (eq && eq.type === 'sep' && eq.char === '=') noteMut(t.text);
-        }
-      }
-      // `arr.push(...)` / `obj.foo = ...` — the path token carries the base
-      // name as its prefix. Flag mutation if followed by a mutating method or `=`.
-      if (t.type === 'other' && PATH_RE.test(t.text)) {
-        const dot = t.text.indexOf('.');
-        const base = t.text.slice(0, dot);
-        const rest = t.text.slice(dot + 1);
-        const next = tokens[i + 1];
-        if (next && next.type === 'sep' && /^[-+*/%]?=$/.test(next.char)) noteMut(base);
-        if (next && next.type === 'open' && next.char === '(') {
-          // Last segment is the method name.
-          const lastDot = rest.lastIndexOf('.');
-          const method = lastDot >= 0 ? rest.slice(lastDot + 1) : rest;
-          if (method === 'push' || method === 'pop' || method === 'shift' || method === 'unshift' || method === 'splice' || method === 'sort' || method === 'reverse' || method === 'fill' || method === 'copyWithin') noteMut(base);
-        }
       }
     }
     const externallyMutable = new Set();
@@ -1138,32 +750,11 @@
     // the pre-pass flagged as externally mutable, so reads of such names
     // consistently produce an opaque source reference rather than a
     // stale initial value.
-    // Snapshot all bindings currently in scope (for closures).
-    // Capture a closure: store references to the actual scope frames (not
-    // copies) so multiple closures over the same variable share state.
-    const captureScope = () => stack.slice();
-    const asRef = (name, value) => value;
-    // resolve() returns opaque references for externally-mutable variables
-    // when reading from inside a function body (sideEffects off). This
-    // prevents inlining values like `currentUrl = 0` into functions where
-    // the variable is modified at runtime by other functions.
-    const resolveWithMutability = (name) => {
-      const val = resolve(name);
-      if (!externallyMutable || !externallyMutable.has(name)) return val;
-      // If a synchronous call already modified this binding, it's fresh.
-      if (confirmedFresh.has(name)) return val;
-      // The variable is modified by functions at deeper scope. If the
-      // binding lives outside the current function scope, the value
-      // might be stale (set by uncalled async functions at runtime).
-      let bindingFrame = -1;
-      for (let i = stack.length - 1; i >= 0; i--) {
-        if (name in stack[i].bindings) { bindingFrame = i; break; }
+    const asRef = (name, value) => {
+      if (externallyMutable && externallyMutable.has(name)) {
+        return chainBinding([exprRef(name)]);
       }
-      if (bindingFrame < 0) return val;
-      for (let i = stack.length - 1; i > bindingFrame; i--) {
-        if (stack[i].isFunction) return chainBinding([exprRef(name)]);
-      }
-      return val;
+      return value;
     };
     const declBlock = (name, value) => { topBlock().bindings[name] = asRef(name, value); };
     const declFunction = (name, value) => {
@@ -1171,75 +762,30 @@
         if (stack[i].isFunction) { stack[i].bindings[name] = asRef(name, value); return; }
       }
     };
-    // Track which bindings have been confirmed fresh by a synchronous
-    // function call (sideEffects on + cross-function write).
-    const confirmedFresh = new Set();
     const assignName = (name, value) => {
       for (let i = stack.length - 1; i >= 0; i--) {
-        if (name in stack[i].bindings) {
-          if (!sideEffects) {
-            let inCurrentFunction = false;
-            for (let j = stack.length - 1; j >= i; j--) {
-              if (j === i) { inCurrentFunction = true; break; }
-              if (stack[j].isFunction) break;
-            }
-            if (!inCurrentFunction) return;
-          }
-          stack[i].bindings[name] = asRef(name, value);
-          // If modifying across a function boundary with effects on,
-          // mark as fresh so resolveWithMutability trusts the value.
-          if (sideEffects) {
-            for (let j = stack.length - 1; j > i; j--) {
-              if (stack[j].isFunction) { confirmedFresh.add(name); break; }
-            }
-          }
-          return;
-        }
+        if (name in stack[i].bindings) { stack[i].bindings[name] = asRef(name, value); return; }
       }
-      if (sideEffects) stack[0].bindings[name] = asRef(name, value);
+      stack[0].bindings[name] = asRef(name, value); // implicit global
     };
     const resolve = (name) => {
-      // `this` resolves to the nearest function scope's thisBinding.
-      if (name === 'this') {
-        for (let i = stack.length - 1; i >= 0; i--) {
-          if (stack[i].isFunction && stack[i].thisBinding) return stack[i].thisBinding;
-        }
-        return null;
-      }
       for (let i = stack.length - 1; i >= 0; i--) {
         if (name in stack[i].bindings) return stack[i].bindings[name];
       }
       return null;
-    };
-    // Check if a global builtin name (possibly dotted like 'Math.floor')
-    // has been shadowed by a user-declared binding. Returns true when the
-    // root identifier appears in ANY scope frame, meaning the user
-    // redefined it and we must NOT apply builtin semantics.
-    const isShadowed = (dottedName) => {
-      const root = dottedName.includes('.') ? dottedName.slice(0, dottedName.indexOf('.')) : dottedName;
-      return resolve(root) !== null;
     };
     // Walk a dotted path ('obj.a.b') resolving into object/array/chain
     // bindings. Handles `.length` specially on arrays and on chains whose
     // operands are all known string/template literals.
     const resolvePath = (path) => {
       const parts = path.split('.');
-      let b = resolveWithMutability(parts[0]);
+      let b = resolve(parts[0]);
       for (let i = 1; i < parts.length && b; i++) {
         const p = parts[i];
         if (b.kind === 'object') {
-          // Check for getter in accessors map.
-          const accessor = b.accessors && b.accessors[p];
-          if (accessor && accessor.get) {
-            stack.push({ bindings: Object.create(null), isFunction: true, thisBinding: b });
-            b = instantiateFunctionBinding(accessor.get, []);
-            stack.pop();
-          } else {
-            // Missing property on a known object → undefined (not null).
-            b = p in b.props ? b.props[p] : chainBinding([makeSynthUndef()]);
-          }
+          b = b.props[p] || null;
         } else if (p === 'length' && b.kind === 'array') {
-          b = chainBinding([makeSynthNum(b.elems.length)]);
+          b = chainBinding([makeSynthStr(String(b.elems.length))]);
         } else if (p === 'length' && b.kind === 'chain') {
           let n = 0; let ok = true;
           for (const tk of b.toks) {
@@ -1257,7 +803,7 @@
             }
             ok = false; break;
           }
-          b = ok ? chainBinding([makeSynthNum(n)]) : null;
+          b = ok ? chainBinding([makeSynthStr(String(n))]) : null;
         } else {
           return null;
         }
@@ -1431,19 +977,10 @@
               const sep = tks[i];
               if (sep && sep.type === 'other' && sep.text === ':') {
                 i++;
-                // Value may be a nested destructuring pattern or a simple name.
-                const nested = tks[i];
-                if (nested && nested.type === 'open' && (nested.char === '{' || nested.char === '[')) {
-                  const sub = readDestructurePattern(i, stop);
-                  if (!sub) return null;
-                  name = sub.pattern; // nested pattern stored as name
-                  i = sub.next;
-                } else if (nested && nested.type === 'other' && IDENT_RE.test(nested.text)) {
-                  name = nested.text;
-                  i++;
-                } else {
-                  return null;
-                }
+                const alias = tks[i];
+                if (!alias || alias.type !== 'other' || !IDENT_RE.test(alias.text)) return null;
+                name = alias.text;
+                i++;
               } else {
                 name = key;
               }
@@ -1537,12 +1074,7 @@
           seen[key] = true;
           let val = props ? (props[key] || null) : null;
           if (val === null && dflt) val = resolveDefault(dflt);
-          // Nested destructuring: name is a pattern object, not a string.
-          if (typeof name === 'object' && name !== null && name.kind) {
-            applyPatternBindings(name, val, bind);
-          } else {
-            bind(name, val);
-          }
+          bind(name, val);
         }
         if (pattern.rest) {
           if (props) {
@@ -1584,7 +1116,6 @@
       const open = tks[k];
       if (!open || open.type !== 'open' || open.char !== '{') return null;
       const props = Object.create(null);
-      const litAccessors = Object.create(null);
       let i = k + 1;
       while (i < stop) {
         const tk = tks[i];
@@ -1628,54 +1159,10 @@
           if (IDENT_RE.test(tk.text)) {
             // `get`/`set`/`async` prefix on a method definition — skip the
             // leading keyword and treat the following name as the key.
-            if ((tk.text === 'get' || tk.text === 'set') &&
+            if ((tk.text === 'get' || tk.text === 'set' || tk.text === 'async') &&
                 tks[i + 1] && tks[i + 1].type === 'other' && IDENT_RE.test(tks[i + 1].text) &&
                 tks[i + 2] && tks[i + 2].type === 'open' && tks[i + 2].char === '(') {
-              const accessorKind = tk.text;
-              i++; // skip get/set
-              keyName = tks[i].text;
-              i++;
-              // Parse params and body into a functionBinding.
-              const params = [];
-              let p = i + 1;
-              if (tks[p] && tks[p].type === 'close' && tks[p].char === ')') { p++; }
-              else {
-                let ok = true;
-                while (p < stop) {
-                  const pt = parseParamWithDefault(tks, p, stop);
-                  if (!pt) { ok = false; break; }
-                  params.push(pt.param);
-                  p = pt.next;
-                  if (tks[p] && tks[p].type === 'close' && tks[p].char === ')') { p++; break; }
-                  if (tks[p] && tks[p].type === 'sep' && tks[p].char === ',') { p++; continue; }
-                  ok = false; break;
-                }
-                if (!ok) { i = p; continue; }
-              }
-              if (tks[p] && tks[p].type === 'open' && tks[p].char === '{') {
-                let bd = 1, bEnd = p + 1;
-                while (bEnd < stop && bd > 0) {
-                  if (tks[bEnd].type === 'open' && tks[bEnd].char === '{') bd++;
-                  else if (tks[bEnd].type === 'close' && tks[bEnd].char === '}') bd--;
-                  bEnd++;
-                }
-                const fn = functionBinding(params, p + 1, bEnd - 1, true);
-                // Store accessor on the object's accessors map (not in props).
-                // Getters are invoked on read; setters on write.
-                if (!litAccessors[keyName]) litAccessors[keyName] = {};
-                if (accessorKind === 'get') litAccessors[keyName].get = fn;
-                else litAccessors[keyName].set = fn;
-                i = bEnd;
-                const sep = tks[i];
-                if (sep && sep.type === 'sep' && sep.char === ',') { i++; continue; }
-                break;
-              }
-              continue;
-            }
-            if (tk.text === 'async' &&
-                tks[i + 1] && tks[i + 1].type === 'other' && IDENT_RE.test(tks[i + 1].text) &&
-                tks[i + 2] && tks[i + 2].type === 'open' && tks[i + 2].char === '(') {
-              i++; // skip async
+              i++; // skip prefix
               keyName = tks[i].text;
               i++;
             } else {
@@ -1705,50 +1192,30 @@
         } else {
           return null;
         }
-        // Method shorthand: `key(...) { ... }` — parse as a functionBinding
-        // so `obj.method()` can invoke it.
+        // Method shorthand: `key(...) { ... }` — skip over the method body
+        // entirely and continue to the next property.
         if (tks[i] && tks[i].type === 'open' && tks[i].char === '(') {
-          const params = [];
-          let p = i + 1;
-          if (tks[p] && tks[p].type === 'close' && tks[p].char === ')') { p++; }
-          else {
-            let ok = true;
-            while (p < stop) {
-              const pt = parseParamWithDefault(tks, p, stop);
-              if (!pt) { ok = false; break; }
-              params.push(pt.param);
-              p = pt.next;
-              if (tks[p] && tks[p].type === 'close' && tks[p].char === ')') { p++; break; }
-              if (tks[p] && tks[p].type === 'sep' && tks[p].char === ',') { p++; continue; }
-              ok = false; break;
-            }
-            if (!ok) {
-              // Can't parse params — skip the method body.
-              while (p < stop) {
-                const tkk = tks[p];
-                if (tkk.type === 'open') p++;
-                else if (tkk.type === 'close') break;
-                else p++;
-              }
-              i = p;
-              const sep = tks[i];
-              if (sep && sep.type === 'sep' && sep.char === ',') { i++; continue; }
-              break;
+          // Skip `(...)`
+          let d = 1; i++;
+          while (i < stop && d > 0) {
+            const tkk = tks[i];
+            if (tkk.type === 'open' && tkk.char === '(') d++;
+            else if (tkk.type === 'close' && tkk.char === ')') d--;
+            i++;
+          }
+          // Skip `{...}`
+          if (tks[i] && tks[i].type === 'open' && tks[i].char === '{') {
+            let bd = 1; i++;
+            while (i < stop && bd > 0) {
+              const tkk = tks[i];
+              if (tkk.type === 'open' && tkk.char === '{') bd++;
+              else if (tkk.type === 'close' && tkk.char === '}') bd--;
+              i++;
             }
           }
-          if (tks[p] && tks[p].type === 'open' && tks[p].char === '{') {
-            let bd = 1, bEnd = p + 1;
-            while (bEnd < stop && bd > 0) {
-              if (tks[bEnd].type === 'open' && tks[bEnd].char === '{') bd++;
-              else if (tks[bEnd].type === 'close' && tks[bEnd].char === '}') bd--;
-              bEnd++;
-            }
-            props[keyName] = functionBinding(params, p + 1, bEnd - 1, true);
-            i = bEnd;
-            const sep = tks[i];
-            if (sep && sep.type === 'sep' && sep.char === ',') { i++; continue; }
-            break;
-          }
+          const sep = tks[i];
+          if (sep && sep.type === 'sep' && sep.char === ',') { i++; continue; }
+          break;
         }
         // Shorthand property `{ name }` → `{ name: name }` (name is a
         // reference to a binding in scope).
@@ -1781,12 +1248,7 @@
       }
       const close = tks[i];
       if (!close || close.type !== 'close' || close.char !== '}') return null;
-      const obj = objectBinding(props);
-      // Copy parsed accessors to the object binding.
-      for (const name of Object.keys(litAccessors)) {
-        obj.accessors[name] = litAccessors[name];
-      }
-      return { binding: obj, next: i + 1 };
+      return { binding: objectBinding(props), next: i + 1 };
     };
 
     // Read an array literal `[ v, v, ... ]`. Returns { binding, next } or null.
@@ -1871,50 +1333,6 @@
     // Given the token index just after `=>`, determine the body range.
     // Returns { bodyStart, bodyEnd, isBlock } or null. For expression bodies,
     // the body extends up to the first top-level `,`/`;`/stop terminator.
-    // Parse a callback: either an arrow function OR `function(params) { body }`.
-    // Returns { fn: functionBinding, next } or null.
-    const peekCallback = (k, stop) => {
-      // Try arrow first.
-      const arrow = peekArrow(k, stop);
-      if (arrow) {
-        const body = readArrowBody(arrow.arrowNext, stop);
-        if (body) return { fn: functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock), next: body.next };
-      }
-      // Try `function(params) { body }`.
-      const t = tks[k];
-      if (t && t.type === 'other' && t.text === 'function') {
-        const lp = tks[k + 1];
-        if (lp && lp.type === 'open' && lp.char === '(') {
-          const params = [];
-          let p = k + 2;
-          if (tks[p] && tks[p].type === 'close' && tks[p].char === ')') { p++; }
-          else {
-            let ok = true;
-            while (p < stop) {
-              const pt = parseParamWithDefault(tks, p, stop);
-              if (!pt) { ok = false; break; }
-              params.push(pt.param);
-              p = pt.next;
-              if (tks[p] && tks[p].type === 'close' && tks[p].char === ')') { p++; break; }
-              if (tks[p] && tks[p].type === 'sep' && tks[p].char === ',') { p++; continue; }
-              ok = false; break;
-            }
-            if (!ok) return null;
-          }
-          if (tks[p] && tks[p].type === 'open' && tks[p].char === '{') {
-            let d = 1, bEnd = p + 1;
-            while (bEnd < stop && d > 0) {
-              if (tks[bEnd].type === 'open' && tks[bEnd].char === '{') d++;
-              else if (tks[bEnd].type === 'close' && tks[bEnd].char === '}') d--;
-              bEnd++;
-            }
-            return { fn: functionBinding(params, p + 1, bEnd - 1, true), next: bEnd };
-          }
-        }
-      }
-      return null;
-    };
-
     const readArrowBody = (arrowNext, stop) => {
       const t = tks[arrowNext];
       if (!t) return null;
@@ -1947,21 +1365,9 @@
         const body = readArrowBody(arrow.arrowNext, stop);
         if (!body) return null;
         return {
-          binding: functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock, stack.length > 1 ? captureScope() : null),
+          binding: functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock),
           next: body.next,
         };
-      }
-      // Assignment expression: `ident = expr` returns the assigned value.
-      // Handles chained assignment: `a = b = "val"`.
-      if (t.type === 'other' && IDENT_RE.test(t.text)) {
-        const eqTok = tks[k + 1];
-        if (eqTok && eqTok.type === 'sep' && eqTok.char === '=') {
-          const rhs = readValue(k + 2, stop, terms);
-          if (rhs) {
-            assignName(t.text, rhs.binding);
-            return rhs; // assignment expression returns the assigned value
-          }
-        }
       }
       // Try the expression as an arithmetic expression with postfix
       // accessors. This folds arithmetic/bitwise/logical/comparison/ternary
@@ -2000,14 +1406,8 @@
 
     // Detect a primitive literal token and return its string form, or null.
     const primitiveAsString = (text) => {
-      // Strip numeric separators: 1_000_000 → 1000000
-      const stripped = text.indexOf('_') >= 0 ? text.replace(/_/g, '') : text;
-      if (/^-?\d+$/.test(stripped)) return stripped.replace(/^-?0+(?=\d)/, (m) => m.startsWith('-') ? '-' : '');
-      if (/^-?\d*\.\d+$/.test(stripped)) return stripped;
-      // Hex (0x), octal (0o), binary (0b) literals.
-      if (/^0[xX][0-9a-fA-F_]+$/.test(stripped)) return String(parseInt(stripped, 16));
-      if (/^0[oO][0-7_]+$/.test(stripped)) return String(parseInt(stripped.slice(2), 8));
-      if (/^0[bB][01_]+$/.test(stripped)) return String(parseInt(stripped.slice(2), 2));
+      if (/^-?\d+$/.test(text)) return text.replace(/^-?0+(?=\d)/, (m) => m.startsWith('-') ? '-' : '');
+      if (/^-?\d*\.\d+$/.test(text)) return text;
       if (text === 'true' || text === 'false' || text === 'null' || text === 'undefined') return text;
       return null;
     };
@@ -2015,7 +1415,6 @@
     // Apply `[key]` subscripts and separate-token `.method(args)` calls as
     // postfix accessors on a typed binding. Returns { bind, next }.
     const applySuffixes = (bind, next, stop) => {
-      let receiver = null; // tracks the object a method was accessed from
       while (next < stop && bind) {
         const t = tks[next];
         if (!t) break;
@@ -2028,10 +1427,10 @@
           if (nt && nt.type === 'other' && IDENT_RE.test(nt.text)) {
             const prop = nt.text;
             if (bind.kind === 'object') bind = bind.props[prop] || null;
-            else if (prop === 'length' && bind.kind === 'array') bind = chainBinding([makeSynthNum(bind.elems.length)]);
+            else if (prop === 'length' && bind.kind === 'array') bind = chainBinding([makeSynthStr(String(bind.elems.length))]);
             else if (prop === 'length' && bind.kind === 'chain') {
               const s = chainAsKnownString(bind);
-              bind = s === null ? null : chainBinding([makeSynthNum(s.length)]);
+              bind = s === null ? null : chainBinding([makeSynthStr(String(s.length))]);
             } else bind = null;
             next += 2;
             continue;
@@ -2068,6 +1467,9 @@
               } else if (bind.kind === 'object') {
                 bind = bind.props[keyText] || null;
                 resolved = true;
+              } else if (bind.kind === 'array' && /^\d+$/.test(keyText)) {
+                bind = bind.elems[parseInt(keyText, 10)] || null;
+                resolved = true;
               }
             }
           }
@@ -2092,16 +1494,9 @@
           for (const p of propSegs) {
             if (!cur) break;
             if (cur.kind === 'object') {
-              const accessor = cur.accessors && cur.accessors[p];
-              if (accessor && accessor.get) {
-                stack.push({ bindings: Object.create(null), isFunction: true, thisBinding: cur });
-                cur = instantiateFunctionBinding(accessor.get, []);
-                stack.pop();
-              } else {
-                cur = cur.props[p] || null;
-              }
+              cur = cur.props[p] || null;
             } else if (p === 'length' && cur.kind === 'array') {
-              cur = chainBinding([makeSynthNum(cur.elems.length)]);
+              cur = chainBinding([makeSynthStr(String(cur.elems.length))]);
             } else if (p === 'length' && cur.kind === 'chain') {
               let n = 0; let ok = true;
               for (const tk of cur.toks) {
@@ -2119,7 +1514,7 @@
                 }
                 ok = false; break;
               }
-              cur = ok ? chainBinding([makeSynthNum(n)]) : null;
+              cur = ok ? chainBinding([makeSynthStr(String(n))]) : null;
             } else {
               cur = null;
               break;
@@ -2127,80 +1522,44 @@
           }
           if (isMethodCall) {
             const r = applyMethod(cur, lastSeg, next + 1, stop);
-            if (r) {
-              bind = r.bind;
-              next = r.next;
-              continue;
-            }
-            break;
+            if (!r) break;
+            bind = r.bind;
+            next = r.next;
+            continue;
           }
-          // Track receiver for `this` binding in subsequent call.
-          if (bind && (bind.kind === 'object' || bind.kind === 'element')) receiver = bind;
           bind = cur;
           next = next + 1;
           continue;
         }
-        // Call on a function binding reached via property access:
-        // `obj.method(args)` where method is a functionBinding in props.
-        // Invoke with `this` bound to the receiver object.
-        if (t.type === 'open' && t.char === '(' && bind && bind.kind === 'function') {
-          const argRes = readCallArgBindings(next, stop);
-          if (argRes) {
-            // Set up this/super for method calls, then delegate to
-            // instantiateFunctionBinding which handles closures.
-            const recCls = receiver && receiver.classRef || null;
-            const savedThis = bind.closure ? null : receiver;
-            const result = instantiateFunctionBinding(bind, argRes.bindings, receiver || null, recCls && recCls.superClass || null);
-            if (result) {
-              receiver = null;
-              bind = result;
-              next = argRes.next;
-              continue;
-            }
-          }
-          break;
-        }
         break;
-      }
-      // Tagged template: `func`a${x}b`` — invoke the function with
-      // [strings, ...values] where strings is the static parts array
-      // and values are the interpolated expressions.
-      if (next < stop && bind && bind.kind === 'function' && tks[next] && tks[next].type === 'tmpl') {
-        const tmpl = tks[next];
-        const strings = [];
-        const values = [];
-        for (const part of tmpl.parts) {
-          if (part.kind === 'text') {
-            strings.push(chainBinding([makeSynthStr(decodeJsString(part.raw, '`'))]));
-          } else if (part.kind === 'expr') {
-            const exprSrc = part.expr || part.raw || '';
-            const exprToks = tokenize(exprSrc);
-            const savedTks = tks;
-            tks = exprToks;
-            const val = readValue(0, exprToks.length, TERMS_NONE);
-            tks = savedTks;
-            values.push(val ? val.binding : chainBinding([exprRef(exprSrc)]));
-          }
-        }
-        // Build args: [stringsArray, ...values]
-        const args = [arrayBinding(strings), ...values];
-        const result = instantiateFunctionBinding(bind, args);
-        if (result) {
-          bind = result;
-          next = next + 1;
-        }
       }
       return { bind, next };
     };
 
     // Apply a method call: .concat on chain, or .join on array.
     const applyMethod = (bind, method, parenIdx, stop) => {
-      if (method === 'concat' && bind && bind.kind === 'chain') {
+      if (method === 'concat') {
+        if (!bind || bind.kind !== 'chain') return null;
         const args = readConcatArgs(parenIdx, stop);
         if (!args) return null;
         const toks = bind.toks.slice();
         for (const a of args.args) { toks.push(SYNTH_PLUS); for (const v of a) toks.push(v); }
         return { bind: chainBinding(toks), next: args.next };
+      }
+      if (method === 'join' && bind && bind.kind === 'mapped') {
+        const lp = tks[parenIdx];
+        if (!lp || lp.type !== 'open' || lp.char !== '(') return null;
+        const sepTok = tks[parenIdx + 1];
+        const rp = tks[parenIdx + (sepTok && (sepTok.type === 'str' || sepTok.type === 'tmpl') ? 2 : 1)];
+        const endIdx = rp && rp.type === 'close' && rp.char === ')' ? (parenIdx + (sepTok && (sepTok.type === 'str' || sepTok.type === 'tmpl') ? 3 : 2)) : null;
+        if (!endIdx) return null;
+        return {
+          bind: chainBinding([{
+            type: 'iter', iterExpr: bind.iterExpr, paramName: bind.paramName,
+            perElemChain: bind.perElemChain,
+          }]),
+          next: endIdx,
+        };
       }
       if (method === 'join') {
         if (!bind || bind.kind !== 'array') return null;
@@ -2221,83 +1580,13 @@
         }
         return { bind: chainBinding(out), next: parenIdx + 3 };
       }
-      // Number methods on a known numeric chain: .toFixed, .toString(radix),
-      // .toPrecision, .toExponential.
-      if (bind && bind.kind === 'chain') {
-        const num = chainAsNumber(bind);
-        if (num !== null && (method === 'toFixed' || method === 'toString' || method === 'toPrecision' || method === 'toExponential' || method === 'valueOf')) {
-          const args = readConcatArgs(parenIdx, stop);
-          if (!args) return null;
-          const argVals = [];
-          let allConcrete = true;
-          for (const a of args.args) {
-            const ch = chainBinding(a);
-            const n = chainAsNumber(ch);
-            if (n !== null) { argVals.push(n); continue; }
-            allConcrete = false; break;
-          }
-          if (allConcrete) {
-            let result;
-            try {
-              switch (method) {
-                case 'toFixed': result = num.toFixed(...argVals); break;
-                case 'toString': result = num.toString(...argVals); break;
-                case 'toPrecision': result = num.toPrecision(...argVals); break;
-                case 'toExponential': result = num.toExponential(...argVals); break;
-                case 'valueOf': result = String(num); break;
-              }
-            } catch (_) { return null; }
-            if (result !== undefined) return { bind: chainBinding([makeSynthStr(result)]), next: args.next };
-          }
-        }
-      }
       // Pure string methods on a known chain string: evaluate when all args
       // are concrete literals. Non-evaluatable cases return null.
-      // Regex `.test(str)` — receiver is a regex, argument is a string.
-      if (bind && bind.kind === 'chain' && method === 'test') {
-        const re = chainAsRegex(bind);
-        if (re) {
-          const args = readConcatArgs(parenIdx, stop);
-          if (args && args.args.length === 1) {
-            const argStr = chainAsKnownString(chainBinding(args.args[0]));
-            if (argStr !== null) {
-              return { bind: chainBinding([makeSynthBool(re.test(argStr))]), next: args.next };
-            }
-          }
-        }
-      }
       if (bind && bind.kind === 'chain') {
         const s = chainAsKnownString(bind);
         if (s !== null) {
           const args = readConcatArgs(parenIdx, stop);
           if (!args) return null;
-          // Check if any arg is a regex token (for replace/match/search/split).
-          const firstArgChain = args.args.length >= 1 ? chainBinding(args.args[0]) : null;
-          const firstArgRegex = firstArgChain ? chainAsRegex(firstArgChain) : null;
-          // Regex-based string methods.
-          if (firstArgRegex && (method === 'replace' || method === 'replaceAll' || method === 'match' || method === 'search' || method === 'split')) {
-            try {
-              if (method === 'replace' || method === 'replaceAll') {
-                const replStr = args.args.length >= 2 ? chainAsKnownString(chainBinding(args.args[1])) : null;
-                if (replStr !== null) {
-                  const result = s.replace(firstArgRegex, replStr);
-                  return { bind: chainBinding([makeSynthStr(result)]), next: args.next };
-                }
-              }
-              if (method === 'match') {
-                const m = s.match(firstArgRegex);
-                if (m === null) return { bind: chainBinding([makeSynthNull()]), next: args.next };
-                return { bind: arrayBinding(m.map((v) => chainBinding([makeSynthStr(v)]))), next: args.next };
-              }
-              if (method === 'search') {
-                return { bind: chainBinding([makeSynthNum(s.search(firstArgRegex))]), next: args.next };
-              }
-              if (method === 'split') {
-                const parts = s.split(firstArgRegex);
-                return { bind: arrayBinding(parts.map((p) => chainBinding([makeSynthStr(p)]))), next: args.next };
-              }
-            } catch (_) { return null; }
-          }
           const argVals = [];
           let allConcrete = true;
           for (const a of args.args) {
@@ -2330,11 +1619,6 @@
               case 'padStart': if (argVals.length <= 2) result = s.padStart(...argVals); break;
               case 'padEnd': if (argVals.length <= 2) result = s.padEnd(...argVals); break;
               case 'toString': if (argVals.length === 0) result = s; break;
-              case 'at': if (argVals.length === 1) result = s.at(argVals[0]); break;
-              case 'replace': if (argVals.length === 2 && typeof argVals[0] === 'string') result = s.replace(argVals[0], argVals[1]); break;
-              case 'replaceAll': if (argVals.length === 2 && typeof argVals[0] === 'string') result = s.replaceAll(argVals[0], argVals[1]); break;
-              case 'charCodeAt': if (argVals.length === 1) result = String(s.charCodeAt(argVals[0])); break;
-              case 'codePointAt': if (argVals.length === 1) result = String(s.codePointAt(argVals[0])); break;
               case 'split': {
                 if (argVals.length === 1) {
                   const parts = s.split(argVals[0]);
@@ -2357,25 +1641,15 @@
         if (method === 'map' || method === 'filter' || method === 'forEach') {
           const lp = tks[parenIdx];
           if (!lp || lp.type !== 'open' || lp.char !== '(') return null;
-          const cb = peekCallback(parenIdx + 1, stop);
-          if (!cb) return null;
-          const rp = tks[cb.next];
+          const arrow = peekArrow(parenIdx + 1, stop);
+          if (!arrow) return null;
+          const body = readArrowBody(arrow.arrowNext, stop);
+          if (!body) return null;
+          const rp = tks[body.next];
           if (!rp || rp.type !== 'close' || rp.char !== ')') return null;
-          const fn = cb.fn;
+          const fn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock);
           if (method === 'forEach') {
-            // Walk body per element for side effects (e.g. html += item).
-            for (let idx = 0; idx < bind.elems.length; idx++) {
-              const el = bind.elems[idx];
-              if (!el) continue;
-              const iterFrame = { bindings: Object.create(null), isFunction: true };
-              if (fn.params[0]) iterFrame.bindings[fn.params[0].name] = el;
-              if (fn.params[1]) iterFrame.bindings[fn.params[1].name] = chainBinding([makeSynthNum(idx)]);
-              if (fn.params[2]) iterFrame.bindings[fn.params[2].name] = bind;
-              stack.push(iterFrame);
-              if (fn.isBlock) walkRangeWithEffects(fn.bodyStart, fn.bodyEnd);
-              stack.pop();
-            }
-            return { bind: chainBinding([makeSynthStr('undefined')]), next: cb.next + 1 };
+            return { bind: chainBinding([makeSynthStr('undefined')]), next: body.next + 1 };
           }
           const results = [];
           for (const el of bind.elems) {
@@ -2388,56 +1662,15 @@
             }
             // method === 'filter': keep element when the callback's
             // return value is truthy (concrete only; unknowns bail).
-            const truth = evalTruthiness(chainBinding(toks));
-            if (truth === true) results.push(el);
-            else if (truth !== false) return null;
+            const resChain = chainBinding(toks);
+            const n = chainAsNumber(resChain);
+            const s = n === null ? chainAsKnownString(resChain) : null;
+            const truthy = (n !== null && n !== 0) || (s !== null && s !== '' && s !== 'false' && s !== 'null' && s !== 'undefined' && s !== '0' && s !== 'NaN');
+            const falsy = n === 0 || s === '' || s === 'false' || s === 'null' || s === 'undefined' || s === '0' || s === 'NaN';
+            if (truthy) results.push(el);
+            else if (!falsy) return null;
           }
-          return { bind: arrayBinding(results), next: cb.next + 1 };
-        }
-        // Callback-based: find, findIndex, some, every, flatMap.
-        if (method === 'find' || method === 'findIndex' || method === 'some' || method === 'every' || method === 'flatMap') {
-          const lp = tks[parenIdx];
-          if (!lp || lp.type !== 'open' || lp.char !== '(') return null;
-          const cb = peekCallback(parenIdx + 1, stop);
-          if (!cb) return null;
-          const rp = tks[cb.next];
-          if (!rp || rp.type !== 'close' || rp.char !== ')') return null;
-          const fn = cb.fn;
-          if (method === 'flatMap') {
-            const out = [];
-            for (const el of bind.elems) {
-              if (!el) return null;
-              const r = instantiateFunctionBinding(fn, [el]);
-              if (!r) return null;
-              if (r.kind === 'array') { for (const e of r.elems) out.push(e); }
-              else out.push(r);
-            }
-            return { bind: arrayBinding(out), next: cb.next + 1 };
-          }
-          for (let idx = 0; idx < bind.elems.length; idx++) {
-            const el = bind.elems[idx];
-            if (!el) return null;
-            const toks = instantiateFunction(fn, [el, chainBinding([makeSynthStr(String(idx))])]);
-            if (!toks) return null;
-            const truth = evalTruthiness(chainBinding(toks));
-            if (method === 'find') {
-              if (truth === true) return { bind: el, next: cb.next + 1 };
-              if (truth === null) return null;
-            } else if (method === 'findIndex') {
-              if (truth === true) return { bind: chainBinding([makeSynthNum(idx)]), next: cb.next + 1 };
-              if (truth === null) return null;
-            } else if (method === 'some') {
-              if (truth === true) return { bind: chainBinding([makeSynthBool(true)]), next: cb.next + 1 };
-              if (truth === null) return null;
-            } else if (method === 'every') {
-              if (truth === false) return { bind: chainBinding([makeSynthBool(false)]), next: cb.next + 1 };
-              if (truth === null) return null;
-            }
-          }
-          if (method === 'find') return { bind: chainBinding([makeSynthStr('undefined')]), next: cb.next + 1 };
-          if (method === 'findIndex') return { bind: chainBinding([makeSynthStr('-1')]), next: cb.next + 1 };
-          if (method === 'some') return { bind: chainBinding([makeSynthStr('false')]), next: cb.next + 1 };
-          if (method === 'every') return { bind: chainBinding([makeSynthStr('true')]), next: cb.next + 1 };
+          return { bind: arrayBinding(results), next: body.next + 1 };
         }
         // `.reduce(fn, init)` — two-arg reducer: invoke the callback
         // per element with (accumulator, element) and thread the
@@ -2445,15 +1678,17 @@
         if (method === 'reduce') {
           const lp = tks[parenIdx];
           if (!lp || lp.type !== 'open' || lp.char !== '(') return null;
-          const cb = peekCallback(parenIdx + 1, stop);
-          if (!cb || cb.fn.params.length !== 2) return null;
-          const sep = tks[cb.next];
+          const arrow = peekArrow(parenIdx + 1, stop);
+          if (!arrow || arrow.params.length !== 2) return null;
+          const body = readArrowBody(arrow.arrowNext, stop);
+          if (!body) return null;
+          const sep = tks[body.next];
           if (!sep || sep.type !== 'sep' || sep.char !== ',') return null;
-          const init = readConcatExpr(cb.next + 1, stop, { sep: [], close: [')'] });
+          const init = readConcatExpr(body.next + 1, stop, { sep: [], close: [')'] });
           if (!init) return null;
           const rp = tks[init.next];
           if (!rp || rp.type !== 'close' || rp.char !== ')') return null;
-          const fn = cb.fn;
+          const fn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock);
           let accBind = chainBinding(init.toks);
           for (const el of bind.elems) {
             if (!el) return null;
@@ -2463,18 +1698,6 @@
           }
           const acc = accBind.toks;
           return { bind: chainBinding(acc), next: init.next + 1 };
-        }
-        // Methods that handle their own arg resolution (args may be arrays
-        // or other non-scalar bindings).
-        if (method === 'concat') {
-          const argRes = readCallArgBindings(parenIdx, stop);
-          if (!argRes) return null;
-          const out = bind.elems.slice();
-          for (const ab of argRes.bindings) {
-            if (ab && ab.kind === 'array') { for (const e of ab.elems) out.push(e); }
-            else out.push(ab);
-          }
-          return { bind: arrayBinding(out), next: argRes.next };
         }
         const args = readConcatArgs(parenIdx, stop);
         if (!args) return null;
@@ -2513,54 +1736,65 @@
         if (method === 'reverse' && argVals.length === 0) {
           return { bind: arrayBinding(bind.elems.slice().reverse()), next: args.next };
         }
-        if (method === 'concat') {
-          // arr.concat(arr2, arr3, ...) — merges arrays/values.
-          const out = bind.elems.slice();
-          for (const a of args.args) {
-            const ab = chainBinding(a);
-            const resolved = ab.toks.length === 1 && ab.toks[0].type === 'other' ? resolve(ab.toks[0].text) : null;
-            const src = resolved && resolved.kind === 'array' ? resolved : (ab.kind === 'array' ? ab : null);
-            if (src && src.kind === 'array') { for (const e of src.elems) out.push(e); }
-            else out.push(chainBinding(a));
+      }
+
+      // .map(fn).join('') on an opaque iterable: extract the callback's
+      // per-element return chain and produce an iter token that
+      // parseChainToVNodes converts into a forEach loop.
+      if (method === 'map') {
+        const lp = tks[parenIdx];
+        if (!lp || lp.type !== 'open' || lp.char !== '(') return null;
+        // Try arrow: `.map(x => ...)` or `.map((x) => ...)`
+        let fn = null, fnEnd = null;
+        const arrow = peekArrow(parenIdx + 1, stop);
+        if (arrow) {
+          const body = readArrowBody(arrow.arrowNext, stop);
+          if (body) {
+            fn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock);
+            fnEnd = body.next;
           }
-          return { bind: arrayBinding(out), next: args.next };
         }
-        if (method === 'flat' && argVals.length <= 1) {
-          const depth = argVals.length === 1 ? argVals[0] : 1;
-          const flattenArr = (arr, d) => {
-            const out = [];
-            for (const el of arr) {
-              if (d > 0 && el && el.kind === 'array') out.push(...flattenArr(el.elems, d - 1));
-              else out.push(el);
+        // Try function expression: `.map(function(x) { ... })`
+        if (!fn) {
+          let k = parenIdx + 1;
+          if (tks[k] && tks[k].type === 'other' && tks[k].text === 'function') {
+            k++;
+            // optional name
+            if (tks[k] && tks[k].type === 'other' && IDENT_RE.test(tks[k].text) && tks[k].text !== 'function') k++;
+            if (tks[k] && tks[k].type === 'open' && tks[k].char === '(') {
+              const params = [];
+              let j = k + 1;
+              while (j < stop) {
+                const pt = tks[j];
+                if (pt && pt.type === 'close' && pt.char === ')') { j++; break; }
+                if (pt && pt.type === 'other' && IDENT_RE.test(pt.text)) params.push({ name: pt.text });
+                j++;
+              }
+              // Expect `{`
+              if (tks[j] && tks[j].type === 'open' && tks[j].char === '{') {
+                let depth = 1, bodyEnd = j + 1;
+                while (bodyEnd < stop && depth > 0) {
+                  if (tks[bodyEnd].type === 'open' && tks[bodyEnd].char === '{') depth++;
+                  else if (tks[bodyEnd].type === 'close' && tks[bodyEnd].char === '}') depth--;
+                  if (depth > 0) bodyEnd++;
+                }
+                fn = functionBinding(params, j, bodyEnd + 1, true);
+                fnEnd = bodyEnd + 1;
+              }
             }
-            return out;
-          };
-          return { bind: arrayBinding(flattenArr(bind.elems, depth)), next: args.next };
+          }
         }
-        if (method === 'fill') {
-          const out = bind.elems.slice();
-          const val = args.args.length >= 1 ? chainBinding(args.args[0]) : null;
-          const start = argVals.length >= 2 ? argVals[1] : 0;
-          const end = argVals.length >= 3 ? argVals[2] : out.length;
-          for (let k = start; k < end && k < out.length; k++) out[k] = val;
-          return { bind: arrayBinding(out), next: args.next };
-        }
-        if (method === 'splice' && argVals.length >= 1) {
-          const out = bind.elems.slice();
-          const startIdx = argVals[0] < 0 ? Math.max(0, out.length + argVals[0]) : argVals[0];
-          const delCount = argVals.length >= 2 ? argVals[1] : out.length - startIdx;
-          const items = args.args.slice(2).map((a) => chainBinding(a));
-          const removed = out.splice(startIdx, delCount, ...items);
-          // Mutate the original binding AND return removed.
-          bind.elems.length = 0;
-          for (const e of out) bind.elems.push(e);
-          return { bind: arrayBinding(removed), next: args.next };
-        }
-        if (method === 'at' && argVals.length === 1) {
-          const idx = argVals[0] < 0 ? bind.elems.length + argVals[0] : argVals[0];
-          const el = bind.elems[idx] || null;
-          return el ? { bind: el, next: args.next } : null;
-        }
+        if (!fn) return null;
+        const rp = tks[fnEnd];
+        if (!rp || rp.type !== 'close' || rp.char !== ')') return null;
+        const paramBinds = fn.params.map((p) => chainBinding([exprRef(p.name)]));
+        const toks = instantiateFunction(fn, paramBinds);
+        if (!toks) return null;
+        const iterExpr = bind ? chainAsExprText(bind) : null;
+        return {
+          bind: { kind: 'mapped', iterExpr: iterExpr || '/* iterable */', paramName: fn.params[0] ? fn.params[0].name : '_', perElemChain: toks },
+          next: fnEnd + 1,
+        };
       }
       return null;
     };
@@ -2606,7 +1840,7 @@
     const jsonToBinding = (v) => {
       if (v === null) return chainBinding([makeSynthStr('null')]);
       if (typeof v === 'boolean') return chainBinding([makeSynthStr(String(v))]);
-      if (typeof v === 'number') return chainBinding([makeSynthNum(v)]);
+      if (typeof v === 'number') return chainBinding([makeSynthStr(String(v))]);
       if (typeof v === 'string') return chainBinding([makeSynthStr(v)]);
       if (Array.isArray(v)) return arrayBinding(v.map(jsonToBinding));
       if (typeof v === 'object') {
@@ -2643,213 +1877,7 @@
       if (!t) return null;
       // `new X(args)` / `new X.Y` / `new X` — absorb the constructor call
       // and its arguments as a single opaque expression reference.
-      // Class expression: `class { ... }` or `class Name { ... }` in
-      // expression position. Parse the same way as the statement-level
-      // class handler but return the classBinding as a value.
-      // Function expression: `function(params) { body }` or
-      // `function name(params) { body }` in expression position.
-      if (t.type === 'other' && t.text === 'function') {
-        let j = k + 1;
-        // Optional name.
-        if (tks[j] && tks[j].type === 'other' && IDENT_RE.test(tks[j].text) &&
-            tks[j + 1] && tks[j + 1].type === 'open' && tks[j + 1].char === '(') j++;
-        if (tks[j] && tks[j].type === 'open' && tks[j].char === '(') {
-          const params = [];
-          let p = j + 1;
-          if (tks[p] && tks[p].type === 'close' && tks[p].char === ')') { p++; }
-          else {
-            let ok = true;
-            while (p < stop) {
-              const pt = parseParamWithDefault(tks, p, stop);
-              if (!pt) { ok = false; break; }
-              params.push(pt.param);
-              p = pt.next;
-              if (tks[p] && tks[p].type === 'close' && tks[p].char === ')') { p++; break; }
-              if (tks[p] && tks[p].type === 'sep' && tks[p].char === ',') { p++; continue; }
-              ok = false; break;
-            }
-            if (!ok) return null;
-          }
-          if (tks[p] && tks[p].type === 'open' && tks[p].char === '{') {
-            let d = 1, bEnd = p + 1;
-            while (bEnd < stop && d > 0) {
-              if (tks[bEnd].type === 'open' && tks[bEnd].char === '{') d++;
-              else if (tks[bEnd].type === 'close' && tks[bEnd].char === '}') d--;
-              bEnd++;
-            }
-            // Capture closure when created inside another function's scope.
-            const closure = stack.length > 1 ? captureScope() : null;
-            return { bind: functionBinding(params, p + 1, bEnd - 1, true, closure), next: bEnd };
-          }
-        }
-      }
-      if (t.type === 'other' && t.text === 'class') {
-        let j = k + 1;
-        let className = null;
-        if (tks[j] && tks[j].type === 'other' && IDENT_RE.test(tks[j].text) &&
-            !(tks[j].text === 'extends') /* don't consume extends as name */) {
-          className = tks[j].text;
-          j++;
-        }
-        let superClass = null;
-        if (tks[j] && tks[j].type === 'other' && tks[j].text === 'extends') {
-          j++;
-          if (tks[j] && tks[j].type === 'other' && IDENT_OR_PATH_RE.test(tks[j].text)) {
-            superClass = resolvePath(tks[j].text) || null;
-            j++;
-          }
-        }
-        if (tks[j] && tks[j].type === 'open' && tks[j].char === '{') {
-          // Skip over the class body to find the closing `}`.
-          let d = 1, bodyEnd = j + 1;
-          while (bodyEnd < stop && d > 0) {
-            const tk = tks[bodyEnd];
-            if (tk.type === 'open' && tk.char === '{') d++;
-            else if (tk.type === 'close' && tk.char === '}') d--;
-            bodyEnd++;
-          }
-          // Reuse the statement-level class body parser by temporarily
-          // switching to walk the class body (same as the walker does).
-          // For simplicity, create a minimal classBinding from the body.
-          let ctor = null;
-          const methods = Object.create(null);
-          let m = j + 1;
-          while (m < bodyEnd - 1) {
-            const mtk = tks[m];
-            if (!mtk) break;
-            if (mtk.type === 'sep' && mtk.char === ';') { m++; continue; }
-            let isStatic = false;
-            if (mtk.type === 'other' && mtk.text === 'static') { isStatic = true; m++; }
-            if (tks[m] && tks[m].type === 'other' && tks[m].text === 'async') m++;
-            if (tks[m] && tks[m].type === 'op' && tks[m].text === '*') m++;
-            if (tks[m] && tks[m].type === 'other' && (tks[m].text === 'get' || tks[m].text === 'set')) {
-              if (tks[m + 1] && tks[m + 1].type === 'other' && IDENT_RE.test(tks[m + 1].text) &&
-                  tks[m + 2] && tks[m + 2].type === 'open' && tks[m + 2].char === '(') m++;
-            }
-            const nameTk = tks[m];
-            if (!nameTk || nameTk.type !== 'other' || !IDENT_RE.test(nameTk.text)) {
-              let sd = 0;
-              while (m < bodyEnd - 1) {
-                const sk = tks[m];
-                if (sk.type === 'open') sd++;
-                else if (sk.type === 'close') { if (sd === 0) break; sd--; }
-                else if (sd === 0 && sk.type === 'sep' && sk.char === ';') break;
-                m++;
-              }
-              if (tks[m] && (tks[m].type === 'close' || (tks[m].type === 'sep' && tks[m].char === ';'))) m++;
-              continue;
-            }
-            const methodName = nameTk.text;
-            m++;
-            if (tks[m] && tks[m].type === 'open' && tks[m].char === '(') {
-              const params = [];
-              let p = m + 1;
-              if (tks[p] && tks[p].type === 'close' && tks[p].char === ')') { p++; }
-              else {
-                let ok = true;
-                while (p < bodyEnd - 1) {
-                  const pt = parseParamWithDefault(tokens, p, bodyEnd - 1);
-                  if (!pt) { ok = false; break; }
-                  params.push(pt.param);
-                  p = pt.next;
-                  if (tks[p] && tks[p].type === 'close' && tks[p].char === ')') { p++; break; }
-                  if (tks[p] && tks[p].type === 'sep' && tks[p].char === ',') { p++; continue; }
-                  ok = false; break;
-                }
-                if (!ok) { m = p; continue; }
-              }
-              if (tks[p] && tks[p].type === 'open' && tks[p].char === '{') {
-                let md = 1, mEnd = p + 1;
-                while (mEnd < bodyEnd && md > 0) {
-                  if (tks[mEnd].type === 'open' && tks[mEnd].char === '{') md++;
-                  else if (tks[mEnd].type === 'close' && tks[mEnd].char === '}') md--;
-                  mEnd++;
-                }
-                const fn = functionBinding(params, p + 1, mEnd - 1, true);
-                if (methodName === 'constructor' && !isStatic) ctor = fn;
-                else if (!isStatic) methods[methodName] = fn;
-                m = mEnd;
-                continue;
-              }
-            }
-            let sd = 0;
-            while (m < bodyEnd - 1) {
-              const sk = tks[m];
-              if (sk.type === 'open') sd++;
-              else if (sk.type === 'close') { if (sd === 0) break; sd--; }
-              else if (sd === 0 && sk.type === 'sep' && sk.char === ';') break;
-              m++;
-            }
-            if (tks[m] && (tks[m].type === 'close' || (tks[m].type === 'sep' && tks[m].char === ';'))) m++;
-          }
-          return { bind: classBinding(className, ctor, methods, superClass), next: bodyEnd };
-        }
-      }
-      // `super.method(args)` in expression context — resolve via superClass.
-      // `super.val` is tokenized as one PATH_RE token 'super.val'.
-      if (t.type === 'other' && (t.text === 'super' || t.text.startsWith('super.'))) {
-        const methodName = t.text.includes('.') ? t.text.slice(t.text.indexOf('.') + 1) : null;
-        const dotTok = !methodName ? tks[k + 1] : null;
-        const resolvedMethod = methodName || (dotTok && dotTok.type === 'other' && /^\.[A-Za-z_$]/.test(dotTok.text) ? dotTok.text.slice(1) : null);
-        if (resolvedMethod) {
-          let thisObj = null, superCls = null;
-          for (let si = stack.length - 1; si >= 0; si--) {
-            if (stack[si].isFunction && stack[si].thisBinding) {
-              thisObj = stack[si].thisBinding;
-              superCls = stack[si].superClass || null;
-              break;
-            }
-          }
-          if (superCls && superCls.kind === 'class' && superCls.methods[resolvedMethod]) {
-            const fn = superCls.methods[resolvedMethod];
-            // Paren is at k+1 when super.method is one token, k+2 when two.
-            const parenOff = methodName ? k + 1 : k + 2;
-            const parenTok = tks[parenOff];
-            if (parenTok && parenTok.type === 'open' && parenTok.char === '(') {
-              const argRes = readCallArgBindings(parenOff, stop);
-              if (argRes) {
-                const result = instantiateFunctionBinding(fn, argRes.bindings, thisObj, superCls.superClass || null);
-                if (result) return { bind: result, next: argRes.next };
-              }
-            }
-          }
-        }
-      }
       if (t.type === 'other' && t.text === 'new') {
-        // Try to resolve `new ClassName(args)` when ClassName is a known
-        // class binding. Creates a fresh object, runs the constructor
-        // with `this` bound to it, and attaches class methods.
-        const ctorTok = tks[k + 1];
-        if (ctorTok && ctorTok.type === 'other' && IDENT_OR_PATH_RE.test(ctorTok.text)) {
-          const cls = resolvePath(ctorTok.text);
-          if (cls && cls.kind === 'class') {
-            const argRes = readCallArgBindings(k + 2, stop);
-            if (argRes) {
-              // Create instance object. Copy super methods first, then own.
-              const props = Object.create(null);
-              if (cls.superClass && cls.superClass.kind === 'class') {
-                for (const mn of Object.keys(cls.superClass.methods)) props[mn] = cls.superClass.methods[mn];
-              }
-              for (const mn of Object.keys(cls.methods)) props[mn] = cls.methods[mn];
-              const instance = objectBinding(props);
-              // Store class ref on instance for super method resolution.
-              instance.classRef = cls;
-              // Run constructor with `this` = instance.
-              if (cls.ctor) {
-                stack.push({ bindings: Object.create(null), isFunction: true, thisBinding: instance, superClass: cls.superClass || null });
-                const frame = stack[stack.length - 1];
-                for (let p = 0; p < cls.ctor.params.length; p++) {
-                  const pi = cls.ctor.params[p];
-                  frame.bindings[pi.name] = argRes.bindings[p] || null;
-                }
-                walkRangeWithEffects(cls.ctor.bodyStart, cls.ctor.bodyEnd);
-                stack.pop();
-              }
-              return { bind: instance, next: argRes.next };
-            }
-          }
-        }
-        // Fall back: absorb as opaque `new X(...)`.
         let j = k + 1;
         if (tks[j] && tks[j].type === 'other' && IDENT_OR_PATH_RE.test(tks[j].text)) j++;
         if (tks[j] && tks[j].type === 'open' && tks[j].char === '(') {
@@ -2871,30 +1899,6 @@
       if (t.type === 'other' && (t.text === 'await' || t.text === 'yield' || t.text === 'typeof' || t.text === 'void' || t.text === 'delete')) {
         const inner = readBase(k + 1, stop);
         if (!inner) return null;
-        // `typeof` folds to a concrete string when the operand has a known
-        // binding kind or a concrete scalar value.
-        if (t.text === 'typeof') {
-          const b = inner.bind;
-          if (b && b.kind === 'object') return { bind: chainBinding([makeSynthStr('object')]), next: inner.next };
-          if (b && b.kind === 'array') return { bind: chainBinding([makeSynthStr('object')]), next: inner.next };
-          if (b && b.kind === 'function') return { bind: chainBinding([makeSynthStr('function')]), next: inner.next };
-          if (b && b.kind === 'element') return { bind: chainBinding([makeSynthStr('object')]), next: inner.next };
-          if (b && b.kind === 'chain' && b.toks.length === 1 && b.toks[0].jsType) {
-            const jt = b.toks[0].jsType;
-            const mapped = jt === 'null' ? 'object' : jt;
-            return { bind: chainBinding([makeSynthStr(mapped)]), next: inner.next };
-          }
-          if (b && b.kind === 'chain') {
-            const n = chainAsNumber(b);
-            if (n !== null) return { bind: chainBinding([makeSynthStr('number')]), next: inner.next };
-            const s = chainAsKnownString(b);
-            if (s !== null) return { bind: chainBinding([makeSynthStr('string')]), next: inner.next };
-          }
-        }
-        // `void expr` is always `undefined`.
-        if (t.text === 'void') {
-          return { bind: chainBinding([makeSynthUndef()]), next: inner.next };
-        }
         const et = chainAsExprText(inner.bind);
         if (et === null) return null;
         const text = t.text + ' ' + et;
@@ -2909,47 +1913,14 @@
         return { bind: applied, next: inner.next };
       }
       if (t.type === 'str') return { bind: chainBinding([t]), next: k + 1 };
-      // Bare number literal: the tokenizer emits digits as type 'other'.
-      // Recognise them here so arithmetic folding works.
-      if (t.type === 'other' && /^[0-9]/.test(t.text) && !Number.isNaN(Number(t.text)) && String(Number(t.text)) === t.text) {
-        return { bind: chainBinding([makeSynthNum(Number(t.text))]), next: k + 1 };
-      }
       if (t.type === 'tmpl') return { bind: chainBinding([rewriteTemplate(t)]), next: k + 1 };
-      // Regex literal: preserve the token type so applyMethod can construct
-      // a real RegExp when used as an argument to .replace/.match/.test etc.
-      if (t.type === 'regex') return { bind: chainBinding([t]), next: k + 1 };
+      if (t.type === 'regex') return { bind: chainBinding([exprRef(t.text)]), next: k + 1 };
       if (t.type === 'open' && t.char === '(') {
-        // Try readValue first to preserve typed bindings (function, array,
-        // object) that readConcatExpr would flatten to opaque tokens.
-        const parenTerms = { sep: [','], close: [')'] };
-        const rv = readValue(k + 1, stop, parenTerms);
-        if (rv) {
-          let lastBind = rv.binding;
-          let pos = rv.next;
-          // Comma operator: evaluate all sub-expressions, keep the last.
-          while (tks[pos] && tks[pos].type === 'sep' && tks[pos].char === ',') {
-            const sub = readValue(pos + 1, stop, parenTerms);
-            if (!sub) break;
-            lastBind = sub.binding;
-            pos = sub.next;
-          }
-          const rp = tks[pos];
-          if (rp && rp.type === 'close' && rp.char === ')') return { bind: lastBind, next: pos + 1 };
-        }
-        // Fallback to readConcatExpr for complex concat chains.
-        const r = readConcatExpr(k + 1, stop, parenTerms);
+        const r = readConcatExpr(k + 1, stop, { sep: [], close: [')'] });
         if (!r) return null;
-        let lastToks = r.toks;
-        let pos = r.next;
-        while (tks[pos] && tks[pos].type === 'sep' && tks[pos].char === ',') {
-          const sub = readConcatExpr(pos + 1, stop, parenTerms);
-          if (!sub) break;
-          lastToks = sub.toks;
-          pos = sub.next;
-        }
-        const rp = tks[pos];
+        const rp = tks[r.next];
         if (!rp || rp.type !== 'close' || rp.char !== ')') return null;
-        return { bind: chainBinding(lastToks), next: pos + 1 };
+        return { bind: chainBinding(r.toks), next: r.next + 1 };
       }
       if (t.type === 'open' && t.char === '[') {
         const a = readArrayLit(k, stop);
@@ -2963,59 +1934,36 @@
       }
       if (t.type !== 'other') return null;
       // Primitive literal.
-      if (t.text === 'true') return { bind: chainBinding([makeSynthBool(true)]), next: k + 1 };
-      if (t.text === 'false') return { bind: chainBinding([makeSynthBool(false)]), next: k + 1 };
-      if (t.text === 'null') return { bind: chainBinding([makeSynthNull()]), next: k + 1 };
-      if (t.text === 'undefined') return { bind: chainBinding([makeSynthUndef()]), next: k + 1 };
-      if (t.text === 'Infinity') return { bind: chainBinding([makeSynthNum(Infinity)]), next: k + 1 };
-      if (t.text === 'NaN') return { bind: chainBinding([makeSynthNum(NaN)]), next: k + 1 };
       const lit = primitiveAsString(t.text);
-      if (lit !== null) return { bind: chainBinding([makeSynthNum(Number(lit))]), next: k + 1 };
+      if (lit !== null) return { bind: chainBinding([makeSynthStr(lit)]), next: k + 1 };
       // Identifier/path, possibly with attached .concat/.join method call.
       if (IDENT_OR_PATH_RE.test(t.text)) {
         const paren = tks[k + 1];
         const isCall = paren && paren.type === 'open' && paren.char === '(';
         // Known math/numeric constants like `Math.PI`.
-        if (!isCall && MATH_CONSTANTS[t.text] !== undefined && !isShadowed(t.text)) {
-          return { bind: chainBinding([makeSynthNum(MATH_CONSTANTS[t.text])]), next: k + 1 };
+        if (!isCall && MATH_CONSTANTS[t.text] !== undefined) {
+          return { bind: chainBinding([makeSynthStr(String(MATH_CONSTANTS[t.text]))]), next: k + 1 };
         }
         // Known global builtin function call (numeric Math.*, parseInt...).
-        if (isCall && BUILTINS[t.text] && !isShadowed(t.text)) {
+        if (isCall && BUILTINS[t.text]) {
           const args = readConcatArgs(k + 1, stop);
           if (args) {
-            // Collect args as numbers. parseInt/parseFloat/Number/Boolean
-            // also accept string arguments, so try chainAsKnownString as
-            // a fallback and coerce via Number() / parseInt() / parseFloat().
             const nums = [];
-            let allResolved = true;
-            const coerceFns = { 'parseInt': true, 'parseFloat': true, 'Number': true, 'Boolean': true, 'isNaN': true, 'isFinite': true };
-            const acceptsStrings = coerceFns[t.text] || false;
+            let allNum = true;
             for (const a of args.args) {
               const ch = chainBinding(a);
               const n = chainAsNumber(ch);
-              if (n !== null) { nums.push(n); continue; }
-              if (acceptsStrings) {
-                const s = chainAsKnownString(ch);
-                if (s !== null) { nums.push(s); continue; }
-              }
-              allResolved = false; break;
+              if (n === null) { allNum = false; break; }
+              nums.push(n);
             }
-            if (allResolved) {
+            if (allNum) {
               const v = BUILTINS[t.text](...nums);
-              if (typeof v === 'number' && !Number.isNaN(v)) {
-                return { bind: chainBinding([makeSynthNum(v)]), next: args.next };
-              }
-              if (typeof v === 'boolean') {
-                return { bind: chainBinding([makeSynthBool(v)]), next: args.next };
-              }
-              if (typeof v === 'number') {
-                return { bind: chainBinding([makeSynthNum(v)]), next: args.next };
-              }
+              return { bind: chainBinding([makeSynthStr(String(v))]), next: args.next };
             }
           }
         }
         // Object.keys/values/entries on known object bindings.
-        if (isCall && (t.text === 'Object.keys' || t.text === 'Object.values' || t.text === 'Object.entries') && !isShadowed(t.text)) {
+        if (isCall && (t.text === 'Object.keys' || t.text === 'Object.values' || t.text === 'Object.entries')) {
           const argRes = readCallArgBindings(k + 1, stop);
           if (argRes && argRes.bindings.length === 1) {
             const ob = argRes.bindings[0];
@@ -3036,41 +1984,8 @@
             }
           }
         }
-        // Object.assign / Object.fromEntries on known bindings.
-        if (isCall && t.text === 'Object.assign' && !isShadowed(t.text)) {
-          const argRes = readCallArgBindings(k + 1, stop);
-          if (argRes && argRes.bindings.length >= 1) {
-            const target = argRes.bindings[0];
-            if (target && target.kind === 'object') {
-              for (let a = 1; a < argRes.bindings.length; a++) {
-                const src = argRes.bindings[a];
-                if (src && src.kind === 'object') {
-                  for (const key of Object.keys(src.props)) target.props[key] = src.props[key];
-                }
-              }
-              return { bind: target, next: argRes.next };
-            }
-          }
-        }
-        if (isCall && t.text === 'Object.fromEntries' && !isShadowed(t.text)) {
-          const argRes = readCallArgBindings(k + 1, stop);
-          if (argRes && argRes.bindings.length === 1) {
-            const src = argRes.bindings[0];
-            if (src && src.kind === 'array') {
-              const props = Object.create(null);
-              let ok = true;
-              for (const entry of src.elems) {
-                if (!entry || entry.kind !== 'array' || entry.elems.length < 2) { ok = false; break; }
-                const key = entry.elems[0] && entry.elems[0].kind === 'chain' ? chainAsKnownString(entry.elems[0]) : null;
-                if (key === null) { ok = false; break; }
-                props[key] = entry.elems[1];
-              }
-              if (ok) return { bind: objectBinding(props), next: argRes.next };
-            }
-          }
-        }
         // Array.isArray / Array.from / Array.of on known bindings.
-        if (isCall && t.text === 'Array.isArray' && !isShadowed(t.text)) {
+        if (isCall && t.text === 'Array.isArray') {
           const argRes = readCallArgBindings(k + 1, stop);
           if (argRes && argRes.bindings.length === 1) {
             const ob = argRes.bindings[0];
@@ -3078,11 +1993,11 @@
             if (v !== null) return { bind: chainBinding([makeSynthStr(v)]), next: argRes.next };
           }
         }
-        if (isCall && t.text === 'Array.of' && !isShadowed(t.text)) {
+        if (isCall && t.text === 'Array.of') {
           const argRes = readCallArgBindings(k + 1, stop);
           if (argRes) return { bind: arrayBinding(argRes.bindings.slice()), next: argRes.next };
         }
-        if (isCall && t.text === 'Array.from' && !isShadowed(t.text)) {
+        if (isCall && t.text === 'Array.from') {
           const argRes = readCallArgBindings(k + 1, stop);
           if (argRes && argRes.bindings.length >= 1) {
             const src = argRes.bindings[0];
@@ -3102,29 +2017,11 @@
               }
               return { bind: arrayBinding(out), next: argRes.next };
             }
-            // Array.from('string') — iterate characters.
-            if (src && src.kind === 'chain') {
-              const s = chainAsKnownString(src);
-              if (s !== null) {
-                let out = Array.from(s).map((ch) => chainBinding([makeSynthStr(ch)]));
-                if (mapFn && mapFn.kind === 'function') {
-                  const mapped = [];
-                  for (let idx = 0; idx < out.length; idx++) {
-                    const el = out[idx];
-                    const r = instantiateFunctionBinding(mapFn, [el, chainBinding([makeSynthNum(idx)])]);
-                    if (!r) return null;
-                    mapped.push(r);
-                  }
-                  out = mapped;
-                }
-                return { bind: arrayBinding(out), next: argRes.next };
-              }
-            }
             // Array.from({length: n}) with optional mapFn.
             if (src && src.kind === 'object') {
               const lenB = src.props.length;
               const lenN = lenB ? chainAsNumber(lenB) : null;
-              if (lenN !== null && lenN >= 0) {
+              if (lenN !== null && lenN >= 0 && lenN < 10000) {
                 const out = [];
                 for (let idx = 0; idx < lenN; idx++) {
                   if (mapFn && mapFn.kind === 'function') {
@@ -3144,7 +2041,7 @@
           }
         }
         // JSON.stringify on known scalar / object / array bindings.
-        if (isCall && (t.text === 'JSON.stringify' || t.text === 'JSON.parse') && !isShadowed(t.text)) {
+        if (isCall && (t.text === 'JSON.stringify' || t.text === 'JSON.parse')) {
           const argRes = readCallArgBindings(k + 1, stop);
           if (argRes && argRes.bindings.length >= 1) {
             const val = bindingToJson(argRes.bindings[0]);
@@ -3170,30 +2067,8 @@
             if (r) return r;
           }
         }
-        // `String.fromCharCode(n, ...)` / `String.fromCodePoint(n, ...)`
-        if (isCall && (t.text === 'String.fromCharCode' || t.text === 'String.fromCodePoint') && !isShadowed(t.text)) {
-          const args = readConcatArgs(k + 1, stop);
-          if (args) {
-            const nums = [];
-            let allNum = true;
-            for (const a of args.args) {
-              const ch = chainBinding(a);
-              const n = chainAsNumber(ch);
-              if (n === null) { allNum = false; break; }
-              nums.push(n);
-            }
-            if (allNum) {
-              try {
-                const result = t.text === 'String.fromCharCode'
-                  ? String.fromCharCode(...nums)
-                  : String.fromCodePoint(...nums);
-                return { bind: chainBinding([makeSynthStr(result)]), next: args.next };
-              } catch (_) { /* fall through */ }
-            }
-          }
-        }
         // `String(x)` coerces any literal to its string form.
-        if (isCall && t.text === 'String' && !isShadowed(t.text)) {
+        if (isCall && t.text === 'String') {
           const args = readConcatArgs(k + 1, stop);
           if (args && args.args.length === 1) {
             const ch = chainBinding(args.args[0]);
@@ -3208,30 +2083,12 @@
             const method = t.text.slice(dot + 1);
             if (KNOWN_METHODS.has(method)) {
               const prefix = t.text.slice(0, dot);
-              const prefBind = resolvePath(prefix);
-              if (prefBind) {
-                const r = applyMethod(prefBind, method, k + 1, stop);
-                if (r) return { bind: r.bind, next: r.next };
-              }
+              const prefBind = resolvePath(prefix) || chainBinding([exprRef(prefix)]);
+              const r = applyMethod(prefBind, method, k + 1, stop);
+              if (r) return { bind: r.bind, next: r.next };
             }
-            // Method call on an object/instance: `obj.method(args)` where
-            // method is a function binding stored in obj's props. Invoke
-            // with `this` bound to the receiver object.
-            if (!KNOWN_METHODS.has(method)) {
-              const prefix = t.text.slice(0, dot);
-              const receiver = resolvePath(prefix);
-              if (receiver && receiver.kind === 'object') {
-                const fn = receiver.props[method];
-                if (fn && fn.kind === 'function') {
-                  const argRes = readCallArgBindings(k + 1, stop);
-                  if (argRes) {
-                    const rcls = receiver && receiver.classRef || null;
-                    const result = instantiateFunctionBinding(fn, argRes.bindings, receiver, rcls && rcls.superClass || null);
-                    if (result) return { bind: result, next: argRes.next };
-                  }
-                }
-              }
-            }
+            // Fall through to the opaque-ident handling below for unknown
+            // methods or unresolved prefixes.
           }
         }
         const b = resolvePath(t.text);
@@ -3270,14 +2127,12 @@
         }
         if (b) {
           // Call syntax: `name(args)` where name resolves to a function binding.
-          // Use instantiateFunctionBinding so typed returns (array, object)
-          // are preserved — not flattened to a token chain.
           if (b.kind === 'function' && isCall) {
-            const argRes = readCallArgBindings(k + 1, stop);
-            if (!argRes) return null;
-            const result = instantiateFunctionBinding(b, argRes.bindings);
-            if (!result) return null;
-            return { bind: result, next: argRes.next };
+            const args = readConcatArgs(k + 1, stop);
+            if (!args) return null;
+            const toks = instantiateFunction(b, args.args.map((a) => chainBinding(a)));
+            if (!toks) return null;
+            return { bind: chainBinding(toks), next: args.next };
           }
           return { bind: b, next: k + 1 };
         }
@@ -3297,14 +2152,12 @@
       tks = tokens;
       for (let p = 0; p < fn.params.length; p++) {
         const pi = fn.params[p];
-        if (pi.rest) {
-          frame.bindings[pi.name] = arrayBinding(argBindings.slice(p));
-          break;
-        }
         const a = argBindings[p];
         if (a) {
           frame.bindings[pi.name] = a;
         } else if (pi.defaultStart != null) {
+          // Evaluate the parameter's default expression in the current
+          // (call-site) scope so enclosing bindings can be referenced.
           const r = readConcatExpr(pi.defaultStart, pi.defaultEnd, TERMS_NONE);
           frame.bindings[pi.name] = (r && r.next === pi.defaultEnd) ? chainBinding(r.toks) : null;
         } else {
@@ -3314,8 +2167,11 @@
       let result = null;
       if (fn.isBlock) {
         // Look for a top-level `return <expr>;` in the block.
+        // bodyStart may point to the `{`; skip it.
         let i = fn.bodyStart;
-        while (i < fn.bodyEnd) {
+        if (tks[i] && tks[i].type === 'open' && tks[i].char === '{') i++;
+        const scanEnd = (tks[fn.bodyEnd - 1] && tks[fn.bodyEnd - 1].type === 'close' && tks[fn.bodyEnd - 1].char === '}') ? fn.bodyEnd - 1 : fn.bodyEnd;
+        while (i < scanEnd) {
           const t = tks[i];
           if (t && t.type === 'other' && t.text === 'return') {
             const r = readConcatExpr(i + 1, fn.bodyEnd, TERMS_TOP);
@@ -3326,7 +2182,7 @@
           // doesn't match.
           if (t && t.type === 'open' && t.char === '{') {
             let depth = 1; i++;
-            while (i < fn.bodyEnd && depth > 0) {
+            while (i < scanEnd && depth > 0) {
               const tk = tks[i];
               if (tk.type === 'open' && tk.char === '{') depth++;
               else if (tk.type === 'close' && tk.char === '}') depth--;
@@ -3342,78 +2198,6 @@
       }
       tks = savedTks;
       stack.pop();
-      return result;
-    };
-
-    // Like instantiateFunction but returns a typed binding (array/object/chain)
-    // instead of raw tokens. Used by flatMap where the callback returns an
-    // array literal that readConcatExpr can't represent as a token chain.
-    // Unified function invocation: pushes closure + frame with this/super,
-    // binds params (including rest), evaluates body, pops frames, returns result.
-    const instantiateFunctionBinding = (fn, argBindings, thisObj, superClass) => {
-      // Restore closure frames: push the ORIGINAL frames (by reference)
-      // so modifications to closed-over variables are shared across all
-      // closures that captured the same scope.
-      const closureFrameCount = fn.closure ? fn.closure.length : 0;
-      if (fn.closure) for (const frame of fn.closure) stack.push(frame);
-      stack.push({ bindings: Object.create(null), isFunction: true, thisBinding: thisObj || null, superClass: superClass || null });
-      const frame = stack[stack.length - 1];
-      const savedTks = tks;
-      tks = tokens;
-      for (let p = 0; p < fn.params.length; p++) {
-        const pi = fn.params[p];
-        // Rest parameter: collect remaining args into an array.
-        if (pi.rest) {
-          frame.bindings[pi.name] = arrayBinding(argBindings.slice(p));
-          break;
-        }
-        const a = argBindings[p];
-        if (a) {
-          frame.bindings[pi.name] = a;
-        } else if (pi.defaultStart != null) {
-          const r = readConcatExpr(pi.defaultStart, pi.defaultEnd, TERMS_NONE);
-          frame.bindings[pi.name] = (r && r.next === pi.defaultEnd) ? chainBinding(r.toks) : null;
-        } else {
-          frame.bindings[pi.name] = null;
-        }
-      }
-      let result = null;
-      if (fn.isBlock) {
-        walkRangeWithEffects(fn.bodyStart, fn.bodyEnd);
-        // Evaluate the return expression with sideEffects on so
-        // resolveWithMutability returns real values, not opaque refs.
-        const savedEffects = sideEffects;
-        sideEffects = true;
-        let i = fn.bodyStart;
-        while (i < fn.bodyEnd) {
-          const ft = tks[i];
-          if (ft && ft.type === 'other' && ft.text === 'return') {
-            const r = readValue(i + 1, fn.bodyEnd, TERMS_TOP);
-            if (r) result = r.binding;
-            break;
-          }
-          if (ft && ft.type === 'open' && ft.char === '{') {
-            let depth = 1; i++;
-            while (i < fn.bodyEnd && depth > 0) {
-              if (tks[i].type === 'open' && tks[i].char === '{') depth++;
-              else if (tks[i].type === 'close' && tks[i].char === '}') depth--;
-              i++;
-            }
-            continue;
-          }
-          i++;
-        }
-        sideEffects = savedEffects;
-      } else {
-        const savedEffects = sideEffects;
-        sideEffects = true;
-        const r = readValue(fn.bodyStart, fn.bodyEnd, TERMS_NONE);
-        if (r && r.next === fn.bodyEnd) result = r.binding;
-        sideEffects = savedEffects;
-      }
-      tks = savedTks;
-      stack.pop();
-      for (let c = 0; c < closureFrameCount; c++) stack.pop();
       return result;
     };
 
@@ -3448,16 +2232,6 @@
       if (parsed) {
         const boundary = skipOperand(parsed.next, stop, terms);
         if (boundary === parsed.next) return { toks: parsed.bind.toks.slice(), next: parsed.next };
-        // parseArithExpr resolved partially (e.g. `items[i]` → `location.search`)
-        // but there are trailing suffixes it couldn't consume (e.g. `.toLowerCase()`).
-        // Use the resolved text + the raw remaining suffix source.
-        const resolvedText = chainAsExprText(parsed.bind);
-        if (resolvedText !== null && boundary > parsed.next) {
-          const suffFirst = tks[parsed.next];
-          const suffLast = tks[boundary - 1];
-          const suffSrc = suffFirst._src.slice(suffFirst.start, suffLast.end);
-          return { toks: [exprRef(resolvedText + suffSrc)], next: boundary };
-        }
       }
       const end = skipOperand(k, stop, terms);
       if (end === k) return null;
@@ -3498,9 +2272,6 @@
         let opText, prec;
         if (opTok && opTok.type === 'op' && BINOP_PREC[opTok.text] !== undefined) {
           opText = opTok.text; prec = BINOP_PREC[opText];
-        } else if (opTok && opTok.type === 'other' && (opTok.text === '==' || opTok.text === '!=' || opTok.text === '===' || opTok.text === '!==')) {
-          // Equality operators are emitted with type 'other' by the tokenizer.
-          opText = opTok.text; prec = BINOP_PREC[opText];
         } else if (opTok && opTok.type === 'plus') {
           // Treat `+` at precedence 12: numeric add when both operands are
           // number literals, otherwise leave it to the concat-chain parser.
@@ -3536,51 +2307,28 @@
       return { bind: cur, next };
     };
 
-    // Fold a ternary when the condition is a concrete value; otherwise emit
-    // canonical symbolic text.
-    // Evaluate a binding's truthiness: returns true, false, or null (opaque).
-    // Parse a regex token's text (e.g. '/abc/gi') into a RegExp, or null.
-    const tokenToRegex = (tok) => {
-      if (!tok || tok.type !== 'regex') return null;
-      const m = /^\/(.*)\/([gimsuy]*)$/.exec(tok.text);
-      if (!m) return null;
-      try { return new RegExp(m[1], m[2]); } catch (_) { return null; }
-    };
-
-    // Try to extract a regex from a chain binding's single token.
-    const chainAsRegex = (chain) => {
-      if (!chain || chain.kind !== 'chain' || chain.toks.length !== 1) return null;
-      return tokenToRegex(chain.toks[0]);
-    };
-
-    const evalTruthiness = (b) => {
-      if (!b) return null;
-      if (b.kind !== 'chain') return true; // array/object/function/element always truthy
-      const jt = b.toks && b.toks.length === 1 ? b.toks[0].jsType : null;
-      if (jt === 'null' || jt === 'undefined') return false;
-      if (jt === 'boolean') return b.toks[0].text === 'true';
-      if (jt === 'number') { const cn = chainAsNumber(b); return cn !== null ? cn !== 0 && !Number.isNaN(cn) : null; }
-      // Strings: only empty string is falsy. '0', 'false', 'NaN' are truthy.
-      const cs = chainAsKnownString(b);
-      if (cs !== null) return cs !== '';
-      const cn = chainAsNumber(b);
-      if (cn !== null) return cn !== 0 && !Number.isNaN(cn);
-      return null;
-    };
-
+    // Fold a ternary when the condition is a concrete value; otherwise
+    // produce a conditional chain token that preserves both branches.
     const combineTernary = (cond, ifT, ifF) => {
       if (!cond || cond.kind !== 'chain') return null;
       if (!ifT || ifT.kind !== 'chain') return null;
       if (!ifF || ifF.kind !== 'chain') return null;
-      const truth = evalTruthiness(cond);
-      if (truth === true) return ifT;
-      if (truth === false) return ifF;
+      const cNum = chainAsNumber(cond);
+      if (cNum !== null) return cNum ? ifT : ifF;
+      // Check for known boolean-ish strings.
+      if (cond.toks.length === 1 && cond.toks[0].type === 'str') {
+        const text = cond.toks[0].text;
+        if (text === 'true') return ifT;
+        if (text === 'false' || text === 'null' || text === 'undefined' || text === '') return ifF;
+      }
       const ct = chainAsExprText(cond);
-      const tt = chainAsExprText(ifT);
-      const ft = chainAsExprText(ifF);
-      if (ct === null || tt === null || ft === null) return null;
-      const text = '(' + ct + ' ? ' + tt + ' : ' + ft + ')';
-      return chainBinding([exprRef(text)]);
+      if (ct === null) return null;
+      // Produce a conditional token that holds both branches as token
+      // arrays. The direct chain parser will emit if/else blocks.
+      return chainBinding([{
+        type: 'cond', condExpr: ct,
+        ifTrue: ifT.toks, ifFalse: ifF.toks,
+      }]);
     };
 
     // Combine two chain bindings via a binary operator. If both sides are
@@ -3628,29 +2376,7 @@
           case '??': v = (lNum === null || lNum === undefined) ? rNum : lNum; break;
           default: return null;
         }
-        if (typeof v === 'boolean') return chainBinding([makeSynthBool(v)]);
-        return chainBinding([typeof v === 'number' ? makeSynthNum(v) : makeSynthStr(String(v))]);
-      }
-      // String comparison folding: when both operands are known strings,
-      // fold `== != === !== < > <= >=` to a boolean literal.
-      if (op === '==' || op === '!=' || op === '===' || op === '!==' ||
-          op === '<' || op === '>' || op === '<=' || op === '>=') {
-        const lS = chainAsKnownString(left);
-        const rS = chainAsKnownString(right);
-        if (lS !== null && rS !== null) {
-          let v;
-          switch (op) {
-            case '==': v = lS == rS; break;
-            case '!=': v = lS != rS; break;
-            case '===': v = lS === rS; break;
-            case '!==': v = lS !== rS; break;
-            case '<': v = lS < rS; break;
-            case '>': v = lS > rS; break;
-            case '<=': v = lS <= rS; break;
-            case '>=': v = lS >= rS; break;
-          }
-          return chainBinding([makeSynthBool(v)]);
-        }
+        return chainBinding([makeSynthStr(String(v))]);
       }
       // `+` is overloaded in JS. When both operands aren't concrete numbers
       // we decline here and let the caller (concat-chain parser) handle it
@@ -3658,12 +2384,13 @@
       if (op === '+') return null;
       // Short-circuit logical/nullish operators using whichever concrete
       // value (number or string) the left-hand side has.
-      const lTruth = evalTruthiness(left);
-      const lJsType = left.toks.length === 1 ? left.toks[0].jsType : null;
-      const lNullish = lJsType === 'null' || lJsType === 'undefined';
-      if (op === '&&') { if (lTruth === false) return left; if (lTruth === true) return right; }
-      else if (op === '||') { if (lTruth === true) return left; if (lTruth === false) return right; }
-      else if (op === '??') { if (lNullish) return right; if (!lNullish && lTruth !== null) return left; }
+      const lStr = lNum === null ? chainAsKnownString(left) : null;
+      const lTruthy = (lNum !== null && lNum !== 0) || (lStr !== null && lStr !== '' && lStr !== 'false' && lStr !== 'null' && lStr !== 'undefined' && lStr !== '0' && lStr !== 'NaN');
+      const lFalsy = lNum === 0 || lStr === '' || lStr === 'false' || lStr === 'null' || lStr === 'undefined' || lStr === '0' || lStr === 'NaN';
+      const lNullish = lStr === 'null' || lStr === 'undefined';
+      if (op === '&&') { if (lFalsy) return left; if (lTruthy) return right; }
+      else if (op === '||') { if (lTruthy) return left; if (lFalsy) return right; }
+      else if (op === '??') { if (lNullish) return right; if (lStr !== null || lNum !== null) return left; }
       // Symbolic: combine texts.
       const lt = chainAsExprText(left);
       const rt = chainAsExprText(right);
@@ -3687,8 +2414,7 @@
           case '~': v = ~n; break;
           default: return null;
         }
-        if (typeof v === 'boolean') return chainBinding([makeSynthBool(v)]);
-        return chainBinding([typeof v === 'number' ? makeSynthNum(v) : makeSynthStr(String(v))]);
+        return chainBinding([makeSynthStr(String(v))]);
       }
       const et = chainAsExprText(operand);
       if (et === null) return null;
@@ -3699,17 +2425,7 @@
     const chainAsNumber = (chain) => {
       if (chain.toks.length !== 1) return null;
       const t = chain.toks[0];
-      // Quoted strings (`'1'`, `"2"`) are string values even when they look
-      // numeric. Only bare number-literal tokens (type 'other' from the
-      // tokenizer, or type 'str' with empty/missing quote from makeSynthNum
-      // or arithmetic results) fold to numbers.
-      if (t.type === 'str' && t.quote && t.quote !== '') return null;
-      if (t.type !== 'str' && t.type !== 'other') return null;
-      // Booleans coerce: true→1, false→0 (JS semantics).
-      if (t.jsType === 'boolean') return t.text === 'true' ? 1 : 0;
-      // null coerces to 0; undefined to NaN (not numeric).
-      if (t.jsType === 'null') return 0;
-      if (t.jsType === 'undefined') return null;
+      if (t.type !== 'str') return null;
       const n = Number(t.text);
       if (Number.isNaN(n)) return null;
       if (String(n) !== t.text) return null;
@@ -3717,7 +2433,7 @@
     };
 
     const chainAsExprText = (chain) => {
-      if (!chain || !chain.toks || chain.toks.length !== 1) return null;
+      if (chain.toks.length !== 1) return null;
       const t = chain.toks[0];
       if (t.type === 'str') {
         // Quote literal strings; bare numbers flow as-is.
@@ -3726,6 +2442,11 @@
         return JSON.stringify(t.text);
       }
       if (t.type === 'other') return t.text;
+      if (t.type === 'cond') {
+        const tt = chainAsExprText(chainBinding(t.ifTrue));
+        const ft = chainAsExprText(chainBinding(t.ifFalse));
+        if (tt !== null && ft !== null) return '(' + t.condExpr + ' ? ' + tt + ' : ' + ft + ')';
+      }
       return null;
     };
 
@@ -3742,21 +2463,6 @@
       const maybeRp = tks[i];
       if (maybeRp && maybeRp.type === 'close' && maybeRp.char === ')') return { bindings, next: i + 1 };
       while (i < stop) {
-        // Spread argument: `...expr` — resolve expr and splice array elements.
-        const spreadTok = tks[i];
-        if (spreadTok && spreadTok.type === 'other' && spreadTok.text.startsWith('...')) {
-          const name = spreadTok.text.slice(3);
-          const resolved = IDENT_RE.test(name) ? resolve(name) : null;
-          if (resolved && resolved.kind === 'array') {
-            for (const el of resolved.elems) bindings.push(el);
-            i++;
-            const sep = tks[i];
-            if (sep && sep.type === 'sep' && sep.char === ',') { i++; continue; }
-            break;
-          }
-          // Can't resolve spread — bail.
-          return null;
-        }
         const v = readValue(i, stop, TERMS_ARG);
         if (!v) return null;
         bindings.push(v.binding);
@@ -3829,31 +2535,8 @@
       return r ? r.toks : null;
     };
 
-    let stop = Math.min(stopAt, tokens.length);
-    // When false, assignments to outer-scope variables and bare function
-    // calls are skipped. This separates scope resolution (declarations,
-    // local bindings) from side-effect execution (mutations to outer vars).
-    // The initial pass runs with sideEffects OFF. Explicit invocations
-    // (instantiateFunctionBinding, loop simulation, forEach) turn it ON.
-    let sideEffects = false;
-    const walkRange = (startI, endI) => {
-      const savedStop = stop;
-      stop = endI;
-      const signal = walkRangeImpl(startI, endI);
-      stop = savedStop;
-      return signal;
-    };
-    // walkRange with side effects enabled — used by function calls,
-    // loop simulation, forEach, etc.
-    const walkRangeWithEffects = (startI, endI) => {
-      const saved = sideEffects;
-      sideEffects = true;
-      const signal = walkRange(startI, endI);
-      sideEffects = saved;
-      return signal;
-    };
-    const walkRangeImpl = (startI, endI) => {
-    for (let i = startI; i < endI; i++) {
+    const stop = Math.min(stopAt, tokens.length);
+    for (let i = 0; i < stop; i++) {
       // Pop any loops whose body we've walked past (and their shadow frames).
       // For each variable modified during the loop, capture its final chain
       // as a loopVar entry AND replace its binding with a single reference
@@ -3866,8 +2549,6 @@
         for (const name of entry.modifiedVars) {
           const b = resolve(name);
           if (b && b.kind === 'chain') {
-            // (Static for-of/for-in unrolling is handled above by walking the
-            // body multiple times with the loop var bound per element.)
             // Store the chain UNSTRIPPED; strip the outer loop's tags only
             // at display time via loopVarHtml. The unstripped chain is
             // needed when unrolling references in a main-chain substitution.
@@ -3883,18 +2564,15 @@
       const t = tokens[i];
 
       if (t.type === 'open' && t.char === '{') {
-        const enteringFunction = pendingFunctionBrace;
-        const frame = { bindings: Object.create(null), isFunction: enteringFunction };
-        if (enteringFunction && pendingFunctionParams) {
+        const frame = { bindings: Object.create(null), isFunction: pendingFunctionBrace };
+        if (pendingFunctionBrace && pendingFunctionParams) {
+          // Bind function parameters as references to their own names so
+          // uses within the body surface via autoSubs when the body is
+          // parsed in scope (e.g. for an innerHTML assignment inside the
+          // function). At call sites, instantiateFunction rebinds them.
           for (const p of pendingFunctionParams) {
             frame.bindings[p.name] = chainBinding([exprRef(p.name)]);
           }
-        }
-        // When entering a function body via the walker (not via an explicit
-        // call), disable side effects — this is scope resolution only.
-        if (enteringFunction) {
-          frame._savedSideEffects = sideEffects;
-          sideEffects = false;
         }
         stack.push(frame);
         pendingFunctionBrace = false;
@@ -3902,127 +2580,13 @@
         continue;
       }
       if (t.type === 'close' && t.char === '}') {
-        if (stack.length > 1) {
-          const popped = stack.pop();
-          // Restore side effects state when leaving a function scope
-          // that was entered via the walker (not an explicit call).
-          if (popped.isFunction && '_savedSideEffects' in popped) {
-            sideEffects = popped._savedSideEffects;
-          }
-        }
+        if (stack.length > 1) stack.pop();
         continue;
-      }
-
-      // Bare function call at statement level: `fn()`, `fn(args)`,
-      // `obj.method()`. Invoke for side effects (e.g. modifying outer vars).
-      if (sideEffects && t.type === 'other' && IDENT_RE.test(t.text)) {
-        const callParen = tokens[i + 1];
-        if (callParen && callParen.type === 'open' && callParen.char === '(') {
-          const fn = resolve(t.text);
-          if (fn && fn.kind === 'function') {
-            const argRes = readCallArgBindings(i + 1, stop);
-            if (argRes) {
-              instantiateFunctionBinding(fn, argRes.bindings);
-              i = argRes.next - 1;
-              continue;
-            }
-          }
-        }
-      }
-      // Bare method call: `obj.method()` at statement level.
-      if (sideEffects && t.type === 'other' && PATH_RE.test(t.text)) {
-        const callParen = tokens[i + 1];
-        if (callParen && callParen.type === 'open' && callParen.char === '(') {
-          const dot = t.text.lastIndexOf('.');
-          const base = t.text.slice(0, dot);
-          const method = t.text.slice(dot + 1);
-          const baseBind = resolvePath(base);
-          if (baseBind && baseBind.kind === 'object') {
-            const fn = baseBind.props[method];
-            if (fn && fn.kind === 'function') {
-              const argRes = readCallArgBindings(i + 1, stop);
-              if (argRes) {
-                instantiateFunctionBinding(fn, argRes.bindings, baseBind, baseBind.classRef && baseBind.classRef.superClass || null);
-                i = argRes.next - 1;
-                continue;
-              }
-            }
-          }
-        }
-      }
-
-      // Destructuring assignment at statement level: `[a,b] = expr`.
-      if (t.type === 'open' && t.char === '[') {
-        const pat = readDestructurePattern(i, stop);
-        if (pat) {
-          const eqTok = tokens[pat.next];
-          if (eqTok && eqTok.type === 'sep' && eqTok.char === '=') {
-            const val = readValue(pat.next + 1, stop, TERMS_TOP);
-            const srcBinding = val ? val.binding : null;
-            applyPatternBindings(pat.pattern, srcBinding, (name, v) => assignName(name, v));
-            i = val ? val.next - 1 : skipExpr(pat.next + 1, stop) - 1;
-            continue;
-          }
-        }
       }
 
       if (t.type !== 'other') continue;
 
-      // `do { ... } while (cond);` — treat identically to a while loop for
-      // loop-marker purposes. The body is always a `{ ... }` block. We push
-      // a loop frame, walk the body via the normal block handling, and set
-      // bodyEnd past the `while(cond);` trailer so the loop-pop pops at the
-      // right position.
-      if (t.text === 'do') {
-        const bodyOpen = tokens[i + 1];
-        if (bodyOpen && bodyOpen.type === 'open' && bodyOpen.char === '{') {
-          let d = 1, k = i + 2;
-          while (k < stop && d > 0) {
-            const tk = tokens[k];
-            if (tk.type === 'open' && tk.char === '{') d++;
-            else if (tk.type === 'close' && tk.char === '}') d--;
-            k++;
-          }
-          // k is now past the `}`. Expect `while (cond) ;`.
-          const whTok = tokens[k];
-          if (whTok && whTok.type === 'other' && whTok.text === 'while') {
-            const wp = tokens[k + 1];
-            if (wp && wp.type === 'open' && wp.char === '(') {
-              let dp = 1, j = k + 2;
-              while (j < stop && dp > 0) {
-                const tk = tokens[j];
-                if (tk.type === 'open' && tk.char === '(') dp++;
-                else if (tk.type === 'close' && tk.char === ')') dp--;
-                j++;
-              }
-              // j past `)`. Skip optional `;`.
-              if (tokens[j] && tokens[j].type === 'sep' && tokens[j].char === ';') j++;
-              const headerFirst = tokens[k + 2];
-              const headerLast = tokens[j - 2]; // before `)` and optional `;`
-              const headerSrc = headerFirst ? headerFirst._src.slice(headerFirst.start, headerLast.end) : '/* do-while */';
-              const id = nextLoopId++;
-              loopInfo[id] = { kind: 'do', headerSrc };
-              const loopFrame = { bindings: Object.create(null), isFunction: false };
-              stack.push(loopFrame);
-              loopStack.push({
-                id, kind: 'do', headerSrc, bodyEnd: j, frame: loopFrame,
-                modifiedVars: new Set(), unrollVar: null, unrollElems: null,
-              });
-              // Let the walker enter the `{` naturally on the next iteration.
-              continue;
-            }
-          }
-        }
-      }
-
       if (t.text === 'for' || t.text === 'while') {
-        // Check for a label: `label: for(...)` — the previous two tokens
-        // would be `ident` `:` before the `for`/`while`.
-        let loopLabel = '';
-        if (i >= 2 && tokens[i - 1] && tokens[i - 1].type === 'other' && tokens[i - 1].text === ':' &&
-            tokens[i - 2] && tokens[i - 2].type === 'other' && IDENT_RE.test(tokens[i - 2].text)) {
-          loopLabel = tokens[i - 2].text;
-        }
         // Detect loop header and body range. The body is either a `{ ... }`
         // block or a single statement terminated by `;`.
         const openParen = tokens[i + 1];
@@ -4061,186 +2625,6 @@
               }
               bodyEnd = k;
             }
-            // Detect for-of / for-in with a static iterable: header shape
-            // `[var|let|const] NAME (of|in) EXPR`. When EXPR is a known
-            // array/object binding, re-walk the body once per element with
-            // NAME bound to that element — a full static unroll with no
-            // loop markers in the output.
-            let unrollVar = null;     // simple ident loop var
-            let unrollPattern = null; // destructuring pattern
-            let unrollElems = null;
-            {
-              let h = i + 2;
-              if (tokens[h] && tokens[h].type === 'other' && (tokens[h].text === 'var' || tokens[h].text === 'let' || tokens[h].text === 'const')) h++;
-              // Check for destructuring pattern: `[k, v] of ...` or `{a, b} of ...`
-              const maybeDestructure = tokens[h] && tokens[h].type === 'open' && (tokens[h].char === '[' || tokens[h].char === '{');
-              if (maybeDestructure) {
-                const pat = readDestructurePattern(h, j);
-                if (pat) {
-                  const kwTok = tokens[pat.next];
-                  if (kwTok && kwTok.type === 'other' && (kwTok.text === 'of' || kwTok.text === 'in')) {
-                    const iterRes = readValue(pat.next + 1, j, null);
-                    if (iterRes && iterRes.binding) {
-                      const b = iterRes.binding;
-                      if (kwTok.text === 'of' && b.kind === 'array') {
-                        unrollPattern = pat.pattern;
-                        unrollElems = b.elems.slice();
-                      } else if (kwTok.text === 'in' && b.kind === 'object') {
-                        unrollPattern = pat.pattern;
-                        unrollElems = Object.keys(b.props).map((k) => chainBinding([makeSynthStr(k)]));
-                      }
-                    }
-                  }
-                }
-              }
-              // Simple identifier: `x of ...`
-              if (!unrollPattern) {
-                const nameTok = tokens[h];
-                const kwTok = tokens[h + 1];
-                if (nameTok && nameTok.type === 'other' && IDENT_RE.test(nameTok.text) &&
-                    kwTok && kwTok.type === 'other' && (kwTok.text === 'of' || kwTok.text === 'in')) {
-                  const iterRes = readValue(h + 2, j, null);
-                  if (iterRes && iterRes.binding) {
-                    const b = iterRes.binding;
-                    if (kwTok.text === 'of' && b.kind === 'array') {
-                      unrollVar = nameTok.text;
-                      unrollElems = b.elems.slice();
-                    } else if (kwTok.text === 'in' && b.kind === 'object') {
-                      unrollVar = nameTok.text;
-                      unrollElems = Object.keys(b.props).map((k) => chainBinding([makeSynthStr(k)]));
-                    }
-                  }
-                }
-              }
-            }
-            if ((unrollVar || unrollPattern) && unrollElems) {
-              const bodyIsBlock = tokens[j + 1] && tokens[j + 1].type === 'open' && tokens[j + 1].char === '{';
-              const bodyStart = bodyIsBlock ? j + 1 : j + 1;
-              for (const elem of unrollElems) {
-                if (elem === null) { i = bodyEnd - 1; break; }
-                const iterFrame = { bindings: Object.create(null), isFunction: false };
-                if (unrollVar) {
-                  iterFrame.bindings[unrollVar] = elem;
-                } else {
-                  applyPatternBindings(unrollPattern, elem, (name, val) => {
-                    iterFrame.bindings[name] = val;
-                  });
-                }
-                stack.push(iterFrame);
-                const sig = walkRangeWithEffects(bodyStart, bodyEnd);
-                const idx = stack.indexOf(iterFrame);
-                if (idx >= 0) stack.splice(idx, 1);
-                // Handle signal with label awareness.
-                if (sig === 'break' || (sig === 'break:' + loopLabel && loopLabel)) break;
-                if (sig === 'continue' || (sig === 'continue:' + loopLabel && loopLabel)) continue;
-                if (sig && (sig.startsWith('break:') || sig.startsWith('continue:'))) return sig;
-              }
-              i = bodyEnd - 1;
-              continue;
-            }
-            // Bounded C-style for-loop or while-loop simulation.
-            // Split the header at top-level `;` to get init/cond/update
-            // ranges for `for`, or use the whole header as the condition
-            // for `while`. Then simulate: evaluate cond → if concrete
-            // true, walk body (+ update for `for`), repeat. Bail to
-            // loop markers if the condition ever becomes opaque.
-            {
-              let simulated = false;
-              if (t.text === 'for') {
-                // Split header tokens[i+2..j) at top-level `;` separators.
-                const semis = [];
-                let sd = 0;
-                for (let h = i + 2; h < j; h++) {
-                  const tk = tokens[h];
-                  if (tk.type === 'open') sd++;
-                  else if (tk.type === 'close') sd--;
-                  else if (sd === 0 && tk.type === 'sep' && tk.char === ';') semis.push(h);
-                }
-                if (semis.length === 2) {
-                  const initStart = i + 2, initEnd = semis[0];
-                  const condStart = semis[0] + 1, condEnd = semis[1];
-                  const updateStart = semis[1] + 1, updateEnd = j;
-                  // Pre-check: evaluate init to set up counter, then test if
-                  // the condition is concrete. If not, skip simulation entirely
-                  // (don't dirty scope state).
-                  if (initEnd > initStart) walkRangeWithEffects(initStart, initEnd);
-                  const bodyStart = (tokens[j + 1] && tokens[j + 1].type === 'open' && tokens[j + 1].char === '{') ? j + 1 : j + 1;
-                  // First condition check — if opaque, bail before any body walk.
-                  const firstCond = condEnd > condStart ? readValue(condStart, condEnd, null) : null;
-                  const firstTruth = firstCond ? evalTruthiness(firstCond.binding) : null;
-                  if (firstTruth !== null) {
-                    // Condition is concrete — simulate.
-                    simulated = true;
-                    // Helper: interpret a signal in this loop's context.
-                    const handleSig = (sig) => {
-                      if (!sig) return 'ok';
-                      if (sig === 'break') return 'break';
-                      if (sig === 'continue') return 'continue';
-                      // Labeled: match against this loop's label.
-                      if (sig === 'break:' + loopLabel && loopLabel) return 'break';
-                      if (sig === 'continue:' + loopLabel && loopLabel) return 'continue';
-                      return sig; // propagate unmatched label
-                    };
-                    if (firstTruth === true) {
-                      let brk = false;
-                      let action = handleSig(walkRangeWithEffects(bodyStart, bodyEnd));
-                      if (action === 'break') brk = true;
-                      else if (action !== 'ok' && action !== 'continue') return action; // propagate
-                      if (!brk) {
-                        if (action !== 'continue' && updateEnd > updateStart) walkRangeWithEffects(updateStart, updateEnd);
-                        if (action === 'continue' && updateEnd > updateStart) walkRangeWithEffects(updateStart, updateEnd);
-                        while (!brk) {
-                          if (condEnd <= condStart) break;
-                          const condVal = readValue(condStart, condEnd, null);
-                          const concrete = evalTruthiness(condVal ? condVal.binding : null);
-                          if (concrete !== true) break;
-                          action = handleSig(walkRangeWithEffects(bodyStart, bodyEnd));
-                          if (action === 'break') { brk = true; break; }
-                          if (action !== 'ok' && action !== 'continue') return action;
-                          if (updateEnd > updateStart) walkRangeWithEffects(updateStart, updateEnd);
-                        }
-                      }
-                    }
-                    // else: firstTruth === false, zero iterations.
-                  }
-                  // If firstTruth === null (opaque), simulated stays false → fall to markers.
-                }
-              } else if (t.text === 'while') {
-                const condStart = i + 2, condEnd = j;
-                const bodyStart = (tokens[j + 1] && tokens[j + 1].type === 'open' && tokens[j + 1].char === '{') ? j + 1 : j + 1;
-                const firstCond = readValue(condStart, condEnd, null);
-                const firstTruth = firstCond ? evalTruthiness(firstCond.binding) : null;
-                if (firstTruth !== null) {
-                  simulated = true;
-                  if (firstTruth === true) {
-                    const handleSig2 = (sig) => {
-                      if (!sig) return 'ok';
-                      if (sig === 'break') return 'break';
-                      if (sig === 'continue') return 'continue';
-                      if (sig === 'break:' + loopLabel && loopLabel) return 'break';
-                      if (sig === 'continue:' + loopLabel && loopLabel) return 'continue';
-                      return sig;
-                    };
-                    let brk = false;
-                    let action = handleSig2(walkRangeWithEffects(bodyStart, bodyEnd));
-                    if (action === 'break') brk = true;
-                    else if (action !== 'ok' && action !== 'continue') return action;
-                    while (!brk) {
-                      const condVal = readValue(condStart, condEnd, null);
-                      const concrete = evalTruthiness(condVal ? condVal.binding : null);
-                      if (concrete !== true) break;
-                      action = handleSig2(walkRangeWithEffects(bodyStart, bodyEnd));
-                      if (action === 'break') { brk = true; break; }
-                      if (action !== 'ok' && action !== 'continue') return action;
-                    }
-                  }
-                }
-              }
-              if (simulated) {
-                i = bodyEnd - 1;
-                continue;
-              }
-            }
             const id = nextLoopId++;
             loopInfo[id] = { kind: t.text, headerSrc };
             // Extract loop variables from the init clause (`var/let/const X`)
@@ -4265,7 +2649,6 @@
             loopStack.push({
               id, kind: t.text, headerSrc, bodyEnd, frame: loopFrame,
               modifiedVars: new Set(),
-              unrollVar: null, unrollElems: null,
             });
             // Skip past the loop header — the init/cond/update clauses
             // don't count as body mutations, so we resume at the body's
@@ -4277,409 +2660,6 @@
         }
         continue;
       }
-      // `switch (expr) { case ... }` — when the discriminant is a concrete
-      // value, walk only the matching case's body. Otherwise walk the entire
-      // switch body and let the variable-tracking accumulate normally.
-      // `if (cond) { ... } else if (...) { ... } else { ... }` — when the
-      // condition is a concrete truthy/falsy value, walk only the matching
-      // branch. When opaque, walk all branches so every binding mutation
-      // is visible (existing implicit behavior via block scope handling).
-      if (t.text === 'if') {
-        const lp = tokens[i + 1];
-        if (lp && lp.type === 'open' && lp.char === '(') {
-          // Find closing `)`.
-          let depth = 1, j = i + 2;
-          while (j < stop && depth > 0) {
-            const tk = tokens[j];
-            if (tk.type === 'open' && tk.char === '(') depth++;
-            else if (tk.type === 'close' && tk.char === ')') depth--;
-            if (depth === 0) break;
-            j++;
-          }
-          if (j < stop) {
-            // Evaluate the condition.
-            const condVal = readValue(i + 2, j, null);
-            const concrete = condVal ? evalTruthiness(condVal.binding) : null;
-            // Determine if-body range.
-            const bodyTok = tokens[j + 1];
-            let ifEnd;
-            if (bodyTok && bodyTok.type === 'open' && bodyTok.char === '{') {
-              let d = 1, k = j + 2;
-              while (k < stop && d > 0) {
-                const tk = tokens[k];
-                if (tk.type === 'open' && tk.char === '{') d++;
-                else if (tk.type === 'close' && tk.char === '}') d--;
-                k++;
-              }
-              ifEnd = k;
-            } else {
-              // Single-statement body.
-              let sd = 0, k = j + 1;
-              while (k < stop) {
-                const tk = tokens[k];
-                if (tk.type === 'open') sd++;
-                else if (tk.type === 'close') sd--;
-                else if (sd === 0 && tk.type === 'sep' && tk.char === ';') { k++; break; }
-                k++;
-              }
-              ifEnd = k;
-            }
-            // Determine else-body range (if present).
-            let elseStart = -1, elseEnd = -1;
-            const elseTok = tokens[ifEnd];
-            if (elseTok && elseTok.type === 'other' && elseTok.text === 'else') {
-              const afterElse = tokens[ifEnd + 1];
-              if (afterElse && afterElse.type === 'other' && afterElse.text === 'if') {
-                // `else if (...)` — the else body is the entire if-chain
-                // from here; let it be walked naturally when we resume at
-                // elseStart (which points at the `if` keyword).
-                elseStart = ifEnd + 1;
-                // Scan to find the end of the else-if chain.
-                let k = ifEnd + 1;
-                // We need to skip the if(...){...} [else ...] recursively.
-                // Simplest: just set elseEnd = stop and let walkRange handle it.
-                // Actually, for concrete=true we skip the else entirely, for
-                // concrete=false we resume at `if` and let the walker process it.
-                elseEnd = -1; // Will be determined by the inner `if` handling.
-              } else if (afterElse && afterElse.type === 'open' && afterElse.char === '{') {
-                elseStart = ifEnd + 1;
-                let d = 1, k = ifEnd + 2;
-                while (k < stop && d > 0) {
-                  const tk = tokens[k];
-                  if (tk.type === 'open' && tk.char === '{') d++;
-                  else if (tk.type === 'close' && tk.char === '}') d--;
-                  k++;
-                }
-                elseEnd = k;
-              } else {
-                // Single-statement else.
-                elseStart = ifEnd + 1;
-                let sd = 0, k = ifEnd + 1;
-                while (k < stop) {
-                  const tk = tokens[k];
-                  if (tk.type === 'open') sd++;
-                  else if (tk.type === 'close') sd--;
-                  else if (sd === 0 && tk.type === 'sep' && tk.char === ';') { k++; break; }
-                  k++;
-                }
-                elseEnd = k;
-              }
-            }
-
-            if (concrete === true) {
-              const sig = walkRange(j + 1, ifEnd);
-              if (sig) return sig; // propagate break/continue
-              i = (elseEnd > 0 ? elseEnd : ifEnd) - 1;
-              continue;
-            }
-            if (concrete === false) {
-              if (elseStart >= 0) {
-                if (elseEnd < 0) {
-                  i = elseStart - 1;
-                  continue;
-                }
-                const sig = walkRange(elseStart, elseEnd);
-                if (sig) return sig;
-                i = elseEnd - 1;
-              } else {
-                i = ifEnd - 1;
-              }
-              continue;
-            }
-            // Unknown condition: walk both branches so all mutations are
-            // visible. This is the default behavior — just let the walker
-            // continue into the if-body naturally, and after the if-body
-            // it'll hit `else` and process that too.
-          }
-        }
-      }
-
-      if (t.text === 'switch') {
-        const lp = tokens[i + 1];
-        if (lp && lp.type === 'open' && lp.char === '(') {
-          let depth = 1, j = i + 2;
-          while (j < stop && depth > 0) {
-            const tk = tokens[j];
-            if (tk.type === 'open' && tk.char === '(') depth++;
-            else if (tk.type === 'close' && tk.char === ')') depth--;
-            if (depth === 0) break;
-            j++;
-          }
-          // j is at closing `)`.
-          const exprVal = readValue(i + 2, j, null);
-          const bodyOpen = tokens[j + 1];
-          if (bodyOpen && bodyOpen.type === 'open' && bodyOpen.char === '{') {
-            let d = 1, k = j + 2;
-            while (k < stop && d > 0) {
-              const tk = tokens[k];
-              if (tk.type === 'open' && tk.char === '{') d++;
-              else if (tk.type === 'close' && tk.char === '}') d--;
-              k++;
-            }
-            const switchEnd = k;
-            // Try concrete match: find the matching case and walk from there.
-            const exprStr = exprVal ? chainAsKnownString(exprVal.binding) : null;
-            const exprNum = exprVal ? chainAsNumber(exprVal.binding) : null;
-            if (exprStr !== null || exprNum !== null) {
-              // Scan for matching case/default.
-              let matchStart = -1;
-              let defaultStart = -1;
-              let ci = j + 2;
-              while (ci < switchEnd - 1) {
-                const ctk = tokens[ci];
-                if (ctk.type === 'other' && ctk.text === 'case') {
-                  const cv = readValue(ci + 1, switchEnd, null);
-                  if (cv) {
-                    const cs = chainAsKnownString(cv.binding);
-                    const cn = chainAsNumber(cv.binding);
-                    if ((exprStr !== null && cs === exprStr) || (exprNum !== null && cn === exprNum)) {
-                      // Skip past the `:` after the case expression.
-                      let cj = cv.next;
-                      if (tokens[cj] && tokens[cj].type === 'other' && tokens[cj].text === ':') cj++;
-                      matchStart = cj;
-                      break;
-                    }
-                  }
-                } else if (ctk.type === 'other' && ctk.text === 'default') {
-                  let cj = ci + 1;
-                  if (tokens[cj] && tokens[cj].type === 'other' && tokens[cj].text === ':') cj++;
-                  defaultStart = cj;
-                }
-                ci++;
-              }
-              const caseStart = matchStart >= 0 ? matchStart : defaultStart;
-              if (caseStart >= 0) {
-                { const sig = walkRange(caseStart, switchEnd - 1); if (sig) return sig; }
-              }
-            } else {
-              // Unknown discriminant: walk entire switch body.
-              { const sig = walkRange(j + 2, switchEnd - 1); if (sig) return sig; }
-            }
-            i = switchEnd - 1;
-            continue;
-          }
-        }
-      }
-
-      // `try { ... } catch (e) { ... } finally { ... }` — walk each block
-      // sequentially. For the catch block, bind the error parameter as opaque.
-      if (t.text === 'try') {
-        const openTry = tokens[i + 1];
-        if (openTry && openTry.type === 'open' && openTry.char === '{') {
-          let d = 1, k = i + 2;
-          while (k < stop && d > 0) {
-            const tk = tokens[k];
-            if (tk.type === 'open' && tk.char === '{') d++;
-            else if (tk.type === 'close' && tk.char === '}') d--;
-            k++;
-          }
-          { const sig = walkRange(i + 1, k); if (sig) return sig; }
-          let j = k;
-          // catch block?
-          if (tokens[j] && tokens[j].type === 'other' && tokens[j].text === 'catch') {
-            j++;
-            // Optional `(e)` param.
-            if (tokens[j] && tokens[j].type === 'open' && tokens[j].char === '(') {
-              let dp = 1; j++;
-              while (j < stop && dp > 0) {
-                const tk = tokens[j];
-                if (tk.type === 'open' && tk.char === '(') dp++;
-                else if (tk.type === 'close' && tk.char === ')') dp--;
-                j++;
-              }
-            }
-            if (tokens[j] && tokens[j].type === 'open' && tokens[j].char === '{') {
-              let d2 = 1, k2 = j + 1;
-              while (k2 < stop && d2 > 0) {
-                const tk = tokens[k2];
-                if (tk.type === 'open' && tk.char === '{') d2++;
-                else if (tk.type === 'close' && tk.char === '}') d2--;
-                k2++;
-              }
-              walkRange(j, k2);
-              j = k2;
-            }
-          }
-          // finally block?
-          if (tokens[j] && tokens[j].type === 'other' && tokens[j].text === 'finally') {
-            j++;
-            if (tokens[j] && tokens[j].type === 'open' && tokens[j].char === '{') {
-              let d3 = 1, k3 = j + 1;
-              while (k3 < stop && d3 > 0) {
-                const tk = tokens[k3];
-                if (tk.type === 'open' && tk.char === '{') d3++;
-                else if (tk.type === 'close' && tk.char === '}') d3--;
-                k3++;
-              }
-              walkRange(j, k3);
-              j = k3;
-            }
-          }
-          i = j - 1;
-          continue;
-        }
-      }
-
-      // `with (expr) { body }` — skip the body entirely since `with`
-      // makes scope resolution unpredictable.
-      if (t.text === 'with') {
-        const wp = tokens[i + 1];
-        if (wp && wp.type === 'open' && wp.char === '(') {
-          let dp = 1, j = i + 2;
-          while (j < stop && dp > 0) {
-            const tk = tokens[j];
-            if (tk.type === 'open' && tk.char === '(') dp++;
-            else if (tk.type === 'close' && tk.char === ')') dp--;
-            j++;
-          }
-          const bodyTok = tokens[j];
-          if (bodyTok && bodyTok.type === 'open' && bodyTok.char === '{') {
-            let d = 1, k = j + 1;
-            while (k < stop && d > 0) {
-              const tk = tokens[k];
-              if (tk.type === 'open' && tk.char === '{') d++;
-              else if (tk.type === 'close' && tk.char === '}') d--;
-              k++;
-            }
-            i = k - 1;
-            continue;
-          }
-        }
-      }
-      // `debugger;` — skip.
-      if (t.text === 'debugger') continue;
-
-      // `break` / `continue` with optional label — return a signal so
-      // the enclosing loop simulation can act on it.
-      if (t.text === 'break' || t.text === 'continue') {
-        const next = tokens[i + 1];
-        const label = (next && next.type === 'other' && IDENT_RE.test(next.text) &&
-                       next.text !== 'case' && next.text !== 'default') ? next.text : '';
-        return label ? t.text + ':' + label : t.text;
-      }
-
-      // `class Name { constructor() {} method() {} }` — parse into a
-      // classBinding with constructor and methods as functionBindings.
-      if (t.text === 'class') {
-        let j = i + 1;
-        let className = null;
-        // Optional name.
-        if (tokens[j] && tokens[j].type === 'other' && IDENT_RE.test(tokens[j].text)) {
-          className = tokens[j].text;
-          j++;
-        }
-        // Optional `extends SuperClass`.
-        let superClass = null;
-        if (tokens[j] && tokens[j].type === 'other' && tokens[j].text === 'extends') {
-          j++;
-          if (tokens[j] && tokens[j].type === 'other' && IDENT_OR_PATH_RE.test(tokens[j].text)) {
-            superClass = resolve(tokens[j].text) || null;
-            j++;
-          }
-        }
-        // Class body `{ ... }`.
-        if (tokens[j] && tokens[j].type === 'open' && tokens[j].char === '{') {
-          let d = 1, bodyEnd = j + 1;
-          while (bodyEnd < stop && d > 0) {
-            const tk = tokens[bodyEnd];
-            if (tk.type === 'open' && tk.char === '{') d++;
-            else if (tk.type === 'close' && tk.char === '}') d--;
-            bodyEnd++;
-          }
-          // Parse methods inside the class body.
-          let ctor = null;
-          const methods = Object.create(null);
-          let m = j + 1;
-          while (m < bodyEnd - 1) {
-            const tk = tokens[m];
-            if (!tk) break;
-            // Skip semicolons between members.
-            if (tk.type === 'sep' && tk.char === ';') { m++; continue; }
-            // Skip prefixes: static, async, get, set, *.
-            let isStatic = false;
-            if (tk.type === 'other' && tk.text === 'static') { isStatic = true; m++; }
-            if (tokens[m] && tokens[m].type === 'other' && tokens[m].text === 'async') m++;
-            if (tokens[m] && tokens[m].type === 'op' && tokens[m].text === '*') m++;
-            if (tokens[m] && tokens[m].type === 'other' && (tokens[m].text === 'get' || tokens[m].text === 'set')) {
-              // Only treat as prefix if followed by ident + `(`, not just ident.
-              if (tokens[m + 1] && tokens[m + 1].type === 'other' && IDENT_RE.test(tokens[m + 1].text) &&
-                  tokens[m + 2] && tokens[m + 2].type === 'open' && tokens[m + 2].char === '(') {
-                m++; // skip get/set prefix
-              }
-            }
-            // Method name.
-            const nameTk = tokens[m];
-            if (!nameTk || nameTk.type !== 'other' || !IDENT_RE.test(nameTk.text)) {
-              // Skip to next `}` at depth 0 or `;`.
-              let sd = 0;
-              while (m < bodyEnd - 1) {
-                const sk = tokens[m];
-                if (sk.type === 'open') sd++;
-                else if (sk.type === 'close') { if (sd === 0) break; sd--; }
-                else if (sd === 0 && sk.type === 'sep' && sk.char === ';') break;
-                m++;
-              }
-              if (tokens[m] && (tokens[m].type === 'close' || (tokens[m].type === 'sep' && tokens[m].char === ';'))) m++;
-              continue;
-            }
-            const methodName = nameTk.text;
-            m++;
-            // Expect `(params) { body }`.
-            if (tokens[m] && tokens[m].type === 'open' && tokens[m].char === '(') {
-              const params = [];
-              let p = m + 1;
-              if (tokens[p] && tokens[p].type === 'close' && tokens[p].char === ')') { p++; }
-              else {
-                let ok = true;
-                while (p < bodyEnd - 1) {
-                  const pt = parseParamWithDefault(tokens, p, bodyEnd - 1);
-                  if (!pt) { ok = false; break; }
-                  params.push(pt.param);
-                  p = pt.next;
-                  const sep = tokens[p];
-                  if (sep && sep.type === 'close' && sep.char === ')') { p++; break; }
-                  if (sep && sep.type === 'sep' && sep.char === ',') { p++; continue; }
-                  ok = false; break;
-                }
-                if (!ok) { m = p; continue; }
-              }
-              if (tokens[p] && tokens[p].type === 'open' && tokens[p].char === '{') {
-                let md = 1, mEnd = p + 1;
-                while (mEnd < bodyEnd && md > 0) {
-                  const mk = tokens[mEnd];
-                  if (mk.type === 'open' && mk.char === '{') md++;
-                  else if (mk.type === 'close' && mk.char === '}') md--;
-                  mEnd++;
-                }
-                const fn = functionBinding(params, p + 1, mEnd - 1, true);
-                if (methodName === 'constructor' && !isStatic) ctor = fn;
-                else if (!isStatic) methods[methodName] = fn;
-                m = mEnd;
-                continue;
-              }
-            }
-            // Property assignment or unrecognised — skip to next member.
-            let sd = 0;
-            while (m < bodyEnd - 1) {
-              const sk = tokens[m];
-              if (sk.type === 'open') sd++;
-              else if (sk.type === 'close') { if (sd === 0) break; sd--; }
-              else if (sd === 0 && sk.type === 'sep' && sk.char === ';') break;
-              m++;
-            }
-            if (tokens[m] && (tokens[m].type === 'close' || (tokens[m].type === 'sep' && tokens[m].char === ';'))) m++;
-          }
-          const cls = classBinding(className, ctor, methods, superClass);
-          if (className) declFunction(className, cls);
-          // Walk the class body so innerHTML assignments inside methods
-          // are still detected (the walker processes method bodies via
-          // the normal function-scope handling).
-          walkRange(j, bodyEnd);
-          i = bodyEnd - 1;
-          continue;
-        }
-      }
-
       if (t.text === 'function') {
         // Try to capture a function declaration: `function NAME(params) { body }`.
         const nameTok = tokens[i + 1];
@@ -4715,9 +2695,11 @@
               k++;
             }
             if (depth === 0) {
-              declFunction(nameTok.text, functionBinding(params, j + 1, k - 1, true, stack.length > 1 ? captureScope() : null));
-              // Let the `{` handler decide whether to walk or skip the body
-              // based on whether it contains our target range.
+              declFunction(nameTok.text, functionBinding(params, j + 1, k - 1, true));
+              // Fall through to let the walker traverse the body in a new
+              // function scope, so inner `var`/`let`/`const` and assignments
+              // (including `this.innerHTML = ...` sites) remain visible to
+              // parseRange while staying isolated from the outer scope.
               pendingFunctionBrace = true;
               pendingFunctionParams = params;
               i = j - 1;
@@ -4729,38 +2711,11 @@
         continue;
       }
       if (t.text === '=>') {
+        // Only arrow bodies of the form `=> { ... }` open a function scope;
+        // expression arrows (`x => x + 1`) don't.
         const next = tokens[i + 1];
         if (next && next.type === 'open' && next.char === '{') pendingFunctionBrace = true;
         continue;
-      }
-
-      // `super(args)` — invoke parent constructor with same `this`.
-      // `super.method(args)` — call parent method with same `this`.
-      if (t.text === 'super') {
-        // Find the nearest constructor frame with thisBinding + superClass.
-        let thisObj = null, superCls = null;
-        for (let si = stack.length - 1; si >= 0; si--) {
-          if (stack[si].isFunction && stack[si].thisBinding) {
-            thisObj = stack[si].thisBinding;
-            superCls = stack[si].superClass || null;
-            break;
-          }
-        }
-        const paren = tokens[i + 1];
-        if (paren && paren.type === 'open' && paren.char === '(' && thisObj && superCls && superCls.kind === 'class' && superCls.ctor) {
-          const argRes = readCallArgBindings(i + 1, stop);
-          if (argRes) {
-            stack.push({ bindings: Object.create(null), isFunction: true, thisBinding: thisObj, superClass: superCls.superClass || null });
-            const frame = stack[stack.length - 1];
-            for (let p = 0; p < superCls.ctor.params.length; p++) {
-              frame.bindings[superCls.ctor.params[p].name] = argRes.bindings[p] || null;
-            }
-            walkRangeWithEffects(superCls.ctor.bodyStart, superCls.ctor.bodyEnd);
-            stack.pop();
-            i = argRes.next - 1;
-            continue;
-          }
-        }
       }
 
       // Skip ES-module `import` statements entirely — their bindings are
@@ -4768,22 +2723,6 @@
       // walker. `export` is stripped: if it fronts a declaration we let the
       // walker see the underlying `const`/`let`/`var`/`function`, otherwise
       // skip to the statement terminator.
-      // `delete obj.prop` — remove the property from a known object binding.
-      if (t.text === 'delete') {
-        const target = tokens[i + 1];
-        if (target && target.type === 'other' && PATH_RE.test(target.text)) {
-          const dot = target.text.lastIndexOf('.');
-          const basePath = target.text.slice(0, dot);
-          const prop = target.text.slice(dot + 1);
-          const baseBind = resolvePath(basePath);
-          if (baseBind && baseBind.kind === 'object' && prop in baseBind.props) {
-            delete baseBind.props[prop];
-          }
-          i++;
-          continue;
-        }
-      }
-
       if (t.text === 'import') {
         let j = i + 1;
         while (j < stop) {
@@ -4884,71 +2823,11 @@
           const cur = resolve(t.text);
           let combined = null;
           if (cur && cur.kind === 'chain' && rhs && rhs.kind === 'chain') {
-            // Numeric fold: if both sides are numbers, add instead of concat.
-            const ln = chainAsNumber(cur);
-            const rn = chainAsNumber(rhs);
-            if (ln !== null && rn !== null) {
-              combined = chainBinding([makeSynthNum(ln + rn)]);
-            } else {
-              const loopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
-              const tagged = loopId !== null ? tagWithLoop(rhs.toks, loopId) : rhs.toks;
-              combined = chainBinding([...cur.toks, SYNTH_PLUS, ...tagged]);
-            }
+            const loopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
+            const tagged = loopId !== null ? tagWithLoop(rhs.toks, loopId) : rhs.toks;
+            combined = chainBinding([...cur.toks, SYNTH_PLUS, ...tagged]);
           }
           assignName(t.text, combined);
-          if (loopStack.length > 0) loopStack[loopStack.length - 1].modifiedVars.add(t.text);
-          i = skipExpr(i + 2, stop) - 1;
-          continue;
-        }
-        // Logical/nullish compound assignment: `||=`, `&&=`, `??=`.
-        if (eqTok && eqTok.type === 'sep' && (eqTok.char === '||=' || eqTok.char === '&&=' || eqTok.char === '??=')) {
-          const r = readValue(i + 2, stop, TERMS_TOP);
-          const rhs = r ? r.binding : null;
-          const cur = resolve(t.text);
-          if (eqTok.char === '||=') {
-            const truth = evalTruthiness(cur);
-            if (truth === false) assignName(t.text, rhs);
-            else if (truth === null) assignName(t.text, null);
-          } else if (eqTok.char === '&&=') {
-            const truth = evalTruthiness(cur);
-            if (truth === true) assignName(t.text, rhs);
-          } else if (eqTok.char === '??=') {
-            const jt = cur && cur.kind === 'chain' && cur.toks.length === 1 ? cur.toks[0].jsType : null;
-            const nullish = jt === 'null' || jt === 'undefined' || !cur;
-            if (nullish) assignName(t.text, rhs);
-          }
-          i = skipExpr(i + 2, stop) - 1;
-          continue;
-        }
-        // Arithmetic compound assignments: `-=`, `*=`, `/=`, `%=`, `**=`.
-        const ARITH_COMPOUND = new Set(['-=', '*=', '/=', '%=', '**=', '|=', '&=', '^=', '<<=', '>>=', '>>>=']);
-        if (eqTok && eqTok.type === 'sep' && ARITH_COMPOUND.has(eqTok.char)) {
-          const r = readValue(i + 2, stop, TERMS_TOP);
-          const rhs = r ? r.binding : null;
-          const cur = resolve(t.text);
-          const ln = cur && cur.kind === 'chain' ? chainAsNumber(cur) : null;
-          const rn = rhs && rhs.kind === 'chain' ? chainAsNumber(rhs) : null;
-          if (ln !== null && rn !== null) {
-            let v;
-            switch (eqTok.char) {
-              case '-=': v = ln - rn; break;
-              case '*=': v = ln * rn; break;
-              case '/=': v = ln / rn; break;
-              case '%=': v = ln % rn; break;
-              case '**=': v = ln ** rn; break;
-              case '|=': v = ln | rn; break;
-              case '&=': v = ln & rn; break;
-              case '^=': v = ln ^ rn; break;
-              case '<<=': v = ln << rn; break;
-              case '>>=': v = ln >> rn; break;
-              case '>>>=': v = ln >>> rn; break;
-              default: v = null;
-            }
-            if (v !== null) assignName(t.text, chainBinding([makeSynthNum(v)]));
-            else assignName(t.text, null);
-          } else {
-            assignName(t.text, null);
-          }
           if (loopStack.length > 0) loopStack[loopStack.length - 1].modifiedVars.add(t.text);
           i = skipExpr(i + 2, stop) - 1;
           continue;
@@ -4959,7 +2838,7 @@
           const n = cur && cur.kind === 'chain' ? chainAsNumber(cur) : null;
           if (n !== null) {
             const delta = eqTok.text === '++' ? 1 : -1;
-            assignName(t.text, chainBinding([makeSynthNum(n + delta)]));
+            assignName(t.text, chainBinding([makeSynthStr(String(n + delta))]));
           } else {
             assignName(t.text, null);
           }
@@ -4968,10 +2847,6 @@
           continue;
         }
       }
-
-      // All remaining handlers below perform mutations (path assignment,
-      // path increment, method calls, delete). Skip when side effects off.
-      if (!sideEffects) continue;
 
       // Path assignment on a tracked DOM element: `el.prop = value`,
       // `el.style.color = value`, etc. Records the mutation on the
@@ -4987,61 +2862,6 @@
             applyElementSet(baseBind, parts.slice(1), val);
             i = skipExpr(i + 2, stop) - 1;
             continue;
-          }
-          // Object-path assignment: `obj.a = v`, `obj.a.b = v`. Walks into
-          // the known object binding and installs the new value at the
-          // terminal key. Bails if any intermediate step isn't an object.
-          if (baseBind && baseBind.kind === 'object' && parts.length >= 2) {
-            const r = readValue(i + 2, stop, TERMS_TOP);
-            const val = r ? r.binding : null;
-            let cur = baseBind;
-            let ok = true;
-            for (let p = 1; p < parts.length - 1; p++) {
-              const nxt = cur.props[parts[p]];
-              if (!nxt || nxt.kind !== 'object') { ok = false; break; }
-              cur = nxt;
-            }
-            if (ok) {
-              const termKey = parts[parts.length - 1];
-              // Check for setter in accessors map.
-              const accessor = cur.accessors && cur.accessors[termKey];
-              if (accessor && accessor.set && accessor.set.kind === 'function') {
-                stack.push({ bindings: Object.create(null), isFunction: true, thisBinding: cur });
-                const setFrame = stack[stack.length - 1];
-                if (accessor.set.params[0]) setFrame.bindings[accessor.set.params[0].name] = val;
-                walkRange(accessor.set.bodyStart, accessor.set.bodyEnd);
-                stack.pop();
-              } else {
-                cur.props[termKey] = val;
-              }
-            }
-            i = skipExpr(i + 2, stop) - 1;
-            continue;
-          }
-        }
-        // Path increment/decrement: `obj.n++`, `this.count--`.
-        if (eqTok && eqTok.type === 'op' && (eqTok.text === '++' || eqTok.text === '--')) {
-          const parts = t.text.split('.');
-          const baseBind = resolve(parts[0]);
-          if (baseBind && baseBind.kind === 'object') {
-            let cur = baseBind;
-            let ok = true;
-            for (let p = 1; p < parts.length - 1; p++) {
-              const nxt = cur.props[parts[p]];
-              if (!nxt || nxt.kind !== 'object') { ok = false; break; }
-              cur = nxt;
-            }
-            if (ok) {
-              const key = parts[parts.length - 1];
-              const val = cur.props[key];
-              const n = val && val.kind === 'chain' ? chainAsNumber(val) : null;
-              if (n !== null) {
-                const delta = eqTok.text === '++' ? 1 : -1;
-                cur.props[key] = chainBinding([makeSynthNum(n + delta)]);
-              }
-              i++;
-              continue;
-            }
           }
         }
         // Path method call: `el.appendChild(child)`, `el.setAttribute(...)`.
@@ -5060,116 +2880,10 @@
                 continue;
               }
             }
-            // Array mutation methods on a known array binding.
-            // `arr.push(v)`, `arr.pop()`, `arr.shift()`, `arr.unshift(v,...)`.
-            if (baseBind && baseBind.kind === 'array' && (method === 'push' || method === 'pop' || method === 'shift' || method === 'unshift' || method === 'splice' || method === 'fill' || method === 'reverse' || method === 'sort')) {
-              const argResult = readCallArgBindings(i + 1, stop);
-              if (argResult) {
-                if (method === 'push') {
-                  for (const b of argResult.bindings) baseBind.elems.push(b);
-                } else if (method === 'pop') {
-                  baseBind.elems.pop();
-                } else if (method === 'shift') {
-                  baseBind.elems.shift();
-                } else if (method === 'unshift') {
-                  baseBind.elems.unshift(...argResult.bindings);
-                } else if (method === 'splice') {
-                  const startN = argResult.bindings[0] ? chainAsNumber(argResult.bindings[0]) : null;
-                  const delN = argResult.bindings[1] ? chainAsNumber(argResult.bindings[1]) : null;
-                  if (startN !== null) {
-                    const start = startN < 0 ? Math.max(0, baseBind.elems.length + startN) : startN;
-                    const del = delN !== null ? delN : baseBind.elems.length - start;
-                    const items = argResult.bindings.slice(2);
-                    baseBind.elems.splice(start, del, ...items);
-                  }
-                } else if (method === 'fill') {
-                  const val = argResult.bindings[0] || null;
-                  const startN = argResult.bindings[1] ? chainAsNumber(argResult.bindings[1]) : 0;
-                  const endN = argResult.bindings[2] ? chainAsNumber(argResult.bindings[2]) : baseBind.elems.length;
-                  for (let k = (startN || 0); k < (endN || baseBind.elems.length); k++) baseBind.elems[k] = val;
-                } else if (method === 'reverse') {
-                  baseBind.elems.reverse();
-                } else if (method === 'sort') {
-                  // No comparator support at statement level; just reverse-sort strings.
-                  baseBind.elems.sort((a, b) => {
-                    const sa = a && a.kind === 'chain' ? chainAsKnownString(a) : null;
-                    const sb = b && b.kind === 'chain' ? chainAsKnownString(b) : null;
-                    if (sa === null || sb === null) return 0;
-                    return sa < sb ? -1 : sa > sb ? 1 : 0;
-                  });
-                }
-                i = argResult.next - 1;
-                continue;
-              }
-            }
-            // forEach at statement level: walk callback body per element
-            // for side effects (e.g. `arr.forEach(function(x) { html += x; })`).
-            if (baseBind && baseBind.kind === 'array' && method === 'forEach') {
-              const lp = tokens[i + 1];
-              if (lp && lp.type === 'open' && lp.char === '(') {
-                const cb = peekCallback(i + 2, stop);
-                if (cb) {
-                  const rp = tks[cb.next];
-                  if (rp && rp.type === 'close' && rp.char === ')') {
-                    for (let idx = 0; idx < baseBind.elems.length; idx++) {
-                      const el = baseBind.elems[idx];
-                      if (!el) continue;
-                      const iterFrame = { bindings: Object.create(null), isFunction: false };
-                      if (cb.fn.params[0]) iterFrame.bindings[cb.fn.params[0].name] = el;
-                      if (cb.fn.params[1]) iterFrame.bindings[cb.fn.params[1].name] = chainBinding([makeSynthNum(idx)]);
-                      if (cb.fn.params[2]) iterFrame.bindings[cb.fn.params[2].name] = baseBind;
-                      stack.push(iterFrame);
-                      if (cb.fn.isBlock) walkRangeWithEffects(cb.fn.bodyStart, cb.fn.bodyEnd);
-                      stack.pop();
-                    }
-                    i = cb.next; // past `)`
-                    continue;
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-
-      // Bracket-indexed assignment: `arr[i] = v`, `obj['key'] = v`.
-      // Walks into the array/object binding and sets the slot when the
-      // key is a concrete number/string.
-      if (t.type === 'other' && IDENT_RE.test(t.text)) {
-        const openTok = tokens[i + 1];
-        if (openTok && openTok.type === 'open' && openTok.char === '[') {
-          // Scan to matching `]`.
-          let d = 1; let j = i + 2;
-          while (j < stop && d > 0) {
-            const tk = tokens[j];
-            if (tk.type === 'open' && tk.char === '[') d++;
-            else if (tk.type === 'close' && tk.char === ']') d--;
-            if (d > 0) j++;
-          }
-          const eqTok = tokens[j + 1];
-          if (j < stop && eqTok && eqTok.type === 'sep' && eqTok.char === '=') {
-            const keyRes = readValue(i + 2, j, null);
-            const valRes = readValue(j + 2, stop, TERMS_TOP);
-            const baseBind = resolve(t.text);
-            const keyN = keyRes ? chainAsNumber(keyRes.binding) : null;
-            const keyS = keyRes && keyN === null ? chainAsKnownString(keyRes.binding) : null;
-            if (baseBind && baseBind.kind === 'array' && keyN !== null && Number.isInteger(keyN) && keyN >= 0) {
-              while (baseBind.elems.length <= keyN) baseBind.elems.push(null);
-              baseBind.elems[keyN] = valRes ? valRes.binding : null;
-              i = skipExpr(j + 2, stop) - 1;
-              continue;
-            }
-            if (baseBind && baseBind.kind === 'object' && keyS !== null) {
-              baseBind.props[keyS] = valRes ? valRes.binding : null;
-              i = skipExpr(j + 2, stop) - 1;
-              continue;
-            }
           }
         }
       }
     }
-    };
-    walkRangeWithEffects(0, stop);
 
     // Parse tokens[start, end) as a concat chain, expanding identifier
     // references, member paths, `[...].join(sep)`, and `.concat(...)` calls.
@@ -5219,168 +2933,7 @@
     return { tokens: out, parsed: false, loopInfo: state.loopInfo, loopVars: state.loopVars, inScope: state.inScope };
   }
 
-  // Materialize a flat concat chain (tokens alternating operand/plus) into
-  // { html, autoSubs, loops }. Unlike materializeChain, doesn't require at
-  // least one string operand — a lone opaque operand yields a placeholder.
-  // Operands tagged with `loopId` emit `__HDLOOP#S__` / `__HDLOOP#E__`
-  // boundary markers and populate the `loops` array.
-  function materializeFlatChain(chainTokens, loopInfoMap) {
-    const operands = [];
-    let cur = [];
-    for (const t of chainTokens) {
-      if (t.type === 'plus') { if (cur.length) operands.push({ toks: cur }); cur = []; }
-      else cur.push(t);
-    }
-    if (cur.length) operands.push({ toks: cur });
-    const loopsSeen = Object.create(null);
-    let html = '';
-    const autoSubs = [];
-    let idx = 0;
-    let activeLoop = null;
-    const closeActive = () => {
-      if (activeLoop !== null) {
-        html += '__HDLOOP' + activeLoop + 'E__';
-        activeLoop = null;
-      }
-    };
-    for (const op of operands) {
-      const opLoop = op.toks[0].loopId != null ? op.toks[0].loopId : null;
-      if (opLoop !== activeLoop) {
-        closeActive();
-        if (opLoop !== null) {
-          html += '__HDLOOP' + opLoop + 'S__';
-          activeLoop = opLoop;
-          if (loopInfoMap && loopInfoMap[opLoop]) loopsSeen[opLoop] = loopInfoMap[opLoop];
-        }
-      }
-      if (op.toks.length === 1 && (op.toks[0].type === 'str' || op.toks[0].type === 'tmpl')) {
-        const m = materializeStringToken(op.toks[0], idx);
-        html += m.html;
-        for (const s of m.autoSubs) autoSubs.push(s);
-        idx = m.nextIdx;
-      } else {
-        const first = op.toks[0];
-        const last = op.toks[op.toks.length - 1];
-        const expr = first._src.slice(first.start, last.end).trim();
-        const ph = makePlaceholder(idx++);
-        autoSubs.push([ph, expr]);
-        html += ph;
-      }
-    }
-    closeActive();
-    const loops = Object.keys(loopsSeen).map((id) => ({
-      id: Number(id), kind: loopsSeen[id].kind, headerSrc: loopsSeen[id].headerSrc,
-    }));
-    return loops.length ? { html, autoSubs, loops } : { html, autoSubs };
-  }
 
-  const EXPR_PREFIX = '__HDX';
-  const EXPR_SUFFIX = '__';
-  function makePlaceholder(n) { return EXPR_PREFIX + n + EXPR_SUFFIX; }
-
-  // Build html/autoSubs from a single string or template literal token.
-  // `startIdx` is the next placeholder index to use.
-  function materializeStringToken(tok, startIdx) {
-    const autoSubs = [];
-    let idx = startIdx;
-    if (tok.type === 'str') {
-      return { html: tok.text, autoSubs, nextIdx: idx };
-    }
-    // template literal
-    let html = '';
-    for (const p of tok.parts) {
-      if (p.kind === 'text') html += decodeJsString(p.raw, '`');
-      else {
-        const ph = makePlaceholder(idx++);
-        autoSubs.push([ph, p.expr.trim()]);
-        html += ph;
-      }
-    }
-    return { html, autoSubs, nextIdx: idx };
-  }
-
-  // Walk tokens, maintaining a stack of bracket levels. At each level, split
-  // the range into operand sub-ranges at every `+` at that level. Collect all
-  // chains (operand-arrays) of length >= 2. Returns the chain producing the
-  // most HTML-like output, or null.
-  function findBestConcatChain(tokens) {
-    const chains = [];
-    const stack = [{ opStart: 0, operands: [] }];
-    const addOperand = (ctx, fromIdx, toIdx) => {
-      if (fromIdx > toIdx) return;
-      // Trim whitespace (we don't emit whitespace tokens, so nothing to do).
-      ctx.operands.push({ toks: tokens.slice(fromIdx, toIdx + 1) });
-    };
-    for (let i = 0; i < tokens.length; i++) {
-      const t = tokens[i];
-      if (t.type === 'open') {
-        stack.push({ opStart: i + 1, operands: [] });
-        continue;
-      }
-      if (t.type === 'close') {
-        const top = stack.pop();
-        addOperand(top, top.opStart, i - 1);
-        if (top.operands.length > 1) chains.push(top.operands);
-        continue;
-      }
-      if (t.type === 'plus') {
-        const top = stack[stack.length - 1];
-        addOperand(top, top.opStart, i - 1);
-        top.opStart = i + 1;
-        continue;
-      }
-      if (t.type === 'sep') {
-        // Terminate and flush the current chain at this depth; start a fresh one.
-        const top = stack[stack.length - 1];
-        addOperand(top, top.opStart, i - 1);
-        if (top.operands.length > 1) chains.push(top.operands);
-        top.operands = [];
-        top.opStart = i + 1;
-      }
-    }
-    while (stack.length) {
-      const top = stack.pop();
-      addOperand(top, top.opStart, tokens.length - 1);
-      if (top.operands.length > 1) chains.push(top.operands);
-    }
-
-    let best = null;
-    let bestScore = -1;
-    for (const chain of chains) {
-      const m = materializeChain(chain);
-      if (!m) continue;
-      if (!/</.test(m.html)) continue;
-      const score = m.html.length + m.autoSubs.length * 50;
-      if (score > bestScore) { bestScore = score; best = m; }
-    }
-    return best;
-  }
-
-  function materializeChain(operands) {
-    let html = '';
-    const autoSubs = [];
-    let idx = 0;
-    let hasString = false;
-    for (const op of operands) {
-      // operand has { toks, start, end }
-      if (op.toks.length === 1 && (op.toks[0].type === 'str' || op.toks[0].type === 'tmpl')) {
-        const m = materializeStringToken(op.toks[0], idx);
-        html += m.html;
-        for (const s of m.autoSubs) autoSubs.push(s);
-        idx = m.nextIdx;
-        hasString = true;
-      } else {
-        const first = op.toks[0];
-        const last = op.toks[op.toks.length - 1];
-        const expr = first._src.slice(first.start, last.end).trim();
-        const ph = makePlaceholder(idx++);
-        autoSubs.push([ph, expr]);
-        html += ph;
-      }
-    }
-    if (!hasString) return null;
-    return { html, autoSubs };
-  }
 
   // --- Tokenizer ---
   function tokenize(src) {
@@ -5445,10 +2998,9 @@
       if (c === ',' || c === ';') { push({ type: 'sep', char: c, start: i, end: i + 1 }); i++; continue; }
       if (c === ':') { push({ type: 'other', text: ':', start: i, end: i + 1 }); i++; continue; }
       if (c === '?') {
-        // Multi-char tokens starting with '?': `??=` (nullish assign),
-        // `??` (nullish coalescing), `?.` (optional chaining; ignore
-        // `?.<digit>` which is a ternary followed by a decimal number).
-        if (src[i + 1] === '?' && src[i + 2] === '=') { push({ type: 'sep', char: '??=', start: i, end: i + 3 }); i += 3; continue; }
+        // Multi-char tokens starting with '?': `??` (nullish coalescing)
+        // and `?.` (optional chaining; ignore `?.<digit>` which is a
+        // ternary followed by a decimal number).
         if (src[i + 1] === '?') { push({ type: 'op', text: '??', start: i, end: i + 2 }); i += 2; continue; }
         if (src[i + 1] === '.' && !/[0-9]/.test(src[i + 2] || '')) {
           push({ type: 'op', text: '?.', start: i, end: i + 2 }); i += 2; continue;
@@ -5560,34 +3112,10 @@
   }
 
   // Produce a JS string literal (or variable/template) for `s`.
-  function jsStr(s, substitutions) {
-    if (substitutions && substitutions.length) {
-      for (const [needle, varName] of substitutions) {
-        if (needle && s === needle) return { code: varName, isVar: true };
-      }
-      // Check if ANY needle appears in s.
-      const needles = substitutions.filter(([n]) => n).map(([n, v]) => ({ n, v }));
-      const present = needles.filter((x) => s.includes(x.n));
-      if (present.length) {
-        // Sort by length descending so longer needles win over substring
-        // overlap in the regex alternation.
-        present.sort((a, b) => b.n.length - a.n.length);
-        const esc = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const re = new RegExp(present.map((x) => esc(x.n)).join('|'), 'g');
-        const encode = (t) => t.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$\{/g, '\\${');
-        let out = '';
-        let last = 0;
-        let match;
-        while ((match = re.exec(s)) !== null) {
-          out += encode(s.slice(last, match.index));
-          const hit = present.find((x) => x.n === match[0]);
-          out += '${' + hit.v + '}';
-          last = match.index + match[0].length;
-        }
-        out += encode(s.slice(last));
-        return { code: '`' + out + '`', isVar: true };
-      }
-    }
+  // Replace placeholder tokens in a raw string with their substituted
+  // expressions. Used for event handler bodies and other contexts where
+  // we need inline substitution without wrapping in quotes.
+  function jsStr(s) {
     const esc = s
       .replace(/\\/g, '\\\\')
       .replace(/'/g, "\\'")
@@ -5596,7 +3124,7 @@
       .replace(/\t/g, '\\t')
       .replace(/\u2028/g, '\\u2028')
       .replace(/\u2029/g, '\\u2029');
-    return { code: "'" + esc + "'", isVar: false };
+    return { code: "'" + esc + "'" };
   }
 
   // Make a safe, unique JS identifier from a tag name.
@@ -5623,22 +3151,13 @@
     return null;
   }
 
-  function isValidIdent(s) { return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(s); }
-
   // Convert a style="..." attribute value into an array of style.* assignments.
   function parseStyle(val) {
     const out = [];
-    // Split on ; that are not inside parens or quoted strings.
-    let depth = 0, cur = '', inQ = '';
+    // Split on ; that are not inside parens (e.g. url(a;b)).
+    let depth = 0, cur = '';
     for (let i = 0; i < val.length; i++) {
       const c = val[i];
-      if (inQ) {
-        cur += c;
-        if (c === '\\' && i + 1 < val.length) { cur += val[++i]; continue; }
-        if (c === inQ) inQ = '';
-        continue;
-      }
-      if (c === '"' || c === "'") { inQ = c; cur += c; continue; }
       if (c === '(') depth++;
       else if (c === ')') depth--;
       if (c === ';' && depth === 0) { if (cur.trim()) out.push(cur.trim()); cur = ''; }
@@ -5662,397 +3181,33 @@
     return decls;
   }
 
-  function convertNode(node, parentVar, lines, used, opts, nsCtx) {
-    // Text node.
-    if (node.nodeType === 3) {
-      const text = node.nodeValue;
-      if (text === '') return;
-      if (opts.skipWhitespaceText && /^\s*$/.test(text)) return;
-      const v = makeVar('text', used);
-      const lit = jsStr(text, opts.subs);
-      lines.push('const ' + v + ' = document.createTextNode(' + lit.code + ');');
-      lines.push(parentVar + '.appendChild(' + v + ');');
-      return;
-    }
-    // Comment.
-    if (node.nodeType === 8) {
-      const v = makeVar('comment', used);
-      const lit = jsStr(node.nodeValue, opts.subs);
-      lines.push('const ' + v + ' = document.createComment(' + lit.code + ');');
-      lines.push(parentVar + '.appendChild(' + v + ');');
-      return;
-    }
-    // CDATA section (appears in foreign content, e.g. SVG).
-    if (node.nodeType === 4) {
-      const v = makeVar('cdata', used);
-      const lit = jsStr(node.nodeValue, opts.subs);
-      // HTML documents cannot create CDATA nodes; emit via an XML document.
-      lines.push('const ' + v + " = document.implementation.createDocument(null, null).createCDATASection(" + lit.code + ');');
-      lines.push(parentVar + '.appendChild(' + v + ');');
-      return;
-    }
-    // Processing instruction.
-    if (node.nodeType === 7) {
-      const v = makeVar('pi', used);
-      const target = jsStr(node.target, opts.subs).code;
-      const data = jsStr(node.nodeValue, opts.subs).code;
-      lines.push('const ' + v + ' = document.createProcessingInstruction(' + target + ', ' + data + ');');
-      lines.push(parentVar + '.appendChild(' + v + ');');
-      return;
-    }
-    if (node.nodeType !== 1) return;
-
-    const tag = node.tagName.toLowerCase();
-    const v = makeVar(tag, used);
-
-    const attrs = Array.from(node.attributes || []);
-
-    // Namespace detection. Elements in a parsed HTML document expose their
-    // namespaceURI; prefer that when present, so fragments like
-    // `<g xmlns="http://www.w3.org/2000/svg">` route through createElementNS
-    // even without a wrapping <svg>. Fall back to tag-name heuristics for
-    // elements lacking a namespaceURI.
-    let ns = node.namespaceURI || nsCtx;
-    if (ns === 'http://www.w3.org/1999/xhtml') ns = null;
-    // Fallback tag-name heuristics for nodes without a namespaceURI.
-    if (!node.namespaceURI) {
-      if (tag === 'svg') ns = SVG_NS;
-      else if (tag === 'math') ns = MATHML_NS;
-    }
-    // Note: <foreignObject> itself stays in SVG; its children revert to HTML
-    // via `childNs` below.
-
-    // Detect `is=` for customized built-ins (HTML namespace only).
-    let isAttr = null;
-    if (ns !== SVG_NS && ns !== MATHML_NS) {
-      for (const a of attrs) {
-        if (a.name === 'is') { isAttr = a.value; break; }
-      }
-    }
-
-    if (ns === SVG_NS || ns === MATHML_NS) {
-      lines.push('const ' + v + " = document.createElementNS('" + ns + "', '" + node.tagName + "');");
-    } else if (isAttr !== null) {
-      const isLit = jsStr(isAttr, opts.subs).code;
-      lines.push('const ' + v + " = document.createElement('" + tag + "', { is: " + isLit + ' });');
-    } else {
-      lines.push('const ' + v + " = document.createElement('" + tag + "');");
-    }
-
-    for (const attr of attrs) {
-      const name = attr.name;
-      const val = attr.value;
-
-      // Event handler -> addEventListener with the original code in a function body.
-      const evMatch = /^on([a-z]+)$/.exec(name);
-      if (evMatch && opts.eventsAsListeners) {
-        const evName = evMatch[1];
-        const body = val;
-        // event/this/target are available in inline handler scope; emulate.
-        lines.push(v + ".addEventListener('" + evName + "', function (event) {");
-        for (const ln of body.split('\n')) lines.push('  ' + ln);
-        lines.push('});');
-        continue;
-      }
-
-      // Style attribute -> always use style.setProperty to prevent CSS injection.
-      // Never use setAttribute('style', ...) which could inject via crafted values.
-      if (name === 'style') {
-        const decls = parseStyle(val);
-        for (const d of decls) {
-          const p = jsStr(d.prop).code;
-          const vv = jsStr(d.value, opts.subs).code;
-          if (d.priority) {
-            lines.push(v + '.style.setProperty(' + p + ', ' + vv + ", 'important');");
-          } else {
-            lines.push(v + '.style.setProperty(' + p + ', ' + vv + ');');
-          }
-        }
-        continue;
-      }
-
-      // Namespaced attributes -> setAttributeNS.
-      if (name.startsWith('xlink:')) {
-        lines.push(v + ".setAttributeNS('" + XLINK_NS + "', '" + name + "', " + jsStr(val, opts.subs).code + ');');
-        continue;
-      }
-      if (name === 'xmlns' || name.startsWith('xmlns:')) {
-        lines.push(v + ".setAttributeNS('" + XMLNS_NS + "', '" + name + "', " + jsStr(val, opts.subs).code + ');');
-        continue;
-      }
-      if (name.startsWith('xml:')) {
-        lines.push(v + ".setAttributeNS('" + XML_NS + "', '" + name + "', " + jsStr(val, opts.subs).code + ');');
-        continue;
-      }
-
-      // Boolean attributes in HTML ns: empty value -> true, else setAttribute.
-      if (ns !== SVG_NS && ns !== MATHML_NS && BOOLEAN_ATTRS.has(name)) {
-        // attribute present implies true
-        lines.push(v + '.' + (ATTR_TO_PROP[name] || name) + ' = true;');
-        continue;
-      }
-
-      // Class attribute: use classList.add(...) for readability if multiple classes.
-      if (name === 'class' && opts.useClassList && ns !== SVG_NS) {
-        const classes = val.split(/\s+/).filter(Boolean);
-        if (classes.length === 0) continue;
-        if (classes.length === 1) {
-          lines.push(v + '.className = ' + jsStr(classes[0], opts.subs).code + ';');
-        } else {
-          const parts = classes.map(c => jsStr(c, opts.subs).code).join(', ');
-          lines.push(v + '.classList.add(' + parts + ');');
-        }
-        continue;
-      }
-
-      // IDL property (HTML ns only).
-      const idl = (opts.useProps && ns !== SVG_NS && ns !== MATHML_NS) ? isIdlProp(name) : null;
-      const lit = jsStr(val, opts.subs);
-      if (idl) {
-        lines.push(v + '.' + idl + ' = ' + lit.code + ';');
-      } else {
-        lines.push(v + ".setAttribute('" + name.replace(/'/g, "\\'") + "', " + lit.code + ');');
-      }
-    }
-
-    // <noscript>: with scripting enabled, the HTML parser stores children as
-    // raw text. DOMParser parses with scripting disabled, so children are real
-    // nodes — serialize them back to text to match runtime semantics.
-    if (tag === 'noscript' && ns !== SVG_NS && ns !== MATHML_NS) {
-      const text = node.innerHTML;
-      if (text !== '') {
-        lines.push(v + '.textContent = ' + jsStr(text, opts.subs).code + ';');
-      }
-      lines.push(parentVar + '.appendChild(' + v + ');');
-      return;
-    }
-
-    // <template> holds its parsed subtree on `.content` (a DocumentFragment),
-    // not on childNodes. Recurse into that fragment instead.
-    if (tag === 'template' && node.content) {
-      const tplChildren = Array.from(node.content.childNodes);
-      for (const child of tplChildren) {
-        convertNode(child, v + '.content', lines, used, opts, null);
-      }
-      lines.push(parentVar + '.appendChild(' + v + ');');
-      return;
-    }
-
-    let children = Array.from(node.childNodes);
-
-    // Declarative Shadow DOM: if a direct child is <template shadowrootmode="…">,
-    // attach a shadow root on this element and recurse the template content
-    // into the shadow root instead. Only the first such template is honored,
-    // matching the HTML parser.
-    let shadowTpl = null;
-    if (ns !== SVG_NS && ns !== MATHML_NS) {
-      for (let i = 0; i < children.length; i++) {
-        const c = children[i];
-        if (c.nodeType !== 1) continue;
-        if (c.tagName === 'TEMPLATE' && c.getAttribute && c.getAttribute('shadowrootmode')) {
-          shadowTpl = c;
-          children.splice(i, 1);
-        }
-        break;
-      }
-    }
-    if (shadowTpl) {
-      const mode = shadowTpl.getAttribute('shadowrootmode');
-      const initParts = ['mode: ' + jsStr(mode).code];
-      if (shadowTpl.hasAttribute('shadowrootdelegatesfocus')) initParts.push('delegatesFocus: true');
-      if (shadowTpl.hasAttribute('shadowrootserializable')) initParts.push('serializable: true');
-      if (shadowTpl.hasAttribute('shadowrootclonable')) initParts.push('clonable: true');
-      const sv = makeVar('shadow', used);
-      lines.push('const ' + sv + ' = ' + v + '.attachShadow({ ' + initParts.join(', ') + ' });');
-      if (shadowTpl.content) {
-        for (const c of shadowTpl.content.childNodes) {
-          convertNode(c, sv, lines, used, opts, null);
-        }
-      }
-    }
-
-    // Children — use textContent shortcut when single text child and no substitution.
-    if (!shadowTpl && opts.textContentShortcut &&
-        children.length === 1 &&
-        children[0].nodeType === 3 &&
-        tag !== 'script' && tag !== 'style') {
-      const text = children[0].nodeValue;
-      const lit = jsStr(text, opts.subs);
-      if (text !== '') {
-        lines.push(v + '.textContent = ' + lit.code + ';');
-      }
-    } else {
-      const childNs = (tag === 'foreignobject') ? null : ns;
-      for (const child of children) {
-        convertNode(child, v, lines, used, opts, childNs);
-      }
-    }
-
-    lines.push(parentVar + '.appendChild(' + v + ');');
-  }
-
-  // Split an HTML string containing `__HDLOOP#S__` / `__HDLOOP#E__` markers
-  // into segments: `{ kind: 'static'|'loop', html, id? }`. Only top-level
-  // (non-nested) loop markers create segment boundaries — nested loops stay
-  // as markers inside the segment html.
-  function splitLoopSegments(html) {
-    const segments = [];
-    const re = /__HDLOOP(\d+)([SE])__/g;
-    let depth = 0;
-    let segStart = 0;
-    let loopId = null;
-    let loopInnerStart = 0;
-    let match;
-    while ((match = re.exec(html)) !== null) {
-      const id = Number(match[1]);
-      const isStart = match[2] === 'S';
-      if (isStart) {
-        if (depth === 0) {
-          if (match.index > segStart) {
-            segments.push({ kind: 'static', html: html.slice(segStart, match.index) });
-          }
-          loopId = id;
-          loopInnerStart = re.lastIndex;
-        }
-        depth++;
-      } else {
-        depth--;
-        if (depth === 0) {
-          segments.push({ kind: 'loop', id: loopId, html: html.slice(loopInnerStart, match.index) });
-          segStart = re.lastIndex;
-        }
-      }
-    }
-    if (segStart < html.length) segments.push({ kind: 'static', html: html.slice(segStart) });
-    return segments;
-  }
 
   function convert() {
     try {
       const raw = (typeof window !== 'undefined' && window._monacoIn) ? window._monacoIn.getValue() : ($('in') ? $('in').value : '');
-
-      // If input is HTML (starts with <), split into HTML portions and
-      // <script> blocks. Convert HTML to DOM API, process script blocks
-      // for innerHTML replacements.
-      if (/^\s*</.test(raw)) {
-        const scriptRe = /<script\b[^>]*>([\s\S]*?)<\/script>/gi;
-        let lastIdx = 0;
-        const parts = [];
-        let m;
-        while ((m = scriptRe.exec(raw)) !== null) {
-          // HTML before this script tag.
-          if (m.index > lastIdx) {
-            parts.push({ kind: 'html', text: raw.slice(lastIdx, m.index) });
-          }
-          parts.push({ kind: 'script', text: m[1], fullMatch: m[0], tagStart: m.index, tagEnd: m.index + m[0].length });
-          lastIdx = scriptRe.lastIndex;
-        }
-        // Trailing HTML after last script.
-        if (lastIdx < raw.length) {
-          parts.push({ kind: 'html', text: raw.slice(lastIdx) });
-        }
-        // If no script tags found, treat entire input as HTML.
-        if (parts.length === 0) parts.push({ kind: 'html', text: raw });
-
-        const outputParts = [];
-        const sharedUsed = new Set(); // shared across HTML portions to avoid duplicate var names
-        for (const part of parts) {
-          if (part.kind === 'html') {
-            const htmlTrimmed = part.text.trim();
-            if (!htmlTrimmed) continue;
-            const result = extractHTML(htmlTrimmed);
-            const block = convertOne(htmlTrimmed, result, false, false, sharedUsed);
-            if (block) outputParts.push(block);
-          } else {
-            // Process script content for innerHTML replacements.
-            const jsCode = part.text;
-            const extractions = extractAllHTML(jsCode);
-            if (extractions.length === 0) {
-              // No innerHTML in this script — keep as-is.
-              outputParts.push(jsCode);
-            } else {
-              // Inline replacement within the script.
-              const trimmed = jsCode;
-              let scriptOutput = '';
-              let cursor = 0;
-              for (const ex of extractions) {
-                if (ex.srcStart === undefined) continue;
-                const domBlock = convertOne(jsCode, ex, false, false);
-                let srcStart = ex.srcStart;
-                let srcEnd = ex.srcEnd;
-                if (ex._assign && ex._tokens) {
-                  const region = findBuildRegion(ex._tokens, ex._assign, domBlock || '');
-                  if (region) {
-                    srcStart = region.regionStart;
-                    srcEnd = region.regionEnd;
-                  }
-                }
-                scriptOutput += trimmed.slice(cursor, srcStart);
-                if (domBlock) {
-                  let lineStart = srcStart;
-                  while (lineStart > 0 && trimmed[lineStart - 1] !== '\n') lineStart--;
-                  const indent = trimmed.slice(lineStart, srcStart).match(/^(\s*)/)[1];
-                  const indented = domBlock.split('\n').map((line, i) => i === 0 ? line : indent + line).join('\n');
-                  scriptOutput += indented;
-                }
-                cursor = srcEnd;
-                // Skip trailing semicolons/whitespace to avoid doubled `;`.
-                while (cursor < trimmed.length && (trimmed[cursor] === ';' || trimmed[cursor] === ' ')) cursor++;
-              }
-              scriptOutput += trimmed.slice(cursor);
-              outputParts.push(scriptOutput);
-            }
-          }
-        }
-        setOutput(outputParts.join('\n'));
-        return;
-      }
-
+      const blocks = [];
       const extractions = extractAllHTML(raw);
       if (extractions.length === 0) {
         const summary = summarizeDomConstruction(raw);
-        if (summary) { setOutput(summary); return; }
-        setOutput(convertOne(raw, extractHTML(raw), false, false) || '');
-        return;
+        if (summary) blocks.push(summary);
+        else blocks.push(convertOne(raw, extractHTML(raw), false, false));
+      } else {
+        const multi = extractions.length > 1;
+        for (const ex of extractions) blocks.push(convertOne(raw, ex, multi, multi));
       }
-      // Build the full rewritten script: original code with innerHTML
-      // assignments replaced inline by safe DOM API equivalents.
-      const trimmed = raw.trim();
-      let output = '';
-      let cursor = 0;
-      for (const ex of extractions) {
-        if (ex.srcStart === undefined) continue;
-        // Generate the DOM replacement block first.
-        const domBlock = convertOne(raw, ex, false, false);
-        // Now compute the build region, passing the replacement output
-        // so variables it references aren't removed as dead code.
-        let srcStart = ex.srcStart;
-        let srcEnd = ex.srcEnd;
-        if (ex._assign && ex._tokens) {
-          const region = findBuildRegion(ex._tokens, ex._assign, domBlock || '');
-          if (region) {
-            srcStart = region.regionStart;
-            srcEnd = region.regionEnd;
-          }
-        }
-        // Copy original source up to this site.
-        output += trimmed.slice(cursor, srcStart);
-        if (domBlock) {
-          let lineStart = srcStart;
-          while (lineStart > 0 && trimmed[lineStart - 1] !== '\n') lineStart--;
-          const indent = trimmed.slice(lineStart, srcStart).match(/^(\s*)/)[1];
-          // Indent the replacement block to match.
-          const indented = domBlock.split('\n').map((line, i) => i === 0 ? line : indent + line).join('\n');
-          output += indented;
-        }
-        cursor = srcEnd;
-        while (cursor < trimmed.length && (trimmed[cursor] === ';' || trimmed[cursor] === ' ')) cursor++;
-      }
-      // Append remaining original source after the last innerHTML site.
-      output += trimmed.slice(cursor);
-      setOutput(output);
+      setOutput(blocks.filter((b) => b).join('\n\n'));
     } catch (err) {
       setOutput('// Error: ' + err.message);
+    }
+  }
+
+  let lastOutput = '';
+  function setOutput(text) {
+    lastOutput = text;
+    if (typeof window !== 'undefined' && window._monacoOut) {
+      window._monacoOut.setValue(text);
+    } else if ($('out')) {
+      $('out').value = text;
     }
   }
 
@@ -6082,188 +3237,594 @@
     return lines.length > 1 ? lines.join('\n') : '';
   }
 
+  // ---------------------------------------------------------------------------
+  // Direct chain-to-DOM converter: bypass DOMParser, work from chain tokens.
+  // ---------------------------------------------------------------------------
+
+  // Parse chain tokens into a lightweight virtual DOM tree. Each str token
+  // is fed character-by-character through an HTML state machine; each other
+  // token (expression) is annotated with its HTML context (text content,
+  // attribute value, attribute name, etc.).
+  function parseChainToVNodes(chainTokens) {
+    // Split chain at plus tokens into operands.
+    const operands = [];
+    let cur = [];
+    for (const t of chainTokens) {
+      if (t.type === 'plus') { if (cur.length) operands.push(cur); cur = []; }
+      else cur.push(t);
+    }
+    if (cur.length) operands.push(cur);
+
+    // Resolve an operand to { kind: 'str', text, loopId } or { kind: 'expr', expr, loopId }.
+    const resolveOp = (toks) => {
+      const loopId = toks[0].loopId != null ? toks[0].loopId : null;
+      if (toks.length === 1 && toks[0].type === 'str') {
+        return { kind: 'str', text: toks[0].text, loopId };
+      }
+      if (toks.length === 1 && toks[0].type === 'tmpl') {
+        // Template literal — flatten parts into sub-operands.
+        const parts = [];
+        for (const p of toks[0].parts) {
+          if (p.kind === 'text') parts.push({ kind: 'str', text: decodeJsString(p.raw, '`'), loopId });
+          else parts.push({ kind: 'expr', expr: p.expr.trim(), loopId });
+        }
+        return { kind: 'tmpl', parts, loopId };
+      }
+      if (toks.length === 1 && (toks[0].type === 'cond' || toks[0].type === 'iter')) {
+        return Object.assign({ kind: toks[0].type, loopId }, toks[0]);
+      }
+      const first = toks[0];
+      const last = toks[toks.length - 1];
+      const expr = first._src.slice(first.start, last.end).trim();
+      return { kind: 'expr', expr, loopId };
+    };
+
+    const resolved = [];
+    for (const op of operands) {
+      const r = resolveOp(op);
+      if (r.kind === 'tmpl') {
+        for (const p of r.parts) resolved.push(p);
+      } else {
+        resolved.push(r);
+      }
+    }
+
+    // HTML state machine.
+    const TEXT = 0, TAG_OPEN = 1, TAG_CLOSE = 2, ATTRS = 3;
+    const ATTR_NAME = 4, ATTR_EQ = 5, ATTR_VALUE_DQ = 6, ATTR_VALUE_SQ = 7;
+    const ATTR_VALUE_UQ = 8, COMMENT = 9;
+
+    let state = TEXT;
+    let tagName = '';
+    let attrName = '';
+    let attrValue = '';
+    let attrExprs = [];  // {pos, expr} embedded in current attr value
+
+    // Virtual DOM construction.
+    const roots = [];
+    const elStack = [];  // stack of { tag, attrs, children }
+    const addChild = (node) => {
+      if (elStack.length) elStack[elStack.length - 1].children.push(node);
+      else roots.push(node);
+    };
+    let currentEl = null;  // element being built (receives attrs)
+    const openTag = (tag, loopId) => {
+      currentEl = { kind: 'element', tag, attrs: [], children: [], loopId };
+    };
+    // Called when `>` closes the opening tag — commit the element.
+    const commitTag = () => {
+      if (!currentEl) return;
+      addChild(currentEl);
+      if (!VOID_ELEMENTS.has(currentEl.tag.toLowerCase())) elStack.push(currentEl);
+      currentEl = null;
+    };
+    const commitAndSelfClose = () => {
+      if (!currentEl) return;
+      addChild(currentEl);
+      // Don't push to stack — self-closing.
+      currentEl = null;
+    };
+    const popEl = () => { if (elStack.length) elStack.pop(); };
+    let textBuf = '';
+    const flushText = () => {
+      if (textBuf) { addChild({ kind: 'text', text: textBuf }); textBuf = ''; }
+    };
+    let currentTagLoopId = null;
+
+    const finishAttr = () => {
+      if (!attrName || !currentEl) { attrName = ''; attrValue = ''; attrExprs = []; return; }
+      if (attrExprs.length) {
+        currentEl.attrs.push({ kind: 'dynamic_value', name: attrName, value: attrValue, valueExprs: attrExprs.slice() });
+      } else {
+        currentEl.attrs.push({ kind: 'static', name: attrName, value: attrValue });
+      }
+      attrName = '';
+      attrValue = '';
+      attrExprs = [];
+    };
+
+    const startTag = (loopId) => {
+      openTag(tagName, loopId);
+      tagName = '';
+    };
+
+    // Feed a string through the state machine.
+    const feedStr = (text, loopId) => {
+      for (let i = 0; i < text.length; i++) {
+        const c = text[i];
+        switch (state) {
+          case TEXT:
+            if (c === '<') {
+              flushText();
+              if (text[i + 1] === '/') { state = TAG_CLOSE; i++; }
+              else if (text[i + 1] === '!' && text[i + 2] === '-' && text[i + 3] === '-') {
+                state = COMMENT; i += 3;
+              }
+              else { state = TAG_OPEN; tagName = ''; currentTagLoopId = loopId; }
+            } else {
+              textBuf += c;
+            }
+            break;
+          case TAG_OPEN:
+            if (c === ' ' || c === '\t' || c === '\n' || c === '\r') {
+              if (tagName) { startTag(currentTagLoopId); state = ATTRS; }
+            } else if (c === '>') {
+              startTag(currentTagLoopId); commitTag(); state = TEXT;
+            } else if (c === '/') {
+              if (text[i + 1] === '>') { startTag(currentTagLoopId); commitAndSelfClose(); state = TEXT; i++; }
+            } else {
+              tagName += c;
+            }
+            break;
+          case TAG_CLOSE:
+            if (c === '>') { popEl(); state = TEXT; }
+            break;
+          case ATTRS:
+            if (c === '>') {
+              finishAttr(); commitTag();
+              state = TEXT;
+            } else if (c === '/') {
+              if (text[i + 1] === '>') { finishAttr(); commitAndSelfClose(); state = TEXT; i++; }
+            } else if (c !== ' ' && c !== '\t' && c !== '\n' && c !== '\r') {
+              finishAttr();
+              attrName = c;
+              state = ATTR_NAME;
+            }
+            break;
+          case ATTR_NAME:
+            if (c === '=') { state = ATTR_EQ; }
+            else if (c === ' ' || c === '\t' || c === '\n' || c === '\r') {
+              // Boolean attribute or space before =
+              // Peek ahead to see if = follows
+              let j = i + 1;
+              while (j < text.length && (text[j] === ' ' || text[j] === '\t')) j++;
+              if (j < text.length && text[j] === '=') {
+                i = j; state = ATTR_EQ;
+              } else {
+                // Boolean attribute
+                finishAttr();
+                state = ATTRS;
+              }
+            } else if (c === '>') {
+              finishAttr(); commitTag(); state = TEXT;
+            } else if (c === '/' && text[i + 1] === '>') {
+              finishAttr(); commitAndSelfClose(); state = TEXT; i++;
+            } else {
+              attrName += c;
+            }
+            break;
+          case ATTR_EQ:
+            if (c === '"') { attrValue = ''; state = ATTR_VALUE_DQ; }
+            else if (c === "'") { attrValue = ''; state = ATTR_VALUE_SQ; }
+            else if (c !== ' ' && c !== '\t') {
+              attrValue = c; state = ATTR_VALUE_UQ;
+            }
+            break;
+          case ATTR_VALUE_DQ:
+            if (c === '"') { finishAttr(); state = ATTRS; }
+            else attrValue += c;
+            break;
+          case ATTR_VALUE_SQ:
+            if (c === "'") { finishAttr(); state = ATTRS; }
+            else attrValue += c;
+            break;
+          case ATTR_VALUE_UQ:
+            if (c === ' ' || c === '\t' || c === '\n' || c === '\r') { finishAttr(); state = ATTRS; }
+            else if (c === '>') { finishAttr(); commitTag(); state = TEXT; }
+            else if (c === '/' && text[i + 1] === '>') { finishAttr(); commitAndSelfClose(); state = TEXT; i++; }
+            else attrValue += c;
+            break;
+          case COMMENT:
+            if (c === '-' && text[i + 1] === '-' && text[i + 2] === '>') {
+              i += 2; state = TEXT;
+            }
+            break;
+        }
+      }
+    };
+
+    // Feed an expression into the current state.
+    const feedExpr = (expr, loopId) => {
+      switch (state) {
+        case TEXT:
+          flushText();
+          addChild({ kind: 'expr_text', expr, loopId });
+          break;
+        case TAG_OPEN:
+          // Expression is the tag name.
+          tagName = null;
+          addChild({ kind: 'expr_text', expr: '/* dynamic tag: ' + expr + ' */', loopId });
+          state = TEXT;
+          break;
+        case ATTRS:
+          // Expression between attributes — conditional boolean attr.
+          if (currentEl) {
+            currentEl.attrs.push({ kind: 'dynamic_name', nameExpr: expr });
+          }
+          break;
+        case ATTR_NAME:
+          // Expression continues attribute name (unusual).
+          attrName += '${' + expr + '}';
+          break;
+        case ATTR_VALUE_DQ:
+        case ATTR_VALUE_SQ:
+        case ATTR_VALUE_UQ:
+          attrExprs.push({ pos: attrValue.length, expr });
+          break;
+        case ATTR_EQ:
+          // Expression is the entire unquoted attribute value.
+          attrExprs.push({ pos: 0, expr });
+          finishAttr();
+          state = ATTRS;
+          break;
+        default:
+          break;
+      }
+    };
+
+    // Convert chain tokens to a JS expression string (for fallback contexts).
+    const chainToksAsExpr = (toks) => {
+      const parts = [];
+      for (const t of toks) {
+        if (t.type === 'plus') continue;
+        if (t.type === 'str') parts.push(JSON.stringify(t.text));
+        else if (t.type === 'other') parts.push(t.text);
+        else if (t.type === 'cond') parts.push('(' + t.condExpr + ' ? ' + chainToksAsExpr(t.ifTrue) + ' : ' + chainToksAsExpr(t.ifFalse) + ')');
+      }
+      return parts.join(' + ') || '""';
+    };
+
+    for (const op of resolved) {
+      if (op.kind === 'str') feedStr(op.text, op.loopId);
+      else if (op.kind === 'iter') {
+        // Iteration: .map(fn).join('') — parse per-element chain and emit forEach loop.
+        if (state === TEXT) {
+          flushText();
+          const elemNodes = parseChainToVNodes(op.perElemChain);
+          addChild({ kind: 'iteration', iterExpr: op.iterExpr, paramName: op.paramName, children: elemNodes, loopId: op.loopId });
+        } else {
+          // Non-TEXT context — fall back to expression.
+          feedExpr(op.iterExpr + '.map(function(' + op.paramName + ') { return ' + chainToksAsExpr(op.perElemChain) + '; }).join(\'\')', op.loopId);
+        }
+      }
+      else if (op.kind === 'cond') {
+        // Conditional HTML: recursively parse both branches into vnodes
+        // and emit a conditional vnode that the emitter renders as if/else.
+        if (state === TEXT) {
+          flushText();
+          const trueNodes = parseChainToVNodes(op.ifTrue);
+          const falseNodes = parseChainToVNodes(op.ifFalse);
+          addChild({ kind: 'conditional', condExpr: op.condExpr, ifTrue: trueNodes, ifFalse: falseNodes, loopId: op.loopId });
+        } else if (state === ATTR_VALUE_DQ || state === ATTR_VALUE_SQ || state === ATTR_VALUE_UQ) {
+          // Conditional inside attribute value — fall back to expression.
+          attrExprs.push({ pos: attrValue.length, expr: '(' + op.condExpr + ' ? ' + chainToksAsExpr(op.ifTrue) + ' : ' + chainToksAsExpr(op.ifFalse) + ')' });
+        } else if (state === ATTRS && currentEl) {
+          // Conditional in attribute-name position.
+          currentEl.attrs.push({ kind: 'dynamic_name', nameExpr: '(' + op.condExpr + ' ? ' + chainToksAsExpr(op.ifTrue) + ' : ' + chainToksAsExpr(op.ifFalse) + ')' });
+        } else {
+          feedExpr('(' + op.condExpr + ' ? ' + chainToksAsExpr(op.ifTrue) + ' : ' + chainToksAsExpr(op.ifFalse) + ')', op.loopId);
+        }
+      }
+      else feedExpr(op.expr, op.loopId);
+    }
+    flushText();
+
+    return roots;
+  }
+
+  // Emit DOM API code from a virtual DOM tree produced by parseChainToVNodes.
+  // Handles the same options as convertNode: useProps, classList, events, etc.
+  function emitVNodes(vnodes, parentVar, lines, used, opts, loopInfoMap, loopIds) {
+    // Group nodes by loopId to wrap loop segments.
+    const groups = [];
+    let curGroup = null;
+    for (const node of vnodes) {
+      const lid = node.loopId != null ? node.loopId : null;
+      if (!curGroup || curGroup.loopId !== lid) {
+        curGroup = { loopId: lid, nodes: [] };
+        groups.push(curGroup);
+      }
+      curGroup.nodes.push(node);
+    }
+
+    for (const group of groups) {
+      if (group.loopId != null && loopInfoMap && loopInfoMap[group.loopId] && !(loopIds && loopIds.has(group.loopId))) {
+        const info = loopInfoMap[group.loopId];
+        const header = info.kind === 'while'
+          ? 'while (' + info.headerSrc + ')'
+          : 'for (' + info.headerSrc + ')';
+        lines.push(header + ' {');
+        const loopUsed = new Set(used);
+        const loopLines = [];
+        const innerLoopIds = new Set(loopIds || []);
+        innerLoopIds.add(group.loopId);
+        for (const node of group.nodes) emitVNode(node, parentVar, loopLines, loopUsed, opts, loopInfoMap, innerLoopIds);
+        for (const l of loopLines) lines.push('  ' + l);
+        lines.push('}');
+      } else {
+        for (const node of group.nodes) emitVNode(node, parentVar, lines, used, opts, loopInfoMap, loopIds);
+      }
+    }
+  }
+
+  function emitVNode(node, parentVar, lines, used, opts, loopInfoMap, loopIds) {
+    if (node.kind === 'text') {
+      const text = node.text;
+      if (!text) return;
+      if (opts.skipWhitespaceText && /^\s*$/.test(text)) return;
+      const v = makeVar('text', used);
+      lines.push('const ' + v + ' = document.createTextNode(' + jsStr(text).code + ');');
+      lines.push(parentVar + '.appendChild(' + v + ');');
+      return;
+    }
+
+    if (node.kind === 'iteration') {
+      const iterLines = [];
+      const iterUsed = new Set(used);
+      emitVNodes(node.children, parentVar, iterLines, iterUsed, opts, loopInfoMap, loopIds);
+      if (iterLines.length) {
+        lines.push(node.iterExpr + '.forEach(function(' + node.paramName + ') {');
+        for (const l of iterLines) lines.push('  ' + l);
+        lines.push('});');
+      }
+      return;
+    }
+
+    if (node.kind === 'conditional') {
+      const ifLines = [];
+      const elseLines = [];
+      const ifUsed = new Set(used);
+      const elseUsed = new Set(used);
+      emitVNodes(node.ifTrue, parentVar, ifLines, ifUsed, opts, loopInfoMap, loopIds);
+      emitVNodes(node.ifFalse, parentVar, elseLines, elseUsed, opts, loopInfoMap, loopIds);
+      if (ifLines.length || elseLines.length) {
+        lines.push('if (' + node.condExpr + ') {');
+        for (const l of ifLines) lines.push('  ' + l);
+        if (elseLines.length) {
+          lines.push('} else {');
+          for (const l of elseLines) lines.push('  ' + l);
+        }
+        lines.push('}');
+      }
+      return;
+    }
+
+    if (node.kind === 'expr_text') {
+      const v = makeVar('text', used);
+      lines.push('const ' + v + ' = document.createTextNode(' + node.expr + ');');
+      lines.push(parentVar + '.appendChild(' + v + ');');
+      return;
+    }
+
+    if (node.kind !== 'element') return;
+
+    const tag = node.tag;
+    const v = makeVar(tag, used);
+    const tagLower = tag.toLowerCase();
+
+    // Namespace detection by tag name.
+    const isSvg = SVG_TAGS.has(tagLower) || tagLower === 'svg';
+    const isMathML = tagLower === 'math';
+    const ns = isSvg ? SVG_NS : isMathML ? MATHML_NS : null;
+
+    if (ns) {
+      lines.push('const ' + v + " = document.createElementNS('" + ns + "', '" + tag + "');");
+    } else {
+      lines.push('const ' + v + " = document.createElement('" + tagLower + "');");
+    }
+
+    // Emit attributes.
+    for (const attr of node.attrs) {
+      if (attr.kind === 'dynamic_name') {
+        // Conditional boolean attribute from expression in attr-name position.
+        const expr = attr.nameExpr;
+        const ternMatch = expr.match(/^\((.+?)\s*\?\s*"([^"]+)"\s*:\s*""\s*\)$/);
+        if (ternMatch) {
+          lines.push('if (' + ternMatch[1] + ') ' + v + ".setAttribute('" + ternMatch[2] + "', '');");
+        } else {
+          lines.push('{ const __a = ' + expr + '; if (__a) ' + v + ".setAttribute(__a, ''); }");
+        }
+        continue;
+      }
+
+      const name = attr.name;
+      const hasDynamic = attr.kind === 'dynamic_value' && attr.valueExprs.length > 0;
+
+      // Build the value expression.
+      let valCode;
+      if (hasDynamic) {
+        valCode = spliceExprs(attr.value, attr.valueExprs, false);
+      } else {
+        valCode = null;  // use attr.value directly via jsStr
+      }
+
+      // Event handler -> addEventListener.
+      const evMatch = /^on([a-z]+)$/i.exec(name);
+      if (evMatch && opts.eventsAsListeners) {
+        const evName = evMatch[1].toLowerCase();
+        const body = hasDynamic ? spliceExprs(attr.value, attr.valueExprs, true) : attr.value;
+        lines.push(v + ".addEventListener('" + evName + "', function (event) {");
+        for (const ln of body.split('\n')) lines.push('  ' + ln);
+        lines.push('});');
+        continue;
+      }
+
+      // Style -> style.setProperty.
+      if (name === 'style' && opts.splitStyle && !hasDynamic) {
+        const decls = parseStyle(attr.value);
+        if (decls.length) {
+          for (const d of decls) {
+            lines.push(v + '.style.setProperty(' + jsStr(d.prop).code + ', ' + jsStr(d.value).code + (d.priority ? ", 'important'" : '') + ');');
+          }
+          continue;
+        }
+      }
+
+      // Boolean attributes.
+      if (!ns && BOOLEAN_ATTRS.has(name.toLowerCase()) && !hasDynamic) {
+        lines.push(v + '.' + (ATTR_TO_PROP[name.toLowerCase()] || name) + ' = true;');
+        continue;
+      }
+
+      // Class attribute with classList.
+      if (name === 'class' && opts.useClassList && !ns) {
+        if (hasDynamic) {
+          lines.push(v + '.className = ' + valCode + ';');
+        } else {
+          const classes = attr.value.split(/\s+/).filter(Boolean);
+          if (classes.length === 0) continue;
+          if (classes.length === 1) lines.push(v + '.className = ' + jsStr(classes[0]).code + ';');
+          else lines.push(v + '.classList.add(' + classes.map(c => jsStr(c).code).join(', ') + ');');
+        }
+        continue;
+      }
+
+      // IDL property.
+      const idl = (opts.useProps && !ns) ? isIdlProp(name) : null;
+      if (hasDynamic) {
+        if (idl) lines.push(v + '.' + idl + ' = ' + valCode + ';');
+        else lines.push(v + ".setAttribute('" + name + "', " + valCode + ');');
+      } else {
+        const lit = jsStr(attr.value);
+        if (idl) lines.push(v + '.' + idl + ' = ' + lit.code + ';');
+        else lines.push(v + ".setAttribute('" + name + "', " + lit.code + ');');
+      }
+    }
+
+    // Recurse into children.
+    if (node.children.length) {
+      // textContent shortcut: if all children are text or expr_text (no
+      // nested elements), emit a single textContent assignment.
+      if (opts.textContentShortcut && node.children.every(c => c.kind === 'text' || c.kind === 'expr_text')) {
+        if (node.children.length === 1) {
+          const child = node.children[0];
+          if (child.kind === 'text') {
+            lines.push(v + '.textContent = ' + jsStr(child.text).code + ';');
+          } else {
+            lines.push(v + '.textContent = ' + child.expr + ';');
+          }
+        } else {
+          let tmpl = '';
+          for (const child of node.children) {
+            if (child.kind === 'text') tmpl += tmplEncode(child.text);
+            else tmpl += '${' + child.expr + '}';
+          }
+          lines.push(v + '.textContent = `' + tmpl + '`;');
+        }
+        lines.push(parentVar + '.appendChild(' + v + ');');
+        return;
+      }
+      emitVNodes(node.children, v, lines, used, opts, loopInfoMap, loopIds);
+    }
+
+    lines.push(parentVar + '.appendChild(' + v + ');');
+  }
+
+  // Escape a string for embedding inside a template literal.
+  const tmplEncode = (t) => t.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$\{/g, '\\${');
+
+  // Splice expressions into a static value string. When `raw` is true,
+  // expressions are inlined directly (for event handler bodies); otherwise
+  // the result is wrapped as a JS template literal.
+  function spliceExprs(value, valueExprs, raw) {
+    if (valueExprs.length === 1 && valueExprs[0].pos === 0 && value === '') {
+      return valueExprs[0].expr;
+    }
+    const sorted = valueExprs.slice().sort((a, b) => a.pos - b.pos);
+    let out = '';
+    let cursor = 0;
+    for (const { pos, expr } of sorted) {
+      out += raw ? value.slice(cursor, pos) : tmplEncode(value.slice(cursor, pos));
+      out += raw ? expr : '${' + expr + '}';
+      cursor = pos;
+    }
+    out += raw ? value.slice(cursor) : tmplEncode(value.slice(cursor));
+    return raw ? out : '`' + out + '`';
+  }
+
   // Produce the DOM-API code block for a single innerHTML/outerHTML
   // extraction. `multi` toggles the leading target-divider comment.
-  function convertOne(raw, result, multi, emitTitle, sharedUsed) {
-    const { html, autoSubs, target, assignProp, assignOp } = result;
-    const loops = result.loops || [];
-    const subs = [];
-    // Auto subs extracted from JS concatenation / template interpolation.
-    for (const s of autoSubs) subs.push(s);
+  function convertOne(raw, result, multi, emitTitle) {
+    const { target, assignProp, assignOp } = result;
 
     let parent = 'document.body';
     let parentFromAssignment = false;
     if (target) {
-      // `el.outerHTML = ...` replaces `el` itself, so new nodes land in
-      // `el.parentNode`. `el.innerHTML = ...` replaces `el`'s children.
       parent = assignProp === 'outerHTML' ? target + '.parentNode' : target;
       parentFromAssignment = true;
     }
 
     const opts = {
       useProps: true,
+      splitStyle: true,
       eventsAsListeners: true,
       textContentShortcut: true,
       useClassList: true,
       skipWhitespaceText: $('skipWS').checked,
       useFragment: $('useFragment').checked,
       emitComments: $('emitComments').checked,
-      subs
     };
 
-    // Table-context elements (<tr>, <td>, <th>, <thead>, etc.) are invalid
-    // outside a <table> and get stripped by DOMParser. Wrap them so they parse
-    // correctly, then extract the inner nodes.
-    let tableWrap = null;
-    const trimmed = html.trimStart();
-    if (/^<(tr|td|th|thead|tbody|tfoot|caption|colgroup|col)\b/i.test(trimmed)) {
-      tableWrap = 'table';
-    } else if (/^<(li)\b/i.test(trimmed)) {
-      tableWrap = 'ul';
-    } else if (/^<(dt|dd)\b/i.test(trimmed)) {
-      tableWrap = 'dl';
-    } else if (/^<(option|optgroup)\b/i.test(trimmed)) {
-      tableWrap = 'select';
-    }
-    const parseHtml = tableWrap ? '<' + tableWrap + '>' + html + '</' + tableWrap + '>' : html;
-    const doc = new DOMParser().parseFromString(parseHtml, 'text/html');
-    const headRoots = [];
-    const bodyRoots = [];
-    if (tableWrap) {
-      const wrapper = doc.body ? doc.body.querySelector(tableWrap) : null;
-      if (wrapper) for (const n of wrapper.childNodes) bodyRoots.push(n);
-    } else {
-      if (doc.head) for (const n of doc.head.childNodes) headRoots.push(n);
-      if (doc.body) {
-        for (const n of doc.body.childNodes) bodyRoots.push(n);
-      } else if (doc.documentElement) {
-        for (const n of doc.documentElement.childNodes) {
-          if (n !== doc.head) bodyRoots.push(n);
-        }
-      }
-    }
-
-    const filterWS = (list) => opts.skipWhitespaceText
-      ? list.filter(n => !(n.nodeType === 3 && /^\s*$/.test(n.nodeValue)))
-      : list;
-    const useHeadRoots = filterWS(headRoots);
-    const useBodyRoots = filterWS(bodyRoots);
-    const useRoots = [...useHeadRoots, ...useBodyRoots];
-
     const lines = [];
-    const used = sharedUsed || new Set();
+    const used = new Set();
 
-    // Reserve identifiers that appear in the user's substitution expressions
-    // so we don't shadow them with element variable names.
-    const idRe = /[A-Za-z_$][A-Za-z0-9_$]*/g;
-    for (const [, expr] of subs) {
-      let m;
-      while ((m = idRe.exec(expr)) !== null) used.add(m[0]);
-    }
-    // Also reserve the parent target identifier root.
+    // Reserve the parent target identifier root.
     const parentRoot = parent.match(/^[A-Za-z_$][A-Za-z0-9_$]*/);
     if (parentRoot) used.add(parentRoot[0]);
 
-    if (opts.emitComments && autoSubs.length) {
-      lines.push('// Auto-detected JS expressions from input:');
-      for (const [ph, expr] of autoSubs) lines.push('//   ' + ph + ' -> ' + expr);
-    }
-
-    if (useRoots.length === 0) {
-      return '// (no nodes parsed)';
-    }
-
-    // Replicate `el.innerHTML = x` semantics (replace existing children) when
-    // the input used `=` rather than `+=`, for innerHTML only. outerHTML is
-    // emitted as a note since faithful replacement requires replaceWith().
     if (parentFromAssignment && assignOp === '=' && assignProp === 'innerHTML') {
       lines.push(target + '.replaceChildren();');
-    } else if (parentFromAssignment && assignProp === 'outerHTML') {
-      if (opts.emitComments) {
-        lines.push('// Note: ' + target + '.outerHTML = ... replaces ' + target + ' itself;');
-        lines.push('//       call ' + target + '.replaceWith(...) or adjust as needed.');
-      }
+    } else if (parentFromAssignment && assignProp === 'outerHTML' && opts.emitComments) {
+      lines.push('// Note: ' + target + '.outerHTML = ... replaces ' + target + ' itself;');
+      lines.push('//       call ' + target + '.replaceWith(...) or adjust as needed.');
+    }
+
+    const chainTokens = result.chainTokens || [];
+    const vnodes = parseChainToVNodes(chainTokens);
+
+    if (vnodes.length === 0) {
+      return '// (no nodes parsed)';
     }
 
     let attachTarget = parent;
     let fragVar = null;
-    if (opts.useFragment && useRoots.length > 1) {
+    if (opts.useFragment && vnodes.length > 1) {
       fragVar = makeVar('frag', used);
       lines.push('const ' + fragVar + ' = document.createDocumentFragment();');
       attachTarget = fragVar;
     }
 
-    // If the extracted html contains loop markers, emit each segment with
-    // a matching for-loop wrapper so the generated DOM code mirrors the
-    // source's iteration structure.
-    const segments = loops.length ? splitLoopSegments(html) : null;
-    if (segments && segments.length) {
-      for (const seg of segments) {
-        const segTrimmed = seg.html.trimStart();
-        let segWrap = null;
-        if (/^<(tr|td|th|thead|tbody|tfoot|caption|colgroup|col)\b/i.test(segTrimmed)) segWrap = 'table';
-        else if (/^<(li)\b/i.test(segTrimmed)) segWrap = 'ul';
-        else if (/^<(dt|dd)\b/i.test(segTrimmed)) segWrap = 'dl';
-        else if (/^<(option|optgroup)\b/i.test(segTrimmed)) segWrap = 'select';
-        const segParseHtml = segWrap ? '<' + segWrap + '>' + seg.html + '</' + segWrap + '>' : seg.html;
-        const segDoc = new DOMParser().parseFromString(segParseHtml, 'text/html');
-        const segNodes = [];
-        if (segWrap) {
-          const w = segDoc.body ? segDoc.body.querySelector(segWrap) : null;
-          if (w) for (const n of w.childNodes) segNodes.push(n);
-        } else if (segDoc.body) {
-          for (const n of segDoc.body.childNodes) segNodes.push(n);
-        }
-        const segRoots = opts.skipWhitespaceText
-          ? segNodes.filter((n) => !(n.nodeType === 3 && /^\s*$/.test(n.nodeValue)))
-          : segNodes;
-        if (seg.kind === 'loop') {
-          const info = loops.find((l) => l.id === seg.id) || { kind: 'for', headerSrc: '/* loop */' };
-          const header = info.kind === 'while'
-            ? 'while (' + info.headerSrc + ')'
-            : 'for (' + info.headerSrc + ')';
-          lines.push(header + ' {');
-          const loopUsed = new Set(used);
-          const loopLines = [];
-          for (const n of segRoots) convertNode(n, attachTarget, loopLines, loopUsed, opts, null);
-          for (const l of loopLines) lines.push('  ' + l);
-          lines.push('}');
-        } else {
-          for (const n of segRoots) convertNode(n, attachTarget, lines, used, opts, null);
-        }
-      }
-    } else {
-      // Head elements: skip whitespace-only text nodes, use document.head.
-      if (useHeadRoots.length > 0) {
-        for (const n of useHeadRoots) {
-          if (n.nodeType === 3 && /^\s*$/.test(n.nodeValue)) continue;
-          convertNode(n, 'document.head', lines, used, opts, null);
-        }
-      }
-      for (const n of useBodyRoots) {
-        convertNode(n, attachTarget, lines, used, opts, null);
-      }
-    }
+    emitVNodes(vnodes, attachTarget, lines, used, opts, result.loopInfoMap || null, null);
 
     if (fragVar) {
       lines.push(parent + '.appendChild(' + fragVar + ');');
     }
 
     let block = lines.join('\n');
-    if (emitTitle) {
+    if (emitTitle && opts.emitComments) {
       block = '// === ' + target + '.' + assignProp + ' ' + assignOp + ' ... ===\n' + block;
     }
     return block;
-  }
-
-  let lastOutput = '';
-  function setOutput(text) {
-    lastOutput = text;
-    if (typeof window !== 'undefined' && window._monacoOut) {
-      window._monacoOut.setValue(text);
-    } else if ($('out')) {
-      $('out').value = text;
-    }
   }
 
   $('copy').addEventListener('click', async () => {
@@ -6275,7 +3836,6 @@
   });
 
   // Monaco editors are initialized by index.html before this script loads.
-  // Hook up the input change listener.
   if (typeof window !== 'undefined' && window._monacoIn) {
     window._monacoIn.onDidChangeModelContent(convert);
   } else if ($('in')) {
