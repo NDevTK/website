@@ -2984,7 +2984,22 @@
               i = (elseEnd > 0 ? elseEnd : ifEnd) - 1;
               continue;
             }
-            // Fallback: couldn't parse condition — skip entire if/else.
+            // Condition too complex to represent — preserve the entire
+            // if/else as raw source so no code is silently dropped.
+            if (trackBuildVar) {
+              const ifStmtEnd = elseEnd > 0 ? elseEnd : ifEnd;
+              const first = tokens[i];
+              const last = tokens[ifStmtEnd - 1];
+              if (first && last) {
+                const stmtSrc = first._src.slice(first.start, last.end);
+                for (const bv of trackBuildVar) {
+                  const cur = resolve(bv);
+                  if (cur && cur.kind === 'chain') {
+                    assignName(bv, chainBinding([...cur.toks, SYNTH_PLUS, { type: 'preserve', text: stmtSrc }]));
+                  }
+                }
+              }
+            }
             i = (elseEnd > 0 ? elseEnd : ifEnd) - 1;
             continue;
           }
@@ -4383,7 +4398,8 @@
       }
     };
 
-    // Convert chain tokens to a JS expression string (for fallback contexts).
+    // Convert chain tokens to a JS expression string (for attribute values
+    // and other non-structural contexts where DOM nodes can't be emitted).
     const chainToksAsExpr = (toks) => {
       const parts = [];
       for (const t of toks) {
