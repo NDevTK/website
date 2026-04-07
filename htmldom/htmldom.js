@@ -274,7 +274,7 @@
         return out;
       };
       const mainTokens = expandChain(r.tokens);
-      return { target, assignProp, assignOp, chainTokens: mainTokens, loopInfoMap: r.loopInfo };
+      return { target, assignProp, assignOp, chainTokens: mainTokens, loopInfoMap: r.loopInfo, buildVarDeclStart: r.buildVarDeclStart };
     }
     // Resolver returned the RHS tokens with per-identifier substitution but
     // couldn't parse the full expression as a concat chain. Return the
@@ -836,6 +836,7 @@
     // When set, non-build statements inject 'preserve' tokens into this
     // variable's chain so the emitter outputs them at the right position.
     let trackBuildVar = trackBuildVarInit || null;
+    let buildVarDeclStart = -1;
     let nextLoopId = 0;
     // Swappable token array for the inner parsing functions. The main scope
     // walker always uses `tokens` directly. Helpers like `evalExprSrc` can
@@ -3063,6 +3064,16 @@
                   if (loopStack.length > 0) loopStack[loopStack.length - 1].modifiedVars.add(name);
                 }
               }
+              // Non-build vars that differ between branches become opaque
+              // so subsequent code doesn't use a stale concrete value.
+              for (const name in ifBindings) {
+                if (name === trackBuildVar) continue;
+                const ifB = ifBindings[name];
+                const elB = elseBindings[name] || snapshot[name];
+                if (ifB === elB) continue;
+                if (JSON.stringify(ifB) === JSON.stringify(elB)) continue;
+                assignName(name, chainBinding([exprRef(name)]));
+              }
               i = (elseEnd > 0 ? elseEnd : ifEnd) - 1;
               continue;
             }
@@ -3279,6 +3290,9 @@
           }
           if (hasInit) {
             declBind(nameTok.text, value);
+            if (trackBuildVar && nameTok.text === trackBuildVar && buildVarDeclStart < 0) {
+              buildVarDeclStart = tokens[i].start;
+            }
           } else {
             if (kind === 'var') {
               if (!hasBinding(stack, nameTok.text)) declFunction(nameTok.text, null);
@@ -3445,7 +3459,8 @@
       return false;
     };
     const setTrackBuildVar = (name) => { trackBuildVar = name; };
-    return { resolve, resolvePath, parseRange, rewriteTemplate, advanceTo, setTrackBuildVar, loopInfo, loopVars, inScope, domElements, domOps };
+    const getBuildVarDeclStart = () => buildVarDeclStart;
+    return { resolve, resolvePath, parseRange, rewriteTemplate, advanceTo, setTrackBuildVar, getBuildVarDeclStart, loopInfo, loopVars, inScope, domElements, domOps };
   }
 
   function hasBinding(stack, name) {
@@ -3462,7 +3477,7 @@
     const externallyMutable = scanMutations(tokens);
     const state = buildScopeState(tokens, startIdx, externallyMutable, buildVar);
     const full = state.parseRange(startIdx, endIdx);
-    if (full) return { tokens: full, parsed: true, loopInfo: state.loopInfo, loopVars: state.loopVars, inScope: state.inScope };
+    if (full) return { tokens: full, parsed: true, loopInfo: state.loopInfo, loopVars: state.loopVars, buildVarDeclStart: state.getBuildVarDeclStart(), inScope: state.inScope };
     const out = [];
     for (let i = startIdx; i < endIdx; i++) {
       const t = tokens[i];
@@ -3790,7 +3805,9 @@
                   const domBlock = convertOne(jsCode, ex, false, false);
                   let srcStart = ex.srcStart;
                   let srcEnd = ex.srcEnd;
-                  if (ex._assign && ex._tokens) {
+                  if (ex.buildVarDeclStart >= 0) {
+                    srcStart = ex.buildVarDeclStart;
+                  } else if (ex._assign && ex._tokens) {
                     const region = findBuildRegion(ex._tokens, ex._assign, domBlock || '');
                     if (region) { srcStart = region.regionStart; srcEnd = region.regionEnd; }
                   }
@@ -3850,12 +3867,14 @@
         const target = ex.target || 'document.body';
         const assignOp = ex.assignOp || '=';
 
-        // Chain-based conversion (the chain now carries preserve tokens
-        // for all non-build statements).
         const domBlock = convertOne(raw, ex, false, false, sharedUsed);
         let srcStart = ex.srcStart;
         let srcEnd = ex.srcEnd;
-        if (ex._assign && ex._tokens) {
+        // When the chain carries preserve tokens, the region starts at
+        // the build var declaration. No findBuildRegion needed.
+        if (ex.buildVarDeclStart >= 0) {
+          srcStart = ex.buildVarDeclStart;
+        } else if (ex._assign && ex._tokens) {
           const region = findBuildRegion(ex._tokens, ex._assign, domBlock || '');
           if (region) { srcStart = region.regionStart; srcEnd = region.regionEnd; }
         }
