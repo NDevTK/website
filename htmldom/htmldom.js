@@ -242,21 +242,33 @@
     const assignOp = assign.op;
     const r = resolveIdentifiers(tokens, assign.rhsStart, assign.rhsEnd);
     if (r.parsed) {
-      // Unroll ONE level of loopVar references: the walker replaces each
-      // loop-built variable's binding with a single name-reference token
-      // on loop exit, and here the main chain's references to those vars
-      // get expanded back to their loopVar chains (which keep their
-      // loop-body tags) so the direct parser emits matching loop wrappers.
-      const lvMap = Object.create(null);
-      if (r.loopVars) for (const lv of r.loopVars) lvMap[lv.name] = lv;
-      const mainTokens = [];
-      for (const t of r.tokens) {
-        if (t.type === 'other' && IDENT_RE.test(t.text) && lvMap[t.text]) {
-          for (const vt of lvMap[t.text].chain) mainTokens.push(vt);
-        } else {
-          mainTokens.push(t);
+      // Recursively expand loopVar references. Multiple loopVars may
+      // share the same name (nested loops modifying the same build var).
+      // Group by name as a stack: inner loops are pushed first, so the
+      // last entry for a name is the outermost. Expansion pops entries
+      // so inner loops expand before outer ones.
+      const lvByName = Object.create(null);
+      if (r.loopVars) {
+        for (const lv of r.loopVars) {
+          if (!lvByName[lv.name]) lvByName[lv.name] = [];
+          lvByName[lv.name].push(lv);
         }
       }
+      const expandChain = (toks) => {
+        const out = [];
+        for (const t of toks) {
+          if (t.type === 'other' && IDENT_RE.test(t.text) && lvByName[t.text] && lvByName[t.text].length) {
+            const lv = lvByName[t.text].pop();
+            const expanded = expandChain(lv.chain);
+            for (const vt of expanded) out.push(vt);
+            lvByName[t.text].push(lv); // restore for potential sibling refs
+          } else {
+            out.push(t);
+          }
+        }
+        return out;
+      };
+      const mainTokens = expandChain(r.tokens);
       return { target, assignProp, assignOp, chainTokens: mainTokens, loopInfoMap: r.loopInfo };
     }
     // Resolver returned the RHS tokens with per-identifier substitution but
@@ -2570,6 +2582,22 @@
         }
         return chainBinding([makeSynthStr(String(v))]);
       }
+      // String comparison: fold ===, !==, ==, != when both sides are known strings.
+      const lStr2 = chainAsKnownString(left);
+      const rStr2 = chainAsKnownString(right);
+      if (lStr2 !== null && rStr2 !== null) {
+        let v;
+        switch (op) {
+          case '===': case '==': v = lStr2 === rStr2; break;
+          case '!==': case '!=': v = lStr2 !== rStr2; break;
+          case '<': v = lStr2 < rStr2; break;
+          case '>': v = lStr2 > rStr2; break;
+          case '<=': v = lStr2 <= rStr2; break;
+          case '>=': v = lStr2 >= rStr2; break;
+          default: v = null;
+        }
+        if (v !== null) return chainBinding([makeSynthStr(String(v))]);
+      }
       // `+` is overloaded in JS. When both operands aren't concrete numbers
       // we decline here and let the caller (concat-chain parser) handle it
       // as string concatenation.
@@ -2627,15 +2655,17 @@
     // Evaluate truthiness of a chain binding. Returns true, false, or null (unknown).
     const evalTruthiness = (bind) => {
       if (!bind || bind.kind !== 'chain') return null;
-      const n = chainAsNumber(bind);
-      if (n !== null) return n !== 0;
-      const s = chainAsKnownString(bind);
-      if (s !== null) return s !== '';
+      // Check boolean/null/undefined keywords first — these are synthetic
+      // tokens from combineArith, not user string literals.
       if (bind.toks.length === 1 && bind.toks[0].type === 'str') {
         const text = bind.toks[0].text;
         if (text === 'true') return true;
         if (text === 'false' || text === 'null' || text === 'undefined' || text === 'NaN') return false;
       }
+      const n = chainAsNumber(bind);
+      if (n !== null) return n !== 0;
+      const s = chainAsKnownString(bind);
+      if (s !== null) return s !== '';
       return null;
     };
 
@@ -2743,7 +2773,13 @@
     };
 
     const stop = Math.min(stopAt, tokens.length);
+    // Skip regions: after a taken if/else branch, skip the remaining branches.
+    const skipRegions = [];  // [{from, to}] sorted by from
     for (let i = 0; i < stop; i++) {
+      // Check skip regions.
+      while (skipRegions.length && i >= skipRegions[0].from) {
+        i = skipRegions.shift().to;
+      }
       // Pop any loops whose body we've walked past (and their shadow frames).
       // For each variable modified during the loop, capture its final chain
       // as a loopVar entry AND replace its binding with a single reference
@@ -2850,8 +2886,63 @@
                 }
                 elseStart = ifEnd + 1; elseEnd = k;
               } else if (nt && nt.type === 'other' && nt.text === 'if') {
-                // else if — let the next iteration handle it.
-                elseStart = ifEnd + 1; elseEnd = ifEnd + 1; // will be re-parsed
+                // else if — find the full extent of the else-if chain.
+                // The else body is `if (cond) { ... } [else ...]`.
+                elseStart = ifEnd + 1;
+                // Recursively find end of the if/else-if/else chain.
+                let ei = ifEnd + 1; // points to `if`
+                while (ei < stop) {
+                  const eiTok = tokens[ei];
+                  if (!eiTok || eiTok.type !== 'other' || eiTok.text !== 'if') break;
+                  // Skip if(cond)
+                  const eiLp = tokens[ei + 1];
+                  if (!eiLp || eiLp.type !== 'open' || eiLp.char !== '(') break;
+                  let ed = 1, ej = ei + 2;
+                  while (ej < stop && ed > 0) {
+                    if (tokens[ej].type === 'open' && tokens[ej].char === '(') ed++;
+                    else if (tokens[ej].type === 'close' && tokens[ej].char === ')') ed--;
+                    if (ed === 0) break; ej++;
+                  }
+                  // Skip body
+                  const eBody = tokens[ej + 1];
+                  if (eBody && eBody.type === 'open' && eBody.char === '{') {
+                    let ed2 = 1, ek = ej + 2;
+                    while (ek < stop && ed2 > 0) {
+                      if (tokens[ek].type === 'open' && tokens[ek].char === '{') ed2++;
+                      else if (tokens[ek].type === 'close' && tokens[ek].char === '}') ed2--;
+                      ek++;
+                    }
+                    ei = ek;
+                  } else {
+                    let sd = 0, ek = ej + 1;
+                    while (ek < stop) {
+                      if (tokens[ek].type === 'open') sd++;
+                      else if (tokens[ek].type === 'close') sd--;
+                      else if (sd === 0 && tokens[ek].type === 'sep' && tokens[ek].char === ';') { ek++; break; }
+                      ek++;
+                    }
+                    ei = ek;
+                  }
+                  // Check for another else
+                  if (tokens[ei] && tokens[ei].type === 'other' && tokens[ei].text === 'else') {
+                    const eiNt = tokens[ei + 1];
+                    if (eiNt && eiNt.type === 'other' && eiNt.text === 'if') {
+                      ei = ei + 1; continue; // another else-if
+                    }
+                    // else { ... }
+                    if (eiNt && eiNt.type === 'open' && eiNt.char === '{') {
+                      let ed3 = 1, ek = ei + 2;
+                      while (ek < stop && ed3 > 0) {
+                        if (tokens[ek].type === 'open' && tokens[ek].char === '{') ed3++;
+                        else if (tokens[ek].type === 'close' && tokens[ek].char === '}') ed3--;
+                        ek++;
+                      }
+                      ei = ek;
+                    }
+                  }
+                  break;
+                }
+                elseEnd = ei;
               } else {
                 let sd = 0, k = ifEnd + 1;
                 while (k < stop) {
@@ -2865,20 +2956,20 @@
               }
             }
             if (concrete === true) {
-              // Walk only if-body; skip else.
-              i = (elseEnd > 0 ? elseEnd : ifEnd) - 1;
-              // Process if-body tokens via the main loop by NOT skipping them.
-              // But we need to skip the condition + header. Set i to body start.
-              // Actually, let the main loop naturally process from j+1 to ifEnd
-              // by not changing i past the body. We'll skip the condition.
-              i = j; // after `)`, main loop will enter `{` naturally
+              // Walk only if-body via the main loop; skip else chain.
+              if (elseEnd > 0) {
+                skipRegions.push({ from: ifEnd, to: elseEnd });
+              }
+              i = j; // resume at `)`, main loop enters `{` naturally
               continue;
             } else if (concrete === false) {
+              // Skip if-body; walk else-body (if present).
               if (elseStart > 0) {
-                i = elseStart - 1; // jump to else body start
-                continue;
+                skipRegions.push({ from: j + 1, to: elseStart });
+                i = j; // resume, skip region will jump past if-body
+              } else {
+                i = ifEnd - 1; // no else, skip entire if
               }
-              i = ifEnd - 1; // skip entire if
               continue;
             }
             // Opaque condition: snapshot bindings, walk both branches,
@@ -3425,10 +3516,10 @@
           continue;
         }
       }
-      // Comparison/equality operators starting with '=' — keep as opaque other.
+      // Equality operators starting with '='.
       if (c === '=' && src[i + 1] === '=') {
         const len = src[i + 2] === '=' ? 3 : 2;
-        push({ type: 'other', text: src.slice(i, i + len), start: i, end: i + len });
+        push({ type: 'op', text: src.slice(i, i + len), start: i, end: i + len });
         i += len;
         continue;
       }
@@ -3693,9 +3784,18 @@
       const trimmed = raw.trim();
       let output = '';
       let cursor = 0;
+      const sharedUsed = new Set();
+      // Reserve all target identifiers so generated variable names
+      // don't shadow them.
+      for (const ex of extractions) {
+        if (ex.target) {
+          const root = ex.target.match(/^[A-Za-z_$][A-Za-z0-9_$]*/);
+          if (root) sharedUsed.add(root[0]);
+        }
+      }
       for (const ex of extractions) {
         if (ex.srcStart === undefined) continue;
-        const domBlock = convertOne(raw, ex, false, false);
+        const domBlock = convertOne(raw, ex, false, false, sharedUsed);
         let srcStart = ex.srcStart;
         let srcEnd = ex.srcEnd;
         if (ex._assign && ex._tokens) {
@@ -3836,7 +3936,7 @@
     const commitTag = () => {
       if (!currentEl) return;
       addChild(currentEl);
-      if (!VOID_ELEMENTS.has(currentEl.tag.toLowerCase())) elStack.push(currentEl);
+      if (!currentEl.tag || !VOID_ELEMENTS.has(currentEl.tag.toLowerCase())) elStack.push(currentEl);
       currentEl = null;
     };
     const commitAndSelfClose = () => {
@@ -3972,10 +4072,11 @@
           addChild({ kind: 'expr_text', expr, loopId });
           break;
         case TAG_OPEN:
-          // Expression is the tag name.
+          // Expression is the tag name (e.g. `"<" + tag + ">"`).
           tagName = null;
-          addChild({ kind: 'expr_text', expr: '/* dynamic tag: ' + expr + ' */', loopId });
-          state = TEXT;
+          openTag(null, loopId);
+          currentEl.tagExpr = expr;
+          state = ATTRS;
           break;
         case ATTRS:
           // Expression between attributes — conditional boolean attr.
@@ -4140,21 +4241,24 @@
     if (node.kind !== 'element') return;
 
     const tag = node.tag;
-    const v = makeVar(tag, used);
-    const tagLower = tag.toLowerCase();
+    const tagExpr = node.tagExpr || null;
+    const v = makeVar(tag || 'el', used);
+    const tagLower = tag ? tag.toLowerCase() : null;
 
-    // Namespace detection: <svg> and <math> introduce their namespace;
-    // children inherit from parent unless inside <foreignObject>.
     let ns = nsCtx || null;
-    if (tagLower === 'svg') ns = SVG_NS;
-    else if (tagLower === 'math') ns = MATHML_NS;
-    else if (tagLower === 'foreignobject') ns = null;
-    else if (!ns && SVG_TAGS.has(tagLower)) ns = SVG_NS;
-
-    if (ns) {
-      lines.push('const ' + v + " = document.createElementNS('" + ns + "', '" + tag + "');");
+    if (tagExpr) {
+      lines.push('const ' + v + ' = document.createElement(' + tagExpr + ');');
     } else {
-      lines.push('const ' + v + " = document.createElement('" + tagLower + "');");
+      if (tagLower === 'svg') ns = SVG_NS;
+      else if (tagLower === 'math') ns = MATHML_NS;
+      else if (tagLower === 'foreignobject') ns = null;
+      else if (!ns && SVG_TAGS.has(tagLower)) ns = SVG_NS;
+
+      if (ns) {
+        lines.push('const ' + v + " = document.createElementNS('" + ns + "', '" + tag + "');");
+      } else {
+        lines.push('const ' + v + " = document.createElement('" + tagLower + "');");
+      }
     }
 
     // Emit attributes.
