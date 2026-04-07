@@ -89,14 +89,6 @@
 
   function $(id) { return document.getElementById(id); }
 
-  // Extract HTML from input. Returns { html, autoSubs, target } where autoSubs
-  // is a list of [placeholder, originalExpression] pairs for JS expressions
-  // embedded via string concatenation or template-literal interpolation, and
-  // `target` is the detected parent element expression from an
-  // `X.innerHTML = ...` (or outerHTML) assignment, or null if none was found.
-  // Extract every `X.innerHTML`/`X.outerHTML` assignment in the input,
-  // returning an array of extraction results in source order. Each result
-  // has the same shape as `extractHTML`'s return value.
   // Extract the virtual DOM constructed by the script: every
   // `document.createElement`/`getElementById`/`createTextNode` call
   // produces a tracked element, and subsequent `el.prop = ...`,
@@ -234,7 +226,7 @@
     });
   }
 
-  // Produce an { html, autoSubs, target, assignProp, assignOp, ... } record
+  // Produce a { target, assignProp, assignOp, chainTokens, ... } record
   // for a single innerHTML/outerHTML assignment located in `tokens`.
   function extractOneAssignment(tokens, assign) {
     const target = assign.target;
@@ -388,186 +380,6 @@
   // region" — the contiguous span of source code that exists solely to
   // construct the value assigned to innerHTML. Returns
   // { regionStart, regionEnd } (source char positions) or null.
-  function findBuildRegion(tokens, assign, replacementCode) {
-    const referencedInReplacement = new Set();
-    if (replacementCode) {
-      const refTokens = replacementCode.match(/[A-Za-z_$][A-Za-z0-9_$]*/g);
-      if (refTokens) for (const t of refTokens) referencedInReplacement.add(t);
-    }
-    const rhsToks = [];
-    for (let j = assign.rhsStart; j < assign.rhsEnd; j++) rhsToks.push(tokens[j]);
-    const hasBuildVar = rhsToks.length === 1 && rhsToks[0].type === 'other' && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(rhsToks[0].text);
-    const buildVar = hasBuildVar ? rhsToks[0].text : null;
-
-    const assignTokIdx = assign.eqIdx;
-    const targetTokIdx = assignTokIdx - 1;
-
-    let blockStart = 0;
-    {
-      let depth = 0;
-      for (let j = targetTokIdx - 1; j >= 0; j--) {
-        const tk = tokens[j];
-        if (tk.type === 'close' && tk.char === '}') depth++;
-        if (tk.type === 'open' && tk.char === '{') {
-          if (depth === 0) { blockStart = j + 1; break; }
-          depth--;
-        }
-      }
-    }
-
-    const allStmts = [];
-    let stmtStart = blockStart;
-    let braceDepth = 0;
-    let parenDepth = 0;
-    const scanEnd = assign.rhsEnd < tokens.length ? assign.rhsEnd : tokens.length - 1;
-    for (let j = blockStart; j <= scanEnd; j++) {
-      const tk = tokens[j];
-      if (tk.type === 'open' && tk.char === '{') braceDepth++;
-      if (tk.type === 'close' && tk.char === '}') {
-        braceDepth--;
-        if (braceDepth < 0) braceDepth = 0;
-        if (braceDepth === 0 && parenDepth === 0) {
-          allStmts.push({ tokStart: stmtStart, tokEnd: j + 1 });
-          stmtStart = j + 1;
-          continue;
-        }
-      }
-      if (tk.type === 'open' && tk.char === '(') parenDepth++;
-      if (tk.type === 'close' && tk.char === ')') {
-        parenDepth--;
-        if (parenDepth < 0) parenDepth = 0;
-      }
-      if (braceDepth === 0 && parenDepth === 0 && tk.type === 'sep' && tk.char === ';') {
-        allStmts.push({ tokStart: stmtStart, tokEnd: j + 1 });
-        stmtStart = j + 1;
-      }
-    }
-
-    let regionTokStart = -1;
-    for (let s = allStmts.length - 1; s >= 0 && buildVar; s--) {
-      const stmt = allStmts[s];
-      if (stmt.tokStart <= targetTokIdx && stmt.tokEnd > targetTokIdx) continue;
-      const stmtTokens = tokens.slice(stmt.tokStart, stmt.tokEnd);
-      let writesBuildVar = false;
-      let isBuildVarDecl = false;
-      for (let j = 0; j < stmtTokens.length; j++) {
-        const tk = stmtTokens[j];
-        if (tk.type === 'other' && tk.text === buildVar) {
-          const next = stmtTokens[j + 1];
-          if (next && next.type === 'sep' && (next.char === '=' || next.char === '+=')) writesBuildVar = true;
-        }
-        if (tk.type === 'other' && (tk.text === 'var' || tk.text === 'let' || tk.text === 'const')) {
-          const nm = stmtTokens[j + 1];
-          if (nm && nm.type === 'other' && nm.text === buildVar) { writesBuildVar = true; isBuildVarDecl = true; }
-        }
-        if (tk.type === 'other' && (tk.text === 'for' || tk.text === 'while' || tk.text === 'do')) {
-          for (let k = j; k < stmtTokens.length; k++) {
-            if (stmtTokens[k].type === 'other' && stmtTokens[k].text === buildVar) {
-              const nx = stmtTokens[k + 1];
-              if (nx && nx.type === 'sep' && (nx.char === '=' || nx.char === '+=')) writesBuildVar = true;
-            }
-          }
-        }
-      }
-      if (!writesBuildVar) break;
-      regionTokStart = stmt.tokStart;
-      if (isBuildVarDecl) break;
-    }
-
-    if (regionTokStart < 0 && buildVar) return null;
-    if (regionTokStart < 0) {
-      const assignCharStart = assign.srcStart;
-      for (const stmt of allStmts) {
-        if (tokens[stmt.tokStart].start <= assignCharStart && tokens[stmt.tokEnd - 1].end >= assignCharStart) {
-          regionTokStart = stmt.tokStart;
-          break;
-        }
-      }
-      if (regionTokStart < 0) return null;
-    }
-
-    let blockEnd = tokens.length;
-    {
-      let depth = 0;
-      for (let j = assign.rhsEnd; j < tokens.length; j++) {
-        const tk = tokens[j];
-        if (tk.type === 'open' && tk.char === '{') depth++;
-        if (tk.type === 'close' && tk.char === '}') {
-          if (depth === 0) { blockEnd = j; break; }
-          depth--;
-        }
-      }
-    }
-
-    const collectIdents = (start, end) => {
-      const ids = new Set();
-      for (let j = start; j < end; j++) {
-        if (tokens[j].type === 'other' && IDENT_RE.test(tokens[j].text)) ids.add(tokens[j].text);
-      }
-      return ids;
-    };
-    let changed = true;
-    while (changed) {
-      changed = false;
-      const deadIdents = collectIdents(regionTokStart, assign.rhsEnd);
-      for (let s = allStmts.length - 1; s >= 0; s--) {
-        const stmt = allStmts[s];
-        if (stmt.tokStart >= regionTokStart) continue;
-        if (stmt.tokEnd !== regionTokStart) continue;
-        const stmtTokens = tokens.slice(stmt.tokStart, stmt.tokEnd);
-        let declNames = [];
-        for (let j = 0; j < stmtTokens.length; j++) {
-          const tk = stmtTokens[j];
-          if (tk.type === 'other' && (tk.text === 'var' || tk.text === 'let' || tk.text === 'const')) {
-            const nm = stmtTokens[j + 1];
-            if (nm && nm.type === 'other' && IDENT_RE.test(nm.text)) declNames.push(nm.text);
-          }
-        }
-        let isLoop = stmtTokens.some(tk => tk.type === 'other' && (tk.text === 'for' || tk.text === 'while' || tk.text === 'do'));
-        if (isLoop) {
-          for (let j = 0; j < stmtTokens.length; j++) {
-            const tk = stmtTokens[j];
-            if (tk.type === 'other' && IDENT_RE.test(tk.text)) {
-              const nx = stmtTokens[j + 1];
-              if (nx && nx.type === 'sep' && (nx.char === '=' || nx.char === '+=')) declNames.push(tk.text);
-            }
-          }
-        }
-        if (declNames.length === 0) break;
-        let allDead = true;
-        for (const name of declNames) {
-          if (referencedInReplacement.has(name)) { allDead = false; break; }
-          if (!deadIdents.has(name) && name !== buildVar) { allDead = false; break; }
-          for (let j = assign.rhsEnd + 1; j < blockEnd; j++) {
-            if (tokens[j].type === 'other' && tokens[j].text === name) { allDead = false; break; }
-          }
-          if (!allDead) break;
-        }
-        if (!allDead) break;
-        regionTokStart = stmt.tokStart;
-        changed = true;
-        break;
-      }
-    }
-
-    if (buildVar) {
-      for (let j = assign.rhsEnd + 1; j < blockEnd; j++) {
-        const tk = tokens[j];
-        if (tk.type === 'other' && tk.text === buildVar) return null;
-        if (tk.type === 'other' && tk.text.endsWith('.' + buildVar)) return null;
-      }
-    }
-
-    const regionStart = tokens[regionTokStart].start;
-    if (regionStart >= assign.srcStart) return null;
-    return { regionStart, regionEnd: assign.srcEnd, buildVar, allStmts, regionTokStart, blockEnd };
-  }
-
-
-  // Given the token index of the trailing `.innerHTML`/`.outerHTML` accessor,
-  // walk backward collecting balanced `()` / `[]` groups and preceding
-  // identifier/member tokens to reconstruct the full target source expression.
-  // Returns the original source slice for the target, or null.
   function reconstructTarget(tokens, accessorIdx) {
     let j = accessorIdx - 1;
     let depth = 0;
@@ -701,10 +513,8 @@
 
   // Represent an unresolved subexpression as a single operand token whose
   // source slice equals `text`. It uses the same `other` token shape the
-  // tokenizer emits for plain identifiers, so the downstream materializer
-  // turns it into a `__HDX#__` placeholder and records the original source
-  // in autoSubs — the same mechanism that already handles standalone
-  // unresolved identifiers in a concat chain.
+  // Represent an unresolved expression as a token whose source text is the
+  // expression. Uses the same `other` token shape the tokenizer emits.
   const exprRef = (text) => ({
     type: 'other', text, start: 0, end: text.length, _src: text,
   });
@@ -2514,7 +2324,7 @@
     // the original text — the same representation used for standalone
     // unresolved identifiers already emitted by the tokenizer). This dual
     // representation is the tool's fundamental model for string expressions:
-    // known parts become text, unknown parts become placeholders.
+    // known parts become string tokens, unknown parts become expression refs.
     const readOperand = (k, stop, terms) => {
       const parsed = parseArithExpr(k, stop);
       if (parsed) {
@@ -2889,7 +2699,7 @@
         const frame = { bindings: Object.create(null), isFunction: pendingFunctionBrace };
         if (pendingFunctionBrace && pendingFunctionParams) {
           // Bind function parameters as references to their own names so
-          // uses within the body surface via autoSubs when the body is
+          // uses within the body surface when the body is
           // parsed in scope (e.g. for an innerHTML assignment inside the
           // function). At call sites, instantiateFunction rebinds them.
           for (const p of pendingFunctionParams) {
@@ -3492,7 +3302,7 @@
             // processes the init clause with this frame on top, but `var`
             // bindings still hoist to the enclosing function scope. Loop
             // counters resolve through this frame to reference tokens so
-            // per-iteration values surface as autoSubs placeholders. This
+            // per-iteration values surface as opaque references. This
             // works for both block-bodied (`for (...) { ... }`) and
             // single-statement (`for (...) stmt;`) loops.
             const loopFrame = { bindings: Object.create(null), isFunction: false };
@@ -4067,10 +3877,6 @@
     });
   }
 
-  // Produce a JS string literal (or variable/template) for `s`.
-  // Replace placeholder tokens in a raw string with their substituted
-  // expressions. Used for event handler bodies and other contexts where
-  // we need inline substitution without wrapping in quotes.
   function jsStr(s) {
     const esc = s
       .replace(/\\/g, '\\\\')
@@ -4201,9 +4007,6 @@
                   let srcEnd = ex.srcEnd;
                   if (ex.buildVarDeclStart >= 0) {
                     srcStart = ex.buildVarDeclStart;
-                  } else if (ex._assign && ex._tokens) {
-                    const region = findBuildRegion(ex._tokens, ex._assign, domBlock || '');
-                    if (region) { srcStart = region.regionStart; srcEnd = region.regionEnd; }
                   }
                   let pre = trimmed.slice(cursor, srcStart);
                   // Trim trailing blank lines but keep the last newline.
@@ -4268,9 +4071,6 @@
         // the build var declaration. No findBuildRegion needed.
         if (ex.buildVarDeclStart >= 0) {
           srcStart = ex.buildVarDeclStart;
-        } else if (ex._assign && ex._tokens) {
-          const region = findBuildRegion(ex._tokens, ex._assign, domBlock || '');
-          if (region) { srcStart = region.regionStart; srcEnd = region.regionEnd; }
         }
         let pre = trimmed.slice(cursor, srcStart);
         pre = pre.replace(/\n\s*$/, '\n');
