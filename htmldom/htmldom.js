@@ -1584,6 +1584,7 @@
       const open = tks[k];
       if (!open || open.type !== 'open' || open.char !== '{') return null;
       const props = Object.create(null);
+      const litAccessors = Object.create(null);
       let i = k + 1;
       while (i < stop) {
         const tk = tks[i];
@@ -1661,10 +1662,9 @@
                 const fn = functionBinding(params, p + 1, bEnd - 1, true);
                 // Store accessor on the object's accessors map (not in props).
                 // Getters are invoked on read; setters on write.
-                if (!props.__pendingAccessors) props.__pendingAccessors = Object.create(null);
-                if (!props.__pendingAccessors[keyName]) props.__pendingAccessors[keyName] = {};
-                if (accessorKind === 'get') props.__pendingAccessors[keyName].get = fn;
-                else props.__pendingAccessors[keyName].set = fn;
+                if (!litAccessors[keyName]) litAccessors[keyName] = {};
+                if (accessorKind === 'get') litAccessors[keyName].get = fn;
+                else litAccessors[keyName].set = fn;
                 i = bEnd;
                 const sep = tks[i];
                 if (sep && sep.type === 'sep' && sep.char === ',') { i++; continue; }
@@ -1782,12 +1782,9 @@
       const close = tks[i];
       if (!close || close.type !== 'close' || close.char !== '}') return null;
       const obj = objectBinding(props);
-      // Move pending accessors from props to the dedicated accessors map.
-      if (props.__pendingAccessors) {
-        for (const name of Object.keys(props.__pendingAccessors)) {
-          obj.accessors[name] = props.__pendingAccessors[name];
-        }
-        delete props.__pendingAccessors;
+      // Copy parsed accessors to the object binding.
+      for (const name of Object.keys(litAccessors)) {
+        obj.accessors[name] = litAccessors[name];
       }
       return { binding: obj, next: i + 1 };
     };
