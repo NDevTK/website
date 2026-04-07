@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Todo App</title>
+<style>
+  body { font-family: system-ui; max-width: 500px; margin: 2rem auto; background: #1a1a2e; color: #eee; }
+  h1 { text-align: center; }
+  input[type=text] { width: 70%; padding: 8px; font-size: 1rem; }
+  button { padding: 8px 16px; cursor: pointer; }
+  .todo-item { display: flex; align-items: center; padding: 8px; border-bottom: 1px solid #333; }
+  .todo-item.done span { text-decoration: line-through; color: #666; }
+  .todo-item span { flex: 1; }
+  .delete-btn { background: #e74c3c; color: white; border: none; padding: 4px 8px; cursor: pointer; border-radius: 3px; }
+  .toggle-btn { margin-right: 8px; cursor: pointer; }
+  .filters { text-align: center; margin: 1rem 0; }
+  .filters button { margin: 0 4px; }
+  .filters button.active { background: #3498db; color: white; }
+  #count { text-align: center; color: #888; }
+</style>
+</head>
+<body>
+<h1>Todo App</h1>
+<div>
+  <input type="text" id="newTodo" placeholder="What needs to be done?" onkeypress="if(event.key==='Enter')addTodo()">
+  <button onclick="addTodo()">Add</button>
+</div>
+<div class="filters">
+  <button class="active" onclick="setFilter('all')">All</button>
+  <button onclick="setFilter('active')">Active</button>
+  <button onclick="setFilter('done')">Done</button>
+</div>
+<div id="todoList"></div>
+<div id="count"></div>
+<script>
+var todos = [];
+var nextId = 0;
+var filter = 'all';
+
+function addTodo() {
+  var input = document.getElementById('newTodo');
+  var text = input.value.trim();
+  if (!text) return;
+  todos.push({ id: nextId++, text: text, done: false });
+  input.value = '';
+  render();
+}
+
+function toggleTodo(id) {
+  for (var i = 0; i < todos.length; i++) {
+    if (todos[i].id === id) {
+      todos[i].done = !todos[i].done;
+      break;
+    }
+  }
+  render();
+}
+
+function deleteTodo(id) {
+  todos = todos.filter(function(t) { return t.id !== id; });
+  render();
+}
+
+function setFilter(f) {
+  filter = f;
+  render();
+}
+
+function render() {
+  var list = document.getElementById('todoList');
+  var filtered = todos;
+  if (filter === 'active') filtered = todos.filter(function(t) { return !t.done; });
+  if (filter === 'done') filtered = todos.filter(function(t) { return t.done; });
+
+  var html = '';
+  for (var i = 0; i < filtered.length; i++) {
+    var t = filtered[i];
+    var cls = t.done ? 'todo-item done' : 'todo-item';
+    html += '<div class="' + cls + '">';
+    html += '<input type="checkbox" class="toggle-btn" ' + (t.done ? 'checked' : '') + ' onchange="toggleTodo(' + t.id + ')">';
+    html += '<span>' + t.text + '</span>';
+    html += '<button class="delete-btn" onclick="deleteTodo(' + t.id + ')">×</button>';
+    html += '</div>';
+  }
+  list.innerHTML = html;
+
+  var active = todos.filter(function(t) { return !t.done; }).length;
+  document.getElementById('count').innerHTML = '<p>' + active + ' item' + (active !== 1 ? 's' : '') + ' left</p>';
+
+  // Update filter button styles
+  var buttons = document.querySelectorAll('.filters button');
+  for (var i = 0; i < buttons.length; i++) {
+    buttons[i].className = '';
+  }
+  if (filter === 'all') buttons[0].className = 'active';
+  if (filter === 'active') buttons[1].className = 'active';
+  if (filter === 'done') buttons[2].className = 'active';
+}
+
+render();
+</script>
+</body>
+</html>
