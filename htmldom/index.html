@@ -20,7 +20,7 @@ code { background: #2a2e33; padding: 0.05rem 0.25rem; border-radius: 3px; font-s
 </head>
 <body>
 <h1>HTML/CSS &rarr; DOM API Converter</h1>
-<p class="hint">Paste HTML or a JS snippet that builds HTML via <code>innerHTML</code>/<code>outerHTML</code> assignments. HTML is converted to safe <code>createElement</code>/<code>appendChild</code> calls, and inline <code>style</code> attributes are split into individual <code>style.setProperty()</code> calls. The JS resolver statically evaluates variables, expressions, loops, conditionals, and method calls. Runtime-only values flow through as named references.</p>
+<p class="hint">Paste HTML or a JS snippet that builds HTML via <code>innerHTML</code>/<code>outerHTML</code>. Each assignment is converted to safe <code>createElement</code>/<code>appendChild</code> calls with correct element nesting. The converter handles full JS: <code>for</code>/<code>while</code>/<code>do</code> loops, <code>if</code>/<code>else</code> chains, <code>try</code>/<code>catch</code>, <code>switch</code>/<code>case</code>, ternaries, <code>.map().join()</code>, template literals, and function inlining. Non-build code (counters, flags, mutations, variable declarations) is preserved in place. Runtime values flow through as named references.</p>
 
 <label>Input</label>
 <div id="inEditor" class="editor-container"></div>
