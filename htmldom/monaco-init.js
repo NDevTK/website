@@ -1,6 +1,12 @@
-// Configure Monaco loader to use CDN
-require.config({ paths: { vs: 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.53.0/min/vs' } });
-require(['vs/editor/editor.main'], function () {
+// Configure Monaco loader to use CDN.
+// Wait for the AMD loader to be fully available before configuring.
+(function init() {
+  if (typeof require === 'undefined' || typeof require.config === 'undefined') {
+    setTimeout(init, 10);
+    return;
+  }
+  require.config({ paths: { vs: 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.53.0/min/vs' } });
+  require(['vs/editor/editor.main'], function () {
   var defaultInput = '<div style="position: fixed; z-index: -99; width: 100%; height: 100%">\n  <iframe credentialless loading="lazy" id="background" title="background" sandbox="allow-scripts" frameborder="0" height="100%" width="100%" src="https://random.ndev.tk/"></iframe>\n</div>\n<button onclick="alert(\'hello\')">Greet</button>\n<script>\nvar items = [\'Home\', \'About\', \'Contact\', location.search];\nvar html = \'<nav>\';\nfor (var i = 0; i < items.length; i++) {\n  html += \'<a href="/\' + items[i].toLowerCase() + \'"\' + \'>\' + items[i] + \'</a>\';\n}\nhtml += \'</nav>\';\ndocument.body.innerHTML = html;\n<\/script>';
 
   // Auto-resize an editor's container to fit its content.
@@ -58,4 +64,5 @@ require(['vs/editor/editor.main'], function () {
   var s = document.createElement('script');
   s.src = 'htmldom.js';
   document.body.appendChild(s);
-});
+  });
+})();
