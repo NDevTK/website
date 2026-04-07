@@ -544,7 +544,104 @@
 
     const regionStart = tokens[regionTokStart].start;
     if (regionStart >= assign.srcStart) return null;
-    return { regionStart, regionEnd: assign.srcEnd };
+    return { regionStart, regionEnd: assign.srcEnd, buildVar, allStmts, regionTokStart, blockEnd };
+  }
+
+  // Rewrite a build region statement-by-statement: replace each
+  // `buildVar +=` with DOM API code, remove the buildVar declaration
+  // and the innerHTML assignment, preserve everything else (loop
+  // structures, variable assignments, if statements, etc.).
+  // Returns the rewritten source string or null if not applicable.
+  function rewriteBuildRegion(source, tokens, assign, region, resolveAndConvert, target, assignOp) {
+    const { buildVar, allStmts, regionTokStart } = region;
+    if (!buildVar) return null;
+
+    // Find all `buildVar +=` sites within the region source. Each one
+    // is an independent innerHTML-like site: its RHS is a concat chain
+    // that gets converted to DOM API code. The surrounding control flow
+    // (for/while/if) is preserved from the original source.
+    const regionSrc = source.slice(region.regionStart, region.regionEnd);
+    const regionOffset = region.regionStart;
+
+    // Scan statements within the region and build replacement actions.
+    const actions = []; // { start, end, replacement } in source coords
+
+    for (const stmt of allStmts) {
+      if (stmt.tokStart < regionTokStart) continue;
+      const sStart = tokens[stmt.tokStart].start;
+      const sEnd = tokens[stmt.tokEnd - 1].end;
+      const stmtTokens = tokens.slice(stmt.tokStart, stmt.tokEnd);
+
+      // buildVar declaration: `var html = '...'` — replace with replaceChildren
+      // (or convert non-empty initializer).
+      for (let j = 0; j < stmtTokens.length; j++) {
+        if (stmtTokens[j].type === 'other' && (stmtTokens[j].text === 'var' || stmtTokens[j].text === 'let' || stmtTokens[j].text === 'const')) {
+          const nm = stmtTokens[j + 1];
+          if (nm && nm.type === 'other' && nm.text === buildVar) {
+            const eq = stmtTokens[j + 2];
+            if (eq && eq.type === 'sep' && eq.char === '=') {
+              const initTok = stmtTokens[j + 3];
+              const isEmpty = initTok && initTok.type === 'str' && initTok.text === '';
+              if (isEmpty) {
+                const preamble = (assignOp === '=') ? target + '.replaceChildren();' : '';
+                actions.push({ start: sStart, end: sEnd, replacement: preamble });
+              } else {
+                // Non-empty init — resolve and convert.
+                const initStart = stmt.tokStart + j + 3;
+                const initEnd = stmt.tokEnd - 1; // before ;
+                const preamble = (assignOp === '=') ? target + '.replaceChildren();\n' : '';
+                const domBlock = resolveAndConvert(initStart, initEnd, target);
+                actions.push({ start: sStart, end: sEnd, replacement: preamble + (domBlock || '') });
+              }
+            } else {
+              actions.push({ start: sStart, end: sEnd, replacement: (assignOp === '=') ? target + '.replaceChildren();' : '' });
+            }
+            break;
+          }
+        }
+      }
+
+      // innerHTML assignment: remove.
+      if (stmt.tokStart <= assign.eqIdx && stmt.tokEnd > assign.eqIdx) {
+        if (!actions.some(a => a.start === sStart)) {
+          actions.push({ start: sStart, end: sEnd, replacement: '' });
+        }
+        continue;
+      }
+
+      // buildVar += expr: convert RHS.
+      for (let j = 0; j < stmtTokens.length; j++) {
+        if (stmtTokens[j].type === 'other' && stmtTokens[j].text === buildVar) {
+          const eq = stmtTokens[j + 1];
+          if (eq && eq.type === 'sep' && eq.char === '+=') {
+            const rhsStart = stmt.tokStart + j + 2;
+            const rhsEnd = stmt.tokEnd - 1; // before ;
+            const domBlock = resolveAndConvert(rhsStart, rhsEnd, target);
+            if (!actions.some(a => a.start === sStart)) {
+              actions.push({ start: sStart, end: sEnd, replacement: domBlock || '' });
+            }
+            break;
+          }
+        }
+      }
+    }
+
+    if (actions.length === 0) return null;
+
+    // Apply in reverse source order.
+    actions.sort((a, b) => b.start - a.start);
+    let result = source;
+    for (const { start, end, replacement } of actions) {
+      // Detect indent from the original line.
+      let lineStart = start;
+      while (lineStart > 0 && result[lineStart - 1] !== '\n') lineStart--;
+      const indent = result.slice(lineStart, start).match(/^(\s*)/)[1];
+      const indented = replacement.split('\n').map((l, i) => i === 0 ? l : indent + l).join('\n');
+      result = result.slice(0, start) + indented + result.slice(end);
+    }
+    // Clean up trailing whitespace on empty replacement lines.
+    result = result.replace(/\n\s*\n\s*\n/g, '\n\n');
+    return result;
   }
 
   // Given the token index of the trailing `.innerHTML`/`.outerHTML` accessor,
@@ -3043,11 +3140,13 @@
                   const elExtra = elFull.slice(snapFull.length);
                   // Strip leading SYNTH_PLUS from extras.
                   const stripPlus = (arr) => (arr.length && arr[0].type === 'plus') ? arr.slice(1) : arr;
+                  const currentLoopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
                   const condTok = {
                     type: 'cond', condExpr,
                     ifTrue: stripPlus(ifExtra),
                     ifFalse: stripPlus(elExtra),
                   };
+                  if (currentLoopId !== null) condTok.loopId = currentLoopId;
                   assignName(name, chainBinding([...snapB.toks, SYNTH_PLUS, condTok]));
                   if (loopStack.length > 0) loopStack[loopStack.length - 1].modifiedVars.add(name);
                 }
@@ -3279,6 +3378,27 @@
           if (tokens[j] && tokens[j].type === 'sep' && tokens[j].char === ',') { j++; continue; }
           break;
         }
+        // Inside a loop body, preserve var declarations for non-build
+        // variables so the emitter outputs them.
+        if (loopStack.length > 0) {
+          const entry = loopStack[loopStack.length - 1];
+          const first = tokens[i]; // the var/let/const keyword
+          const last = tokens[j - 1];
+          // Check if ANY name in this declaration is the build var.
+          let declaresBuildVar = false;
+          for (let d = i + 1; d < j; d++) {
+            if (tokens[d].type === 'other' && entry.modifiedVars.has(tokens[d].text)) { declaresBuildVar = true; break; }
+          }
+          if (!declaresBuildVar && first && last) {
+            const stmtSrc = first._src.slice(first.start, last.end);
+            for (const bv of entry.modifiedVars) {
+              const cur = resolve(bv);
+              if (cur && cur.kind === 'chain') {
+                assignName(bv, chainBinding([...cur.toks, SYNTH_PLUS, { type: 'preserve', text: stmtSrc, loopId: entry.id }]));
+              }
+            }
+          }
+        }
         i = j - 1;
         continue;
       }
@@ -3288,9 +3408,27 @@
       if (IDENT_RE.test(t.text)) {
         const eqTok = tokens[i + 1];
         if (eqTok && eqTok.type === 'sep' && eqTok.char === '=') {
+          const stmtEndIdx = skipExpr(i + 2, stop);
           const r = readValue(i + 2, stop, TERMS_TOP);
           assignName(t.text, r ? r.binding : null);
-          i = skipExpr(i + 2, stop) - 1;
+          // Inside a loop body, preserve non-build-var assignments in
+          // the build var's chain so the emitter outputs them.
+          if (loopStack.length > 0) {
+            const entry = loopStack[loopStack.length - 1];
+            if (!entry.modifiedVars.has(t.text)) {
+              const first = tokens[i];
+              const last = tokens[stmtEndIdx - 1];
+              const stmtSrc = first._src.slice(first.start, last.end);
+              for (const bv of entry.modifiedVars) {
+                const cur = resolve(bv);
+                if (cur && cur.kind === 'chain') {
+                  const preserveTok = { type: 'preserve', text: stmtSrc, loopId: entry.id };
+                  assignName(bv, chainBinding([...cur.toks, SYNTH_PLUS, preserveTok]));
+                }
+              }
+            }
+          }
+          i = stmtEndIdx - 1;
           continue;
         }
         if (eqTok && eqTok.type === 'sep' && eqTok.char === '+=') {
@@ -3778,6 +3916,9 @@
       }
       for (const ex of extractions) {
         if (ex.srcStart === undefined) continue;
+        const target = ex.target || 'document.body';
+        const assignOp = ex.assignOp || '=';
+
         const domBlock = convertOne(raw, ex, false, false, sharedUsed);
         let srcStart = ex.srcStart;
         let srcEnd = ex.srcEnd;
@@ -3873,6 +4014,9 @@
           else parts.push({ kind: 'expr', expr: p.expr.trim(), loopId });
         }
         return { kind: 'tmpl', parts, loopId };
+      }
+      if (toks.length === 1 && toks[0].type === 'preserve') {
+        return { kind: 'preserve', text: toks[0].text, loopId };
       }
       if (toks.length === 1 && (toks[0].type === 'cond' || toks[0].type === 'iter')) {
         return Object.assign({ kind: toks[0].type, loopId }, toks[0]);
@@ -4095,6 +4239,7 @@
         if (t.type === 'str') parts.push(JSON.stringify(t.text));
         else if (t.type === 'other') parts.push(t.text);
         else if (t.type === 'cond') parts.push('(' + t.condExpr + ' ? ' + chainToksAsExpr(t.ifTrue) + ' : ' + chainToksAsExpr(t.ifFalse) + ')');
+        else if (t.type === 'preserve') { /* skip — side-effect statements don't produce values */ }
       }
       return parts.join(' + ') || '""';
     };
@@ -4111,6 +4256,10 @@
           // Non-TEXT context — fall back to expression.
           feedExpr(op.iterExpr + '.map(function(' + op.paramName + ') { return ' + chainToksAsExpr(op.perElemChain) + '; }).join(\'\')', op.loopId);
         }
+      }
+      else if (op.kind === 'preserve') {
+        flushText();
+        addChild({ kind: 'preserve', text: op.text, loopId: op.loopId });
       }
       else if (op.kind === 'cond') {
         // Conditional HTML: recursively parse both branches into vnodes
@@ -4180,6 +4329,11 @@
       const v = makeVar('text', used);
       lines.push('const ' + v + ' = document.createTextNode(' + jsStr(text).code + ');');
       lines.push(parentVar + '.appendChild(' + v + ');');
+      return;
+    }
+
+    if (node.kind === 'preserve') {
+      lines.push(node.text);
       return;
     }
 
