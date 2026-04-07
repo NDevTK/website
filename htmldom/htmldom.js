@@ -5958,12 +5958,13 @@
         if (parts.length === 0) parts.push({ kind: 'html', text: raw });
 
         const outputParts = [];
+        const sharedUsed = new Set(); // shared across HTML portions to avoid duplicate var names
         for (const part of parts) {
           if (part.kind === 'html') {
             const htmlTrimmed = part.text.trim();
             if (!htmlTrimmed) continue;
             const result = extractHTML(htmlTrimmed);
-            const block = convertOne(htmlTrimmed, result, false, false);
+            const block = convertOne(htmlTrimmed, result, false, false, sharedUsed);
             if (block) outputParts.push(block);
           } else {
             // Process script content for innerHTML replacements.
@@ -6086,7 +6087,7 @@
 
   // Produce the DOM-API code block for a single innerHTML/outerHTML
   // extraction. `multi` toggles the leading target-divider comment.
-  function convertOne(raw, result, multi, emitTitle) {
+  function convertOne(raw, result, multi, emitTitle, sharedUsed) {
     const { html, autoSubs, target, assignProp, assignOp } = result;
     const loops = result.loops || [];
     const subs = [];
@@ -6153,7 +6154,7 @@
     const useRoots = [...useHeadRoots, ...useBodyRoots];
 
     const lines = [];
-    const used = new Set();
+    const used = sharedUsed || new Set();
 
     // Reserve identifiers that appear in the user's substitution expressions
     // so we don't shadow them with element variable names.
@@ -6235,9 +6236,10 @@
         }
       }
     } else {
-      // Head elements use document.head as parent.
+      // Head elements: skip whitespace-only text nodes, use document.head.
       if (useHeadRoots.length > 0) {
         for (const n of useHeadRoots) {
+          if (n.nodeType === 3 && /^\s*$/.test(n.nodeValue)) continue;
           convertNode(n, 'document.head', lines, used, opts, null);
         }
       }
