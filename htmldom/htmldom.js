@@ -2624,6 +2624,21 @@
       return n;
     };
 
+    // Evaluate truthiness of a chain binding. Returns true, false, or null (unknown).
+    const evalTruthiness = (bind) => {
+      if (!bind || bind.kind !== 'chain') return null;
+      const n = chainAsNumber(bind);
+      if (n !== null) return n !== 0;
+      const s = chainAsKnownString(bind);
+      if (s !== null) return s !== '';
+      if (bind.toks.length === 1 && bind.toks[0].type === 'str') {
+        const text = bind.toks[0].text;
+        if (text === 'true') return true;
+        if (text === 'false' || text === 'null' || text === 'undefined' || text === 'NaN') return false;
+      }
+      return null;
+    };
+
     const chainAsExprText = (chain) => {
       if (chain.toks.length !== 1) return null;
       const t = chain.toks[0];
@@ -2777,6 +2792,203 @@
       }
 
       if (t.type !== 'other') continue;
+
+      // `if (cond) { ... } [else { ... }]` — when the condition is
+      // concrete, walk only the matching branch. When opaque, walk both
+      // branches; if a build variable is mutated in only one branch,
+      // produce a cond token so the direct parser emits if/else blocks.
+      if (t.text === 'if') {
+        const lp = tokens[i + 1];
+        if (lp && lp.type === 'open' && lp.char === '(') {
+          // Find closing `)`.
+          let depth = 1, j = i + 2;
+          while (j < stop && depth > 0) {
+            const tk = tokens[j];
+            if (tk.type === 'open' && tk.char === '(') depth++;
+            else if (tk.type === 'close' && tk.char === ')') depth--;
+            if (depth === 0) break;
+            j++;
+          }
+          if (j < stop) {
+            // Evaluate the condition.
+            const condVal = readValue(i + 2, j, null);
+            const concrete = condVal ? evalTruthiness(condVal.binding) : null;
+            // Determine if-body range.
+            const bodyTok = tokens[j + 1];
+            let ifEnd;
+            if (bodyTok && bodyTok.type === 'open' && bodyTok.char === '{') {
+              let d = 1, k = j + 2;
+              while (k < stop && d > 0) {
+                const tk = tokens[k];
+                if (tk.type === 'open' && tk.char === '{') d++;
+                else if (tk.type === 'close' && tk.char === '}') d--;
+                k++;
+              }
+              ifEnd = k;
+            } else {
+              let sd = 0, k = j + 1;
+              while (k < stop) {
+                const tk = tokens[k];
+                if (tk.type === 'open') sd++;
+                else if (tk.type === 'close') sd--;
+                else if (sd === 0 && tk.type === 'sep' && tk.char === ';') { k++; break; }
+                k++;
+              }
+              ifEnd = k;
+            }
+            // Determine else-body range (if present).
+            let elseStart = -1, elseEnd = -1;
+            if (tokens[ifEnd] && tokens[ifEnd].type === 'other' && tokens[ifEnd].text === 'else') {
+              const nt = tokens[ifEnd + 1];
+              if (nt && nt.type === 'open' && nt.char === '{') {
+                let d = 1, k = ifEnd + 2;
+                while (k < stop && d > 0) {
+                  const tk = tokens[k];
+                  if (tk.type === 'open' && tk.char === '{') d++;
+                  else if (tk.type === 'close' && tk.char === '}') d--;
+                  k++;
+                }
+                elseStart = ifEnd + 1; elseEnd = k;
+              } else if (nt && nt.type === 'other' && nt.text === 'if') {
+                // else if — let the next iteration handle it.
+                elseStart = ifEnd + 1; elseEnd = ifEnd + 1; // will be re-parsed
+              } else {
+                let sd = 0, k = ifEnd + 1;
+                while (k < stop) {
+                  const tk = tokens[k];
+                  if (tk.type === 'open') sd++;
+                  else if (tk.type === 'close') sd--;
+                  else if (sd === 0 && tk.type === 'sep' && tk.char === ';') { k++; break; }
+                  k++;
+                }
+                elseStart = ifEnd + 1; elseEnd = k;
+              }
+            }
+            if (concrete === true) {
+              // Walk only if-body; skip else.
+              i = (elseEnd > 0 ? elseEnd : ifEnd) - 1;
+              // Process if-body tokens via the main loop by NOT skipping them.
+              // But we need to skip the condition + header. Set i to body start.
+              // Actually, let the main loop naturally process from j+1 to ifEnd
+              // by not changing i past the body. We'll skip the condition.
+              i = j; // after `)`, main loop will enter `{` naturally
+              continue;
+            } else if (concrete === false) {
+              if (elseStart > 0) {
+                i = elseStart - 1; // jump to else body start
+                continue;
+              }
+              i = ifEnd - 1; // skip entire if
+              continue;
+            }
+            // Opaque condition: snapshot bindings, walk both branches,
+            // and merge. For build variables (chain kind), produce cond
+            // tokens if the branches differ.
+            const condExpr = condVal ? chainAsExprText(condVal.binding) : null;
+            if (condExpr) {
+              // Snapshot current bindings.
+              const snapshot = Object.create(null);
+              for (let si = stack.length - 1; si >= 0; si--) {
+                for (const name in stack[si].bindings) {
+                  if (!(name in snapshot)) snapshot[name] = stack[si].bindings[name];
+                }
+              }
+              // Walk if-body.
+              const ifBodyStart = (bodyTok && bodyTok.type === 'open' && bodyTok.char === '{') ? j + 2 : j + 1;
+              const ifBodyEnd = (bodyTok && bodyTok.type === 'open' && bodyTok.char === '{') ? ifEnd - 1 : ifEnd;
+              for (let wi = ifBodyStart; wi < ifBodyEnd; wi++) {
+                // Process each token via the main walker logic — but we can't
+                // easily recurse. Instead, just handle the common case:
+                // `buildVar += expr;`
+                const wt = tokens[wi];
+                if (wt && wt.type === 'other' && IDENT_RE.test(wt.text)) {
+                  const weq = tokens[wi + 1];
+                  if (weq && weq.type === 'sep' && weq.char === '+=') {
+                    const wr = readValue(wi + 2, stop, TERMS_TOP);
+                    const wCur = resolve(wt.text);
+                    if (wCur && wCur.kind === 'chain' && wr && wr.binding && wr.binding.kind === 'chain') {
+                      const loopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
+                      const tagged = loopId !== null ? tagWithLoop(wr.binding.toks, loopId) : wr.binding.toks;
+                      assignName(wt.text, chainBinding([...wCur.toks, SYNTH_PLUS, ...tagged]));
+                      if (loopStack.length > 0) loopStack[loopStack.length - 1].modifiedVars.add(wt.text);
+                    }
+                    wi = skipExpr(wi + 2, stop) - 1;
+                  }
+                }
+              }
+              // Capture if-branch bindings.
+              const ifBindings = Object.create(null);
+              for (let si = stack.length - 1; si >= 0; si--) {
+                for (const name in stack[si].bindings) {
+                  if (!(name in ifBindings)) ifBindings[name] = stack[si].bindings[name];
+                }
+              }
+              // Restore snapshot and walk else-body.
+              for (const name in snapshot) {
+                assignName(name, snapshot[name]);
+              }
+              if (elseStart > 0 && elseEnd > elseStart) {
+                const elseBodyStart = (tokens[elseStart] && tokens[elseStart].type === 'open' && tokens[elseStart].char === '{') ? elseStart + 1 : elseStart;
+                const elseBodyEnd = (tokens[elseStart] && tokens[elseStart].type === 'open' && tokens[elseStart].char === '{') ? elseEnd - 1 : elseEnd;
+                for (let wi = elseBodyStart; wi < elseBodyEnd; wi++) {
+                  const wt = tokens[wi];
+                  if (wt && wt.type === 'other' && IDENT_RE.test(wt.text)) {
+                    const weq = tokens[wi + 1];
+                    if (weq && weq.type === 'sep' && weq.char === '+=') {
+                      const wr = readValue(wi + 2, stop, TERMS_TOP);
+                      const wCur = resolve(wt.text);
+                      if (wCur && wCur.kind === 'chain' && wr && wr.binding && wr.binding.kind === 'chain') {
+                        const loopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
+                        const tagged = loopId !== null ? tagWithLoop(wr.binding.toks, loopId) : wr.binding.toks;
+                        assignName(wt.text, chainBinding([...wCur.toks, SYNTH_PLUS, ...tagged]));
+                        if (loopStack.length > 0) loopStack[loopStack.length - 1].modifiedVars.add(wt.text);
+                      }
+                      wi = skipExpr(wi + 2, stop) - 1;
+                    }
+                  }
+                }
+              }
+              // Merge: for any binding that differs between branches,
+              // produce a cond token.
+              const elseBindings = Object.create(null);
+              for (let si = stack.length - 1; si >= 0; si--) {
+                for (const name in stack[si].bindings) {
+                  if (!(name in elseBindings)) elseBindings[name] = stack[si].bindings[name];
+                }
+              }
+              for (const name in ifBindings) {
+                const ifB = ifBindings[name];
+                const elB = elseBindings[name] || snapshot[name];
+                if (ifB === elB) continue;
+                if (!ifB || !elB || ifB.kind !== 'chain' || elB.kind !== 'chain') continue;
+                if (JSON.stringify(ifB.toks) === JSON.stringify(elB.toks)) continue;
+                // Build variable was mutated differently in each branch.
+                // The if-branch appended tokens beyond the snapshot; those
+                // tokens are the conditional content.
+                const snapB = snapshot[name];
+                if (snapB && snapB.kind === 'chain') {
+                  const ifExtra = ifB.toks.slice(snapB.toks.length);
+                  const elExtra = elB.toks.slice(snapB.toks.length);
+                  // Strip leading SYNTH_PLUS from extras.
+                  const stripPlus = (arr) => (arr.length && arr[0].type === 'plus') ? arr.slice(1) : arr;
+                  const condTok = {
+                    type: 'cond', condExpr,
+                    ifTrue: stripPlus(ifExtra),
+                    ifFalse: stripPlus(elExtra),
+                  };
+                  assignName(name, chainBinding([...snapB.toks, SYNTH_PLUS, condTok]));
+                  if (loopStack.length > 0) loopStack[loopStack.length - 1].modifiedVars.add(name);
+                }
+              }
+              i = (elseEnd > 0 ? elseEnd : ifEnd) - 1;
+              continue;
+            }
+            // Fallback: couldn't parse condition — skip entire if/else.
+            i = (elseEnd > 0 ? elseEnd : ifEnd) - 1;
+            continue;
+          }
+        }
+      }
 
       if (t.text === 'for' || t.text === 'while') {
         // Detect loop header and body range. The body is either a `{ ... }`
@@ -3440,14 +3652,16 @@
                     if (region) { srcStart = region.regionStart; srcEnd = region.regionEnd; }
                   }
                   let pre = trimmed.slice(cursor, srcStart);
-                  if (domBlock && pre.length && !pre.endsWith('\n')) pre += '\n';
+                  // Trim trailing blank lines but keep the last newline.
+                  pre = pre.replace(/\n\s*$/, '\n');
                   scriptOutput += pre;
                   if (domBlock) {
                     let lineStart = srcStart;
                     while (lineStart > 0 && trimmed[lineStart - 1] !== '\n') lineStart--;
                     const indent = trimmed.slice(lineStart, srcStart).match(/^(\s*)/)[1];
-                    const indented = domBlock.split('\n').map((line, i) => i === 0 ? line : indent + line).join('\n');
+                    const indented = domBlock.split('\n').map((line, i) => i === 0 ? indent + line : indent + line).join('\n');
                     scriptOutput += indented;
+                    if (!indented.endsWith('\n')) scriptOutput += '\n';
                   }
                   cursor = srcEnd;
                   while (cursor < trimmed.length && (trimmed[cursor] === ';' || trimmed[cursor] === ' ' || trimmed[cursor] === '\n')) cursor++;
@@ -3489,13 +3703,14 @@
           if (region) { srcStart = region.regionStart; srcEnd = region.regionEnd; }
         }
         let pre = trimmed.slice(cursor, srcStart);
-        if (domBlock && pre.length && !pre.endsWith('\n')) pre += '\n';
+        pre = pre.replace(/\n\s*$/, '\n');
         output += pre;
         if (domBlock) {
           let lineStart = srcStart;
           while (lineStart > 0 && trimmed[lineStart - 1] !== '\n') lineStart--;
           const indent = trimmed.slice(lineStart, srcStart).match(/^(\s*)/)[1];
-          output += domBlock.split('\n').map((line, i) => i === 0 ? line : indent + line).join('\n');
+          output += domBlock.split('\n').map((line) => indent + line).join('\n');
+          if (!output.endsWith('\n')) output += '\n';
         }
         cursor = srcEnd;
         while (cursor < trimmed.length && (trimmed[cursor] === ';' || trimmed[cursor] === ' ' || trimmed[cursor] === '\n')) cursor++;
@@ -3840,7 +4055,7 @@
 
   // Emit DOM API code from a virtual DOM tree produced by parseChainToVNodes.
   // Handles the same options as convertNode: useProps, classList, events, etc.
-  function emitVNodes(vnodes, parentVar, lines, used, opts, loopInfoMap, loopIds) {
+  function emitVNodes(vnodes, parentVar, lines, used, opts, loopInfoMap, loopIds, nsCtx) {
     // Group nodes by loopId to wrap loop segments.
     const groups = [];
     let curGroup = null;
@@ -3864,16 +4079,16 @@
         const loopLines = [];
         const innerLoopIds = new Set(loopIds || []);
         innerLoopIds.add(group.loopId);
-        for (const node of group.nodes) emitVNode(node, parentVar, loopLines, loopUsed, opts, loopInfoMap, innerLoopIds);
+        for (const node of group.nodes) emitVNode(node, parentVar, loopLines, loopUsed, opts, loopInfoMap, innerLoopIds, nsCtx);
         for (const l of loopLines) lines.push('  ' + l);
         lines.push('}');
       } else {
-        for (const node of group.nodes) emitVNode(node, parentVar, lines, used, opts, loopInfoMap, loopIds);
+        for (const node of group.nodes) emitVNode(node, parentVar, lines, used, opts, loopInfoMap, loopIds, nsCtx);
       }
     }
   }
 
-  function emitVNode(node, parentVar, lines, used, opts, loopInfoMap, loopIds) {
+  function emitVNode(node, parentVar, lines, used, opts, loopInfoMap, loopIds, nsCtx) {
     if (node.kind === 'text') {
       const text = node.text;
       if (!text) return;
@@ -3887,7 +4102,7 @@
     if (node.kind === 'iteration') {
       const iterLines = [];
       const iterUsed = new Set(used);
-      emitVNodes(node.children, parentVar, iterLines, iterUsed, opts, loopInfoMap, loopIds);
+      emitVNodes(node.children, parentVar, iterLines, iterUsed, opts, loopInfoMap, loopIds, nsCtx);
       if (iterLines.length) {
         lines.push(node.iterExpr + '.forEach(function(' + node.paramName + ') {');
         for (const l of iterLines) lines.push('  ' + l);
@@ -3901,8 +4116,8 @@
       const elseLines = [];
       const ifUsed = new Set(used);
       const elseUsed = new Set(used);
-      emitVNodes(node.ifTrue, parentVar, ifLines, ifUsed, opts, loopInfoMap, loopIds);
-      emitVNodes(node.ifFalse, parentVar, elseLines, elseUsed, opts, loopInfoMap, loopIds);
+      emitVNodes(node.ifTrue, parentVar, ifLines, ifUsed, opts, loopInfoMap, loopIds, nsCtx);
+      emitVNodes(node.ifFalse, parentVar, elseLines, elseUsed, opts, loopInfoMap, loopIds, nsCtx);
       if (ifLines.length || elseLines.length) {
         lines.push('if (' + node.condExpr + ') {');
         for (const l of ifLines) lines.push('  ' + l);
@@ -3928,10 +4143,13 @@
     const v = makeVar(tag, used);
     const tagLower = tag.toLowerCase();
 
-    // Namespace detection by tag name.
-    const isSvg = SVG_TAGS.has(tagLower) || tagLower === 'svg';
-    const isMathML = tagLower === 'math';
-    const ns = isSvg ? SVG_NS : isMathML ? MATHML_NS : null;
+    // Namespace detection: <svg> and <math> introduce their namespace;
+    // children inherit from parent unless inside <foreignObject>.
+    let ns = nsCtx || null;
+    if (tagLower === 'svg') ns = SVG_NS;
+    else if (tagLower === 'math') ns = MATHML_NS;
+    else if (tagLower === 'foreignobject') ns = null;
+    else if (!ns && SVG_TAGS.has(tagLower)) ns = SVG_NS;
 
     if (ns) {
       lines.push('const ' + v + " = document.createElementNS('" + ns + "', '" + tag + "');");
@@ -4040,7 +4258,9 @@
         lines.push(parentVar + '.appendChild(' + v + ');');
         return;
       }
-      emitVNodes(node.children, v, lines, used, opts, loopInfoMap, loopIds);
+      // Children inherit namespace; <foreignObject> reverts to HTML.
+      const childNs = (tagLower === 'foreignobject') ? null : ns;
+      emitVNodes(node.children, v, lines, used, opts, loopInfoMap, loopIds, childNs);
     }
 
     lines.push(parentVar + '.appendChild(' + v + ');');
