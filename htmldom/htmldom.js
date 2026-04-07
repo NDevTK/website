@@ -4659,6 +4659,22 @@
   // Emit DOM API code from a virtual DOM tree produced by parseChainToVNodes.
   // Handles the same options as convertNode: useProps, classList, events, etc.
   function emitVNodes(vnodes, parentVar, lines, used, opts, loopInfoMap, loopIds, nsCtx) {
+    // Reserve identifiers from preserve tokens so makeVar doesn't collide.
+    const reservePreserveIdents = (nodes) => {
+      for (const n of nodes) {
+        if (n.kind === 'preserve' && n.text) {
+          const ids = n.text.match(/[A-Za-z_$][A-Za-z0-9_$]*/g);
+          if (ids) for (const id of ids) used.add(id);
+        }
+        if (n.kind === 'conditional') { reservePreserveIdents(n.ifTrue); reservePreserveIdents(n.ifFalse); }
+        if (n.kind === 'iteration') reservePreserveIdents(n.children);
+        if (n.kind === 'trycatch') { reservePreserveIdents(n.tryBody); reservePreserveIdents(n.catchBody); }
+        if (n.kind === 'switch') for (const br of n.branches) reservePreserveIdents(br.nodes);
+        if (n.kind === 'element') reservePreserveIdents(n.children);
+      }
+    };
+    reservePreserveIdents(vnodes);
+
     // Group nodes by loopId to wrap loop segments.
     const groups = [];
     let curGroup = null;
