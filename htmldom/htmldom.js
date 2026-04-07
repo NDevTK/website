@@ -6129,26 +6129,28 @@
     }
     const parseHtml = tableWrap ? '<' + tableWrap + '>' + html + '</' + tableWrap + '>' : html;
     const doc = new DOMParser().parseFromString(parseHtml, 'text/html');
-    const roots = [];
+    const headRoots = [];
+    const bodyRoots = [];
     if (tableWrap) {
-      // Extract from the wrapper element.
       const wrapper = doc.body ? doc.body.querySelector(tableWrap) : null;
-      if (wrapper) for (const n of wrapper.childNodes) roots.push(n);
-    } else if (doc.head) {
-      for (const n of doc.head.childNodes) roots.push(n);
-    }
-    if (!tableWrap && doc.body) {
-      for (const n of doc.body.childNodes) roots.push(n);
-    } else if (!tableWrap && doc.documentElement) {
-      for (const n of doc.documentElement.childNodes) {
-        if (n !== doc.head) roots.push(n);
+      if (wrapper) for (const n of wrapper.childNodes) bodyRoots.push(n);
+    } else {
+      if (doc.head) for (const n of doc.head.childNodes) headRoots.push(n);
+      if (doc.body) {
+        for (const n of doc.body.childNodes) bodyRoots.push(n);
+      } else if (doc.documentElement) {
+        for (const n of doc.documentElement.childNodes) {
+          if (n !== doc.head) bodyRoots.push(n);
+        }
       }
     }
 
-    // Filter whitespace-only text at the root level when requested.
-    const useRoots = opts.skipWhitespaceText
-      ? roots.filter(n => !(n.nodeType === 3 && /^\s*$/.test(n.nodeValue)))
-      : roots;
+    const filterWS = (list) => opts.skipWhitespaceText
+      ? list.filter(n => !(n.nodeType === 3 && /^\s*$/.test(n.nodeValue)))
+      : list;
+    const useHeadRoots = filterWS(headRoots);
+    const useBodyRoots = filterWS(bodyRoots);
+    const useRoots = [...useHeadRoots, ...useBodyRoots];
 
     const lines = [];
     const used = new Set();
@@ -6233,7 +6235,13 @@
         }
       }
     } else {
-      for (const n of useRoots) {
+      // Head elements use document.head as parent.
+      if (useHeadRoots.length > 0) {
+        for (const n of useHeadRoots) {
+          convertNode(n, 'document.head', lines, used, opts, null);
+        }
+      }
+      for (const n of useBodyRoots) {
         convertNode(n, attachTarget, lines, used, opts, null);
       }
     }
