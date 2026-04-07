@@ -240,12 +240,16 @@
     const target = assign.target;
     const assignProp = assign.prop;
     const assignOp = assign.op;
-    // Determine the build variable (if the RHS is a single identifier).
+    // Determine build variables from the RHS (single ident or concat of idents).
     const rhsToks = [];
     for (let j = assign.rhsStart; j < assign.rhsEnd; j++) rhsToks.push(tokens[j]);
-    const isBuildVar = rhsToks.length === 1 && rhsToks[0].type === 'other' && IDENT_RE.test(rhsToks[0].text);
-    const buildVar = isBuildVar ? rhsToks[0].text : null;
-    const r = resolveIdentifiers(tokens, assign.rhsStart, assign.rhsEnd, buildVar);
+    // Collect all identifiers in the RHS that could be build variables.
+    const buildVars = [];
+    for (const rt of rhsToks) {
+      if (rt.type === 'other' && IDENT_RE.test(rt.text)) buildVars.push(rt.text);
+    }
+    const buildVar = buildVars.length === 1 ? buildVars[0] : null;
+    const r = resolveIdentifiers(tokens, assign.rhsStart, assign.rhsEnd, buildVars.length ? buildVars : null);
     if (r.parsed) {
       // Recursively expand loopVar references. Multiple loopVars may
       // share the same name (nested loops modifying the same build var).
@@ -867,7 +871,15 @@
     const loopVars = [];
     // When set, non-build statements inject 'preserve' tokens into this
     // variable's chain so the emitter outputs them at the right position.
-    let trackBuildVar = trackBuildVarInit || null;
+    // trackBuildVar can be a string (single build var) or a Set (multiple).
+    let trackBuildVar = null;
+    if (trackBuildVarInit) {
+      if (Array.isArray(trackBuildVarInit)) {
+        trackBuildVar = new Set(trackBuildVarInit);
+      } else {
+        trackBuildVar = new Set([trackBuildVarInit]);
+      }
+    }
     let buildVarDeclStart = -1;
     let nextLoopId = 0;
     // Swappable token array for the inner parsing functions. The main scope
@@ -1133,7 +1145,33 @@
           if (b) resolvedText = bindingToText(b);
         } else {
           const chain = evalExprSrc(p.expr);
-          if (chain) resolvedText = bindingToText(chainBinding(chain));
+          if (chain) {
+            // Check if the chain contains structured tokens (cond, trycatch, switch).
+            const hasStructured = chain.some(t => t.type === 'cond' || t.type === 'trycatch' || t.type === 'switch' || t.type === 'iter');
+            if (hasStructured) {
+              // Can't embed in template — flatten by converting this
+              // template into a concat chain. Return the full chain with
+              // the structured tokens spliced in at this position.
+              const out = [];
+              for (const prev of parts) {
+                if (out.length) out.push(SYNTH_PLUS);
+                if (prev.kind === 'text') out.push(makeSynthStr(decodeJsString(prev.raw, '`')));
+                else out.push(exprRef(prev.expr));
+              }
+              if (out.length) out.push(SYNTH_PLUS);
+              for (const ct of chain) out.push(ct);
+              // Process remaining parts.
+              for (let ri = tok.parts.indexOf(p) + 1; ri < tok.parts.length; ri++) {
+                const rp = tok.parts[ri];
+                out.push(SYNTH_PLUS);
+                if (rp.kind === 'text') out.push(makeSynthStr(decodeJsString(rp.raw, '`')));
+                else out.push(exprRef(rp.expr));
+              }
+              // Return a synthetic chain token that expandChain can handle.
+              return { type: '_chain', toks: out };
+            }
+            resolvedText = bindingToText(chainBinding(chain));
+          }
         }
         if (resolvedText !== null) {
           const raw = resolvedText.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$\{/g, '\\${');
@@ -2159,7 +2197,11 @@
         return { bind: applied, next: inner.next };
       }
       if (t.type === 'str') return { bind: chainBinding([t]), next: k + 1 };
-      if (t.type === 'tmpl') return { bind: chainBinding([rewriteTemplate(t)]), next: k + 1 };
+      if (t.type === 'tmpl') {
+        const rw = rewriteTemplate(t);
+        if (rw.type === '_chain') return { bind: chainBinding(rw.toks), next: k + 1 };
+        return { bind: chainBinding([rw]), next: k + 1 };
+      }
       if (t.type === 'regex') return { bind: chainBinding([exprRef(t.text)]), next: k + 1 };
       if (t.type === 'open' && t.char === '(') {
         const r = readConcatExpr(k + 1, stop, { sep: [], close: [')'] });
@@ -3122,7 +3164,7 @@
               // Non-build vars that differ between branches become opaque
               // so subsequent code doesn't use a stale concrete value.
               for (const name in ifBindings) {
-                if (name === trackBuildVar) continue;
+                if (trackBuildVar && trackBuildVar.has(name)) continue;
                 const ifB = ifBindings[name];
                 const elB = elseBindings[name] || snapshot[name];
                 if (ifB === elB) continue;
@@ -3254,7 +3296,7 @@
             if (JSON.stringify(tryFull) === JSON.stringify(catchFull)) continue;
             const snapB = snapshot[name];
             if (snapB && snapB.kind === 'chain') {
-              if (name === trackBuildVar) {
+              if (trackBuildVar && trackBuildVar.has(name)) {
                 const tryExtra = tryFull.slice(snapB.toks.length);
                 const catchExtra = catchFull.slice(snapB.toks.length);
                 const stripPlus = (arr) => (arr.length && arr[0].type === 'plus') ? arr.slice(1) : arr;
@@ -3338,11 +3380,12 @@
             }
             // Merge: produce a switchcase token for the build var.
             if (trackBuildVar) {
-              const snapB = snapshot[trackBuildVar];
-              if (snapB && snapB.kind === 'chain') {
+              for (const bv of trackBuildVar) {
+                const snapB = snapshot[bv];
+                if (!snapB || snapB.kind !== 'chain') continue;
                 const branches = [];
                 for (const cr of caseResults) {
-                  const b = cr.bindings[trackBuildVar];
+                  const b = cr.bindings[bv];
                   if (b && b.kind === 'chain') {
                     const extra = b.toks.slice(snapB.toks.length);
                     const stripPlus = (arr) => (arr.length && arr[0].type === 'plus') ? arr.slice(1) : arr;
@@ -3351,14 +3394,14 @@
                 }
                 if (branches.length) {
                   const switchTok = { type: 'switch', discExpr: discExpr || '/* switch */', branches };
-                  assignName(trackBuildVar, chainBinding([...snapB.toks, SYNTH_PLUS, switchTok]));
+                  assignName(bv, chainBinding([...snapB.toks, SYNTH_PLUS, switchTok]));
                 }
               }
             }
             // Non-build vars: make opaque.
             for (const cr of caseResults) {
               for (const name in cr.bindings) {
-                if (name === trackBuildVar) continue;
+                if (trackBuildVar && trackBuildVar.has(name)) continue;
                 const b = cr.bindings[name];
                 if (b && snapshot[name] && JSON.stringify(b) !== JSON.stringify(snapshot[name])) {
                   assignName(name, chainBinding([exprRef(name)]));
@@ -3609,7 +3652,7 @@
           }
           if (hasInit) {
             declBind(nameTok.text, value);
-            if (trackBuildVar && nameTok.text === trackBuildVar && buildVarDeclStart < 0) {
+            if (trackBuildVar && trackBuildVar.has(nameTok.text) && buildVarDeclStart < 0) {
               buildVarDeclStart = tokens[i].start;
             }
           } else {
@@ -3629,17 +3672,18 @@
           const last = tokens[j - 1];
           let declaresBuildVar = false;
           for (let d = i + 1; d < j; d++) {
-            if (tokens[d].type === 'other' && tokens[d].text === trackBuildVar) { declaresBuildVar = true; break; }
+            if (tokens[d].type === "other" && trackBuildVar && trackBuildVar.has(tokens[d].text)) { declaresBuildVar = true; break; }
           }
           if (!declaresBuildVar && first && last) {
-            const bv = trackBuildVar;
-            const cur = resolve(bv);
-            if (cur && cur.kind === 'chain') {
-              const stmtSrc = first._src.slice(first.start, last.end);
-              const loopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
-              const preserveTok = { type: 'preserve', text: stmtSrc };
-              if (loopId !== null) preserveTok.loopId = loopId;
-              assignName(bv, chainBinding([...cur.toks, SYNTH_PLUS, preserveTok]));
+            for (const bv of trackBuildVar) {
+              const cur = resolve(bv);
+              if (cur && cur.kind === 'chain') {
+                const stmtSrc = first._src.slice(first.start, last.end);
+                const loopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
+                const preserveTok = { type: 'preserve', text: stmtSrc };
+                if (loopId !== null) preserveTok.loopId = loopId;
+                assignName(bv, chainBinding([...cur.toks, SYNTH_PLUS, preserveTok]));
+              }
             }
           }
         }
@@ -3657,17 +3701,18 @@
           assignName(t.text, r ? r.binding : null);
           // Preserve non-build-var assignments in the build var's chain
           // so the emitter outputs them at the correct position.
-          if (trackBuildVar && t.text !== trackBuildVar) {
-            const bv = trackBuildVar;
-            const cur = resolve(bv);
-            if (cur && cur.kind === 'chain') {
-              const first = tokens[i];
-              const last = tokens[stmtEndIdx - 1];
-              const stmtSrc = first._src.slice(first.start, last.end);
-              const loopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
-              const preserveTok = { type: 'preserve', text: stmtSrc };
-              if (loopId !== null) preserveTok.loopId = loopId;
-              assignName(bv, chainBinding([...cur.toks, SYNTH_PLUS, preserveTok]));
+          if (trackBuildVar && !trackBuildVar.has(t.text)) {
+            for (const bv of trackBuildVar) {
+              const cur = resolve(bv);
+              if (cur && cur.kind === 'chain') {
+                const first = tokens[i];
+                const last = tokens[stmtEndIdx - 1];
+                const stmtSrc = first._src.slice(first.start, last.end);
+                const loopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
+                const preserveTok = { type: 'preserve', text: stmtSrc };
+                if (loopId !== null) preserveTok.loopId = loopId;
+                assignName(bv, chainBinding([...cur.toks, SYNTH_PLUS, preserveTok]));
+              }
             }
           }
           i = stmtEndIdx - 1;
@@ -3699,15 +3744,16 @@
             assignName(t.text, chainBinding([exprRef(t.text)]));
           }
           // Preserve as non-build statement.
-          if (trackBuildVar && t.text !== trackBuildVar) {
-            const bv = trackBuildVar;
-            const bCur = resolve(bv);
-            if (bCur && bCur.kind === 'chain') {
-              const stmtSrc = t.text + eqTok.text;
-              const loopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
-              const preserveTok = { type: 'preserve', text: stmtSrc };
-              if (loopId !== null) preserveTok.loopId = loopId;
-              assignName(bv, chainBinding([...bCur.toks, SYNTH_PLUS, preserveTok]));
+          if (trackBuildVar && !trackBuildVar.has(t.text)) {
+            for (const bv of trackBuildVar) {
+              const bCur = resolve(bv);
+              if (bCur && bCur.kind === 'chain') {
+                const stmtSrc = t.text + eqTok.text;
+                const loopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
+                const preserveTok = { type: 'preserve', text: stmtSrc };
+                if (loopId !== null) preserveTok.loopId = loopId;
+                assignName(bv, chainBinding([...bCur.toks, SYNTH_PLUS, preserveTok]));
+              }
             }
           }
           if (loopStack.length > 0) loopStack[loopStack.length - 1].modifiedVars.add(t.text);
@@ -3777,7 +3823,7 @@
       for (let i = stack.length - 1; i >= 0; i--) if (name in stack[i].bindings) return true;
       return false;
     };
-    const setTrackBuildVar = (name) => { trackBuildVar = name; };
+    const setTrackBuildVar = (name) => { trackBuildVar = name ? new Set(Array.isArray(name) ? name : [name]) : null; };
     const getBuildVarDeclStart = () => buildVarDeclStart;
     return { resolve, resolvePath, parseRange, rewriteTemplate, advanceTo, setTrackBuildVar, getBuildVarDeclStart, loopInfo, loopVars, inScope, domElements, domOps };
   }
@@ -3792,15 +3838,20 @@
   // paths, `.join(sep)`, `.concat(...)`, and template interpolation); if that
   // fails, falls back to per-identifier substitution so downstream chain
   // detection can still find partial matches.
-  function resolveIdentifiers(tokens, startIdx, endIdx, buildVar) {
+  function resolveIdentifiers(tokens, startIdx, endIdx, buildVarOrVars) {
     const externallyMutable = scanMutations(tokens);
-    const state = buildScopeState(tokens, startIdx, externallyMutable, buildVar);
+    const state = buildScopeState(tokens, startIdx, externallyMutable, buildVarOrVars);
     const full = state.parseRange(startIdx, endIdx);
     if (full) return { tokens: full, parsed: true, loopInfo: state.loopInfo, loopVars: state.loopVars, buildVarDeclStart: state.getBuildVarDeclStart(), inScope: state.inScope };
     const out = [];
     for (let i = startIdx; i < endIdx; i++) {
       const t = tokens[i];
-      if (t.type === 'tmpl') { out.push(state.rewriteTemplate(t)); continue; }
+      if (t.type === 'tmpl') {
+        const rw = state.rewriteTemplate(t);
+        if (rw.type === '_chain') { for (const ct of rw.toks) out.push(ct); }
+        else out.push(rw);
+        continue;
+      }
       if (t.type === 'other' && IDENT_OR_PATH_RE.test(t.text)) {
         const next = tokens[i + 1];
         const isLhs = next && next.type === 'sep' && next.char === '=';
@@ -3822,11 +3873,35 @@
     let i = 0;
     const n = src.length;
     function push(tok) { tok._src = src; tokens.push(tok); }
+    // ASI: track whether a newline was crossed in whitespace. When the
+    // previous token could end a statement and the next token could start
+    // one, insert a synthetic semicolon.
+    let sawNewline = false;
+    const canEndStmt = () => {
+      if (!tokens.length) return false;
+      const last = tokens[tokens.length - 1];
+      if (last.type === 'str' || last.type === 'tmpl') return true;
+      if (last.type === 'other') return true; // identifiers, numbers, keywords like return/break/continue
+      if (last.type === 'close') return true; // ) ] }
+      if (last.type === 'op' && (last.text === '++' || last.text === '--')) return true;
+      return false;
+    };
+    const canStartStmt = (ch) => {
+      // Tokens that can start a new statement.
+      return /[A-Za-z_$'"`({[]/.test(ch) || ch === '!' || ch === '~' || ch === '+' || ch === '-';
+    };
     while (i < n) {
       const c = src[i];
-      if (c === ' ' || c === '\t' || c === '\n' || c === '\r') { i++; continue; }
-      if (c === '/' && src[i + 1] === '/') { while (i < n && src[i] !== '\n') i++; continue; }
-      if (c === '/' && src[i + 1] === '*') { i += 2; while (i < n && !(src[i] === '*' && src[i + 1] === '/')) i++; i += 2; continue; }
+      if (c === ' ' || c === '\t' || c === '\r') { i++; continue; }
+      if (c === '\n') { sawNewline = true; i++; continue; }
+      if (c === '/' && src[i + 1] === '/') { while (i < n && src[i] !== '\n') i++; sawNewline = true; continue; }
+      if (c === '/' && src[i + 1] === '*') { i += 2; while (i < n && !(src[i] === '*' && src[i + 1] === '/')) { if (src[i] === '\n') sawNewline = true; i++; } i += 2; continue; }
+      // ASI: insert synthetic semicolon if newline crossed between
+      // a statement-ending token and a statement-starting token.
+      if (sawNewline && canEndStmt() && canStartStmt(c)) {
+        push({ type: 'sep', char: ';', start: i, end: i });
+      }
+      sawNewline = false;
       if (c === "'" || c === '"') {
         const start = i; const quote = c; i++;
         let raw = '';
@@ -4599,17 +4674,25 @@
     for (const group of groups) {
       if (group.loopId != null && loopInfoMap && loopInfoMap[group.loopId] && !(loopIds && loopIds.has(group.loopId))) {
         const info = loopInfoMap[group.loopId];
-        const header = info.kind === 'while'
-          ? 'while (' + info.headerSrc + ')'
-          : 'for (' + info.headerSrc + ')';
-        lines.push(header + ' {');
+        if (info.kind === 'do') {
+          lines.push('do {');
+        } else {
+          const header = info.kind === 'while'
+            ? 'while (' + info.headerSrc + ')'
+            : 'for (' + info.headerSrc + ')';
+          lines.push(header + ' {');
+        }
         const loopUsed = new Set(used);
         const loopLines = [];
         const innerLoopIds = new Set(loopIds || []);
         innerLoopIds.add(group.loopId);
         for (const node of group.nodes) emitVNode(node, parentVar, loopLines, loopUsed, opts, loopInfoMap, innerLoopIds, nsCtx);
         for (const l of loopLines) lines.push('  ' + l);
-        lines.push('}');
+        if (info.kind === 'do') {
+          lines.push('} while (' + info.headerSrc + ');');
+        } else {
+          lines.push('}');
+        }
       } else {
         for (const node of group.nodes) emitVNode(node, parentVar, lines, used, opts, loopInfoMap, loopIds, nsCtx);
       }
