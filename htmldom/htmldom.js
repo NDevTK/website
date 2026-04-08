@@ -300,7 +300,11 @@
       // so inner loops expand before outer ones.
       const lvByName = Object.create(null);
       if (r.loopVars) {
+        // Only expand build variables through loopVars. Non-build
+        // variables (counters, flags) should stay as runtime references.
+        const buildVarSet = new Set(buildVars);
         for (const lv of r.loopVars) {
+          if (!buildVarSet.has(lv.name)) continue;
           if (!lvByName[lv.name]) lvByName[lv.name] = [];
           lvByName[lv.name].push(lv);
         }
@@ -2903,9 +2907,15 @@
       // as a named variable rather than inlining the one-iteration chain.
       while (loopStack.length > 0 && i >= loopStack[loopStack.length - 1].bodyEnd) {
         const entry = loopStack.pop();
+        // Collect names that were pre-scanned as opaque in the loop frame.
+        const preScanNames = entry.frame ? Object.keys(entry.frame.bindings) : [];
         const topIdx = stack.indexOf(entry.frame);
         if (topIdx >= 0) stack.splice(topIdx, 1);
-        for (const name of entry.modifiedVars) {
+        // Merge pre-scanned and modified variables: all need to be
+        // opaque in the outer scope after the loop exits.
+        const allModified = new Set(entry.modifiedVars);
+        for (const n of preScanNames) allModified.add(n);
+        for (const name of allModified) {
           const b = resolve(name);
           if (b && b.kind === 'chain') {
             // Store the chain UNSTRIPPED; strip the outer loop's tags only
@@ -3460,15 +3470,23 @@
                 }
               }
             }
-            // Non-build vars: make opaque.
-            for (const cr of caseResults) {
-              for (const name in cr.bindings) {
+            // Non-build vars that differ across cases: make opaque so
+            // the resolver doesn't statically pick the last case's value.
+            // Collect all names assigned in any case.
+            const switchChanged = new Set();
+            for (const cr2 of caseResults) {
+              for (const name in cr2.bindings) {
                 if (trackBuildVar && trackBuildVar.has(name)) continue;
-                const b = cr.bindings[name];
-                if (b && snapshot[name] && JSON.stringify(b) !== JSON.stringify(snapshot[name])) {
-                  assignName(name, chainBinding([exprRef(name)]));
+                const b = cr2.bindings[name];
+                const snap = snapshot[name];
+                // Changed if: exists in case but not snapshot, or differs.
+                if (b && (!snap || JSON.stringify(b) !== JSON.stringify(snap))) {
+                  switchChanged.add(name);
                 }
               }
+            }
+            for (const name of switchChanged) {
+              assignName(name, chainBinding([exprRef(name)]));
             }
             i = switchEnd - 1;
             continue;
@@ -3495,6 +3513,20 @@
               const id = nextLoopId++;
               loopInfo[id] = { kind: 'do', headerSrc };
               const loopFrame = { bindings: Object.create(null), isFunction: false };
+              // Pre-scan body for non-build modified variables (same as for/while).
+              for (let h = i + 1; h < bodyEnd; h++) {
+                const hk = tokens[h];
+                if (hk.type === 'other' && IDENT_RE.test(hk.text)) {
+                  if (trackBuildVar && trackBuildVar.has(hk.text)) continue;
+                  const hn = tokens[h + 1];
+                  if (hn && hn.type === 'sep' && (hn.char === '=' || hn.char === '+=' || hn.char === '-=' || hn.char === '*=' || hn.char === '/=')) {
+                    if (!loopFrame.bindings[hk.text]) loopFrame.bindings[hk.text] = chainBinding([exprRef(hk.text)]);
+                  }
+                  if (hn && hn.type === 'op' && (hn.text === '++' || hn.text === '--')) {
+                    if (!loopFrame.bindings[hk.text]) loopFrame.bindings[hk.text] = chainBinding([exprRef(hk.text)]);
+                  }
+                }
+              }
               stack.push(loopFrame);
               loopStack.push({
                 id, kind: 'do', headerSrc, bodyEnd: doEnd, frame: loopFrame,
@@ -3558,12 +3590,32 @@
             // works for both block-bodied (`for (...) { ... }`) and
             // single-statement (`for (...) stmt;`) loops.
             const loopFrame = { bindings: Object.create(null), isFunction: false };
+            // Scan the header for var/let/const declarations.
             for (let h = i + 2; h < j; h++) {
               const hk = tokens[h];
               if (hk.type === 'other' && (hk.text === 'var' || hk.text === 'let' || hk.text === 'const')) {
                 const nm = tokens[h + 1];
                 if (nm && nm.type === 'other' && IDENT_RE.test(nm.text)) {
                   loopFrame.bindings[nm.text] = chainBinding([exprRef(nm.text)]);
+                }
+              }
+            }
+            // Pre-scan the loop body for non-build variables modified by
+            // =, +=, ++, -- and make them opaque. This ensures references
+            // to loop counters like `i` resolve to the runtime value, not
+            // a stale initial value, even when the mutation (i++) comes
+            // after the reference (html += i). Build variables are excluded
+            // because their += mutations are tracked by the chain system.
+            for (let h = j + 1; h < bodyEnd; h++) {
+              const hk = tokens[h];
+              if (hk.type === 'other' && IDENT_RE.test(hk.text)) {
+                if (trackBuildVar && trackBuildVar.has(hk.text)) continue;
+                const hn = tokens[h + 1];
+                if (hn && hn.type === 'sep' && (hn.char === '=' || hn.char === '+=' || hn.char === '-=' || hn.char === '*=' || hn.char === '/=')) {
+                  if (!loopFrame.bindings[hk.text]) loopFrame.bindings[hk.text] = chainBinding([exprRef(hk.text)]);
+                }
+                if (hn && hn.type === 'op' && (hn.text === '++' || hn.text === '--')) {
+                  if (!loopFrame.bindings[hk.text]) loopFrame.bindings[hk.text] = chainBinding([exprRef(hk.text)]);
                 }
               }
             }
@@ -3883,6 +3935,91 @@
               }
             }
           }
+        }
+      }
+
+      // Bracket-access statement: `ident[expr]...` — assignments
+      // (`items[i] = ...`, `items[i].prop = ...`) or method calls
+      // (`items[i].sort()`). Walk through the bracket and any trailing
+      // property/call chain to find the statement boundary, then preserve
+      // the full statement if it has side effects.
+      if (t.type === 'other' && IDENT_RE.test(t.text)) {
+        const bracketTok = tokens[i + 1];
+        if (bracketTok && bracketTok.type === 'open' && bracketTok.char === '[') {
+          // Walk past balanced [...] and any following .prop, [...], or (...)
+          let j = i + 1;
+          while (j < endI) {
+            const jt = tokens[j];
+            if (jt.type === 'open' && (jt.char === '[' || jt.char === '(')) {
+              const match = jt.char === '[' ? ']' : ')';
+              let d = 1; j++;
+              while (j < endI && d > 0) {
+                if (tokens[j].type === 'open' && tokens[j].char === jt.char) d++;
+                else if (tokens[j].type === 'close' && tokens[j].char === match) d--;
+                j++;
+              }
+            } else if (jt.type === 'other' && jt.text.startsWith('.')) {
+              j++;
+            } else {
+              break;
+            }
+          }
+          // Check what follows: = (assignment), += etc., or ; (expression stmt).
+          const afterTok = tokens[j];
+          if (afterTok && afterTok.type === 'sep' &&
+              (afterTok.char === '=' || afterTok.char === '+=' || afterTok.char === '-=' ||
+               afterTok.char === '*=' || afterTok.char === '/=')) {
+            // Bracket-access assignment: items[i].seen = true
+            const stmtEndIdx = skipExpr(j + 1, endI);
+            // Preserve the statement in build var chains.
+            if (trackBuildVar && (trackBuildVarDepth < 0 || funcDepth() === trackBuildVarDepth)) {
+              const first = tokens[i];
+              const last = tokens[stmtEndIdx - 1];
+              if (first && last && first._src) {
+                const stmtSrc = first._src.slice(first.start, last.end);
+                for (const bv of trackBuildVar) {
+                  const bCur = resolve(bv);
+                  if (bCur && bCur.kind === 'chain') {
+                    const loopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
+                    const preserveTok = { type: 'preserve', text: stmtSrc };
+                    if (loopId !== null) preserveTok.loopId = loopId;
+                    assignName(bv, chainBinding([...bCur.toks, SYNTH_PLUS, preserveTok]));
+                  }
+                }
+              }
+            }
+            i = stmtEndIdx - 1;
+            continue;
+          }
+          // Bracket-access followed by ; or end — expression statement
+          // (e.g. items[i].doSomething()). Skip to statement boundary.
+          let stmtEnd = j;
+          let sd = 0;
+          while (stmtEnd < endI) {
+            const st = tokens[stmtEnd];
+            if (st.type === 'open') sd++;
+            else if (st.type === 'close') sd--;
+            else if (sd === 0 && st.type === 'sep' && (st.char === ';' || st.char === ',')) { stmtEnd++; break; }
+            stmtEnd++;
+          }
+          if (trackBuildVar && (trackBuildVarDepth < 0 || funcDepth() === trackBuildVarDepth) && stmtEnd > i + 1) {
+            const first = tokens[i];
+            const last = tokens[stmtEnd - 1];
+            if (first && last && first._src) {
+              const stmtSrc = first._src.slice(first.start, last.end);
+              for (const bv of trackBuildVar) {
+                const bCur = resolve(bv);
+                if (bCur && bCur.kind === 'chain') {
+                  const loopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
+                  const preserveTok = { type: 'preserve', text: stmtSrc };
+                  if (loopId !== null) preserveTok.loopId = loopId;
+                  assignName(bv, chainBinding([...bCur.toks, SYNTH_PLUS, preserveTok]));
+                }
+              }
+            }
+          }
+          i = stmtEnd - 1;
+          continue;
         }
       }
     }
