@@ -2975,6 +2975,31 @@
 
       if (t.type !== 'other') continue;
 
+      // break / continue — preserve as runtime flow control so they
+      // execute at the right point in the converted loop body.
+      if (t.text === 'break' || t.text === 'continue') {
+        if (trackBuildVar && loopStack.length > 0 && (trackBuildVarDepth < 0 || funcDepth() === trackBuildVarDepth)) {
+          // Include optional label and semicolon.
+          let stmtEnd = i + 1;
+          if (stmtEnd < endI && tokens[stmtEnd].type === 'other' && IDENT_RE.test(tokens[stmtEnd].text)) stmtEnd++;
+          if (stmtEnd < endI && tokens[stmtEnd].type === 'sep' && tokens[stmtEnd].char === ';') stmtEnd++;
+          const first = tokens[i];
+          const last = tokens[stmtEnd - 1];
+          const stmtSrc = first._src.slice(first.start, last.end);
+          for (const bv of trackBuildVar) {
+            const bCur = resolve(bv);
+            if (bCur && bCur.kind === 'chain') {
+              const loopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
+              const preserveTok = { type: 'preserve', text: stmtSrc };
+              if (loopId !== null) preserveTok.loopId = loopId;
+              assignName(bv, chainBinding([...bCur.toks, SYNTH_PLUS, preserveTok]));
+            }
+          }
+          i = stmtEnd - 1;
+          continue;
+        }
+      }
+
       // `if (cond) { ... } [else { ... }]` — when the condition is
       // concrete, walk only the matching branch. When opaque, walk both
       // branches; if a build variable is mutated in only one branch,
@@ -3109,47 +3134,6 @@
                   k++;
                 }
                 elseStart = ifEnd + 1; elseEnd = k;
-              }
-            }
-            // If the if-body or else-body contains break/continue and
-            // we're inside a loop building HTML, the entire if-statement
-            // must be preserved as runtime code — break/continue affect
-            // which iterations add to the HTML.
-            if (trackBuildVar && loopStack.length > 0 && (trackBuildVarDepth < 0 || funcDepth() === trackBuildVarDepth)) {
-              let hasFlowControl = false;
-              const scanRange = (start, end) => {
-                let sd = 0;
-                for (let s = start; s < end; s++) {
-                  // Don't look inside nested functions.
-                  if (tokens[s].type === 'other' && tokens[s].text === 'function') return;
-                  if (tokens[s].type === 'open' && tokens[s].char === '{') sd++;
-                  if (tokens[s].type === 'close' && tokens[s].char === '}') sd--;
-                  if (tokens[s].type === 'other' && (tokens[s].text === 'break' || tokens[s].text === 'continue')) {
-                    hasFlowControl = true;
-                  }
-                }
-              };
-              scanRange(j + 1, ifEnd);
-              if (elseStart > 0) scanRange(elseStart, elseEnd);
-              if (hasFlowControl) {
-                // Preserve the entire if/else statement.
-                const stmtEnd = elseEnd > 0 ? elseEnd : ifEnd;
-                const first = tokens[i];
-                const last = tokens[stmtEnd - 1];
-                if (first && last && first._src) {
-                  const stmtSrc = first._src.slice(first.start, last.end);
-                  for (const bv of trackBuildVar) {
-                    const bCur = resolve(bv);
-                    if (bCur && bCur.kind === 'chain') {
-                      const loopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
-                      const preserveTok = { type: 'preserve', text: stmtSrc };
-                      if (loopId !== null) preserveTok.loopId = loopId;
-                      assignName(bv, chainBinding([...bCur.toks, SYNTH_PLUS, preserveTok]));
-                    }
-                  }
-                }
-                i = stmtEnd - 1;
-                continue;
               }
             }
             if (concrete === true) {
@@ -3530,18 +3514,34 @@
               for (const bv of trackBuildVar) {
                 const snapB = snapshot[bv];
                 if (!snapB || snapB.kind !== 'chain') continue;
+                const snapFull = snapB.toks;
+                const stripPlus = (arr) => (arr.length && arr[0].type === 'plus') ? arr.slice(1) : arr;
+                const startsWithSnap = (full) => {
+                  if (full.length < snapFull.length) return false;
+                  for (let s = 0; s < snapFull.length; s++) {
+                    if (JSON.stringify(full[s]) !== JSON.stringify(snapFull[s])) return false;
+                  }
+                  return true;
+                };
                 const branches = [];
+                let allAppended = true;
                 for (const cr of caseResults) {
                   const b = cr.bindings[bv];
                   if (b && b.kind === 'chain') {
-                    const extra = b.toks.slice(snapB.toks.length);
-                    const stripPlus = (arr) => (arr.length && arr[0].type === 'plus') ? arr.slice(1) : arr;
-                    branches.push({ label: cr.label, caseExpr: cr.caseExpr, chain: stripPlus(extra) });
+                    const full = b.toks;
+                    const appended = startsWithSnap(full);
+                    if (!appended) allAppended = false;
+                    const extra = appended ? stripPlus(full.slice(snapFull.length)) : full;
+                    branches.push({ label: cr.label, caseExpr: cr.caseExpr, chain: extra });
                   }
                 }
                 if (branches.length) {
                   const switchTok = { type: 'switch', discExpr: discExpr || '/* switch */', branches };
-                  assignName(bv, chainBinding([...snapB.toks, SYNTH_PLUS, switchTok]));
+                  if (allAppended) {
+                    assignName(bv, chainBinding([...snapB.toks, SYNTH_PLUS, switchTok]));
+                  } else {
+                    assignName(bv, chainBinding([switchTok]));
+                  }
                 }
               }
             }
@@ -5270,8 +5270,11 @@
         const caseLines = [];
         const caseUsed = new Set(used);
         emitVNodes(br.nodes, parentVar, caseLines, caseUsed, opts, loopInfoMap, loopIds, nsCtx);
+        // Wrap case body in { } block to scope const/let declarations.
+        lines.push('  {');
         for (const l of caseLines) lines.push('    ' + l);
         lines.push('    break;');
+        lines.push('  }');
       }
       lines.push('}');
       return;
