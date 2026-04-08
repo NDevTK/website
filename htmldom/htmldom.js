@@ -2698,17 +2698,20 @@
         // inside the function body properly tag chain tokens.
         const savedTrackBuildVar = trackBuildVar;
         const savedTrackDepth = trackBuildVarDepth;
+        const savedBuildVarDeclStart = buildVarDeclStart;
         if (returnVar) {
           trackBuildVar = new Set([returnVar]);
           trackBuildVarDepth = funcDepth();
         } else {
           trackBuildVar = null;
         }
+        buildVarDeclStart = -1; // reset so inner decls don't leak out
         const lvBefore = loopVars.length;
         walkRange(bodyStart, bodyEnd);
         fnLoopVars = loopVars.splice(lvBefore);
         trackBuildVar = savedTrackBuildVar;
         trackBuildVarDepth = savedTrackDepth;
+        buildVarDeclStart = savedBuildVarDeclStart;
         // Find the return value and resolve the returned expression.
         let ri = bodyStart;
         while (ri < bodyEnd) {
@@ -3790,6 +3793,13 @@
               // Pre-scan body for non-build modified variables (same as for/while).
               for (let h = i + 1; h < bodyEnd; h++) {
                 const hk = tokens[h];
+                if (hk.type === 'op' && (hk.text === '++' || hk.text === '--')) {
+                  const hn = tokens[h + 1];
+                  if (hn && hn.type === 'other' && IDENT_RE.test(hn.text) &&
+                      !(trackBuildVar && trackBuildVar.has(hn.text))) {
+                    if (!loopFrame.bindings[hn.text]) loopFrame.bindings[hn.text] = chainBinding([exprRef(hn.text)]);
+                  }
+                }
                 if (hk.type === 'other' && IDENT_RE.test(hk.text)) {
                   if (trackBuildVar && trackBuildVar.has(hk.text)) continue;
                   const hn = tokens[h + 1];
@@ -3882,6 +3892,14 @@
             // because their += mutations are tracked by the chain system.
             for (let h = j + 1; h < bodyEnd; h++) {
               const hk = tokens[h];
+              // Pre-increment/decrement: ++IDENT or --IDENT
+              if (hk.type === 'op' && (hk.text === '++' || hk.text === '--')) {
+                const hn = tokens[h + 1];
+                if (hn && hn.type === 'other' && IDENT_RE.test(hn.text) &&
+                    !(trackBuildVar && trackBuildVar.has(hn.text))) {
+                  if (!loopFrame.bindings[hn.text]) loopFrame.bindings[hn.text] = chainBinding([exprRef(hn.text)]);
+                }
+              }
               if (hk.type === 'other' && IDENT_RE.test(hk.text)) {
                 if (trackBuildVar && trackBuildVar.has(hk.text)) continue;
                 const hn = tokens[h + 1];
@@ -4041,10 +4059,15 @@
           if (hasInit) {
             declBind(nameTok.text, value);
             if (trackBuildVar && trackBuildVar.has(nameTok.text)) {
-              // Always update — later declarations (closer to the innerHTML
-              // assignment) take precedence over earlier ones in outer scopes.
-              buildVarDeclStart = tokens[i].start;
-              trackBuildVarDepth = funcDepth();
+              // Only set buildVarDeclStart at the outer scope level, not
+              // inside inlined functions. When instantiateFunction enables
+              // trackBuildVar for the function's internal build var, the
+              // declaration is inside the function body — we don't want
+              // the inline rewriter to replace from inside the function.
+              if (trackBuildVarDepth < 0 || funcDepth() <= trackBuildVarDepth) {
+                buildVarDeclStart = tokens[i].start;
+                trackBuildVarDepth = funcDepth();
+              }
             }
           } else {
             if (kind === 'var') {
@@ -5321,6 +5344,17 @@
           continue;
         }
         if (t.type === 'str') hFeedStr(t.text);
+        else if (t.type === 'tmpl') {
+          // Template literal: process each part — text portions through
+          // the HTML parser, expression portions as dynamic values.
+          for (const p of t.parts) {
+            if (p.kind === 'text') {
+              hFeedStr(decodeJsString(p.raw, '`'));
+            } else if (p.kind === 'expr') {
+              hFeedExpr(p.expr.trim());
+            }
+          }
+        }
         else if (t.type === 'other') hFeedExpr(t.text);
         else if (t.type === 'preserve') { hFlushText(); lines.push(t.text); }
         else if (t.type === 'cond') {
