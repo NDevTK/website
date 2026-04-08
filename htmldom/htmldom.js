@@ -4876,13 +4876,17 @@
     return block;
   }
 
-  $('copy').addEventListener('click', async () => {
-    try {
-      await navigator.clipboard.writeText(lastOutput);
-      $('copy').textContent = 'Copied!';
-      setTimeout(() => { $('copy').textContent = 'Copy output'; }, 1200);
-    } catch (_) {}
-  });
+  // Copy is handled by monaco-init.js in the full UI.
+  // Only attach here for standalone/test usage.
+  if ($('copy') && !(typeof window !== 'undefined' && window._monacoIn)) {
+    $('copy').addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(lastOutput);
+        $('copy').textContent = 'Copied!';
+        setTimeout(() => { $('copy').textContent = 'Copy output'; }, 1200);
+      } catch (_) {}
+    });
+  }
 
   // Monaco editors are initialized by index.html before this script loads.
   if (typeof window !== 'undefined' && window._monacoIn) {
