@@ -3001,6 +3001,138 @@ function render() {
     'app.js': 'var items = ["a","b","c"]; document.getElementById("out").innerHTML = "<p>" + items.join(", ") + "</p>";'
   });
 
+  // 98. Select with conditional selected attribute (array access ternary)
+  checkEquiv('select conditional selected attr', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'var opts=[{v:"a",t:"Alpha"},{v:"b",t:"Beta"},{v:"c",t:"Gamma"}];var sel="b";var h="<select>";for(var i=0;i<opts.length;i++){h+="<option value=\\""+opts[i].v+"\\"\"+(opts[i].v===sel?" selected":"")+">"+opts[i].t+"</option>";}h+="</select>";document.getElementById("out").innerHTML=h;'
+  });
+
+  // 99. Nested loop + conditional attrs + counters + continue
+  checkEquiv('nested loop complex state', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var groups=[{name:"A",items:[{v:1,ok:true},{v:2,ok:false},{v:3,ok:true}]},{name:"B",items:[{v:4,ok:true},{v:5,ok:false}]}];',
+      'var h="";var total=0;var shown=0;',
+      'for(var g=0;g<groups.length;g++){',
+      '  h+="<div class=\\"group\\"><h2>"+groups[g].name+"</h2><ul>";',
+      '  for(var j=0;j<groups[g].items.length;j++){',
+      '    var item=groups[g].items[j];if(!item.ok)continue;',
+      '    h+="<li class=\\""+(item.v>2?"high":"low")+"\\">"+ item.v+"</li>";',
+      '    total+=item.v;shown++;',
+      '  }h+="</ul></div>";',
+      '}h+="<p>Shown: "+shown+"/"+total+"</p>";',
+      'document.getElementById("out").innerHTML=h;'
+    ].join('\n')
+  });
+
+  // 100. Builder fn with conditional structure called in loop
+  checkEquiv('builder conditional in loop', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'function renderItem(item){var h="<div class=\\""+(item.active?"active":"inactive")+"\\">";',
+      'h+="<span>"+item.name+"</span>";if(item.badge)h+="<b>"+item.badge+"</b>";h+="</div>";return h;}',
+      'var items=[{name:"X",active:true,badge:"!"},{name:"Y",active:false,badge:null},{name:"Z",active:true,badge:"*"}];',
+      'var h="";for(var i=0;i<items.length;i++){h+=renderItem(items[i]);}',
+      'document.getElementById("out").innerHTML=h;'
+    ].join('\n')
+  });
+
+  // 101. Multi-target from loop (two build vars, one loop)
+  checkEquiv('multi-target from loop', {
+    'index.html': '<html><body><ul id="good"></ul><ul id="bad"></ul><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var items=[{n:"A",ok:true},{n:"B",ok:false},{n:"C",ok:true}];',
+      'var gH="";var bH="";',
+      'for(var i=0;i<items.length;i++){',
+      '  if(items[i].ok)gH+="<li>"+items[i].n+"</li>";',
+      '  else bH+="<li>"+items[i].n+"</li>";',
+      '}',
+      'document.getElementById("good").innerHTML=gH;',
+      'document.getElementById("bad").innerHTML=bH;'
+    ].join('\n')
+  });
+
+  // 102. Cross-file try-catch builder
+  checkEquiv('cross-file try-catch', {
+    'index.html': '<html><body><div id="out"></div><script src="cfg.js"></script><script src="ui.js"></script><script src="app.js"></script></body></html>',
+    'cfg.js': 'var LABELS={ok:"Success",err:"Error"};',
+    'ui.js': 'function status(ok){var h="<span class=\\""+(ok?"green":"red")+"\\">";h+=ok?LABELS.ok:LABELS.err;h+="</span>";return h;}',
+    'app.js': 'var h="";try{h="<p>Result: "+status(true)+"</p>";}catch(e){h="<p>"+e.message+"</p>";}document.getElementById("out").innerHTML=h;'
+  });
+
+  // 103. Switch + template literal
+  checkEquiv('switch template', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'var mode="dark";var h="";switch(mode){case "light":h=`<div class="light"><p>Light mode</p></div>`;break;case "dark":h=`<div class="dark"><p>Dark mode</p></div>`;break;default:h="<div><p>Default</p></div>";}document.getElementById("out").innerHTML=h;'
+  });
+
+  // 104. While + table + pre-increment + break
+  checkEquiv('while table preincrement break', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var data=[10,20,999,30,40];',
+      'var h="<table><thead><tr><th>#</th><th>Val</th></tr></thead>";',
+      'var i=0;var n=0;var sum=0;',
+      'while(i<data.length){if(data[i]>100)break;',
+      'h+="<tr><td>"+(++n)+"</td><td>"+data[i]+"</td></tr>";sum+=data[i];i++;}',
+      'h+="<tfoot><tr><td>Total</td><td>"+sum+"</td></tr></tfoot></table>";',
+      'document.getElementById("out").innerHTML=h;'
+    ].join('\n')
+  });
+
+  // 105. Conditional wrap
+  checkEquiv('conditional wrap state', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var items=[{text:"normal",bold:false},{text:"important",bold:true},{text:"also normal",bold:false}];',
+      'var h="";for(var i=0;i<items.length;i++){',
+      'if(items[i].bold)h+="<b>";h+="<span>"+items[i].text+"</span>";if(items[i].bold)h+="</b>";}',
+      'document.getElementById("out").innerHTML=h;'
+    ].join('\n')
+  });
+
+  // 106. do-while + for-in + for-of combined
+  checkEquiv('do-while for-in for-of', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'var obj={a:1,b:2};var arr=["x","y"];var h="<dl>";for(var k in obj){h+="<dt>"+k+"</dt><dd>"+obj[k]+"</dd>";}h+="</dl><ul>";for(var v of arr){h+="<li>"+v+"</li>";}h+="</ul><ol>";var n=1;do{h+="<li>"+n+"</li>";n++;}while(n<=3);h+="</ol>";document.getElementById("out").innerHTML=h;'
+  });
+
+  // 107. innerHTML read + write
+  checkEquiv('innerHTML read write', {
+    'index.html': '<html><body><div id="src"></div><div id="dst"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("src").innerHTML="<b>Original</b>";document.getElementById("dst").innerHTML=document.getElementById("src").innerHTML;'
+  });
+
+  // 108. Multiple counters
+  checkEquiv('multiple counters complex', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'var data=[3,1,4,1,5,9];var h="<ul>";var sum=0;var max=0;var count=0;for(var i=0;i<data.length;i++){h+="<li>"+data[i]+"</li>";sum+=data[i];if(data[i]>max)max=data[i];count++;}h+="</ul><p>Sum:"+sum+" Max:"+max+" Count:"+count+"</p>";document.getElementById("out").innerHTML=h;'
+  });
+
+  // 109. Mixed sinks
+  checkEquiv('mixed sinks', {
+    'index.html': '<html><body><div id="a"></div><div id="b"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("a").innerHTML="<p>innerHTML</p>";document.getElementById("b").insertAdjacentHTML("beforeend","<p>adjacent</p>");'
+  });
+
+  // 110. Arithmetic in style attribute
+  checkEquiv('arithmetic style attr', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'var w=100;var h2=50;document.getElementById("out").innerHTML="<div style=\\"width:"+(w*2)+"px;height:"+(h2+10)+"px\\">sized</div>";'
+  });
+
+  // 111. HTML comment preserved
+  checkEquiv('comment preserved', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("out").innerHTML="<p>before</p><!-- comment --><p>after</p>";'
+  });
+
+  // 112. Entity decoding
+  checkEquiv('entity decoding', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("out").innerHTML="<p>Tom &amp; Jerry &lt;3 &quot;Cartoons&quot;</p>";'
+  });
+
   console.log(`  (${pass + fail - before} cases)`);
 })();
 
