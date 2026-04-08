@@ -5170,19 +5170,30 @@
         sel = 'document.querySelector(\'[data-hd="' + hdId + '"]\')';
         cleanedTag = '<' + tag + cleaned + ' data-hd="' + hdId + '">';
       }
+      // Count total operations for this element.
+      const opCount = events.length + (jsHref ? 1 : 0) +
+        (styleVal ? styleVal.split(';').filter(function(d) { return d.trim() && d.indexOf(':') >= 0; }).length : 0);
+      // Use a variable when multiple operations target the same element.
+      const useVar = opCount > 1;
+      const varName = useVar ? ('__el' + (elemCounter - 1)) : null;
+      const ref = useVar ? varName : sel;
+      if (useVar) {
+        jsLines.push('(function() {');
+        jsLines.push('var ' + varName + ' = ' + sel + ';');
+      }
       for (const ev of events) {
         const body = ev.handler.trim();
         if (/\breturn\b/.test(body)) {
-          jsLines.push(sel + '.addEventListener(\'' + ev.event + '\', function(event) {');
+          jsLines.push(ref + '.addEventListener(\'' + ev.event + '\', function(event) {');
           jsLines.push('  var __r = (function() { ' + body + ' }).call(this);');
           jsLines.push('  if (__r === false) event.preventDefault();');
           jsLines.push('});');
         } else {
-          jsLines.push(sel + '.addEventListener(\'' + ev.event + '\', function(event) { ' + body + ' });');
+          jsLines.push(ref + '.addEventListener(\'' + ev.event + '\', function(event) { ' + body + ' });');
         }
       }
       if (jsHref) {
-        jsLines.push(sel + '.addEventListener(\'click\', function(event) {');
+        jsLines.push(ref + '.addEventListener(\'click\', function(event) {');
         jsLines.push('  event.preventDefault();');
         jsLines.push('  ' + jsHref);
         jsLines.push('});');
@@ -5199,8 +5210,11 @@
             val = val.replace(/\s*!important\s*$/, '');
             important = ', \'important\'';
           }
-          jsLines.push(sel + '.style.setProperty(\'' + prop + '\', \'' + val.replace(/'/g, "\\'") + '\'' + important + ');');
+          jsLines.push(ref + '.style.setProperty(\'' + prop + '\', \'' + val.replace(/'/g, "\\'") + '\'' + important + ');');
         }
+      }
+      if (useVar) {
+        jsLines.push('})();');
       }
       return cleanedTag;
     });
