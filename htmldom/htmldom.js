@@ -5896,16 +5896,15 @@
       if (existingId) {
         sel = 'document.getElementById(\'' + existingId + '\')';
       } else {
-        // Generate a unique data attribute ID, checking against existing
-        // data-hd values in the HTML to avoid collisions.
-        let hdId;
+        // Generate a unique id, checking against existing ids in the HTML.
+        let genId;
         do {
-          hdId = 'hd' + (elemCounter++);
+          genId = 'el' + (elemCounter++);
         } while (htmlTokens.some(function(ht) {
-          return ht.type === 'openTag' && ht.attrs && ht.attrs.some(function(a) { return a.name === 'data-hd' && a.value === hdId; });
+          return ht.type === 'openTag' && ht.attrs && ht.attrs.some(function(a) { return a.name === 'id' && a.value === genId; });
         }));
-        sel = 'document.querySelector(\'[data-hd="' + hdId + '"]\')';
-        keepAttrs.push({ name: 'data-hd', value: hdId, nameRaw: 'data-hd', start: 0, end: 0 });
+        sel = 'document.getElementById(\'' + genId + '\')';
+        keepAttrs.push({ name: 'id', value: genId, nameRaw: 'id', start: 0, end: 0 });
       }
 
       // Count operations for grouping.
