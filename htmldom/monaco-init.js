@@ -50,7 +50,7 @@
     var outputFiles = {};         // { path: content } — generated output files
     var outputForCurrent = '';    // output captured from htmldom.js convert()
     var activeFile = null;        // { path, source: 'original'|'output' }
-    var pasteMode = true;
+    // Start with no folder open — editor shows default input.
 
     function langFor(name) {
       if (/\.html?$/i.test(name)) return 'html';
@@ -205,8 +205,6 @@
         var dirHandle = await window.showDirectoryPicker({ mode: 'read' });
         folderFiles = await readFolder(dirHandle, '');
         outputFiles = {};
-        pasteMode = false;
-        document.getElementById('sidebarPanel').style.display = '';
         document.getElementById('folderName').textContent = dirHandle.name;
         document.getElementById('processAll').disabled = false;
         renderSidebar();
@@ -216,22 +214,6 @@
       } catch (e) {
         if (e.name !== 'AbortError') console.error(e);
       }
-    });
-
-    document.getElementById('pasteMode').addEventListener('click', function() {
-      folderFiles = null;
-      outputFiles = {};
-      activeFile = null;
-      pasteMode = true;
-      document.getElementById('sidebarPanel').style.display = 'none';
-      document.getElementById('processAll').disabled = true;
-      document.getElementById('downloadCurrent').disabled = true;
-      document.getElementById('downloadAll').disabled = true;
-      document.getElementById('folderName').textContent = '';
-      document.getElementById('editorFilename').textContent = 'Paste mode';
-      editor.setValue(defaultInput);
-      editor.updateOptions({ readOnly: false });
-      monaco.editor.setModelLanguage(editor.getModel(), 'html');
     });
 
     document.getElementById('processAll').addEventListener('click', async function() {
@@ -285,7 +267,7 @@
 
     // Auto-detect language in paste mode.
     editor.onDidChangeModelContent(function() {
-      if (pasteMode) {
+      if (!folderFiles) {
         var text = editor.getValue();
         monaco.editor.setModelLanguage(editor.getModel(), /^\s*</.test(text) ? 'html' : 'javascript');
       }

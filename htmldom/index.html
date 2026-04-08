@@ -53,7 +53,6 @@ code { background: #2a2e33; padding: 0.05rem 0.25rem; border-radius: 3px; font-s
 
 <div class="toolbar">
   <button id="openFolder">Open Folder</button>
-  <button id="pasteMode" class="secondary">Paste Mode</button>
   <span id="folderName" class="status"></span>
   <span class="spacer"></span>
   <button id="processAll" disabled>Convert All</button>
@@ -63,9 +62,11 @@ code { background: #2a2e33; padding: 0.05rem 0.25rem; border-radius: 3px; font-s
 </div>
 
 <div class="main">
-  <div class="sidebar" id="sidebarPanel" style="display:none;">
+  <div class="sidebar" id="sidebarPanel">
     <div class="section-header">Original Files</div>
-    <div class="file-list" id="originalFiles"></div>
+    <div class="file-list" id="originalFiles">
+      <div class="empty-hint">Open a folder to load files</div>
+    </div>
     <div class="section-header">Output Files</div>
     <div class="file-list" id="outputFiles">
       <div class="empty-hint">Convert files to see output</div>
@@ -73,7 +74,7 @@ code { background: #2a2e33; padding: 0.05rem 0.25rem; border-radius: 3px; font-s
   </div>
 
   <div class="editor-wrap">
-    <div class="editor-filename" id="editorFilename">Paste mode</div>
+    <div class="editor-filename" id="editorFilename">Open a folder or paste code directly</div>
     <div id="editor" class="editor-container"></div>
   </div>
 </div>
