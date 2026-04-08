@@ -5546,38 +5546,68 @@
               // Introduce a runtime parent variable for subsequent code.
               // The variable is set in each branch to wherever that branch
               // left the parent.
-              var condParent = makeVar('current', used);
-              // Insert the variable assignment in each branch, BEFORE any
-              // continue/break statements (which would skip the assignment).
+              // Reuse existing runtime parent if the current parent is
+              // already a runtime variable (from a previous cond).
+              var existingRuntime = curParent().match(/^[a-z]+\d*$/) && !curParent().includes('.') && !curParent().includes('(');
+              var condParent = existingRuntime ? curParent() : makeVar('current', used);
+              // Insert assignment in branches that CHANGED the parent.
+              // Branches that didn't change the stack (empty content)
+              // should NOT set current — it preserves its previous value
+              // (important for state machines where bold_on persists).
               function insertBeforeFlowControl(startIdx, endIdx, assignment) {
-                // Find the last non-flow-control line in the range.
                 var insertAt = endIdx;
                 for (var li = endIdx - 1; li >= startIdx; li--) {
                   if (lines[li] === 'continue;' || lines[li] === 'break;') {
                     insertAt = li;
-                  } else {
-                    break;
-                  }
+                  } else break;
                 }
                 lines.splice(insertAt, 0, assignment);
               }
+              var trueChanged = JSON.stringify(trueStack) !== JSON.stringify(savedStack);
+              var falseChanged = JSON.stringify(falseStack) !== JSON.stringify(savedStack);
               var elseIdx = lines.lastIndexOf('} else {');
-              if (elseIdx >= 0) {
+              if (trueChanged && elseIdx >= 0) {
                 insertBeforeFlowControl(0, elseIdx, condParent + ' = ' + trueStack[trueStack.length - 1] + ';');
               }
-              // Re-find after splice.
-              var closeIdx = lines.lastIndexOf('}');
-              if (closeIdx >= 0) {
+              if (falseChanged) {
+                var closeIdx = lines.lastIndexOf('}');
                 var elseIdx2 = lines.lastIndexOf('} else {');
-                insertBeforeFlowControl(elseIdx2 + 1, closeIdx, condParent + ' = ' + falseStack[falseStack.length - 1] + ';');
+                if (closeIdx >= 0 && elseIdx2 >= 0) {
+                  insertBeforeFlowControl(elseIdx2 + 1, closeIdx, condParent + ' = ' + falseStack[falseStack.length - 1] + ';');
+                }
               }
-              // Add var declaration before the if.
+              // If only one branch changes, remove the empty else.
+              if (!falseChanged) {
+                var eIdx = lines.lastIndexOf('} else {');
+                var cIdx = lines.lastIndexOf('}');
+                if (eIdx >= 0 && cIdx > eIdx) {
+                  // Check if else block is empty.
+                  var elseContent = lines.slice(eIdx + 1, cIdx).filter(function(l) { return l.trim(); });
+                  if (elseContent.length === 0) {
+                    lines.splice(eIdx, cIdx - eIdx + 1, '}');
+                  }
+                }
+              }
+              // Add var declaration BEFORE any enclosing loop (so it
+              // persists across iterations) or before the if if not in a loop.
               var ifIdx = -1;
               for (var li = lines.length - 1; li >= 0; li--) {
                 if (lines[li] === 'if (' + t.condExpr + ') {') { ifIdx = li; break; }
               }
+              // Look for an enclosing loop header before the if.
+              var loopIdx = -1;
               if (ifIdx >= 0) {
-                lines.splice(ifIdx, 0, 'var ' + condParent + ';');
+                for (var li2 = ifIdx - 1; li2 >= 0; li2--) {
+                  if (/^(for|while|do)\b/.test(lines[li2])) { loopIdx = li2; break; }
+                  // Stop at function boundaries or other blocks.
+                  if (lines[li2] === '}') break;
+                }
+              }
+              if (!existingRuntime) {
+                var insertIdx = loopIdx >= 0 ? loopIdx : ifIdx;
+                if (insertIdx >= 0) {
+                  lines.splice(insertIdx, 0, 'var ' + condParent + ' = ' + savedStack[savedStack.length - 1] + ';');
+                }
               }
               // Replace parent stack with the runtime variable.
               parentStack.length = 0;
