@@ -3863,6 +3863,15 @@
             for (var hi = i + 2; hi <= j - 1; hi++) {
               var ht = tokens[hi];
               if (ht.type === 'other' && (IDENT_RE.test(ht.text) || IDENT_OR_PATH_RE.test(ht.text))) {
+                // Don't resolve build variables (or paths rooted in them)
+                // in loop headers - their value changes each iteration.
+                var htRoot = ht.text.split('.')[0];
+                if (trackBuildVar && trackBuildVar.has(htRoot)) {
+                  var prevEnd2 = hi > i + 2 ? tokens[hi - 1].end : headerFirst.start;
+                  var gap2 = ht._src.slice(prevEnd2, ht.start);
+                  headerParts.push(gap2 + ht._src.slice(ht.start, ht.end));
+                  continue;
+                }
                 var resolved = resolvePath(ht.text);
                 if (resolved && resolved.kind === 'chain') {
                   var exprText = chainAsExprText(resolved);
