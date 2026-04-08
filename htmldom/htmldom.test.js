@@ -1727,7 +1727,7 @@ function render() {
 
   // Basic element creation
   checkDOM('div with text', 'el.innerHTML = "<div>hello</div>";',
-    c => /createElement\('div'\)/.test(c) && /textContent = 'hello'/.test(c) && /appendChild/.test(c));
+    c => /createElement\('div'\)/.test(c) && (/textContent/.test(c) || /createTextNode\('hello'\)/.test(c)) && /appendChild/.test(c));
   checkDOM('nested elements', 'el.innerHTML = "<ul><li>a</li><li>b</li></ul>";',
     c => /createElement\('ul'\)/.test(c) && /createElement\('li'\)/.test(c));
   checkDOM('void element', 'el.innerHTML = "<br>";',

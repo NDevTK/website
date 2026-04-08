@@ -5497,7 +5497,22 @@
   }
 
   // Produce the DOM-API code block for a single innerHTML/outerHTML
-  // extraction. `multi` toggles the leading target-divider comment.
+  // extraction using the runtime parent stack approach.
+  //
+  // Instead of building a static VNode tree and emitting code from it,
+  // this directly generates DOM operations from the chain tokens.
+  // Each HTML string fragment is decomposed into tag operations at
+  // compile time, but the actual DOM tree is built at runtime using a
+  // parent pointer (__p) that tracks the current insertion point:
+  //   - Open tag: createElement, appendChild, __p = newEl
+  //   - Close tag: __p = __p.parentNode
+  //   - Text: createTextNode, appendChild to __p
+  //   - Expressions: createTextNode(expr), appendChild to __p
+  //   - Preserve: emitted verbatim (break, continue, mutations)
+  //   - Conditionals/loops: emitted as runtime if/for/while/switch
+  //
+  // This handles ALL patterns uniformly — static HTML, loops, state
+  // machines, cross-iteration tag pairing, multiple build variables.
   function convertOne(raw, result, multi, emitTitle, sharedUsed, parentOverride, domFunctions) {
     const { target, assignProp, assignOp } = result;
 
@@ -5508,18 +5523,7 @@
       parentFromAssignment = true;
     }
 
-    const opts = {
-      useProps: true,
-      splitStyle: true,
-      eventsAsListeners: true,
-      textContentShortcut: true,
-      useClassList: true,
-      skipWhitespaceText: $('skipWS').checked,
-      useFragment: $('useFragment').checked,
-      emitComments: $('emitComments').checked,
-      domFunctions: domFunctions || new Set(),
-    };
-
+    const domFuncs = domFunctions || new Set();
     const lines = [];
     const used = sharedUsed || new Set();
 
@@ -5529,34 +5533,422 @@
 
     if (parentFromAssignment && assignOp === '=' && assignProp === 'innerHTML') {
       lines.push(target + '.replaceChildren();');
-    } else if (parentFromAssignment && assignProp === 'outerHTML' && opts.emitComments) {
-      lines.push('// Note: ' + target + '.outerHTML = ... replaces ' + target + ' itself;');
-      lines.push('//       call ' + target + '.replaceWith(...) or adjust as needed.');
     }
 
     const chainTokens = result.chainTokens || [];
-    const vnodes = parseChainToVNodes(chainTokens);
-
-    if (vnodes.length === 0) {
+    if (chainTokens.length === 0 || (chainTokens.length === 1 && chainTokens[0].type === 'str' && chainTokens[0].text === '')) {
       return lines.length ? lines.join('\n') : '// (no nodes parsed)';
     }
 
-    let attachTarget = parent;
-    let fragVar = null;
-    if (opts.useFragment && vnodes.length > 1) {
-      fragVar = makeVar('frag', used);
-      lines.push('const ' + fragVar + ' = document.createDocumentFragment();');
-      attachTarget = fragVar;
+    const pVar = makeVar('__p', used);
+    let needsP = false;
+    const SVG_NS_STR = "'http://www.w3.org/2000/svg'";
+    const MATHML_NS_STR = "'http://www.w3.org/1998/Math/MathML'";
+
+    // Stateful HTML parser that persists across chain tokens.
+    // States: TEXT, TAG_OPEN, ATTRS, ATTR_NAME, ATTR_EQ,
+    //         ATTR_VAL_DQ, ATTR_VAL_SQ, ATTR_VAL_UQ, TAG_CLOSE, COMMENT
+    const S_TEXT = 0, S_TAG_OPEN = 1, S_ATTRS = 2, S_ATTR_NAME = 3;
+    const S_ATTR_EQ = 4, S_ATTR_VAL_DQ = 5, S_ATTR_VAL_SQ = 6;
+    const S_ATTR_VAL_UQ = 7, S_TAG_CLOSE = 8, S_COMMENT = 9;
+    let hState = S_TEXT;
+    let hTag = '';
+    let hAttrName = '';
+    let hAttrVal = '';
+    let hAttrExprs = []; // dynamic expressions embedded in attribute value
+    let hAttrs = [];     // { name, value, dynamic:bool, exprs:[] }
+    let hTagVar = '';     // variable name for current element being built
+    let hCommentBuf = '';
+    let hTextBuf = '';
+    let hParentTags = []; // track parent tag names for auto-tbody
+    let hTbodyVar = null; // variable for auto-inserted tbody
+
+    function hFlushText() {
+      if (hTextBuf) {
+        const decoded = decodeHtmlEntities(hTextBuf);
+        lines.push(pVar + '.appendChild(document.createTextNode(' + jsStr(decoded).code + '));');
+        hTextBuf = '';
+      }
     }
 
-    emitVNodes(vnodes, attachTarget, lines, used, opts, result.loopInfoMap || null, null);
+    function hFinishAttr() {
+      if (hAttrName) {
+        hAttrs.push({
+          name: hAttrName.toLowerCase(),
+          value: decodeHtmlEntities(hAttrVal),
+          dynamic: hAttrExprs.length > 0,
+          exprs: hAttrExprs.slice(),
+        });
+      }
+      hAttrName = '';
+      hAttrVal = '';
+      hAttrExprs = [];
+    }
 
-    if (fragVar) {
-      lines.push(parent + '.appendChild(' + fragVar + ');');
+    function hCommitTag(selfClose) {
+      const tagLower = hTag.toLowerCase();
+      if (VOID_ELEMENTS.has(tagLower)) selfClose = true;
+
+      let nsExpr = null;
+      if (tagLower === 'svg') nsExpr = SVG_NS_STR;
+      else if (tagLower === 'math') nsExpr = MATHML_NS_STR;
+      else if (SVG_TAGS.has(tagLower)) nsExpr = SVG_NS_STR;
+
+      const v = makeVar(hTag, used);
+      hTagVar = v;
+      if (nsExpr) {
+        lines.push('const ' + v + ' = document.createElementNS(' + nsExpr + ', ' + jsStr(tagLower).code + ');');
+      } else {
+        lines.push('const ' + v + ' = document.createElement(' + jsStr(tagLower).code + ');');
+      }
+
+      const eventAttrs = [];
+      for (const attr of hAttrs) {
+        const name = attr.name;
+        // Extract inline event handlers and javascript: URLs.
+        if (name.length > 2 && name.slice(0, 2) === 'on' && !attr.dynamic) {
+          eventAttrs.push({ event: name.slice(2), handler: attr.value });
+          continue;
+        }
+        if (name === 'href' && !attr.dynamic && attr.value.slice(0, 11).toLowerCase() === 'javascript:') {
+          eventAttrs.push({ event: 'click', handler: attr.value.slice(11), preventDefault: true });
+          continue;
+        }
+        if (attr.dynamic) {
+          // Build expression from static parts + dynamic expressions.
+          const parts = [];
+          let cursor = 0;
+          const sorted = attr.exprs.slice().sort(function(a, b) { return a.pos - b.pos; });
+          for (const e of sorted) {
+            if (e.pos > cursor) parts.push(jsStr(decodeHtmlEntities(attr.value.slice(cursor, e.pos))).code);
+            parts.push(e.expr);
+            cursor = e.pos;
+          }
+          if (cursor < attr.value.length) parts.push(jsStr(decodeHtmlEntities(attr.value.slice(cursor))).code);
+          const valExpr = parts.length === 1 ? parts[0] : parts.join(' + ');
+
+          if (name === 'style') {
+            lines.push(v + '.setAttribute(' + jsStr(name).code + ', ' + valExpr + ');');
+          } else if (name === 'class') {
+            lines.push(v + '.className = ' + valExpr + ';');
+          } else if (!nsExpr && isIdlProp(name)) {
+            lines.push(v + '.' + (ATTR_TO_PROP[name] || name) + ' = ' + valExpr + ';');
+          } else {
+            lines.push(v + '.setAttribute(' + jsStr(name).code + ', ' + valExpr + ');');
+          }
+        } else {
+          const val = attr.value;
+          if (name === 'style') {
+            const decls = parseStyleDecls(val);
+            for (const d of decls) {
+              lines.push(v + '.style.setProperty(' + jsStr(d.prop).code + ', ' + jsStr(d.value).code + (d.important ? ", 'important'" : '') + ');');
+            }
+          } else if (name === 'class') {
+            const classes = val.split(/\s+/).filter(Boolean);
+            if (classes.length === 1) lines.push(v + '.className = ' + jsStr(val).code + ';');
+            else if (classes.length > 1) lines.push(v + '.classList.add(' + classes.map(function(c) { return jsStr(c).code; }).join(', ') + ');');
+          } else if (!nsExpr && BOOLEAN_ATTRS.has(name) && (val === '' || val === name)) {
+            lines.push(v + '.' + (ATTR_TO_PROP[name] || name) + ' = true;');
+          } else if (!nsExpr && isIdlProp(name)) {
+            lines.push(v + '.' + (ATTR_TO_PROP[name] || name) + ' = ' + jsStr(val).code + ';');
+          } else {
+            lines.push(v + '.setAttribute(' + jsStr(name).code + ', ' + jsStr(val).code + ');');
+          }
+        }
+      }
+
+      // Auto-insert <tbody> when <tr> is appended to <table>.
+      // Done at runtime to handle loops correctly.
+      if (tagLower === 'tr') {
+        lines.push('if (' + pVar + '.tagName === "TABLE") {');
+        lines.push('  var __tb = ' + pVar + '.lastElementChild;');
+        lines.push('  if (!__tb || __tb.tagName !== "TBODY") { __tb = document.createElement("tbody"); ' + pVar + '.appendChild(__tb); }');
+        lines.push('  ' + pVar + ' = __tb;');
+        lines.push('}');
+        needsP = true;
+      }
+      // Auto-close implicit <tbody> when table section elements appear.
+      if (tagLower === 'tfoot' || tagLower === 'thead' || tagLower === 'caption') {
+        lines.push('if (' + pVar + '.tagName === "TBODY") ' + pVar + ' = ' + pVar + '.parentNode;');
+      }
+
+      // Emit event listeners for extracted on* attributes.
+      for (const ev of eventAttrs) {
+        if (ev.preventDefault) {
+          lines.push(v + '.addEventListener(' + jsStr(ev.event).code + ', function(event) {');
+          lines.push('  event.preventDefault();');
+          lines.push('  ' + ev.handler);
+          lines.push('});');
+        } else {
+          lines.push(v + '.addEventListener(' + jsStr(ev.event).code + ', function(event) { ' + ev.handler + ' });');
+        }
+      }
+
+      lines.push(pVar + '.appendChild(' + v + ');');
+      if (!selfClose) {
+        needsP = true;
+        lines.push(pVar + ' = ' + v + ';');
+        hParentTags.push(tagLower);
+      }
+      hTag = '';
+      hAttrs = [];
+      hTagVar = '';
+    }
+
+    // Feed a character from a string literal through the HTML state machine.
+    function hFeedStr(text) {
+      for (let i = 0; i < text.length; i++) {
+        const c = text[i];
+        switch (hState) {
+          case S_TEXT:
+            if (c === '<') {
+              hFlushText();
+              if (text[i+1] === '/' && i+1 < text.length) { hState = S_TAG_CLOSE; hTag = ''; i++; }
+              else if (text[i+1] === '!' && text[i+2] === '-' && text[i+3] === '-') { hState = S_COMMENT; hCommentBuf = ''; i += 3; }
+              else { hState = S_TAG_OPEN; hTag = ''; }
+            } else {
+              hTextBuf += c;
+            }
+            break;
+          case S_TAG_OPEN:
+            if (c === ' ' || c === '\t' || c === '\n') { if (hTag) { hState = S_ATTRS; hAttrs = []; } }
+            else if (c === '>') { hAttrs = []; hCommitTag(false); hState = S_TEXT; }
+            else if (c === '/' && text[i+1] === '>') { hAttrs = []; hCommitTag(true); hState = S_TEXT; i++; }
+            else hTag += c;
+            break;
+          case S_TAG_CLOSE:
+            if (c === '>') {
+              needsP = true;
+              const closingTagLower = hTag.toLowerCase();
+              // Auto-close implicit <tbody> when closing <table>.
+              if (closingTagLower === 'table') {
+                lines.push('if (' + pVar + '.tagName === "TBODY") ' + pVar + ' = ' + pVar + '.parentNode;');
+              }
+              lines.push(pVar + ' = ' + pVar + '.parentNode;');
+              if (hParentTags.length > 0) hParentTags.pop();
+              hTag = '';
+              hState = S_TEXT;
+            } else {
+              hTag += c;
+            }
+            break;
+          case S_ATTRS:
+            if (c === '>') { hFinishAttr(); hCommitTag(false); hState = S_TEXT; }
+            else if (c === '/' && text[i+1] === '>') { hFinishAttr(); hCommitTag(true); hState = S_TEXT; i++; }
+            else if (c !== ' ' && c !== '\t' && c !== '\n') { hAttrName = c; hAttrVal = ''; hAttrExprs = []; hState = S_ATTR_NAME; }
+            break;
+          case S_ATTR_NAME:
+            if (c === '=') { hState = S_ATTR_EQ; }
+            else if (c === ' ' || c === '\t') { hFinishAttr(); hState = S_ATTRS; }
+            else if (c === '>') { hFinishAttr(); hCommitTag(false); hState = S_TEXT; }
+            else if (c === '/' && text[i+1] === '>') { hFinishAttr(); hCommitTag(true); hState = S_TEXT; i++; }
+            else hAttrName += c;
+            break;
+          case S_ATTR_EQ:
+            if (c === '"') hState = S_ATTR_VAL_DQ;
+            else if (c === "'") hState = S_ATTR_VAL_SQ;
+            else if (c !== ' ' && c !== '\t') { hAttrVal = c; hState = S_ATTR_VAL_UQ; }
+            break;
+          case S_ATTR_VAL_DQ:
+            if (c === '"') { hFinishAttr(); hState = S_ATTRS; }
+            else hAttrVal += c;
+            break;
+          case S_ATTR_VAL_SQ:
+            if (c === "'") { hFinishAttr(); hState = S_ATTRS; }
+            else hAttrVal += c;
+            break;
+          case S_ATTR_VAL_UQ:
+            if (c === ' ' || c === '\t') { hFinishAttr(); hState = S_ATTRS; }
+            else if (c === '>') { hFinishAttr(); hCommitTag(false); hState = S_TEXT; }
+            else hAttrVal += c;
+            break;
+          case S_COMMENT:
+            if (c === '-' && text[i+1] === '-' && text[i+2] === '>') {
+              lines.push(pVar + '.appendChild(document.createComment(' + jsStr(hCommentBuf).code + '));');
+              hState = S_TEXT; i += 2;
+            } else hCommentBuf += c;
+            break;
+        }
+      }
+    }
+
+    // Feed an expression token. If we're inside an attribute value,
+    // the expression becomes a dynamic part of that attribute.
+    // If we're in text context, it becomes a text node.
+    function hFeedExpr(expr) {
+      if (hState === S_ATTR_VAL_DQ || hState === S_ATTR_VAL_SQ || hState === S_ATTR_VAL_UQ) {
+        // Dynamic expression in attribute value.
+        hAttrExprs.push({ pos: hAttrVal.length, expr: expr });
+      } else {
+        // Text context — emit as text node or DOM call.
+        hFlushText();
+        const isDomCall = domFuncs.size > 0 &&
+          [...domFuncs].some(function(fn) { return new RegExp('^' + fn.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*\\(').test(expr); });
+        if (isDomCall) {
+          lines.push(pVar + '.appendChild(' + expr + ');');
+        } else {
+          lines.push(pVar + '.appendChild(document.createTextNode(' + expr + '));');
+        }
+      }
+    }
+
+    // Recursively process chain tokens.
+    function emitChain(tokens) {
+      for (let ti = 0; ti < tokens.length; ti++) {
+        const t = tokens[ti];
+        if (t.type === 'plus') continue;
+        if (t.type === 'str') hFeedStr(t.text);
+        else if (t.type === 'other') hFeedExpr(t.text);
+        else if (t.type === 'preserve') { hFlushText(); lines.push(t.text); }
+        else if (t.type === 'cond') {
+          // If we're inside an attribute value, emit as ternary expression.
+          if (hState === S_ATTR_VAL_DQ || hState === S_ATTR_VAL_SQ || hState === S_ATTR_VAL_UQ) {
+            function condToExpr(ct) {
+              if (ct.length === 1 && ct[0].type === 'str') return JSON.stringify(ct[0].text);
+              if (ct.length === 1 && ct[0].type === 'other') return ct[0].text;
+              return ct.filter(function(x){return x.type!=='plus';}).map(function(x) {
+                return x.type === 'str' ? JSON.stringify(x.text) : x.text;
+              }).join(' + ');
+            }
+            var ternaryExpr = '(' + t.condExpr + ' ? ' + condToExpr(t.ifTrue) + ' : ' + condToExpr(t.ifFalse) + ')';
+            hAttrExprs.push({ pos: hAttrVal.length, expr: ternaryExpr });
+          } else {
+            hFlushText();
+            lines.push('if (' + t.condExpr + ') {');
+            emitChain(t.ifTrue);
+            lines.push('} else {');
+            emitChain(t.ifFalse);
+            lines.push('}');
+          }
+        } else if (t.type === 'trycatch') {
+          hFlushText();
+          var savedState1 = hState, savedParents1 = hParentTags.slice();
+          // Use a DocumentFragment for the try branch so partial DOM
+          // from a failed try doesn't pollute the main tree.
+          var tryFrag = makeVar('__tf', used);
+          lines.push('var ' + tryFrag + ' = document.createDocumentFragment();');
+          var savedP = makeVar('__sp', used);
+          lines.push('var ' + savedP + ' = ' + pVar + ';');
+          lines.push(pVar + ' = ' + tryFrag + ';');
+          lines.push('try {');
+          emitChain(t.tryBody);
+          hFlushText();
+          // Success: append fragment to parent.
+          lines.push(savedP + '.appendChild(' + tryFrag + ');');
+          lines.push(pVar + ' = ' + savedP + ';');
+          hState = savedState1; hParentTags = savedParents1.slice();
+          lines.push('} catch(' + (t.catchParam || 'e') + ') {');
+          // Failure: discard fragment, build catch content directly.
+          lines.push(pVar + ' = ' + savedP + ';');
+          emitChain(t.catchBody);
+          hFlushText();
+          lines.push('}');
+        } else if (t.type === 'switch') {
+          hFlushText();
+          lines.push('switch (' + t.discExpr + ') {');
+          for (const br of t.branches) {
+            if (br.label === 'default') lines.push('  default: {');
+            else lines.push('  case ' + br.caseExpr + ': {');
+            emitChain(br.chain);
+            lines.push('    break;');
+            lines.push('  }');
+          }
+          lines.push('}');
+        } else if (t.type === 'iter') {
+          hFlushText();
+          lines.push(t.iterExpr + '.forEach(function(' + t.paramName + ') {');
+          emitChain(t.perElemChain);
+          lines.push('});');
+        }
+      }
+    }
+
+    // Emit chain tokens with proper nested loop wrappers.
+    // Tokens carry loopId tags. When the loopId changes (increases),
+    // we've entered an inner loop. When it reverts to a previous id
+    // or null, we've exited. This handles arbitrary nesting depth.
+    function emitWithLoops(tokens, loopInfoMap) {
+      const toks = tokens.filter(function(t) { return t.type !== 'plus'; });
+      const openLoops = []; // stack of currently open loop IDs
+
+      function emitLoopHeader(id) {
+        const info = loopInfoMap ? loopInfoMap[id] : null;
+        if (info) {
+          if (info.kind === 'do') lines.push('do {');
+          else lines.push((info.kind === 'while' ? 'while' : 'for') + ' (' + info.headerSrc + ') {');
+        } else {
+          lines.push('/* loop */ {');
+        }
+        openLoops.push(id);
+      }
+
+      function emitLoopFooter() {
+        const id = openLoops.pop();
+        const info = loopInfoMap ? loopInfoMap[id] : null;
+        if (info && info.kind === 'do') {
+          lines.push('} while (' + info.headerSrc + ');');
+        } else {
+          lines.push('}');
+        }
+      }
+
+      for (let i = 0; i < toks.length; i++) {
+        const t = toks[i];
+        const loopId = t.loopId != null ? t.loopId : null;
+        const currentLoop = openLoops.length > 0 ? openLoops[openLoops.length - 1] : null;
+
+        if (loopId === currentLoop) {
+          // Same loop (or both null) — just emit.
+          emitChain([t]);
+        } else if (loopId !== null && currentLoop === null) {
+          // Entering a loop from non-loop context.
+          emitLoopHeader(loopId);
+          emitChain([t]);
+        } else if (loopId === null && currentLoop !== null) {
+          // Exiting all loops.
+          while (openLoops.length > 0) emitLoopFooter();
+          emitChain([t]);
+        } else if (loopId !== null && currentLoop !== null && loopId !== currentLoop) {
+          if (openLoops.includes(loopId)) {
+            // Returning to an outer loop — close inner loops.
+            while (openLoops.length > 0 && openLoops[openLoops.length - 1] !== loopId) {
+              emitLoopFooter();
+            }
+          } else {
+            // Entering a deeper/sibling loop — open new loop (keep outer open).
+            emitLoopHeader(loopId);
+          }
+          emitChain([t]);
+        }
+      }
+
+      // Close any remaining open loops.
+      while (openLoops.length > 0) emitLoopFooter();
+
+      hFlushText();
+    }
+
+    // Initialize parent pointer.
+    lines.push('var ' + pVar + ' = ' + parent + ';');
+
+    // Emit all chain tokens.
+    const loopInfoMap = result.loopInfoMap || null;
+    emitWithLoops(chainTokens, loopInfoMap);
+
+    // If we never needed __p (no nesting), optimize it out.
+    if (!needsP) {
+      // Replace all __p references with the parent directly.
+      for (let li = 0; li < lines.length; li++) {
+        lines[li] = lines[li].split(pVar).join(parent);
+      }
+      // Remove the var __p = parent; line.
+      const initLine = 'var ' + parent + ' = ' + parent + ';';
+      const idx = lines.indexOf(initLine);
+      if (idx >= 0) lines.splice(idx, 1);
     }
 
     let block = lines.join('\n');
-    if (emitTitle && opts.emitComments) {
+    if (emitTitle) {
       block = '// === ' + target + '.' + assignProp + ' ' + assignOp + ' ... ===\n' + block;
     }
     return block;
