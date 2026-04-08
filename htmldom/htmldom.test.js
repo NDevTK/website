@@ -2702,6 +2702,169 @@ function render() {
     'app.js': 'document.getElementById("out").innerHTML = "<p>&lt;b&gt;bold&lt;/b&gt; &amp; &lt;i&gt;italic&lt;/i&gt; &copy; 2024</p>";'
   });
 
+  // 71. Same-file builder function with loop
+  checkEquiv('same-file builder loop', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'function renderNav(links) {',
+      '  var s = "<nav>";',
+      '  for (var i = 0; i < links.length; i++) {',
+      '    s += "<a href=\\"" + links[i].url + "\\">" + links[i].text + "</a>";',
+      '  }',
+      '  s += "</nav>";',
+      '  return s;',
+      '}',
+      'var links = [{url:"/",text:"Home"},{url:"/about",text:"About"}];',
+      'document.getElementById("out").innerHTML = renderNav(links) + "<main><p>Content</p></main>";'
+    ].join('\n')
+  });
+
+  // 72. Same-file builder function with conditional
+  checkEquiv('same-file builder conditional', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'function card(title, body, hasFooter) {',
+      '  var h = "<div><h3>" + title + "</h3><p>" + body + "</p>";',
+      '  if (hasFooter) h += "<footer>Footer</footer>";',
+      '  h += "</div>";',
+      '  return h;',
+      '}',
+      'document.getElementById("out").innerHTML = card("Hello", "World", true) + card("No Footer", "Content", false);'
+    ].join('\n')
+  });
+
+  // 73. Pre-increment counter in loop
+  checkEquiv('pre-increment counter', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var items = ["x", "y", "z"];',
+      'var h = "<ul>";',
+      'var n = 0;',
+      'for (var i = 0; i < items.length; i++) {',
+      '  h += "<li>#" + (++n) + ": " + items[i] + "</li>";',
+      '}',
+      'h += "</ul><p>Total: " + n + "</p>";',
+      'document.getElementById("out").innerHTML = h;'
+    ].join('\n')
+  });
+
+  // 74. Template literal with expressions in loop
+  checkEquiv('template literal loop', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var users = [{name:"Alice",role:"admin"},{name:"Bob",role:"user"}];',
+      'var h = "";',
+      'for (var i = 0; i < users.length; i++) {',
+      '  h += `<div class="${users[i].role}"><span>${users[i].name}</span></div>`;',
+      '}',
+      'document.getElementById("out").innerHTML = h;'
+    ].join('\n')
+  });
+
+  // 75. Accumulator used as loop bound (nested loops, counter)
+  checkEquiv('accumulator as bound', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var data = [["a","b"],["c"],["d","e","f"]];',
+      'var h = "";',
+      'var total = 0;',
+      'for (var i = 0; i < data.length; i++) {',
+      '  h += "<div>";',
+      '  for (var j = 0; j < data[i].length; j++) {',
+      '    h += "<span>" + data[i][j] + "</span>";',
+      '    total++;',
+      '  }',
+      '  h += "</div>";',
+      '}',
+      'h += "<p>Total: " + total + "</p>";',
+      'document.getElementById("out").innerHTML = h;'
+    ].join('\n')
+  });
+
+  // 76. Alternating row classes
+  checkEquiv('alternating rows', {
+    'index.html': '<html><body><table id="out"></table><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var items = ["A","B","C","D","E"];',
+      'var h = "";',
+      'for (var i = 0; i < items.length; i++) {',
+      '  h += "<tr class=\\"" + (i % 2 === 0 ? "even" : "odd") + "\\"><td>" + items[i] + "</td></tr>";',
+      '}',
+      'document.getElementById("out").innerHTML = h;'
+    ].join('\n')
+  });
+
+  // 77. Conditional wrapping (wrap content in tag based on flag)
+  checkEquiv('conditional wrap', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var items = [{text:"normal",bold:false},{text:"important",bold:true},{text:"also normal",bold:false}];',
+      'var h = "";',
+      'for (var i = 0; i < items.length; i++) {',
+      '  if (items[i].bold) h += "<b>";',
+      '  h += "<span>" + items[i].text + "</span>";',
+      '  if (items[i].bold) h += "</b>";',
+      '}',
+      'document.getElementById("out").innerHTML = h;'
+    ].join('\n')
+  });
+
+  // 78. Nested computed attributes
+  checkEquiv('nested computed attrs', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var sections = [{id:"s1",title:"Intro",items:["a","b"]},{id:"s2",title:"Main",items:["c","d","e"]}];',
+      'var h = "";',
+      'for (var i = 0; i < sections.length; i++) {',
+      '  var s = sections[i];',
+      '  h += "<section id=\\"" + s.id + "\\"><h2>" + s.title + "</h2><ul>";',
+      '  for (var j = 0; j < s.items.length; j++) {',
+      '    h += "<li data-idx=\\"" + j + "\\">" + s.items[j] + "</li>";',
+      '  }',
+      '  h += "</ul></section>";',
+      '}',
+      'document.getElementById("out").innerHTML = h;'
+    ].join('\n')
+  });
+
+  // 79. While with early exit and result
+  checkEquiv('while early exit', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var data = [2, 4, 7, 1, 3];',
+      'var h = "<ul>";',
+      'var i = 0;',
+      'var found = "none";',
+      'while (i < data.length) {',
+      '  if (data[i] > 5) { found = data[i]; break; }',
+      '  h += "<li>" + data[i] + "</li>";',
+      '  i++;',
+      '}',
+      'h += "</ul><p>First >5: " + found + "</p>";',
+      'document.getElementById("out").innerHTML = h;'
+    ].join('\n')
+  });
+
+  // 80. Three-level nested loops
+  checkEquiv('three level loops', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var h = "";',
+      'for (var a = 0; a < 2; a++) {',
+      '  h += "<div>";',
+      '  for (var b = 0; b < 2; b++) {',
+      '    h += "<ul>";',
+      '    for (var c = 0; c < 2; c++) {',
+      '      h += "<li>" + a + "." + b + "." + c + "</li>";',
+      '    }',
+      '    h += "</ul>";',
+      '  }',
+      '  h += "</div>";',
+      '}',
+      'document.getElementById("out").innerHTML = h;'
+    ].join('\n')
+  });
+
   console.log(`  (${pass + fail - before} cases)`);
 })();
 
