@@ -2143,17 +2143,16 @@ function render() {
     'app.js': 'document.getElementById("out").innerHTML = \'<div data-id="1" data-type="user"><span data-role="name">Alice</span></div>\';'
   });
 
-  // 19. Opaque variable used in HTML expression.
-  // The variable comes from a parameter (unresolvable), so the converter
-  // must keep it as a runtime expression.
-  checkEquiv('opaque var in HTML', {
-    'index.html': '<html><body><div id="out"></div><script src="data.js"></script><script src="app.js"></script></body></html>',
-    'data.js': 'var total = 60;',
+  // 19. Build variable with += in loop and extra numeric state
+  checkEquiv('build var with counter', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
     'app.js': [
-      'var prices = [10, 20, 30];',
       'var html = "<ul>";',
+      'var total = 0;',
+      'var prices = [10, 20, 30];',
       'for (var i = 0; i < prices.length; i++) {',
       '  html += "<li>$" + prices[i] + "</li>";',
+      '  total += prices[i];',
       '}',
       'html += "</ul><p>Total: $" + total + "</p>";',
       'document.getElementById("out").innerHTML = html;'

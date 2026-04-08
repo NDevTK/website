@@ -3755,6 +3755,28 @@
           }
           assignName(t.text, combined);
           if (loopStack.length > 0) loopStack[loopStack.length - 1].modifiedVars.add(t.text);
+          // For non-build variables modified by +=, preserve the statement
+          // in the build chain AND make the variable opaque. This prevents
+          // numeric accumulators (total += x) from being expanded as text
+          // nodes — the variable stays as a runtime reference.
+          if (trackBuildVar && !trackBuildVar.has(t.text) && (trackBuildVarDepth < 0 || funcDepth() === trackBuildVarDepth)) {
+            // Make the variable opaque so later references to it produce
+            // the variable name, not the expanded chain.
+            assignName(t.text, chainBinding([exprRef(t.text)]));
+            for (const bv of trackBuildVar) {
+              const bCur = resolve(bv);
+              if (bCur && bCur.kind === 'chain') {
+                const stmtEndIdx = skipExpr(i + 2, stop);
+                const first = tokens[i];
+                const last = tokens[stmtEndIdx - 1];
+                const stmtSrc = first._src.slice(first.start, last.end);
+                const loopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
+                const preserveTok = { type: 'preserve', text: stmtSrc };
+                if (loopId !== null) preserveTok.loopId = loopId;
+                assignName(bv, chainBinding([...bCur.toks, SYNTH_PLUS, preserveTok]));
+              }
+            }
+          }
           i = skipExpr(i + 2, stop) - 1;
           continue;
         }
