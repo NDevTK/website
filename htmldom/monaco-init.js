@@ -46,7 +46,7 @@
     // Start with the example as a single file.
     var folderFiles = { 'example.html': defaultInput };
     var outputFiles = {};
-
+    var dirHandle = null; // FSA directory handle from Open Folder
     var activeFile = null;
 
     function langFor(name) {
@@ -172,7 +172,7 @@
         return;
       }
       try {
-        var dirHandle = await window.showDirectoryPicker({ mode: 'read' });
+        dirHandle = await window.showDirectoryPicker({ mode: 'read' });
         folderFiles = await readFolder(dirHandle, '');
         outputFiles = {};
         document.getElementById('folderName').textContent = dirHandle.name;
@@ -190,10 +190,43 @@
       downloadFile(activeFile.path, outputFiles[activeFile.path]);
     });
 
-    document.getElementById('downloadAll').addEventListener('click', function() {
-      Object.keys(outputFiles).forEach(function(path) {
-        downloadFile(path, outputFiles[path]);
-      });
+    document.getElementById('downloadAll').addEventListener('click', async function() {
+      if (!Object.keys(outputFiles).length) return;
+      try {
+        // Use the opened folder's handle or prompt for one.
+        var saveHandle = dirHandle;
+        if (!saveHandle || !saveHandle.requestPermission) {
+          if (!window.showDirectoryPicker) {
+            // Fallback: download each file individually.
+            Object.keys(outputFiles).forEach(function(path) { downloadFile(path, outputFiles[path]); });
+            return;
+          }
+          saveHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+        } else {
+          // Request write permission on the existing handle.
+          var perm = await saveHandle.requestPermission({ mode: 'readwrite' });
+          if (perm !== 'granted') {
+            saveHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+          }
+        }
+        // Create 'converted' subfolder.
+        var convertedDir = await saveHandle.getDirectoryHandle('converted', { create: true });
+        // Write each output file, creating subdirectories as needed.
+        for (var path of Object.keys(outputFiles)) {
+          var parts = path.split('/');
+          var dir = convertedDir;
+          for (var pi = 0; pi < parts.length - 1; pi++) {
+            dir = await dir.getDirectoryHandle(parts[pi], { create: true });
+          }
+          var fileHandle = await dir.getFileHandle(parts[parts.length - 1], { create: true });
+          var writable = await fileHandle.createWritable();
+          await writable.write(outputFiles[path]);
+          await writable.close();
+        }
+        document.getElementById('folderName').textContent += ' — saved to converted/';
+      } catch (e) {
+        if (e.name !== 'AbortError') console.error('Save failed:', e);
+      }
     });
 
     function downloadFile(name, content) {

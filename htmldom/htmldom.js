@@ -5118,23 +5118,18 @@
     // Run conversion directly on the content string.
     const captured = convertRaw(content);
     if (!captured || captured === '// (no nodes parsed)') return output;
-    // Parse output into separate files.
+    // Parse output into separate files, keeping original names.
     const dir = htmlPath.indexOf('/') >= 0 ? htmlPath.slice(0, htmlPath.lastIndexOf('/') + 1) : '';
-    const baseName = htmlPath.replace(/^.*\//, '').replace(/\.[^.]+$/, '');
     const parts = captured.split(/^\/\/ === (.+?) ===$/m);
     if (parts.length > 1) {
       for (let i = 1; i < parts.length; i += 2) {
         const name = parts[i].trim();
         const body = (parts[i + 1] || '').trim();
-        if (!body) continue;
-        if (name === 'safe-handlers.js') {
-          output[dir + baseName + '.safe.js'] = body;
-        } else {
-          output[dir + name] = body;
-        }
+        if (body) output[dir + name] = body;
       }
     } else {
-      output[dir + baseName + '.safe.js'] = captured;
+      // Single output — keep the original filename.
+      output[htmlPath] = captured;
     }
     return output;
   }
