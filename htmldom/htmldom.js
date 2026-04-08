@@ -4087,183 +4087,37 @@
       // blocks. Convert HTML to DOM API, process script blocks for
       // innerHTML replacements, preserve non-innerHTML script code as-is.
       if (/^\s*</.test(raw)) {
-        // Strip document structure (<!DOCTYPE>, <html>, <head>, <body>)
-        // and split into head-content vs body-content regions, then
-        // split each region into HTML portions and <script> blocks.
-        let processed = raw;
-        // Remove DOCTYPE.
-        processed = processed.replace(/<!DOCTYPE[^>]*>/i, '');
-        // Remove <html ...> and </html>.
-        processed = processed.replace(/<\/?html[^>]*>/gi, '');
+        // HTML input: use the proper DOM parser via convertHtmlMarkup.
 
-        // Split into head and body regions.
-        let headContent = '';
-        let bodyContent = processed;
-        const headMatch = processed.match(/<head[^>]*>([\s\S]*?)<\/head>/i);
-        if (headMatch) {
-          headContent = headMatch[1];
-          bodyContent = processed.slice(0, headMatch.index) + processed.slice(headMatch.index + headMatch[0].length);
+        const htmlName = sourceName || "input.html";
+        const markup = convertHtmlMarkup(raw, htmlName);
+        const parts = [];
+        // Convert extracted scripts with cross-file scope.
+        let precedingCode = "";
+        const outputParts = {};
+        for (const script of markup.extractedScripts) {
+          const converted = convertJsFile(script.content, precedingCode);
+          outputParts[script.name] = converted || script.content;
+          precedingCode += (precedingCode ? '\n' : '') + script.content;
         }
-        // Remove <body ...> and </body> from body content.
-        bodyContent = bodyContent.replace(/<\/?body[^>]*>/gi, '');
-
-        const jsFileLines = [];
-        let elemCounter = 0;
-        const processRegion = (html, parentTarget, outputParts, sharedUsed) => {
-          const scriptRe = /<script\b[^>]*>([\s\S]*?)<\/script>/gi;
-          let lastIdx = 0;
-          const parts = [];
-          let m;
-          while ((m = scriptRe.exec(html)) !== null) {
-            if (m.index > lastIdx) parts.push({ kind: 'html', text: html.slice(lastIdx, m.index) });
-            parts.push({ kind: 'script', text: m[1] });
-            lastIdx = scriptRe.lastIndex;
-          }
-          if (lastIdx < html.length) parts.push({ kind: 'html', text: html.slice(lastIdx) });
-
-          // Collect all unsafe-attribute rewrites into a separate JS file.
-          // HTML structure is preserved; only inline events, javascript:
-          // URLs, and inline styles are extracted.
-          const scriptParts = [];
-          for (const part of parts) {
-            if (part.kind === 'html') {
-              let safeHtml = part.text;
-              safeHtml = safeHtml.replace(/<([a-zA-Z][a-zA-Z0-9]*)((?:\s+[^>]*?)?)>/g, function(match, tag, attrsStr) {
-                const events = [];
-                let styleVal = null;
-                let jsHref = null;
-                let cleaned = attrsStr.replace(/\s+on([a-z]+)="([^"]*)"/gi, function(_, evName, handler) {
-                  events.push({ event: evName.toLowerCase(), handler: handler.replace(/&quot;/g, '"').replace(/&amp;/g, '&') });
-                  return '';
-                });
-                cleaned = cleaned.replace(/\s+href="javascript:([^"]*)"/gi, function(_, code) {
-                  jsHref = code.replace(/&quot;/g, '"').replace(/&amp;/g, '&');
-                  return '';
-                });
-                cleaned = cleaned.replace(/\s+style="([^"]*)"/gi, function(_, val) {
-                  styleVal = val.replace(/&quot;/g, '"').replace(/&amp;/g, '&');
-                  return '';
-                });
-                if (events.length === 0 && !jsHref && !styleVal) return match;
-                // Use existing id or add data-hd for targeting.
-                const idMatch = attrsStr.match(/\s+id="([^"]*)"/i);
-                var sel, cleanedTag;
-                if (idMatch) {
-                  sel = 'document.getElementById(\'' + idMatch[1] + '\')';
-                  cleanedTag = '<' + tag + cleaned + '>';
-                } else {
-                  const hdId = 'hd' + (elemCounter++);
-                  sel = 'document.querySelector(\'[data-hd="' + hdId + '"]\')';
-                  cleanedTag = '<' + tag + cleaned + ' data-hd="' + hdId + '">';
-                }
-                for (const ev of events) {
-                  var body = ev.handler.trim();
-                  if (/\breturn\b/.test(body)) {
-                    jsFileLines.push(sel + '.addEventListener(\'' + ev.event + '\', function(event) {');
-                    jsFileLines.push('  var __r = (function() { ' + body + ' }).call(this);');
-                    jsFileLines.push('  if (__r === false) event.preventDefault();');
-                    jsFileLines.push('});');
-                  } else {
-                    jsFileLines.push(sel + '.addEventListener(\'' + ev.event + '\', function(event) { ' + body + ' });');
-                  }
-                }
-                if (jsHref) {
-                  jsFileLines.push(sel + '.addEventListener(\'click\', function(event) {');
-                  jsFileLines.push('  event.preventDefault();');
-                  jsFileLines.push('  ' + jsHref);
-                  jsFileLines.push('});');
-                }
-                if (styleVal) {
-                  var decls = styleVal.split(';').map(function(d) { return d.trim(); }).filter(Boolean);
-                  for (var di = 0; di < decls.length; di++) {
-                    var colon = decls[di].indexOf(':');
-                    if (colon < 0) continue;
-                    var prop = decls[di].slice(0, colon).trim();
-                    var val = decls[di].slice(colon + 1).trim();
-                    var important = '';
-                    if (/!important\s*$/.test(val)) {
-                      val = val.replace(/\s*!important\s*$/, '');
-                      important = ', \'important\'';
-                    }
-                    jsFileLines.push(sel + '.style.setProperty(\'' + prop + '\', \'' + val.replace(/'/g, "\\'") + '\'' + important + ');');
-                  }
-                }
-                return cleanedTag;
-              });
-              outputParts.push(safeHtml);
-            } else {
-              scriptParts.push(part);
-            }
-          }
-
-          // Combine all script blocks into one for cross-file scope,
-          // then split the output back by tracking separator positions.
-          if (scriptParts.length > 0) {
-            // Build combined JS with separators we can split on later.
-            const separator = '\n/*__BLOCK_SEP__*/\n';
-            let combinedJs = scriptParts.map(p => p.text).join(separator);
-            // Pre-pass: convert HTML-building helper functions to return
-            // DOM fragments. This prevents multi-level inlining.
-            const prepass = convertHtmlBuilderFunctions(combinedJs);
-            combinedJs = prepass.source;
-            const extractions = extractAllHTML(combinedJs);
-            if (extractions.length === 0) {
-              // No innerHTML — keep script code as-is in the JS file.
-              for (const part of scriptParts) jsFileLines.push(part.text.trim());
-            } else {
-              const trimmed = combinedJs.trim();
-              let scriptOutput = '';
-              let cursor = 0;
-              for (const ex of extractions) {
-                if (ex.srcStart === undefined) continue;
-                const domBlock = convertOne(combinedJs, ex, false, false, sharedUsed, null, prepass.converted);
-                let srcStart = ex.srcStart;
-                let srcEnd = ex.srcEnd;
-                if (ex.buildVarDeclStart >= 0) {
-                  srcStart = ex.buildVarDeclStart;
-                }
-                let pre = trimmed.slice(cursor, srcStart);
-                pre = pre.replace(/\n\s*$/, '\n');
-                scriptOutput += pre;
-                if (domBlock) {
-                  let lineStart = srcStart;
-                  while (lineStart > 0 && trimmed[lineStart - 1] !== '\n') lineStart--;
-                  const indent = trimmed.slice(lineStart, srcStart).match(/^(\s*)/)[1];
-                  const indented = domBlock.split('\n').map((line) => indent + line).join('\n');
-                  scriptOutput += indented;
-                  if (!indented.endsWith('\n')) scriptOutput += '\n';
-                }
-                cursor = srcEnd;
-                while (cursor < trimmed.length && (trimmed[cursor] === ';' || trimmed[cursor] === ' ' || trimmed[cursor] === '\n')) cursor++;
-              }
-              scriptOutput += trimmed.slice(cursor);
-              scriptOutput = scriptOutput.replace(/\n\/\*__BLOCK_SEP__\*\/\n/g, '\n');
-              jsFileLines.push(scriptOutput.trim());
-            }
-          }
-        };
-
-        const outputParts = [];
-        const sharedUsed = new Set();
-        // Reconstruct the document with safe HTML.
-        outputParts.push('<!DOCTYPE html>\n<html>\n<head>');
-        if (headContent.trim()) processRegion(headContent, 'document.head', outputParts, sharedUsed);
-        outputParts.push('</head>\n<body>');
-        if (bodyContent.trim()) processRegion(bodyContent, 'document.body', outputParts, sharedUsed);
-        // Add reference to the generated JS file if there are any rewrites.
-        if (jsFileLines.length) {
-          outputParts.push('<script src="' + handlersFile + '"></script>');
+        // Build output with file separators.
+        const hasChanges = markup.handlers || markup.extractedScripts.length || markup.extractedStyles.length;
+        if (!hasChanges) return raw;
+        parts.push("// === " + htmlName + " ===");
+        parts.push(markup.html);
+        for (const style of markup.extractedStyles) {
+          parts.push("// === " + style.name + " ===");
+          parts.push(style.content);
         }
-        outputParts.push('</body>\n</html>');
-        const cleanHtml = outputParts.join('\n').replace(/\n{3,}/g, '\n\n');
-        const jsFile = jsFileLines.length ? '// Generated by HTML to DOM API Converter\n// Extracted inline handlers, styles, and innerHTML conversions.\n\n' + jsFileLines.join('\n\n') + '\n' : '';
-        // Output both: HTML file, separator, JS file.
-        if (jsFile) {
-          return ('// === ' + (sourceName || 'index.html') + ' ===\n' + cleanHtml + '\n\n// === ' + handlersFile + ' ===\n' + jsFile);
-        } else {
-          return (cleanHtml);
+        for (const script of markup.extractedScripts) {
+          parts.push("// === " + script.name + " ===");
+          parts.push(outputParts[script.name] || script.content);
         }
-        return;
+        if (markup.handlers) {
+          parts.push("// === " + markup.handlers.name + " ===");
+          parts.push(markup.handlers.content);
+        }
+        return parts.join('\n\n');
       }
 
       // Pure JS input (no leading <).
@@ -5047,7 +4901,8 @@
     const vnodes = parseChainToVNodes(chainTokens);
 
     if (vnodes.length === 0) {
-      return '// (no nodes parsed)';
+      // Still return lines if we have replaceChildren (empty innerHTML = "").
+      return lines.length ? lines.join('\n') : '// (no nodes parsed)';
     }
 
     let attachTarget = parent;
@@ -5119,8 +4974,20 @@
   }
 
   function convertJsFile(jsContent, precedingCode) {
-    // Only process if there's innerHTML usage in this file.
-    if (!/\.innerHTML\s*[+=]/.test(jsContent)) return null;
+    // Use the tokenizer to detect actual innerHTML/outerHTML assignments.
+    // This avoids false positives from comments, strings, and eval.
+    const tokens = tokenize(jsContent.trim());
+    let hasInnerHTML = false;
+    for (let i = 1; i < tokens.length; i++) {
+      const t = tokens[i];
+      if (t.type !== 'sep' || (t.char !== '=' && t.char !== '+=')) continue;
+      const prev = tokens[i - 1];
+      if (prev && prev.type === 'other' && /\.(innerHTML|outerHTML)$/.test(prev.text)) {
+        hasInnerHTML = true;
+        break;
+      }
+    }
+    if (!hasInnerHTML) return null;
     const sep = '\n/*__FILE_BOUNDARY__*/\n';
     const combined = precedingCode ? precedingCode + sep + jsContent : jsContent;
     const converted = convertRaw(combined);
@@ -5140,112 +5007,167 @@
   function convertHtmlMarkup(htmlContent, htmlPath) {
     const baseName = (htmlPath.indexOf('/') >= 0 ? htmlPath.slice(htmlPath.lastIndexOf('/') + 1) : htmlPath).replace(/\.[^.]+$/, '');
     const handlersFile = baseName + '.handlers.js';
-    let processed = htmlContent;
+    const doc = new DOMParser().parseFromString(htmlContent, 'text/html');
     let elemCounter = 0;
     const jsLines = [];
-    processed = processed.replace(/<([a-zA-Z][a-zA-Z0-9]*)((?:\s+[^>]*?)?)>/g, function(match, tag, attrsStr) {
-      const events = [];
-      let styleVal = null;
-      let jsHref = null;
-      let cleaned = attrsStr.replace(/\s+on([a-z]+)="([^"]*)"/gi, function(_, evName, handler) {
-        events.push({ event: evName.toLowerCase(), handler: handler.replace(/&quot;/g, '"').replace(/&amp;/g, '&') });
-        return '';
-      });
-      cleaned = cleaned.replace(/\s+href="javascript:([^"]*)"/gi, function(_, code) {
-        jsHref = code.replace(/&quot;/g, '"').replace(/&amp;/g, '&');
-        return '';
-      });
-      cleaned = cleaned.replace(/\s+style="([^"]*)"/gi, function(_, val) {
-        styleVal = val.replace(/&quot;/g, '"').replace(/&amp;/g, '&');
-        return '';
-      });
-      if (events.length === 0 && !jsHref && !styleVal) return match;
-      const idMatch = attrsStr.match(/\s+id="([^"]*)"/i);
-      let sel, cleanedTag;
-      if (idMatch) {
-        sel = 'document.getElementById(\'' + idMatch[1] + '\')';
-        cleanedTag = '<' + tag + cleaned + '>';
-      } else {
-        const hdId = 'hd' + (elemCounter++);
-        sel = 'document.querySelector(\'[data-hd="' + hdId + '"]\')';
-        cleanedTag = '<' + tag + cleaned + ' data-hd="' + hdId + '">';
-      }
-      // Count total operations for this element.
-      const opCount = events.length + (jsHref ? 1 : 0) +
-        (styleVal ? styleVal.split(';').filter(function(d) { return d.trim() && d.indexOf(':') >= 0; }).length : 0);
-      // Use a variable when multiple operations target the same element.
-      const useVar = opCount > 1;
-      const varName = useVar ? ('__el' + (elemCounter - 1)) : null;
-      const ref = useVar ? varName : sel;
-      if (useVar) {
-        jsLines.push('(function() {');
-        jsLines.push('var ' + varName + ' = ' + sel + ';');
-      }
-      for (const ev of events) {
-        const body = ev.handler.trim();
-        if (/\breturn\b/.test(body)) {
-          jsLines.push(ref + '.addEventListener(\'' + ev.event + '\', function(event) {');
-          jsLines.push('  var __r = (function() { ' + body + ' }).call(this);');
-          jsLines.push('  if (__r === false) event.preventDefault();');
-          jsLines.push('});');
-        } else {
-          jsLines.push(ref + '.addEventListener(\'' + ev.event + '\', function(event) { ' + body + ' });');
-        }
-      }
-      if (jsHref) {
-        jsLines.push(ref + '.addEventListener(\'click\', function(event) {');
-        jsLines.push('  event.preventDefault();');
-        jsLines.push('  ' + jsHref);
-        jsLines.push('});');
-      }
-      if (styleVal) {
-        const decls = styleVal.split(';').map(function(d) { return d.trim(); }).filter(Boolean);
-        for (const d of decls) {
-          const colon = d.indexOf(':');
-          if (colon < 0) continue;
-          const prop = d.slice(0, colon).trim();
-          let val = d.slice(colon + 1).trim();
-          let important = '';
-          if (/!important\s*$/.test(val)) {
-            val = val.replace(/\s*!important\s*$/, '');
-            important = ', \'important\'';
-          }
-          jsLines.push(ref + '.style.setProperty(\'' + prop + '\', \'' + val.replace(/'/g, "\\'") + '\'' + important + ');');
-        }
-      }
-      if (useVar) {
-        jsLines.push('})();');
-      }
-      return cleanedTag;
-    });
-    const result = { html: processed, handlers: null, extractedScripts: [], extractedStyles: [] };
-    // Extract inline <script> blocks to external files.
+    const extractedScripts = [];
+    const extractedStyles = [];
     let scriptIdx = 0;
-    processed = processed.replace(/<script\b(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi, function(match, body) {
-      const trimmed = body.trim();
-      if (!trimmed) return '';
-      const name = scriptIdx === 0 ? baseName + '.js' : baseName + '.' + scriptIdx + '.js';
-      scriptIdx++;
-      result.extractedScripts.push({ name: name, content: trimmed });
-      return '<script src="' + name + '"><\/script>';
-    });
-    // Extract inline <style> blocks to external files.
     let styleIdx = 0;
-    processed = processed.replace(/<style\b[^>]*>([\s\S]*?)<\/style>/gi, function(match, body) {
-      const trimmed = body.trim();
-      if (!trimmed) return '';
-      const name = styleIdx === 0 ? baseName + '.css' : baseName + '.' + styleIdx + '.css';
-      styleIdx++;
-      result.extractedStyles.push({ name: name, content: trimmed });
-      return '<link rel="stylesheet" href="' + name + '">';
-    });
-    if (jsLines.length) {
-      if (processed.indexOf(handlersFile) < 0) {
-        processed = processed.replace(/<\/body>/i, '<script src="' + handlersFile + '"><\/script>\n</body>');
+
+    // Walk all elements in the document.
+    function walkNode(node) {
+      if (node.nodeType !== 1) return; // element nodes only
+      const el = node;
+
+      // Extract inline event handlers.
+      const events = [];
+      const attrsToRemove = [];
+      for (let i = 0; i < el.attributes.length; i++) {
+        const attr = el.attributes[i];
+        if (/^on[a-z]+$/i.test(attr.name)) {
+          events.push({ event: attr.name.slice(2).toLowerCase(), handler: attr.value });
+          attrsToRemove.push(attr.name);
+        }
       }
-      result.handlers = { name: handlersFile, content: jsLines.join('\n') };
+
+      // Extract javascript: URLs.
+      let jsHref = null;
+      const href = el.getAttribute('href');
+      if (href && /^javascript:/i.test(href)) {
+        jsHref = href.slice('javascript:'.length);
+        attrsToRemove.push('href');
+      }
+
+      // Extract inline styles.
+      let styleVal = null;
+      if (el.hasAttribute('style')) {
+        styleVal = el.getAttribute('style');
+        attrsToRemove.push('style');
+      }
+
+      if (events.length || jsHref || styleVal) {
+        // Determine selector: use existing id or add data-hd.
+        let sel;
+        if (el.id) {
+          sel = 'document.getElementById(\'' + el.id + '\')';
+        } else {
+          const hdId = 'hd' + (elemCounter++);
+          el.setAttribute('data-hd', hdId);
+          sel = 'document.querySelector(\'[data-hd="' + hdId + '"]\')';
+        }
+
+        // Count operations for grouping.
+        let opCount = events.length + (jsHref ? 1 : 0);
+        if (styleVal) {
+          opCount += styleVal.split(';').filter(function(d) { return d.trim() && d.indexOf(':') >= 0; }).length;
+        }
+        const useVar = opCount > 1;
+        const varName = useVar ? ('__el' + (elemCounter - 1)) : null;
+        const ref = useVar ? varName : sel;
+        if (useVar) {
+          jsLines.push('(function() {');
+          jsLines.push('var ' + varName + ' = ' + sel + ';');
+        }
+
+        for (const ev of events) {
+          const body = ev.handler.trim();
+          if (/\breturn\b/.test(body)) {
+            jsLines.push(ref + '.addEventListener(\'' + ev.event + '\', function(event) {');
+            jsLines.push('  var __r = (function() { ' + body + ' }).call(this);');
+            jsLines.push('  if (__r === false) event.preventDefault();');
+            jsLines.push('});');
+          } else {
+            jsLines.push(ref + '.addEventListener(\'' + ev.event + '\', function(event) { ' + body + ' });');
+          }
+        }
+        if (jsHref) {
+          jsLines.push(ref + '.addEventListener(\'click\', function(event) {');
+          jsLines.push('  event.preventDefault();');
+          jsLines.push('  ' + jsHref);
+          jsLines.push('});');
+        }
+        if (styleVal) {
+          const decls = styleVal.split(';').map(function(d) { return d.trim(); }).filter(Boolean);
+          for (const d of decls) {
+            const colon = d.indexOf(':');
+            if (colon < 0) continue;
+            const prop = d.slice(0, colon).trim();
+            let val = d.slice(colon + 1).trim();
+            let important = '';
+            if (/!important\s*$/i.test(val)) {
+              val = val.replace(/\s*!important\s*$/i, '');
+              important = ', \'important\'';
+            }
+            jsLines.push(ref + '.style.setProperty(\'' + prop + '\', \'' + val.replace(/'/g, "\\'") + '\'' + important + ');');
+          }
+        }
+        if (useVar) {
+          jsLines.push('})();');
+        }
+
+        // Remove unsafe attributes from the element.
+        for (const name of attrsToRemove) {
+          el.removeAttribute(name);
+        }
+      }
+
+      // Extract inline <script> blocks (not src-referenced ones).
+      if (el.tagName === 'SCRIPT' && !el.hasAttribute('src')) {
+        const body = el.textContent.trim();
+        if (body) {
+          const name = scriptIdx === 0 ? baseName + '.js' : baseName + '.' + scriptIdx + '.js';
+          scriptIdx++;
+          extractedScripts.push({ name: name, content: body });
+          // Replace with external reference.
+          el.textContent = '';
+          el.setAttribute('src', name);
+        }
+      }
+
+      // Extract inline <style> blocks.
+      if (el.tagName === 'STYLE') {
+        const body = el.textContent.trim();
+        if (body) {
+          const name = styleIdx === 0 ? baseName + '.css' : baseName + '.' + styleIdx + '.css';
+          styleIdx++;
+          extractedStyles.push({ name: name, content: body });
+          // Replace <style> with <link>.
+          const link = doc.createElement('link');
+          link.setAttribute('rel', 'stylesheet');
+          link.setAttribute('href', name);
+          el.parentNode.replaceChild(link, el);
+          return; // don't recurse into replaced node
+        }
+      }
+
+      // Recurse into children (copy to array since we may modify during walk).
+      const children = Array.from(el.childNodes);
+      for (const child of children) walkNode(child);
     }
-    result.html = processed;
+
+    walkNode(doc.documentElement);
+
+    // Add handlers script reference before </body> if needed.
+    if (jsLines.length && doc.body) {
+      const script = doc.createElement('script');
+      script.setAttribute('src', handlersFile);
+      doc.body.appendChild(script);
+    }
+
+    // Serialize back to HTML.
+    let html = '';
+    if (doc.doctype) {
+      html += '<!DOCTYPE ' + doc.doctype.name + '>\n';
+    }
+    html += doc.documentElement.outerHTML;
+
+    const result = {
+      html: html,
+      handlers: jsLines.length ? { name: handlersFile, content: jsLines.join('\n') } : null,
+      extractedScripts: extractedScripts,
+      extractedStyles: extractedStyles,
+    };
     return result;
   }
 
@@ -5262,8 +5184,10 @@
     for (const page of htmlPages) {
       const markup = convertHtmlMarkup(files[page], page);
       const dir = page.indexOf('/') >= 0 ? page.slice(0, page.lastIndexOf('/') + 1) : '';
-      // Only output HTML if it actually changed.
-      if (markup.html !== files[page]) output[page] = markup.html;
+      // Only output HTML if there were actual changes (unsafe attrs
+      // extracted, scripts extracted, styles extracted).
+      const htmlChanged = markup.handlers || markup.extractedScripts.length || markup.extractedStyles.length;
+      if (htmlChanged) output[page] = markup.html;
       if (markup.handlers) {
         output[dir + markup.handlers.name] = markup.handlers.content;
       }
