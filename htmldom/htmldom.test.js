@@ -2299,6 +2299,204 @@ function render() {
     ].join('\n')
   });
 
+  // 31. for...in loop
+  checkEquiv('for-in loop', {
+    'index.html': '<html><body><dl id="out"></dl><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var html = "";',
+      'var obj = {a: 1, b: 2, c: 3};',
+      'for (var k in obj) {',
+      '  html += "<dt>" + k + "</dt><dd>" + obj[k] + "</dd>";',
+      '}',
+      'document.getElementById("out").innerHTML = html;'
+    ].join('\n')
+  });
+
+  // 32. for...of loop
+  checkEquiv('for-of loop', {
+    'index.html': '<html><body><ul id="out"></ul><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var html = "";',
+      'var arr = ["x", "y", "z"];',
+      'for (var v of arr) {',
+      '  html += "<li>" + v + "</li>";',
+      '}',
+      'document.getElementById("out").innerHTML = html;'
+    ].join('\n')
+  });
+
+  // 33. while loop with counter
+  checkEquiv('while loop counter', {
+    'index.html': '<html><body><ul id="out"></ul><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var html = "";',
+      'var i = 0;',
+      'while (i < 4) {',
+      '  html += "<li>Item " + i + "</li>";',
+      '  i++;',
+      '}',
+      'document.getElementById("out").innerHTML = html;'
+    ].join('\n')
+  });
+
+  // 34. do-while loop
+  checkEquiv('do-while loop', {
+    'index.html': '<html><body><ul id="out"></ul><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var html = "";',
+      'var i = 0;',
+      'do {',
+      '  html += "<li>Item " + i + "</li>";',
+      '  i++;',
+      '} while (i < 3);',
+      'document.getElementById("out").innerHTML = html;'
+    ].join('\n')
+  });
+
+  // 35. Nested conditionals in loop (if/else per iteration)
+  checkEquiv('conditional class in loop', {
+    'index.html': '<html><body><ul id="out"></ul><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var html = "";',
+      'for (var i = 0; i < 6; i++) {',
+      '  if (i % 2 === 0) {',
+      '    html += "<li class=\\"even\\">" + i + "</li>";',
+      '  } else {',
+      '    html += "<li class=\\"odd\\">" + i + "</li>";',
+      '  }',
+      '}',
+      'document.getElementById("out").innerHTML = html;'
+    ].join('\n')
+  });
+
+  // 36. HTML entities decoded properly
+  checkEquiv('entity decoding', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("out").innerHTML = "<p>Tom &amp; Jerry &lt;3 &quot;Cartoons&quot;</p>";'
+  });
+
+  // 37. Entity in attribute value
+  checkEquiv('entity in attr', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("out").innerHTML = "<a href=\\"page?a=1&amp;b=2\\">link</a>";'
+  });
+
+  // 38. Mixed text and elements with entities
+  checkEquiv('mixed text entities', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("out").innerHTML = "Hello &amp; <b>bold</b> &amp; <i>italic</i>";'
+  });
+
+  // 39. Multiple attributes including boolean
+  checkEquiv('multi attr boolean', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("out").innerHTML = "<input type=\\"text\\" id=\\"name\\" placeholder=\\"Enter name\\" required>";'
+  });
+
+  // 40. Self-closing elements in context
+  checkEquiv('br and hr', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("out").innerHTML = "<p>Line 1<br>Line 2</p><hr><p>After</p>";'
+  });
+
+  // 41. Complex nested structure
+  checkEquiv('deep nested mixed', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("out").innerHTML = "<div>Hello <b>bold <i>italic</i></b> world</div>";'
+  });
+
+  // 42. Dynamic data attributes
+  checkEquiv('dynamic data attrs', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var id = 42;',
+      'var type = "user";',
+      'var name = "Alice";',
+      'document.getElementById("out").innerHTML = "<div data-id=\\"" + id + "\\" data-type=\\"" + type + "\\">" + name + "</div>";'
+    ].join('\n')
+  });
+
+  // 43. Image with dynamic src and alt
+  checkEquiv('img dynamic attrs', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var src = "photo.jpg";',
+      'var alt = "Photo";',
+      'document.getElementById("out").innerHTML = "<img src=\\"" + src + "\\" alt=\\"" + alt + "\\">";'
+    ].join('\n')
+  });
+
+  // 44. Anchor with dynamic href
+  checkEquiv('anchor dynamic href', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var url = "https://example.com";',
+      'var text = "Click here";',
+      'document.getElementById("out").innerHTML = "<a href=\\"" + url + "\\" target=\\"_blank\\">" + text + "</a>";'
+    ].join('\n')
+  });
+
+  // 45. Full table with static data
+  checkEquiv('full table', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("out").innerHTML = "<table><thead><tr><th>Name</th><th>Age</th></tr></thead><tr><td>Alice</td><td>30</td></tr><tr><td>Bob</td><td>25</td></tr></table>";'
+  });
+
+  // 46. join with comma separator
+  checkEquiv('join comma separator', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("out").innerHTML = "<p>" + ["a", "b", "c"].join(", ") + "</p>";'
+  });
+
+  // 47. Arithmetic expression in text content
+  checkEquiv('arithmetic in text', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var width = 100;',
+      'var height = 50;',
+      'document.getElementById("out").innerHTML = "<p>Area: " + (width * height) + " sq px</p>";'
+    ].join('\n')
+  });
+
+  // 48. Ternary in attribute
+  checkEquiv('ternary in attr', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var isActive = true;',
+      'document.getElementById("out").innerHTML = "<div class=\\"" + (isActive ? "active" : "inactive") + "\\">status</div>";'
+    ].join('\n')
+  });
+
+  // 49. Multiple separate innerHTML targets from shared data
+  checkEquiv('shared data multi target', {
+    'index.html': '<html><body><h1 id="title"></h1><p id="desc"></p><span id="count"></span><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var data = {title: "Dashboard", desc: "Welcome", count: 42};',
+      'document.getElementById("title").innerHTML = data.title;',
+      'document.getElementById("desc").innerHTML = "<em>" + data.desc + "</em>";',
+      'document.getElementById("count").innerHTML = "<b>" + data.count + "</b> items";'
+    ].join('\n')
+  });
+
+  // 50. Build with counter, flag, and accumulator all together
+  checkEquiv('counter flag accum together', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var data = [{v:10,ok:true},{v:20,ok:false},{v:30,ok:true}];',
+      'var html = "<ul>";',
+      'var total = 0;',
+      'var okCount = 0;',
+      'for (var i = 0; i < data.length; i++) {',
+      '  html += "<li>" + data[i].v + "</li>";',
+      '  total += data[i].v;',
+      '  if (data[i].ok) okCount++;',
+      '}',
+      'html += "</ul>";',
+      'html += "<p>Total: " + total + ", OK: " + okCount + "</p>";',
+      'document.getElementById("out").innerHTML = html;'
+    ].join('\n')
+  });
+
   console.log(`  (${pass + fail - before} cases)`);
 })();
 

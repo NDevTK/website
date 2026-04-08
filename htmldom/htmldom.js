@@ -4811,16 +4811,17 @@
     const popEl = () => { if (elStack.length) elStack.pop(); };
     let textBuf = '';
     const flushText = () => {
-      if (textBuf) { addChild({ kind: 'text', text: textBuf }); textBuf = ''; }
+      if (textBuf) { addChild({ kind: 'text', text: decodeHtmlEntities(textBuf) }); textBuf = ''; }
     };
     let currentTagLoopId = null;
 
     const finishAttr = () => {
       if (!attrName || !currentEl) { attrName = ''; attrValue = ''; attrExprs = []; return; }
       if (attrExprs.length) {
-        currentEl.attrs.push({ kind: 'dynamic_value', name: attrName, value: attrValue, valueExprs: attrExprs.slice() });
+        // Dynamic attrs: decode the static portions, exprs stay as-is.
+        currentEl.attrs.push({ kind: 'dynamic_value', name: attrName, value: decodeHtmlEntities(attrValue), valueExprs: attrExprs.slice() });
       } else {
-        currentEl.attrs.push({ kind: 'static', name: attrName, value: attrValue });
+        currentEl.attrs.push({ kind: 'static', name: attrName, value: decodeHtmlEntities(attrValue) });
       }
       attrName = '';
       attrValue = '';
