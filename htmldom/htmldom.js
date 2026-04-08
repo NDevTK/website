@@ -5547,16 +5547,29 @@
               // The variable is set in each branch to wherever that branch
               // left the parent.
               var condParent = makeVar('current', used);
-              // Go back and insert the variable assignment at the end of each branch.
-              // Find the '} else {' line and insert before it.
+              // Insert the variable assignment in each branch, BEFORE any
+              // continue/break statements (which would skip the assignment).
+              function insertBeforeFlowControl(startIdx, endIdx, assignment) {
+                // Find the last non-flow-control line in the range.
+                var insertAt = endIdx;
+                for (var li = endIdx - 1; li >= startIdx; li--) {
+                  if (lines[li] === 'continue;' || lines[li] === 'break;') {
+                    insertAt = li;
+                  } else {
+                    break;
+                  }
+                }
+                lines.splice(insertAt, 0, assignment);
+              }
               var elseIdx = lines.lastIndexOf('} else {');
               if (elseIdx >= 0) {
-                lines.splice(elseIdx, 0, condParent + ' = ' + trueStack[trueStack.length - 1] + ';');
+                insertBeforeFlowControl(0, elseIdx, condParent + ' = ' + trueStack[trueStack.length - 1] + ';');
               }
-              // Insert at end of else branch (before the closing }).
+              // Re-find after splice.
               var closeIdx = lines.lastIndexOf('}');
               if (closeIdx >= 0) {
-                lines.splice(closeIdx, 0, condParent + ' = ' + falseStack[falseStack.length - 1] + ';');
+                var elseIdx2 = lines.lastIndexOf('} else {');
+                insertBeforeFlowControl(elseIdx2 + 1, closeIdx, condParent + ' = ' + falseStack[falseStack.length - 1] + ';');
               }
               // Add var declaration before the if.
               var ifIdx = -1;
