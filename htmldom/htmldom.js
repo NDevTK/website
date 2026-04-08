@@ -351,8 +351,8 @@
       if (target === '' || target.startsWith('.')) {
         const r = reconstructTarget(tokens, i - 1);
         if (!r) continue;
-        // Combine reconstructed base with any remaining prefix.
-        target = target.startsWith('.') ? r + target : r;
+        target = target.startsWith('.') ? r.text + target : r.text;
+        targetSrcStart = r.srcStart;
       }
       let depth = 0;
       let rhsEnd = tokens.length;
@@ -366,7 +366,7 @@
         }
       }
       // Source character positions for the entire statement.
-      const srcStart = prev.start;
+      const srcStart = targetSrcStart >= 0 ? targetSrcStart : prev.start;
       let srcEnd = rhsEnd < tokens.length ? tokens[rhsEnd].end : tokens[tokens.length - 1].end;
       if (rhsEnd < tokens.length && tokens[rhsEnd].type === 'sep' && tokens[rhsEnd].char === ';') {
         srcEnd = tokens[rhsEnd].end;
@@ -404,8 +404,8 @@
     const firstIdx = j + 1;
     if (firstIdx > accessorIdx - 1) return null;
     const first = tokens[firstIdx];
-    // Exclude the trailing .innerHTML/.outerHTML from the target slice.
-    return first._src.slice(first.start, startAccessor.start).trim() || null;
+    var text = first._src.slice(first.start, startAccessor.start).trim() || null;
+    return text ? { text, srcStart: first.start } : null;
   }
 
   const IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
@@ -862,6 +862,11 @@
         const p = parts[i];
         if (b.kind === 'object') {
           b = b.props[p] || null;
+        } else if (b.kind === 'chain' && b.toks.length === 1 && b.toks[0].type === 'other') {
+          // Opaque chain (e.g. parameter bound to exprRef) — extend the
+          // path so `column.title` becomes `store.columns[i].title`.
+          b = chainBinding([exprRef(b.toks[0].text + '.' + parts.slice(i).join('.'))]);
+          break;
         } else if (p === 'length' && b.kind === 'array') {
           b = chainBinding([makeSynthStr(String(b.elems.length))]);
         } else if (p === 'length' && b.kind === 'chain') {
