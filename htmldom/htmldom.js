@@ -242,20 +242,31 @@
     // Determine build variables from the RHS (single ident or concat of idents).
     const rhsToks = [];
     for (let j = assign.rhsStart; j < assign.rhsEnd; j++) rhsToks.push(tokens[j]);
-    // Collect identifiers in the RHS that are true build variables: they
-    // were built up via `var x = "..."; x += "...";` patterns, not just
-    // simple references. A build variable must have a `+=` assignment
-    // somewhere in the source preceding the innerHTML site.
+    // Collect identifiers in the RHS that are build variables: they
+    // were built up via `x += "..."` patterns, OR they are the sole
+    // RHS identifier and were assigned HTML strings (containing '<')
+    // via `x = "..."` before the innerHTML site. The second case
+    // handles try-catch/if-else patterns where x is assigned HTML
+    // in different branches via = instead of +=.
     const buildVars = [];
     for (const rt of rhsToks) {
       if (rt.type !== 'other' || !IDENT_RE.test(rt.text)) continue;
-      // Check: is this identifier assigned via += anywhere before the innerHTML?
       let isBuildVar = false;
       for (let bi = 0; bi < assign.eqIdx; bi++) {
-        if (tokens[bi].type === 'other' && tokens[bi].text === rt.text &&
-            bi + 1 < tokens.length && tokens[bi + 1].type === 'sep' && tokens[bi + 1].char === '+=') {
-          isBuildVar = true;
-          break;
+        if (tokens[bi].type !== 'other' || tokens[bi].text !== rt.text) continue;
+        const nextTok = tokens[bi + 1];
+        if (!nextTok || nextTok.type !== 'sep') continue;
+        // += is always a build variable indicator.
+        if (nextTok.char === '+=') { isBuildVar = true; break; }
+        // = with an HTML string on the RHS (sole-identifier case).
+        if (nextTok.char === '=' && rhsToks.length === 1) {
+          // Scan the RHS of this assignment for a string containing '<'.
+          for (let rbi = bi + 2; rbi < tokens.length; rbi++) {
+            const rbt = tokens[rbi];
+            if (rbt.type === 'sep' && (rbt.char === ';' || rbt.char === ',')) break;
+            if (rbt.type === 'str' && /</.test(rbt.text)) { isBuildVar = true; break; }
+          }
+          if (isBuildVar) break;
         }
       }
       if (isBuildVar) buildVars.push(rt.text);
@@ -3419,12 +3430,26 @@
             const snapB = snapshot[name];
             if (snapB && snapB.kind === 'chain') {
               if (trackBuildVar && trackBuildVar.has(name)) {
-                const tryExtra = tryFull.slice(snapB.toks.length);
-                const catchExtra = catchFull.slice(snapB.toks.length);
+                const snapFull = snapB.toks;
                 const stripPlus = (arr) => (arr.length && arr[0].type === 'plus') ? arr.slice(1) : arr;
-                // Use a 'trycatch' token that the parser/emitter handles.
-                const tryCatchTok = { type: 'trycatch', tryBody: stripPlus(tryExtra), catchBody: stripPlus(catchExtra), catchParam };
-                assignName(name, chainBinding([...snapB.toks, SYNTH_PLUS, tryCatchTok]));
+                const startsWithSnap = (full) => {
+                  if (full.length < snapFull.length) return false;
+                  for (let s = 0; s < snapFull.length; s++) {
+                    if (JSON.stringify(full[s]) !== JSON.stringify(snapFull[s])) return false;
+                  }
+                  return true;
+                };
+                const tryAppended = startsWithSnap(tryFull);
+                const catchAppended = startsWithSnap(catchFull);
+                const tryExtra = tryAppended ? stripPlus(tryFull.slice(snapFull.length)) : tryFull;
+                const catchExtra = catchAppended ? stripPlus(catchFull.slice(snapFull.length)) : catchFull;
+                const tryCatchTok = { type: 'trycatch', tryBody: tryExtra, catchBody: catchExtra, catchParam };
+                if (tryAppended && catchAppended) {
+                  assignName(name, chainBinding([...snapB.toks, SYNTH_PLUS, tryCatchTok]));
+                } else {
+                  // Full replacement in at least one branch.
+                  assignName(name, chainBinding([tryCatchTok]));
+                }
               } else {
                 assignName(name, chainBinding([exprRef(name)]));
               }
@@ -4516,31 +4541,38 @@
 
       // Check the build-and-return pattern using the tokenizer to
       // avoid matching inside strings or comments.
-      let hasInnerHTML = false, hasVarHtml = false, hasHtmlConcat = false, hasReturnHtml = false;
-      // Tokenize the body to check patterns properly.
+      let hasInnerHTML = false;
+      // Tokenize the body to check for the build-and-return pattern.
+      // Find any variable that: (1) is declared with var/let X = ...,
+      // (2) has X += ..., and (3) has return X. The variable can have
+      // any name, not just "html".
       const bodyToks = tokenize(body);
+      const declaredVars = new Set();
+      const concatVars = new Set();
+      const returnedVars = new Set();
       for (let bi = 0; bi < bodyToks.length; bi++) {
         const bt = bodyToks[bi];
         if (bt.type === 'other' && /\.innerHTML$/.test(bt.text)) hasInnerHTML = true;
-        // var html = ... or let html = ...
         if (bt.type === 'other' && (bt.text === 'var' || bt.text === 'let') &&
-            bi + 1 < bodyToks.length && bodyToks[bi + 1].type === 'other' && bodyToks[bi + 1].text === 'html' &&
+            bi + 1 < bodyToks.length && bodyToks[bi + 1].type === 'other' && IDENT_RE.test(bodyToks[bi + 1].text) &&
             bi + 2 < bodyToks.length && bodyToks[bi + 2].type === 'sep' && bodyToks[bi + 2].char === '=') {
-          hasVarHtml = true;
+          declaredVars.add(bodyToks[bi + 1].text);
         }
-        // html +=
-        if (bt.type === 'other' && bt.text === 'html' &&
+        if (bt.type === 'other' && IDENT_RE.test(bt.text) &&
             bi + 1 < bodyToks.length && bodyToks[bi + 1].type === 'sep' && bodyToks[bi + 1].char === '+=') {
-          hasHtmlConcat = true;
+          concatVars.add(bt.text);
         }
-        // return html
         if (bt.type === 'other' && bt.text === 'return' &&
-            bi + 1 < bodyToks.length && bodyToks[bi + 1].type === 'other' && bodyToks[bi + 1].text === 'html') {
-          hasReturnHtml = true;
+            bi + 1 < bodyToks.length && bodyToks[bi + 1].type === 'other' && IDENT_RE.test(bodyToks[bi + 1].text)) {
+          returnedVars.add(bodyToks[bi + 1].text);
         }
       }
-
-      if (hasInnerHTML || !hasVarHtml || !hasHtmlConcat || !hasReturnHtml) continue;
+      // Find the build variable: declared, concatenated, and returned.
+      let buildVarName = null;
+      for (const v of declaredVars) {
+        if (concatVars.has(v) && returnedVars.has(v)) { buildVarName = v; break; }
+      }
+      if (hasInnerHTML || !buildVarName) continue;
 
       // Convert: replace `return html` with a synthetic innerHTML
       // assignment, run through the converter, wrap in fragment.
@@ -4548,14 +4580,13 @@
       let syntheticBody = body;
       for (let bi = 0; bi < bodyToks.length; bi++) {
         if (bodyToks[bi].type === 'other' && bodyToks[bi].text === 'return' &&
-            bi + 1 < bodyToks.length && bodyToks[bi + 1].type === 'other' && bodyToks[bi + 1].text === 'html') {
+            bi + 1 < bodyToks.length && bodyToks[bi + 1].type === 'other' && bodyToks[bi + 1].text === buildVarName) {
           const retStart = bodyToks[bi].start;
-          // Find end: skip past 'html' and optional ;
           let retEnd = bodyToks[bi + 1].end;
           if (bi + 2 < bodyToks.length && bodyToks[bi + 2].type === 'sep' && bodyToks[bi + 2].char === ';') {
             retEnd = bodyToks[bi + 2].end;
           }
-          syntheticBody = body.slice(0, retStart) + '__frag.innerHTML = html;' + body.slice(retEnd);
+          syntheticBody = body.slice(0, retStart) + '__frag.innerHTML = ' + buildVarName + ';' + body.slice(retEnd);
           break;
         }
       }
@@ -4852,12 +4883,21 @@
       // Auto-insert <tbody> when <tr> is a direct child of <table>,
       // matching innerHTML's HTML parser behavior. Reuse an existing
       // <tbody> if the table already has one as its last child.
+      // Auto-close implicit <tbody> when a table section element
+      // (thead, tfoot, caption, colgroup) is encountered as a sibling.
+      const parentEl = elStack.length ? elStack[elStack.length - 1] : null;
+      if (parentEl && parentEl.tag === 'tbody' &&
+          (currentEl.tag === 'tfoot' || currentEl.tag === 'thead' ||
+           currentEl.tag === 'caption' || currentEl.tag === 'colgroup')) {
+        elStack.pop(); // pop implicit tbody
+      }
+      // Re-read parent after possible pop.
+      const parentEl2 = elStack.length ? elStack[elStack.length - 1] : null;
       // Auto-insert <tbody> when <tr> is a direct child of <table>.
       // The <tbody> is a structural wrapper — it does NOT carry loopId
       // because it exists once, while the <tr> inside it repeats.
-      const parentEl = elStack.length ? elStack[elStack.length - 1] : null;
-      if (currentEl.tag === 'tr' && parentEl && parentEl.tag === 'table') {
-        const lastChild = parentEl.children[parentEl.children.length - 1];
+      if (currentEl.tag === 'tr' && parentEl2 && parentEl2.tag === 'table') {
+        const lastChild = parentEl2.children[parentEl2.children.length - 1];
         if (lastChild && lastChild.kind === 'element' && lastChild.tag === 'tbody') {
           elStack.push(lastChild);
         } else {
