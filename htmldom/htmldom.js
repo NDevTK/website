@@ -3974,33 +3974,56 @@
   }
 
   // Convert a style="..." attribute value into an array of style.* assignments.
-  function parseStyle(val) {
-    const out = [];
-    // Split on ; that are not inside parens (e.g. url(a;b)).
-    let depth = 0, cur = '';
-    for (let i = 0; i < val.length; i++) {
-      const c = val[i];
-      if (c === '(') depth++;
-      else if (c === ')') depth--;
-      if (c === ';' && depth === 0) { if (cur.trim()) out.push(cur.trim()); cur = ''; }
-      else cur += c;
-    }
-    if (cur.trim()) out.push(cur.trim());
-    const decls = [];
-    for (const d of out) {
-      const idx = d.indexOf(':');
-      if (idx === -1) continue;
-      const prop = d.slice(0, idx).trim().toLowerCase();
-      let value = d.slice(idx + 1).trim();
-      let priority = '';
-      const important = /!\s*important\s*$/i;
-      if (important.test(value)) {
-        value = value.replace(important, '').trim();
-        priority = 'important';
+  // Parse CSS declarations from a style attribute value.
+  // Handles quoted strings, parens (url(), calc()), and !important.
+  // Returns array of { prop, value, important }.
+  function parseStyleDecls(styleVal) {
+    // Split on ; respecting parens and quoted strings.
+    const parts = [];
+    let depth = 0, cur = '', quote = '';
+    for (let i = 0; i < styleVal.length; i++) {
+      const c = styleVal[i];
+      if (quote) {
+        cur += c;
+        if (c === '\\' && i + 1 < styleVal.length) {
+          i++;
+          cur += styleVal[i];
+        } else if (c === quote) {
+          quote = '';
+        }
+        continue;
       }
-      decls.push({ prop, value, priority });
+      if (c === '"' || c === "'") {
+        quote = c;
+        cur += c;
+        continue;
+      }
+      if (c === '(') depth++;
+      else if (c === ')' && depth > 0) depth--;
+      if (c === ';' && depth === 0) {
+        if (cur.trim()) parts.push(cur.trim());
+        cur = '';
+      } else {
+        cur += c;
+      }
     }
-    return decls;
+    if (cur.trim()) parts.push(cur.trim());
+
+    const result = [];
+    for (const d of parts) {
+      const colon = d.indexOf(':');
+      if (colon < 0) continue;
+      const prop = d.slice(0, colon).trim().toLowerCase();
+      let val = d.slice(colon + 1).trim();
+      let important = false;
+      const impIdx = val.toLowerCase().lastIndexOf('!important');
+      if (impIdx >= 0 && impIdx === val.length - '!important'.length) {
+        val = val.slice(0, impIdx).trim();
+        important = true;
+      }
+      result.push({ prop: prop, value: val, important: important });
+    }
+    return result;
   }
 
 
@@ -4008,66 +4031,128 @@
   // variable (var html = ''; html += ...; return html;). Convert each
   // independently to return a DocumentFragment with DOM operations.
   // This avoids multi-level inlining which flattens scopes.
-  // Returns the transformed source.
+  // Uses the JS tokenizer for proper function detection and brace
+  // matching (handles strings, comments, regex containing braces).
   function convertHtmlBuilderFunctions(source) {
-    // Use a simple regex scan to find function declarations with the
-    // build-and-return pattern. This is deliberately conservative —
-    // only matches straightforward cases.
     const result = { source: source, converted: new Set() };
-    const funcRe = /function\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(([^)]*)\)\s*\{/g;
-    let fm;
+    const toks = tokenize(source);
     const replacements = []; // { start, end, replacement }
-    while ((fm = funcRe.exec(source)) !== null) {
-      const funcName = fm[1];
-      const params = fm[2];
-      const bodyStart = fm.index + fm[0].length;
-      // Find matching closing brace.
-      let depth = 1, k = bodyStart;
-      while (k < source.length && depth > 0) {
-        if (source[k] === '{') depth++;
-        else if (source[k] === '}') depth--;
-        if (depth > 0) k++;
+
+    for (let i = 0; i < toks.length; i++) {
+      // Look for: function NAME ( params ) {
+      if (toks[i].type !== 'other' || toks[i].text !== 'function') continue;
+      const funcStart = toks[i].start;
+
+      // Skip to name.
+      let j = i + 1;
+      while (j < toks.length && toks[j].type === 'sep' && toks[j].char === ';') j++;
+      if (j >= toks.length || toks[j].type !== 'other') continue;
+      const funcName = toks[j].text;
+      j++;
+
+      // Skip to (.
+      if (j >= toks.length || toks[j].type !== 'open' || toks[j].char !== '(') continue;
+      const paramsStart = toks[j].end;
+      j++;
+
+      // Find matching ).
+      let parenDepth = 1;
+      while (j < toks.length && parenDepth > 0) {
+        if (toks[j].type === 'open' && toks[j].char === '(') parenDepth++;
+        else if (toks[j].type === 'close' && toks[j].char === ')') parenDepth--;
+        if (parenDepth > 0) j++;
       }
-      const bodyEnd = k;
-      const body = source.slice(bodyStart, bodyEnd);
-      // Check the pattern: has var html = ..., has html +=, has return html, no innerHTML.
-      if (!/\binnerHTML\b/.test(body) &&
-          /\bvar\s+html\s*=/.test(body) &&
-          /\bhtml\s*\+=/.test(body) &&
-          /\breturn\s+html\s*[;\n}]/.test(body)) {
-        // Convert: replace `return html;` with a synthetic innerHTML
-        // assignment, run through the converter, wrap in fragment.
-        const syntheticBody = body.replace(
-          /\breturn\s+html\s*;?/,
-          '__frag.innerHTML = html;'
-        );
-        const extractions = extractAllHTML(syntheticBody);
-        if (extractions.length > 0) {
-          const ex = extractions[0];
-          const used = new Set();
-          const domBlock = convertOne(syntheticBody, ex, false, false, used, '__frag', result.converted);
-          if (domBlock) {
-            // Build the new function body.
-            let converted = domBlock
-              .replace('__frag.replaceChildren();\n', '')
-              .replace(/__frag/g, '__f');
-            // Indent properly.
-            const indented = converted.split('\n').map(l => '  ' + l).join('\n');
-            const newBody = '  var __f = document.createDocumentFragment();\n' + indented + '\n  return __f;\n';
-            replacements.push({
-              start: fm.index,
-              end: bodyEnd + 1, // include closing }
-              replacement: 'function ' + funcName + '(' + params + ') {\n' + newBody + '}'
-            });
-            result.converted.add(funcName);
+      if (parenDepth !== 0 || j >= toks.length) continue;
+      const params = source.slice(paramsStart, toks[j].start);
+      j++;
+
+      // Skip to {.
+      if (j >= toks.length || toks[j].type !== 'open' || toks[j].char !== '{') continue;
+      const bodyStartPos = toks[j].end;
+      j++;
+
+      // Find matching } using the tokenizer's brace tracking.
+      let braceDepth = 1;
+      while (j < toks.length && braceDepth > 0) {
+        if (toks[j].type === 'open' && toks[j].char === '{') braceDepth++;
+        else if (toks[j].type === 'close' && toks[j].char === '}') braceDepth--;
+        if (braceDepth > 0) j++;
+      }
+      if (braceDepth !== 0 || j >= toks.length) continue;
+      const bodyEndPos = toks[j].start;
+      const funcEnd = toks[j].end;
+      const body = source.slice(bodyStartPos, bodyEndPos);
+
+      // Check the build-and-return pattern using the tokenizer to
+      // avoid matching inside strings or comments.
+      let hasInnerHTML = false, hasVarHtml = false, hasHtmlConcat = false, hasReturnHtml = false;
+      // Tokenize the body to check patterns properly.
+      const bodyToks = tokenize(body);
+      for (let bi = 0; bi < bodyToks.length; bi++) {
+        const bt = bodyToks[bi];
+        if (bt.type === 'other' && /\.innerHTML$/.test(bt.text)) hasInnerHTML = true;
+        // var html = ... or let html = ...
+        if (bt.type === 'other' && (bt.text === 'var' || bt.text === 'let') &&
+            bi + 1 < bodyToks.length && bodyToks[bi + 1].type === 'other' && bodyToks[bi + 1].text === 'html' &&
+            bi + 2 < bodyToks.length && bodyToks[bi + 2].type === 'sep' && bodyToks[bi + 2].char === '=') {
+          hasVarHtml = true;
+        }
+        // html +=
+        if (bt.type === 'other' && bt.text === 'html' &&
+            bi + 1 < bodyToks.length && bodyToks[bi + 1].type === 'sep' && bodyToks[bi + 1].char === '+=') {
+          hasHtmlConcat = true;
+        }
+        // return html
+        if (bt.type === 'other' && bt.text === 'return' &&
+            bi + 1 < bodyToks.length && bodyToks[bi + 1].type === 'other' && bodyToks[bi + 1].text === 'html') {
+          hasReturnHtml = true;
+        }
+      }
+
+      if (hasInnerHTML || !hasVarHtml || !hasHtmlConcat || !hasReturnHtml) continue;
+
+      // Convert: replace `return html` with a synthetic innerHTML
+      // assignment, run through the converter, wrap in fragment.
+      // Find the return html token position in body to do the replacement.
+      let syntheticBody = body;
+      for (let bi = 0; bi < bodyToks.length; bi++) {
+        if (bodyToks[bi].type === 'other' && bodyToks[bi].text === 'return' &&
+            bi + 1 < bodyToks.length && bodyToks[bi + 1].type === 'other' && bodyToks[bi + 1].text === 'html') {
+          const retStart = bodyToks[bi].start;
+          // Find end: skip past 'html' and optional ;
+          let retEnd = bodyToks[bi + 1].end;
+          if (bi + 2 < bodyToks.length && bodyToks[bi + 2].type === 'sep' && bodyToks[bi + 2].char === ';') {
+            retEnd = bodyToks[bi + 2].end;
           }
+          syntheticBody = body.slice(0, retStart) + '__frag.innerHTML = html;' + body.slice(retEnd);
+          break;
+        }
+      }
+
+      const extractions = extractAllHTML(syntheticBody);
+      if (extractions.length > 0) {
+        const ex = extractions[0];
+        const used = new Set();
+        const domBlock = convertOne(syntheticBody, ex, false, false, used, '__frag', result.converted);
+        if (domBlock) {
+          let converted = domBlock
+            .replace('__frag.replaceChildren();\n', '')
+            .replace(/__frag/g, '__f');
+          const indented = converted.split('\n').map(function(l) { return '  ' + l; }).join('\n');
+          const newBody = '  var __f = document.createDocumentFragment();\n' + indented + '\n  return __f;\n';
+          replacements.push({
+            start: funcStart,
+            end: funcEnd,
+            replacement: 'function ' + funcName + '(' + params + ') {\n' + newBody + '}'
+          });
+          result.converted.add(funcName);
         }
       }
     }
     // Apply replacements in reverse order.
     if (replacements.length) {
       let s = source;
-      replacements.sort((a, b) => b.start - a.start);
+      replacements.sort(function(a, b) { return b.start - a.start; });
       for (const r of replacements) {
         s = s.slice(0, r.start) + r.replacement + s.slice(r.end);
       }
@@ -4785,10 +4870,10 @@
 
       // Style -> style.setProperty.
       if (name === 'style' && opts.splitStyle && !hasDynamic) {
-        const decls = parseStyle(attr.value);
+        const decls = parseStyleDecls(attr.value);
         if (decls.length) {
           for (const d of decls) {
-            lines.push(v + '.style.setProperty(' + jsStr(d.prop).code + ', ' + jsStr(d.value).code + (d.priority ? ", 'important'" : '') + ');');
+            lines.push(v + '.style.setProperty(' + jsStr(d.prop).code + ', ' + jsStr(d.value).code + (d.important ? ", 'important'" : '') + ');');
           }
           continue;
         }
@@ -5170,8 +5255,28 @@
   }
 
   // Decode HTML entities in attribute values.
+  // Handles named entities, decimal (&#123;), and hex (&#xA0;) numeric entities.
+  var HTML_ENTITIES = {
+    amp: '&', lt: '<', gt: '>', quot: '"', apos: "'",
+    nbsp: '\u00A0', ensp: '\u2002', emsp: '\u2003', thinsp: '\u2009',
+    mdash: '\u2014', ndash: '\u2013', lsquo: '\u2018', rsquo: '\u2019',
+    ldquo: '\u201C', rdquo: '\u201D', bull: '\u2022', hellip: '\u2026',
+    copy: '\u00A9', reg: '\u00AE', trade: '\u2122', deg: '\u00B0',
+    plusmn: '\u00B1', times: '\u00D7', divide: '\u00F7', micro: '\u00B5',
+    cent: '\u00A2', pound: '\u00A3', euro: '\u20AC', yen: '\u00A5',
+    laquo: '\u00AB', raquo: '\u00BB', larr: '\u2190', rarr: '\u2192',
+    uarr: '\u2191', darr: '\u2193', para: '\u00B6', sect: '\u00A7',
+    iexcl: '\u00A1', iquest: '\u00BF', frac12: '\u00BD', frac14: '\u00BC',
+    frac34: '\u00BE', sup1: '\u00B9', sup2: '\u00B2', sup3: '\u00B3',
+    acute: '\u00B4', cedil: '\u00B8',
+  };
   function decodeHtmlEntities(s) {
-    return s.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&#x27;/g, "'");
+    return s.replace(/&(#x([0-9a-fA-F]+)|#([0-9]+)|([a-zA-Z]+));/g, function(match, _, hex, dec, named) {
+      if (hex) return String.fromCodePoint(parseInt(hex, 16));
+      if (dec) return String.fromCodePoint(parseInt(dec, 10));
+      if (named && HTML_ENTITIES[named]) return HTML_ENTITIES[named];
+      return match; // Unknown entity — preserve as-is.
+    });
   }
 
   // Serialize HTML tokens back to a string.
@@ -5192,41 +5297,6 @@
       }
     }
     return out;
-  }
-
-  // Parse CSS style declarations from a style attribute value.
-  // Returns array of { prop, value, important }.
-  function parseStyleDecls(styleVal) {
-    const decls = [];
-    let depth = 0, cur = '';
-    for (let i = 0; i < styleVal.length; i++) {
-      const c = styleVal[i];
-      if (c === '(') depth++;
-      else if (c === ')') depth--;
-      if (c === ';' && depth === 0) {
-        if (cur.trim()) decls.push(cur.trim());
-        cur = '';
-      } else {
-        cur += c;
-      }
-    }
-    if (cur.trim()) decls.push(cur.trim());
-
-    const result = [];
-    for (const d of decls) {
-      const colon = d.indexOf(':');
-      if (colon < 0) continue;
-      const prop = d.slice(0, colon).trim();
-      let val = d.slice(colon + 1).trim();
-      let important = false;
-      const impIdx = val.toLowerCase().lastIndexOf('!important');
-      if (impIdx >= 0 && impIdx === val.length - '!important'.length) {
-        val = val.slice(0, impIdx).trim();
-        important = true;
-      }
-      result.push({ prop: prop, value: val, important: important });
-    }
-    return result;
   }
 
   function convertHtmlMarkup(htmlContent, htmlPath) {
