@@ -1021,6 +1021,153 @@ function render() {
 });
 
 // -----------------------------------------------------------------------
+// convertProject: multi-file project conversion
+// -----------------------------------------------------------------------
+(function () {
+  if (!globalThis.__convertProject) { console.log('\nconvertProject not available — skipping'); return; }
+  const cp = globalThis.__convertProject;
+  const before = pass + fail;
+  console.log('\nconvertProject');
+  console.log('--------------');
+
+  // Helper: check output files match expectations.
+  function checkProject(name, files, expectedKeys, checks) {
+    const out = cp(files);
+    const gotKeys = Object.keys(out).sort();
+    const wantKeys = expectedKeys.sort();
+    if (JSON.stringify(gotKeys) !== JSON.stringify(wantKeys)) {
+      fail++;
+      failures.push({ name: name + ' (files)', input: Object.keys(files), want: wantKeys, got: gotKeys });
+      return;
+    }
+    if (checks) {
+      for (const [key, test] of Object.entries(checks)) {
+        if (!test(out[key] || '')) {
+          fail++;
+          failures.push({ name: name + ' (' + key + ')', input: key, want: 'check failed', got: (out[key] || '').slice(0, 100) });
+          return;
+        }
+      }
+    }
+    pass++;
+  }
+
+  // 1. JS file with innerHTML → converted in place, same filename.
+  checkProject('JS converted in place',
+    {
+      'index.html': '<html><body><div id="app"></div><script src="app.js"></script></body></html>',
+      'app.js': 'document.getElementById("app").innerHTML = "<p>" + text + "</p>";'
+    },
+    ['app.js'],
+    { 'app.js': c => /createElement/.test(c) && !/innerHTML/.test(c) }
+  );
+
+  // 2. JS without innerHTML → not in output.
+  checkProject('clean JS not in output',
+    {
+      'index.html': '<html><body><script src="utils.js"></script><script src="app.js"></script></body></html>',
+      'utils.js': 'function helper() { return 1; }',
+      'app.js': 'el.innerHTML = "<div>" + helper() + "</div>";'
+    },
+    ['app.js'],
+    { 'app.js': c => /createElement/.test(c) }
+  );
+
+  // 3. Inline events/styles → handlers file.
+  checkProject('inline events to handlers',
+    {
+      'page.html': '<html><body><button onclick="go()" style="color:red">Go</button></body></html>'
+    },
+    ['page.html', 'page.handlers.js'],
+    {
+      'page.html': c => !/onclick/.test(c) && !/style=/.test(c),
+      'page.handlers.js': c => /addEventListener/.test(c) && /setProperty/.test(c)
+    }
+  );
+
+  // 4. Inline <script> extracted to external file.
+  checkProject('inline script extracted',
+    {
+      'app.html': '<html><body><script>var x = 1;</script></body></html>'
+    },
+    ['app.html', 'app.js'],
+    {
+      'app.html': c => /<script src="app\.js">/.test(c) && !/>var x/.test(c),
+      'app.js': c => /var x = 1/.test(c)
+    }
+  );
+
+  // 5. Inline <style> extracted to external file.
+  checkProject('inline style extracted',
+    {
+      'page.html': '<html><head><style>body { color: red; }</style></head><body></body></html>'
+    },
+    ['page.html', 'page.css'],
+    {
+      'page.html': c => /link.*href="page\.css"/.test(c) && !/<style>/.test(c),
+      'page.css': c => /body.*color.*red/.test(c)
+    }
+  );
+
+  // 6. Two HTML pages — no collision.
+  checkProject('two pages no collision',
+    {
+      'a.html': '<html><body><button onclick="x()">A</button></body></html>',
+      'b.html': '<html><body><button onclick="y()">B</button></body></html>'
+    },
+    ['a.html', 'a.handlers.js', 'b.html', 'b.handlers.js'],
+    {
+      'a.handlers.js': c => /x\(\)/.test(c) && !/y\(\)/.test(c),
+      'b.handlers.js': c => /y\(\)/.test(c) && !/x\(\)/.test(c)
+    }
+  );
+
+  // 7. Cross-file scope: app.js uses var from store.js.
+  checkProject('cross-file scope',
+    {
+      'index.html': '<html><body><div id="app"></div><script src="store.js"></script><script src="app.js"></script></body></html>',
+      'store.js': 'var items = []; function addItem(t) { items.push(t); }',
+      'app.js': 'var html = ""; for (var i = 0; i < items.length; i++) { html += "<li>" + items[i] + "</li>"; } document.getElementById("app").innerHTML = html;'
+    },
+    ['app.js'],
+    { 'app.js': c => /createElement/.test(c) && /items\[i\]/.test(c) }
+  );
+
+  // 8. Standalone JS (not referenced by any HTML) converted in place.
+  checkProject('standalone JS',
+    {
+      'page.html': '<html><body><p>Static</p></body></html>',
+      'widget.js': 'document.body.innerHTML = "<div>" + x + "</div>";'
+    },
+    ['widget.js'],
+    { 'widget.js': c => /createElement/.test(c) }
+  );
+
+  // 9. Clean HTML with no unsafe content → not in output.
+  checkProject('clean HTML not in output',
+    {
+      'clean.html': '<html><body><p>Hello</p></body></html>'
+    },
+    []
+  );
+
+  // 10. HTML with both inline script AND external script.
+  checkProject('mixed inline and external scripts',
+    {
+      'app.html': '<html><body><div id="out"></div><script src="lib.js"></script><script>document.getElementById("out").innerHTML = "<b>" + greet() + "</b>";</script></body></html>',
+      'lib.js': 'function greet() { return "hi"; }'
+    },
+    ['app.html', 'app.js'],
+    {
+      'app.html': c => /script src="lib\.js"/.test(c) && /script src="app\.js"/.test(c),
+      'app.js': c => /createElement/.test(c)
+    }
+  );
+
+  console.log(`  (${pass + fail - before} cases)`);
+})();
+
+// -----------------------------------------------------------------------
 // Report
 // -----------------------------------------------------------------------
 console.log('');

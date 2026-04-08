@@ -4079,9 +4079,9 @@
   // Core conversion: takes a raw input string, returns the converted output.
   // sourceName: optional filename for naming output files (e.g. 'index.html').
   function convertRaw(raw, sourceName) {
-    // Derive the safe-handlers filename from the source.
+    // Derive the handlers filename from the source.
     const baseName = sourceName ? sourceName.replace(/\.[^.]+$/, '') : 'index';
-    const handlersFile = baseName + '.safe-handlers.js';
+    const handlersFile = baseName + '.handlers.js';
     try {
       // If input starts with HTML, split into HTML portions and <script>
       // blocks. Convert HTML to DOM API, process script blocks for
@@ -5139,7 +5139,7 @@
 
   function convertHtmlMarkup(htmlContent, htmlPath) {
     const baseName = (htmlPath.indexOf('/') >= 0 ? htmlPath.slice(htmlPath.lastIndexOf('/') + 1) : htmlPath).replace(/\.[^.]+$/, '');
-    const handlersFile = baseName + '.safe-handlers.js';
+    const handlersFile = baseName + '.handlers.js';
     let processed = htmlContent;
     let elemCounter = 0;
     const jsLines = [];
@@ -5248,8 +5248,8 @@
     for (const page of htmlPages) {
       const markup = convertHtmlMarkup(files[page], page);
       const dir = page.indexOf('/') >= 0 ? page.slice(0, page.lastIndexOf('/') + 1) : '';
-      // The HTML is always output (inline scripts/styles extracted).
-      output[page] = markup.html;
+      // Only output HTML if it actually changed.
+      if (markup.html !== files[page]) output[page] = markup.html;
       if (markup.handlers) {
         output[dir + markup.handlers.name] = markup.handlers.content;
       }
