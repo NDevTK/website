@@ -2187,26 +2187,10 @@
       }
       if (t.type === 'regex') return { bind: chainBinding([exprRef(t.text)]), next: k + 1 };
       if (t.type === 'open' && t.char === '(') {
-        // First try the normal concat parse.
         const r = readConcatExpr(k + 1, stop, { sep: [], close: [')'] });
         if (!r) return null;
         const rp = tks[r.next];
         if (!rp || rp.type !== 'close' || rp.char !== ')') return null;
-        // If the result is a multi-operand concat chain (has plus tokens)
-        // AND the parenthesized expression contains no string literals,
-        // this is likely arithmetic (r * 3 + c), not string concatenation.
-        // Return it as a single opaque expression instead.
-        if (r.toks.some(rt => rt.type === 'plus')) {
-          let hasStr = false;
-          for (let pi = k + 1; pi < r.next; pi++) {
-            if (tks[pi].type === 'str' || tks[pi].type === 'tmpl') { hasStr = true; break; }
-          }
-          if (!hasStr) {
-            const first = tks[k];
-            const last = tks[r.next];
-            return { bind: chainBinding([exprRef(first._src.slice(first.start, last.end))]), next: r.next + 1 };
-          }
-        }
         return { bind: chainBinding(r.toks), next: r.next + 1 };
       }
       if (t.type === 'open' && t.char === '[') {
@@ -2707,10 +2691,26 @@
         }
         if (v !== null) return chainBinding([makeSynthStr(String(v))]);
       }
-      // `+` is overloaded in JS. When both operands aren't concrete numbers
-      // we decline here and let the caller (concat-chain parser) handle it
-      // as string concatenation.
-      if (op === '+') return null;
+      // `+` is overloaded in JS: numeric addition or string concatenation.
+      // If neither operand is a known string, treat as arithmetic (symbolic).
+      // Only fall through to the concat-chain parser when at least one side
+      // could be a string (known string literal or multi-token chain that
+      // likely contains HTML).
+      if (op === '+') {
+        const lStr = chainAsKnownString(left);
+        const rStr = chainAsKnownString(right);
+        const lIsStr = lStr !== null || (left.toks.length > 1);
+        const rIsStr = rStr !== null || (right.toks.length > 1);
+        if (!lIsStr && !rIsStr) {
+          // Neither side is a known string — treat as arithmetic.
+          const lt = chainAsExprText(left);
+          const rt = chainAsExprText(right);
+          if (lt !== null && rt !== null) {
+            return chainBinding([exprRef('(' + lt + ' + ' + rt + ')')]);
+          }
+        }
+        return null; // Let concat-chain parser handle string concatenation.
+      }
       // Short-circuit logical/nullish operators using whichever concrete
       // value (number or string) the left-hand side has.
       const lStr = lNum === null ? chainAsKnownString(left) : null;
