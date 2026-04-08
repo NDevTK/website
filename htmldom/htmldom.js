@@ -5070,7 +5070,7 @@
       return lines.length ? lines.join('\n') : '// (no nodes parsed)';
     }
 
-    var pVar = makeVar('__p', used);
+    var pVar = makeVar('parent', used);
     const pVarStack = []; // for _targetPush/_targetPop
     let needsP = false;
     const SVG_NS_STR = "'http://www.w3.org/2000/svg'";
@@ -5332,7 +5332,7 @@
         if (t.type === '_targetPush') {
           hFlushText();
           pVarStack.push(pVar);
-          var newP = makeVar('__p', used);
+          var newP = makeVar('parent', used);
           lines.push('var ' + newP + ' = ' + t.target + ';');
           pVar = newP;
           needsP = true;
@@ -5382,9 +5382,9 @@
           var savedState1 = hState, savedParents1 = hParentTags.slice();
           // Use a DocumentFragment for the try branch so partial DOM
           // from a failed try doesn't pollute the main tree.
-          var tryFrag = makeVar('__tf', used);
+          var tryFrag = makeVar('frag', used);
           lines.push('var ' + tryFrag + ' = document.createDocumentFragment();');
-          var savedP = makeVar('__sp', used);
+          var savedP = makeVar('saved', used);
           lines.push('var ' + savedP + ' = ' + pVar + ';');
           lines.push(pVar + ' = ' + tryFrag + ';');
           lines.push('try {');
@@ -5771,7 +5771,7 @@
     return out;
   }
 
-  function convertHtmlMarkup(htmlContent, htmlPath) {
+  function convertHtmlMarkup(htmlContent, htmlPath, reservedIdents) {
     // Derive filenames from source path.
     let baseName = htmlPath;
     const slashIdx = baseName.lastIndexOf('/');
@@ -5787,6 +5787,25 @@
     const extractedStyles = [];
     let scriptIdx = 0;
     let styleIdx = 0;
+    // Collect reserved identifiers from all inline scripts so generated
+    // handler variable names don't collide with user code.
+    const used = new Set(reservedIdents || []);
+    for (let si = 0; si < htmlTokens.length; si++) {
+      if (htmlTokens[si].type === 'openTag' && htmlTokens[si].tag === 'script') {
+        const hasSrc = htmlTokens[si].attrs.some(function(a) { return a.name === 'src'; });
+        if (!hasSrc) {
+          let body = '';
+          for (let sj = si + 1; sj < htmlTokens.length; sj++) {
+            if (htmlTokens[sj].type === 'closeTag' && htmlTokens[sj].tag === 'script') break;
+            if (htmlTokens[sj].type === 'text') body += htmlTokens[sj].text;
+          }
+          const toks = tokenize(body.trim());
+          for (const t of toks) {
+            if (t.type === 'other' && IDENT_RE.test(t.text)) used.add(t.text);
+          }
+        }
+      }
+    }
 
     // Walk tokens and process each opening tag.
     for (let ti = 0; ti < htmlTokens.length; ti++) {
@@ -5888,7 +5907,7 @@
         opCount += parseStyleDecls(styleVal).length;
       }
       const useVar = opCount > 1;
-      const varName = useVar ? ('__el' + (elemCounter - 1)) : null;
+      const varName = useVar ? makeVar('el', used) : null;
       const ref = useVar ? varName : sel;
 
       if (useVar) {
@@ -5974,7 +5993,18 @@
       for (const s of scripts) referencedJs.add(s);
     }
     for (const page of htmlPages) {
-      const markup = convertHtmlMarkup(files[page], page);
+      // Collect identifiers from ALL scripts on this page so generated
+      // variable names in handlers don't collide with user code.
+      const pageIdents = new Set();
+      const pageScripts = pageScriptMap[page] || [];
+      for (const sp of pageScripts) {
+        if (!files[sp]) continue;
+        const toks = tokenize(files[sp].trim());
+        for (const t of toks) {
+          if (t.type === 'other' && IDENT_RE.test(t.text)) pageIdents.add(t.text);
+        }
+      }
+      const markup = convertHtmlMarkup(files[page], page, pageIdents);
       const dir = page.indexOf('/') >= 0 ? page.slice(0, page.lastIndexOf('/') + 1) : '';
       // Only output HTML if it actually changed.
       if (markup.html !== files[page]) output[page] = markup.html;
