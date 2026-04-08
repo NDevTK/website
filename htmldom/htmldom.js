@@ -5135,6 +5135,19 @@
 
       const eventAttrs = [];
       for (const attr of hAttrs) {
+        // Dynamic attribute name: expression that produces attr text
+        // like " selected" or "". Emit as conditional setAttribute.
+        if (attr.kind === 'dynamic_name') {
+          // Dynamic attribute: expression produces " selected" or ""
+          // or " key=value". Parse at runtime.
+          lines.push('(function(el, a) {');
+          lines.push('  a = a.trim(); if (!a) return;');
+          lines.push('  var eq = a.indexOf("=");');
+          lines.push('  if (eq >= 0) el.setAttribute(a.slice(0, eq), a.slice(eq+1).replace(/^["\']/,"").replace(/["\']\$/,""));');
+          lines.push('  else el.setAttribute(a, "");');
+          lines.push('})(' + v + ', ' + attr.nameExpr + ');');
+          continue;
+        }
         const name = attr.name;
         // Extract inline event handlers and javascript: URLs.
         if (name.length > 2 && name.slice(0, 2) === 'on' && !attr.dynamic) {
@@ -5310,6 +5323,13 @@
       if (hState === S_ATTR_VAL_DQ || hState === S_ATTR_VAL_SQ || hState === S_ATTR_VAL_UQ) {
         // Dynamic expression in attribute value.
         hAttrExprs.push({ pos: hAttrVal.length, expr: expr });
+      } else if (hState === S_ATTRS || hState === S_TAG_OPEN) {
+        // Expression inside a tag (between attributes). This handles
+        // patterns like: <option value="x" + (cond ? " selected" : "") + ">
+        // The expression may add/remove attributes dynamically.
+        // Store it as a dynamic attribute name expression.
+        hFinishAttr();
+        hAttrs.push({ kind: 'dynamic_name', nameExpr: expr });
       } else {
         // Text context — emit as text node or DOM call.
         hFlushText();

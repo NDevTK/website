@@ -2865,6 +2865,142 @@ function render() {
     ].join('\n')
   });
 
+  // 81. Builder reuse with different args
+  checkEquiv('builder reuse', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'function tag(name, content) { var h = "<" + name + ">" + content + "</" + name + ">"; return h; }',
+      'document.getElementById("out").innerHTML = tag("h1", "Title") + tag("p", "Body") + tag("footer", "End");'
+    ].join('\n')
+  });
+
+  // 82. Two independent innerHTML targets (no shared state)
+  checkEquiv('two independent targets', {
+    'index.html': '<html><body><div id="a"></div><div id="b"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var x = "Hello";',
+      'document.getElementById("a").innerHTML = "<h1>" + x + "</h1>";',
+      'var y = "World";',
+      'document.getElementById("b").innerHTML = "<p>" + y + "</p>";'
+    ].join('\n')
+  });
+
+  // 83. Ternary choosing different structures
+  checkEquiv('ternary structure choice', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'var isTable = false; document.getElementById("out").innerHTML = isTable ? "<table><tr><td>Cell</td></tr></table>" : "<ul><li>Item</li></ul>";'
+  });
+
+  // 84. String methods in innerHTML expression
+  checkEquiv('string methods', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'var name = "alice"; document.getElementById("out").innerHTML = "<p>" + name.charAt(0).toUpperCase() + name.slice(1) + "</p>";'
+  });
+
+  // 85. Nested ternary in multiple attributes
+  checkEquiv('nested ternary attrs', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'var level = 2; document.getElementById("out").innerHTML = "<div class=\\"" + (level > 2 ? "high" : level > 1 ? "mid" : "low") + "\\" data-level=\\"" + level + "\\">" + level + "</div>";'
+  });
+
+  // 86. Multiple counters (sum, max, count)
+  checkEquiv('multiple counters', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var data = [3, 1, 4, 1, 5, 9];',
+      'var h = "<ul>";',
+      'var sum = 0; var max = 0; var count = 0;',
+      'for (var i = 0; i < data.length; i++) {',
+      '  h += "<li>" + data[i] + "</li>";',
+      '  sum += data[i]; if (data[i] > max) max = data[i]; count++;',
+      '}',
+      'h += "</ul><p>Sum:" + sum + " Max:" + max + " Count:" + count + "</p>";',
+      'document.getElementById("out").innerHTML = h;'
+    ].join('\n')
+  });
+
+  // 87. Multi-condition class list
+  checkEquiv('multi condition class', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var active = true; var disabled = false; var large = true;',
+      'var cls = "btn";',
+      'if (active) cls += " active";',
+      'if (disabled) cls += " disabled";',
+      'if (large) cls += " btn-lg";',
+      'document.getElementById("out").innerHTML = "<button class=\\"" + cls + "\\">" + cls + "</button>";'
+    ].join('\n')
+  });
+
+  // 88. do-while with counter
+  checkEquiv('do-while counter', {
+    'index.html': '<html><body><ul id="out"></ul><script src="app.js"></script></body></html>',
+    'app.js': 'var h = ""; var i = 1; do { h += "<li>Item " + i + "</li>"; i++; } while (i <= 4); document.getElementById("out").innerHTML = h;'
+  });
+
+  // 89. 6-level deep nesting
+  checkEquiv('6 level nesting', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("out").innerHTML = "<div><section><article><main><aside><nav><a href=\\"#\\">Deep</a></nav></aside></main></article></section></div>";'
+  });
+
+  // 90. innerHTML += chain building a page
+  checkEquiv('page build chain', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var el = document.getElementById("out");',
+      'el.innerHTML = "<header><h1>Title</h1></header>";',
+      'el.innerHTML += "<nav><a href=\\"/\\">Home</a></nav>";',
+      'el.innerHTML += "<main><p>Content</p></main>";',
+      'el.innerHTML += "<footer><small>2024</small></footer>";'
+    ].join('\n')
+  });
+
+  // 91. undefined and null in concat
+  checkEquiv('undefined null concat', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'var x; var y = null; document.getElementById("out").innerHTML = "<p>" + x + "</p><p>" + y + "</p>";'
+  });
+
+  // 93. Arithmetic in style attribute
+  checkEquiv('arithmetic in attr', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'var w = 100; var h2 = 50; document.getElementById("out").innerHTML = "<div style=\\"width:" + (w * 2) + "px;height:" + (h2 + 10) + "px\\">sized</div>";'
+  });
+
+  // 94. Select with conditional selected attribute
+  checkEquiv('select conditional selected', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var opts = [{v:"a",t:"Alpha"},{v:"b",t:"Beta"},{v:"c",t:"Gamma"}];',
+      'var sel = "b";',
+      'var h = "<select>";',
+      'for (var i = 0; i < opts.length; i++) {',
+      '  h += "<option value=\\"" + opts[i].v + "\\"" + (opts[i].v === sel ? " selected" : "") + ">" + opts[i].t + "</option>";',
+      '}',
+      'h += "</select>";',
+      'document.getElementById("out").innerHTML = h;'
+    ].join('\n')
+  });
+
+  // 95. for-in on object
+  checkEquiv('for-in object', {
+    'index.html': '<html><body><dl id="out"></dl><script src="app.js"></script></body></html>',
+    'app.js': 'var obj = {name:"Alice",age:"30",city:"NYC"}; var h = ""; for (var k in obj) { h += "<dt>" + k + "</dt><dd>" + obj[k] + "</dd>"; } document.getElementById("out").innerHTML = h;'
+  });
+
+  // 96. for-of on array
+  checkEquiv('for-of array', {
+    'index.html': '<html><body><ul id="out"></ul><script src="app.js"></script></body></html>',
+    'app.js': 'var items = ["X","Y","Z"]; var h = ""; for (var v of items) { h += "<li>" + v + "</li>"; } document.getElementById("out").innerHTML = h;'
+  });
+
+  // 97. Array.join
+  checkEquiv('array join', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'var items = ["a","b","c"]; document.getElementById("out").innerHTML = "<p>" + items.join(", ") + "</p>";'
+  });
+
   console.log(`  (${pass + fail - before} cases)`);
 })();
 
