@@ -5272,8 +5272,8 @@
             break;
           case S_TAG_OPEN:
             if (c === ' ' || c === '\t' || c === '\n') { if (hTag) { hState = S_ATTRS; hAttrs = []; } }
-            else if (c === '>') { hAttrs = []; hCommitTag(false); hState = S_TEXT; }
-            else if (c === '/' && text[i+1] === '>') { hAttrs = []; hCommitTag(true); hState = S_TEXT; i++; }
+            else if (c === '>') { hCommitTag(false); hState = S_TEXT; }
+            else if (c === '/' && text[i+1] === '>') { hCommitTag(true); hState = S_TEXT; i++; }
             else hTag += c;
             break;
           case S_TAG_CLOSE:
