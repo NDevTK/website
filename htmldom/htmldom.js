@@ -4131,7 +4131,16 @@
           const r = readValue(i + 2, stop, TERMS_TOP);
           // Detect prepend pattern: x = expr + x (builds string in reverse).
           // Treat as equivalent to x += expr but with the new content prepended.
-          assignName(t.text, r ? r.binding : null);
+          // For build variables assigned via = inside a loop (prepend
+          // pattern: x = newContent + x), tag the new content with the
+          // current loopId so it repeats per iteration.
+          if (r && r.binding && r.binding.kind === 'chain' && trackBuildVar && trackBuildVar.has(t.text) && loopStack.length > 0) {
+            const loopId = loopStack[loopStack.length - 1].id;
+            const tagged = tagWithLoop(r.binding.toks, loopId);
+            assignName(t.text, chainBinding(tagged));
+          } else {
+            assignName(t.text, r ? r.binding : null);
+          }
           // Preserve non-build-var assignments in the build var's chain
           // so the emitter outputs them at the correct position.
           if (trackBuildVar && !trackBuildVar.has(t.text) && (trackBuildVarDepth < 0 || funcDepth() === trackBuildVarDepth)) {
