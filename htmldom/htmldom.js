@@ -5096,96 +5096,173 @@
   convert();
 
   // --- Project-level API ---
-  // Resolve <script src="..."> in an HTML file by inlining referenced
-  // JS files from the project. Returns the HTML with scripts inlined.
-  function resolveScriptSrcs(html, htmlPath, files) {
-    const dir = htmlPath.indexOf('/') >= 0 ? htmlPath.slice(0, htmlPath.lastIndexOf('/')) : '';
-    return html.replace(/<script\s+src="([^"]+)"[^>]*><\/script>/gi, function(match, src) {
-      const parts = (dir ? dir + '/' + src : src).split('/');
-      const norm = [];
-      for (let i = 0; i < parts.length; i++) {
-        if (parts[i] === '..') norm.pop();
-        else if (parts[i] !== '.') norm.push(parts[i]);
-      }
-      const key = norm.join('/');
-      return files[key] ? '<script>\n' + files[key] + '\n<\/script>' : match;
-    });
-  }
 
-  // Convert a single HTML page within a project context.
-  // files: { path: content } — all project files
-  // htmlPath: the HTML file to convert
-  // Returns { path: content } of output files for this page.
-  function convertPage(files, htmlPath) {
-    const content = resolveScriptSrcs(files[htmlPath], htmlPath, files);
-    const output = {};
-    // Run conversion directly on the content string.
-    const fileName = htmlPath.indexOf('/') >= 0 ? htmlPath.slice(htmlPath.lastIndexOf('/') + 1) : htmlPath;
-    const captured = convertRaw(content, fileName);
-    if (!captured || captured === '// (no nodes parsed)') return output;
-    // Parse output into separate files, keeping original names.
+  function resolveRelativePath(src, htmlPath) {
     const dir = htmlPath.indexOf('/') >= 0 ? htmlPath.slice(0, htmlPath.lastIndexOf('/') + 1) : '';
-    const parts = captured.split(/^\/\/ === (.+?) ===$/m);
-    if (parts.length > 1) {
-      for (let i = 1; i < parts.length; i += 2) {
-        const name = parts[i].trim();
-        const body = (parts[i + 1] || '').trim();
-        if (body) output[dir + name] = body;
-      }
-    } else {
-      // Single output — keep the original filename.
-      output[htmlPath] = captured;
+    const parts = (dir + src).split('/');
+    const norm = [];
+    for (let i = 0; i < parts.length; i++) {
+      if (parts[i] === '..') norm.pop();
+      else if (parts[i] !== '.') norm.push(parts[i]);
     }
-    return output;
+    return norm.join('/');
   }
 
-  // Convert all HTML pages in a project.
-  // files: { path: content } — all project files
-  // Returns { path: content } of all output files.
+  function findPageScripts(htmlContent, htmlPath) {
+    const scripts = [];
+    const re = /<script\s+src="([^"]+)"[^>]*><\/script>/gi;
+    let m;
+    while ((m = re.exec(htmlContent)) !== null) {
+      scripts.push(resolveRelativePath(m[1], htmlPath));
+    }
+    return scripts;
+  }
+
+  function convertJsFile(jsContent, precedingCode) {
+    // Only process if there's innerHTML usage in this file.
+    if (!/\.innerHTML\s*[+=]/.test(jsContent)) return null;
+    const sep = '\n/*__FILE_BOUNDARY__*/\n';
+    const combined = precedingCode ? precedingCode + sep + jsContent : jsContent;
+    const converted = convertRaw(combined);
+    if (!converted || converted === '// (no nodes parsed)') return null;
+    if (precedingCode) {
+      const idx = converted.indexOf('/*__FILE_BOUNDARY__*/');
+      if (idx >= 0) {
+        const result = converted.slice(idx + '/*__FILE_BOUNDARY__*/'.length).trim();
+        if (result && result !== jsContent.trim()) return result;
+        return null;
+      }
+    }
+    if (converted.trim() === jsContent.trim()) return null;
+    return converted;
+  }
+
+  function convertHtmlMarkup(htmlContent, htmlPath) {
+    const baseName = (htmlPath.indexOf('/') >= 0 ? htmlPath.slice(htmlPath.lastIndexOf('/') + 1) : htmlPath).replace(/\.[^.]+$/, '');
+    const handlersFile = baseName + '.safe-handlers.js';
+    let processed = htmlContent;
+    let elemCounter = 0;
+    const jsLines = [];
+    processed = processed.replace(/<([a-zA-Z][a-zA-Z0-9]*)((?:\s+[^>]*?)?)>/g, function(match, tag, attrsStr) {
+      const events = [];
+      let styleVal = null;
+      let jsHref = null;
+      let cleaned = attrsStr.replace(/\s+on([a-z]+)="([^"]*)"/gi, function(_, evName, handler) {
+        events.push({ event: evName.toLowerCase(), handler: handler.replace(/&quot;/g, '"').replace(/&amp;/g, '&') });
+        return '';
+      });
+      cleaned = cleaned.replace(/\s+href="javascript:([^"]*)"/gi, function(_, code) {
+        jsHref = code.replace(/&quot;/g, '"').replace(/&amp;/g, '&');
+        return '';
+      });
+      cleaned = cleaned.replace(/\s+style="([^"]*)"/gi, function(_, val) {
+        styleVal = val.replace(/&quot;/g, '"').replace(/&amp;/g, '&');
+        return '';
+      });
+      if (events.length === 0 && !jsHref && !styleVal) return match;
+      const idMatch = attrsStr.match(/\s+id="([^"]*)"/i);
+      let sel, cleanedTag;
+      if (idMatch) {
+        sel = 'document.getElementById(\'' + idMatch[1] + '\')';
+        cleanedTag = '<' + tag + cleaned + '>';
+      } else {
+        const hdId = 'hd' + (elemCounter++);
+        sel = 'document.querySelector(\'[data-hd="' + hdId + '"]\')';
+        cleanedTag = '<' + tag + cleaned + ' data-hd="' + hdId + '">';
+      }
+      for (const ev of events) {
+        const body = ev.handler.trim();
+        if (/\breturn\b/.test(body)) {
+          jsLines.push(sel + '.addEventListener(\'' + ev.event + '\', function(event) {');
+          jsLines.push('  var __r = (function() { ' + body + ' }).call(this);');
+          jsLines.push('  if (__r === false) event.preventDefault();');
+          jsLines.push('});');
+        } else {
+          jsLines.push(sel + '.addEventListener(\'' + ev.event + '\', function(event) { ' + body + ' });');
+        }
+      }
+      if (jsHref) {
+        jsLines.push(sel + '.addEventListener(\'click\', function(event) {');
+        jsLines.push('  event.preventDefault();');
+        jsLines.push('  ' + jsHref);
+        jsLines.push('});');
+      }
+      if (styleVal) {
+        const decls = styleVal.split(';').map(function(d) { return d.trim(); }).filter(Boolean);
+        for (const d of decls) {
+          const colon = d.indexOf(':');
+          if (colon < 0) continue;
+          const prop = d.slice(0, colon).trim();
+          let val = d.slice(colon + 1).trim();
+          let important = '';
+          if (/!important\s*$/.test(val)) {
+            val = val.replace(/\s*!important\s*$/, '');
+            important = ', \'important\'';
+          }
+          jsLines.push(sel + '.style.setProperty(\'' + prop + '\', \'' + val.replace(/'/g, "\\'") + '\'' + important + ');');
+        }
+      }
+      return cleanedTag;
+    });
+    const result = { html: processed, handlers: null };
+    if (jsLines.length) {
+      if (processed.indexOf(handlersFile) < 0) {
+        result.html = processed.replace(/<\/body>/i, '<script src="' + handlersFile + '"><\/script>\n</body>');
+      }
+      result.handlers = { name: handlersFile, content: jsLines.join('\n') };
+    }
+    return result;
+  }
+
   function convertProject(files) {
     const output = {};
-    // Track which JS files are referenced by HTML pages.
+    const htmlPages = Object.keys(files).filter(function(p) { return /\.html?$/i.test(p); }).sort();
     const referencedJs = new Set();
-    const htmlPages = Object.keys(files).filter(function(p) {
-      return /\.html?$/i.test(p);
-    }).sort();
-    // Find all JS files referenced via <script src="..."> in each HTML page.
+    const pageScriptMap = {};
     for (const page of htmlPages) {
-      const srcRe = /<script\s+src="([^"]+)"/gi;
-      let m;
-      while ((m = srcRe.exec(files[page])) !== null) {
+      const scripts = findPageScripts(files[page], page);
+      pageScriptMap[page] = scripts;
+      for (const s of scripts) referencedJs.add(s);
+    }
+    for (const page of htmlPages) {
+      const markup = convertHtmlMarkup(files[page], page);
+      if (markup.html !== files[page]) output[page] = markup.html;
+      if (markup.handlers) {
         const dir = page.indexOf('/') >= 0 ? page.slice(0, page.lastIndexOf('/') + 1) : '';
-        const parts = (dir + m[1]).split('/');
-        const norm = [];
-        for (let i = 0; i < parts.length; i++) {
-          if (parts[i] === '..') norm.pop();
-          else if (parts[i] !== '.') norm.push(parts[i]);
+        output[dir + markup.handlers.name] = markup.handlers.content;
+      }
+      const scripts = pageScriptMap[page] || [];
+      let precedingCode = '';
+      for (const sp of scripts) {
+        if (!files[sp]) continue;
+        const converted = convertJsFile(files[sp], precedingCode);
+        if (converted) output[sp] = converted;
+        precedingCode += (precedingCode ? '\n' : '') + files[sp];
+      }
+      const inlineRe = /<script\b(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi;
+      let im;
+      while ((im = inlineRe.exec(files[page])) !== null) {
+        const inlineJs = im[1].trim();
+        if (!inlineJs) continue;
+        const converted = convertJsFile(inlineJs, precedingCode);
+        if (converted) {
+          const outHtml = output[page] || markup.html;
+          output[page] = outHtml.replace(im[1], '\n' + converted + '\n');
         }
-        referencedJs.add(norm.join('/'));
+        precedingCode += (precedingCode ? '\n' : '') + inlineJs;
       }
     }
-    // Convert each HTML page (inlines its JS dependencies).
-    for (const page of htmlPages) {
-      Object.assign(output, convertPage(files, page));
-    }
-    // Convert standalone JS files that have innerHTML but aren't
-    // referenced by any HTML page — convert in place, same filename.
-    const jsFiles = Object.keys(files).filter(function(p) {
-      return /\.js$/i.test(p) && !referencedJs.has(p);
-    }).sort();
-    for (const jsPath of jsFiles) {
-      const converted = convertRaw(files[jsPath], jsPath);
-      if (converted && converted !== '// (no nodes parsed)' && converted !== files[jsPath]) {
-        output[jsPath] = converted;
-      }
+    const standaloneJs = Object.keys(files).filter(function(p) { return /\.js$/i.test(p) && !referencedJs.has(p); }).sort();
+    for (const jp of standaloneJs) {
+      const converted = convertJsFile(files[jp], '');
+      if (converted) output[jp] = converted;
     }
     return output;
   }
 
-  // Expose for tests and external use.
   if (typeof globalThis !== 'undefined') {
     globalThis.__convertProject = convertProject;
-    globalThis.__convertPage = convertPage;
-    globalThis.__resolveScriptSrcs = resolveScriptSrcs;
+    globalThis.__convertHtmlMarkup = convertHtmlMarkup;
+    globalThis.__convertJsFile = convertJsFile;
   }
 })();
