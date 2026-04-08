@@ -5135,17 +5135,30 @@
 
       const eventAttrs = [];
       for (const attr of hAttrs) {
-        // Dynamic attribute name: expression that produces attr text
-        // like " selected" or "". Emit as conditional setAttribute.
+        // Compile-time conditional attribute: if (cond) el.setAttribute(...)
+        if (attr.kind === 'cond_attr') {
+          if (BOOLEAN_ATTRS.has(attr.name)) {
+            lines.push('if (' + attr.condExpr + ') ' + v + '.' + attr.name + ' = true;');
+          } else {
+            lines.push('if (' + attr.condExpr + ') ' + v + '.setAttribute(' + jsStr(attr.name).code + ', ' + jsStr(attr.value).code + ');');
+          }
+          continue;
+        }
+        // Dynamic attribute name: expression that produces attr text.
+        // Fallback for complex cases where compile-time parsing isn't possible.
         if (attr.kind === 'dynamic_name') {
-          // Dynamic attribute: expression produces " selected" or ""
-          // or " key=value". Parse at runtime.
-          lines.push('(function(el, a) {');
-          lines.push('  a = a.trim(); if (!a) return;');
-          lines.push('  var eq = a.indexOf("=");');
-          lines.push('  if (eq >= 0) el.setAttribute(a.slice(0, eq), a.slice(eq+1).replace(/^["\']/,"").replace(/["\']\$/,""));');
-          lines.push('  else el.setAttribute(a, "");');
-          lines.push('})(' + v + ', ' + attr.nameExpr + ');');
+          // Runtime attribute: the expression produces text like
+          // " selected" or " class=active". Parse name=value at runtime.
+          var attrVar = makeVar('attr', used);
+          lines.push('var ' + attrVar + ' = (' + attr.nameExpr + ').trim();');
+          lines.push('if (' + attrVar + ') {');
+          lines.push('  var __eq = ' + attrVar + '.indexOf("=");');
+          lines.push('  if (__eq >= 0) {');
+          lines.push('    var __val = ' + attrVar + '.slice(__eq + 1);');
+          lines.push('    var __q = __val[0]; if (__q === String.fromCharCode(34) || __q === String.fromCharCode(39)) __val = __val.slice(1, -1);');
+          lines.push('    ' + v + '.setAttribute(' + attrVar + '.slice(0, __eq), __val);');
+          lines.push('  } else ' + v + '.setAttribute(' + attrVar + ', "");');
+          lines.push('}');
           continue;
         }
         const name = attr.name;
@@ -5378,18 +5391,48 @@
         else if (t.type === 'other') hFeedExpr(t.text);
         else if (t.type === 'preserve') { hFlushText(); lines.push(t.text); }
         else if (t.type === 'cond') {
-          // If we're inside an attribute value, emit as ternary expression.
+          function condToExpr(ct) {
+            if (ct.length === 1 && ct[0].type === 'str') return JSON.stringify(ct[0].text);
+            if (ct.length === 1 && ct[0].type === 'other') return ct[0].text;
+            return ct.filter(function(x){return x.type!=='plus';}).map(function(x) {
+              return x.type === 'str' ? JSON.stringify(x.text) : x.text;
+            }).join(' + ');
+          }
           if (hState === S_ATTR_VAL_DQ || hState === S_ATTR_VAL_SQ || hState === S_ATTR_VAL_UQ) {
-            function condToExpr(ct) {
-              if (ct.length === 1 && ct[0].type === 'str') return JSON.stringify(ct[0].text);
-              if (ct.length === 1 && ct[0].type === 'other') return ct[0].text;
-              return ct.filter(function(x){return x.type!=='plus';}).map(function(x) {
-                return x.type === 'str' ? JSON.stringify(x.text) : x.text;
-              }).join(' + ');
-            }
+            // Inside an attribute value: emit as ternary expression.
             var ternaryExpr = '(' + t.condExpr + ' ? ' + condToExpr(t.ifTrue) + ' : ' + condToExpr(t.ifFalse) + ')';
             hAttrExprs.push({ pos: hAttrVal.length, expr: ternaryExpr });
+          } else if (hState === S_ATTRS || hState === S_TAG_OPEN) {
+            // Between tag attributes: conditional attribute addition.
+            // Parse the branches at compile time to extract attribute
+            // name/value and emit a static if/setAttribute.
+            hFinishAttr();
+            var trueStr = t.ifTrue.length === 1 && t.ifTrue[0].type === 'str' ? t.ifTrue[0].text.trim() : null;
+            var falseStr = t.ifFalse.length === 1 && t.ifFalse[0].type === 'str' ? t.ifFalse[0].text.trim() : null;
+            if (trueStr && !falseStr) {
+              // Pattern: cond ? " selected" : "" — conditional boolean attr.
+              var eqPos = trueStr.indexOf('=');
+              if (eqPos >= 0) {
+                var aName = trueStr.slice(0, eqPos);
+                var aVal = trueStr.slice(eqPos + 1).replace(/^['"]/, '').replace(/['"]$/, '');
+                hAttrs.push({ kind: 'cond_attr', condExpr: t.condExpr, name: aName, value: aVal });
+              } else {
+                hAttrs.push({ kind: 'cond_attr', condExpr: t.condExpr, name: trueStr, value: '' });
+              }
+            } else if (falseStr && !trueStr) {
+              // Pattern: cond ? "" : " disabled" — inverted conditional.
+              var eqPos2 = falseStr.indexOf('=');
+              if (eqPos2 >= 0) {
+                hAttrs.push({ kind: 'cond_attr', condExpr: '!(' + t.condExpr + ')', name: falseStr.slice(0, eqPos2), value: falseStr.slice(eqPos2 + 1).replace(/^['"]/, '').replace(/['"]$/, '') });
+              } else {
+                hAttrs.push({ kind: 'cond_attr', condExpr: '!(' + t.condExpr + ')', name: falseStr, value: '' });
+              }
+            } else {
+              // Complex case: both branches have content. Use runtime.
+              hAttrs.push({ kind: 'dynamic_name', nameExpr: '(' + t.condExpr + ' ? ' + condToExpr(t.ifTrue) + ' : ' + condToExpr(t.ifFalse) + ')' });
+            }
           } else {
+            // Text context: emit if/else blocks.
             hFlushText();
             lines.push('if (' + t.condExpr + ') {');
             emitChain(t.ifTrue);
