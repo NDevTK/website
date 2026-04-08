@@ -19,30 +19,29 @@ header .hint { color: #aaa; font-size: 0.8rem; margin-left: 1rem; }
 .toolbar button.secondary:hover { background: #555; }
 .toolbar button.success { background: #2ecc71; }
 .toolbar button.success:hover { background: #27ae60; }
-.toolbar select { background: #111; color: #eee; border: 1px solid #444; border-radius: 4px; padding: 0.3rem; max-width: 300px; }
 .toolbar .spacer { flex: 1; }
 .toolbar .status { color: #aaa; font-size: 0.8rem; }
 .main { display: flex; flex: 1; overflow: hidden; }
-.sidebar { width: 240px; border-right: 1px solid #333; overflow-y: auto; flex-shrink: 0; }
-.sidebar .file-tree { padding: 0.5rem 0; }
-.sidebar .file-item { padding: 0.3rem 0.75rem; cursor: pointer; font-size: 0.85rem; display: flex; align-items: center; gap: 0.4rem; }
+.sidebar { width: 260px; border-right: 1px solid #333; overflow-y: auto; flex-shrink: 0; display: flex; flex-direction: column; }
+.sidebar .section-header { padding: 0.4rem 0.75rem; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: #888; background: #1a1d21; border-bottom: 1px solid #333; position: sticky; top: 0; }
+.sidebar .file-list { flex: 1; overflow-y: auto; }
+.sidebar .file-item { padding: 0.3rem 0.75rem; cursor: pointer; font-size: 0.85rem; display: flex; align-items: center; gap: 0.4rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .sidebar .file-item:hover { background: #2a2e33; }
 .sidebar .file-item.active { background: #317EFB33; border-left: 2px solid #317EFB; }
-.sidebar .file-item .icon { opacity: 0.6; font-size: 0.75rem; }
-.sidebar .file-item .badge { margin-left: auto; font-size: 0.7rem; padding: 0.1rem 0.4rem; border-radius: 3px; }
+.sidebar .file-item .icon { opacity: 0.6; font-size: 0.75rem; flex-shrink: 0; }
+.sidebar .file-item .name { overflow: hidden; text-overflow: ellipsis; }
+.sidebar .file-item .badge { margin-left: auto; font-size: 0.7rem; padding: 0.1rem 0.4rem; border-radius: 3px; flex-shrink: 0; }
 .sidebar .file-item .badge.converted { background: #2ecc7133; color: #2ecc71; }
 .sidebar .file-item .badge.has-inner { background: #f39c1233; color: #f39c12; }
 .sidebar .file-item .badge.clean { background: #33333366; color: #888; }
-.editors { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
-.editor-tabs { display: flex; border-bottom: 1px solid #333; flex-shrink: 0; }
-.editor-tabs .tab { padding: 0.4rem 1rem; cursor: pointer; font-size: 0.85rem; border-bottom: 2px solid transparent; color: #aaa; }
-.editor-tabs .tab.active { color: #eee; border-bottom-color: #317EFB; }
+.sidebar .file-item .badge.generated { background: #317EFB33; color: #6ea8fe; }
+.sidebar .empty-hint { padding: 1rem 0.75rem; color: #555; font-size: 0.8rem; font-style: italic; }
+.editor-wrap { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+.editor-filename { padding: 0.3rem 1rem; font-size: 0.8rem; color: #888; border-bottom: 1px solid #333; background: #1a1d21; flex-shrink: 0; }
 .editor-container { flex: 1; }
 .options { padding: 0.5rem 1rem; border-top: 1px solid #333; flex-shrink: 0; display: flex; gap: 1.5rem; align-items: center; font-size: 0.8rem; color: #aaa; }
 .options label { margin: 0; font-weight: normal; cursor: pointer; }
 code { background: #2a2e33; padding: 0.05rem 0.25rem; border-radius: 3px; font-size: 0.85em; }
-.empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; flex: 1; color: #666; gap: 1rem; text-align: center; padding: 2rem; }
-.empty-state button { font-size: 1rem; padding: 0.6rem 1.5rem; }
 </style>
 </head>
 <body>
@@ -55,27 +54,27 @@ code { background: #2a2e33; padding: 0.05rem 0.25rem; border-radius: 3px; font-s
 <div class="toolbar">
   <button id="openFolder">Open Folder</button>
   <button id="pasteMode" class="secondary">Paste Mode</button>
-  <select id="fileSelect" style="display:none;"></select>
   <span id="folderName" class="status"></span>
   <span class="spacer"></span>
   <button id="processAll" disabled>Convert All</button>
   <button id="downloadCurrent" class="secondary" disabled>Download File</button>
   <button id="downloadAll" class="success" disabled>Download All</button>
-  <button id="copy" class="secondary">Copy Output</button>
+  <button id="copy" class="secondary">Copy</button>
 </div>
 
 <div class="main">
   <div class="sidebar" id="sidebarPanel" style="display:none;">
-    <div class="file-tree" id="fileTree"></div>
+    <div class="section-header">Original Files</div>
+    <div class="file-list" id="originalFiles"></div>
+    <div class="section-header">Output Files</div>
+    <div class="file-list" id="outputFiles">
+      <div class="empty-hint">Convert files to see output</div>
+    </div>
   </div>
 
-  <div class="editors">
-    <div class="editor-tabs">
-      <div class="tab active" id="tabInput" data-tab="input">Input</div>
-      <div class="tab" id="tabOutput" data-tab="output">Output</div>
-    </div>
-    <div id="inEditor" class="editor-container"></div>
-    <div id="outEditor" class="editor-container" style="display:none;"></div>
+  <div class="editor-wrap">
+    <div class="editor-filename" id="editorFilename">Paste mode</div>
+    <div id="editor" class="editor-container"></div>
   </div>
 </div>
 

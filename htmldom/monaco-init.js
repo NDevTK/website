@@ -20,61 +20,52 @@
   require(['vs/editor/editor.main'], function () {
     var defaultInput = '<div style="position: fixed; z-index: -99; width: 100%; height: 100%">\n  <iframe credentialless loading="lazy" id="background" title="background" sandbox="allow-scripts" frameborder="0" height="100%" width="100%" src="https://random.ndev.tk/"></iframe>\n</div>\n<button onclick="alert(\'hello\')">Greet</button>\n<script>\nvar items = [\'Home\', \'About\', \'Contact\', location.search];\nvar html = \'<nav>\';\nfor (var i = 0; i < items.length; i++) {\n  html += \'<a href="/\' + items[i].toLowerCase() + \'"\' + \'>\' + items[i] + \'</a>\';\n}\nhtml += \'</nav>\';\ndocument.body.innerHTML = html;\n<\/script>';
 
-    function autoResize(editor, container) {
-      function update() {
-        var contentHeight = editor.getContentHeight();
-        container.style.height = Math.max(contentHeight, 100) + 'px';
-        editor.layout();
-      }
-      editor.onDidContentSizeChange(update);
-      update();
-    }
+    // Single editor — shows whichever file is selected.
+    var editor = monaco.editor.create(document.getElementById('editor'), {
+      value: defaultInput,
+      language: 'html',
+      theme: 'vs-dark',
+      minimap: { enabled: false },
+      fontSize: 14,
+      lineNumbers: 'on',
+      scrollBeyondLastLine: false,
+      wordWrap: 'on',
+      automaticLayout: true,
+    });
 
-    var editorOpts = {
-      theme: 'vs-dark', minimap: { enabled: false }, fontSize: 14,
-      lineNumbers: 'on', scrollBeyondLastLine: false,
-      scrollbar: { vertical: 'hidden', horizontal: 'hidden', handleMouseWheel: false },
-      wordWrap: 'on', automaticLayout: true,
+    // Expose for htmldom.js (it reads _monacoIn / _monacoOut).
+    window._monacoIn = editor;
+    window._monacoOut = {
+      setValue: function(v) { outputForCurrent = v; },
+      getValue: function() { return outputForCurrent; }
     };
-
-    window._monacoIn = monaco.editor.create(document.getElementById('inEditor'),
-      Object.assign({ value: defaultInput, language: 'html' }, editorOpts));
-
-    window._monacoOut = monaco.editor.create(document.getElementById('outEditor'),
-      Object.assign({ value: '', language: 'javascript', readOnly: true }, editorOpts));
-
-    // Tab switching.
-    var activeTab = 'input';
-    document.querySelectorAll('.editor-tabs .tab').forEach(function(tab) {
-      tab.addEventListener('click', function() {
-        activeTab = tab.dataset.tab;
-        document.querySelectorAll('.editor-tabs .tab').forEach(function(t) { t.classList.toggle('active', t === tab); });
-        document.getElementById('inEditor').style.display = activeTab === 'input' ? '' : 'none';
-        document.getElementById('outEditor').style.display = activeTab === 'output' ? '' : 'none';
-        if (activeTab === 'input') window._monacoIn.layout();
-        else window._monacoOut.layout();
-      });
-    });
-
-    // Auto-detect language.
-    window._monacoIn.onDidChangeModelContent(function () {
-      var text = window._monacoIn.getValue();
-      var model = window._monacoIn.getModel();
-      var lang = /^\s*</.test(text) ? 'html' : 'javascript';
-      if (model) monaco.editor.setModelLanguage(model, lang);
-    });
 
     // Load htmldom.js.
     var s = document.createElement('script');
     s.src = 'htmldom.js';
     document.body.appendChild(s);
 
-    // --- Multi-file project support ---
+    // --- State ---
+    var folderFiles = null;      // { path: content } — original files
+    var outputFiles = {};         // { path: content } — generated output files
+    var outputForCurrent = '';    // output captured from htmldom.js convert()
+    var activeFile = null;        // { path, source: 'original'|'output' }
+    var pasteMode = true;
 
-    var folderFiles = null;   // { path: content }
-    var convertedFiles = {};  // { path: convertedContent }
-    var currentFile = null;
+    function langFor(name) {
+      if (/\.html?$/i.test(name)) return 'html';
+      if (/\.css$/i.test(name)) return 'css';
+      return 'javascript';
+    }
 
+    function iconFor(name) {
+      if (/\.html?$/i.test(name)) return '📄';
+      if (/\.js$/i.test(name)) return '📜';
+      if (/\.css$/i.test(name)) return '🎨';
+      return '📎';
+    }
+
+    // --- File reading ---
     async function readFolder(dirHandle, prefix) {
       var files = {};
       for await (var entry of dirHandle.values()) {
@@ -97,110 +88,114 @@
           if (parts[i] === '..') norm.pop();
           else if (parts[i] !== '.') norm.push(parts[i]);
         }
-        var key = norm.join('/');
-        return files[key] ? '<script>\n' + files[key] + '\n<\/script>' : match;
+        return files[norm.join('/')] ? '<script>\n' + files[norm.join('/')] + '\n<\/script>' : match;
       });
     }
 
-    function getFileIcon(name) {
-      if (/\.html?$/i.test(name)) return '📄';
-      if (/\.js$/i.test(name)) return '📜';
-      if (/\.css$/i.test(name)) return '🎨';
-      return '📎';
+    // --- Sidebar rendering ---
+    function renderSidebar() {
+      renderFileList('originalFiles', folderFiles, 'original');
+      renderOutputList();
     }
 
-    function buildFileTree() {
-      var tree = document.getElementById('fileTree');
-      tree.innerHTML = '';
-      if (!folderFiles) return;
-      var paths = Object.keys(folderFiles).sort();
-      paths.forEach(function(path) {
-        var el = document.createElement('div');
-        el.className = 'file-item' + (path === currentFile ? ' active' : '');
-        el.dataset.path = path;
-
-        var icon = document.createElement('span');
-        icon.className = 'icon';
-        icon.textContent = getFileIcon(path);
-        el.appendChild(icon);
-
-        var name = document.createElement('span');
-        name.textContent = path;
-        el.appendChild(name);
-
-        // Badge: converted / has innerHTML / clean.
-        var badge = document.createElement('span');
-        badge.className = 'badge';
-        if (convertedFiles[path]) {
-          badge.className += ' converted';
-          badge.textContent = 'converted';
-        } else if (/\.innerHTML\s*[+=]/.test(folderFiles[path])) {
-          badge.className += ' has-inner';
-          badge.textContent = 'innerHTML';
-        } else {
-          badge.className += ' clean';
-          badge.textContent = 'clean';
-        }
-        el.appendChild(badge);
-
-        el.addEventListener('click', function() { selectFile(path); });
-        tree.appendChild(el);
-      });
-    }
-
-    function selectFile(path) {
-      // Save current output if converted.
-      if (currentFile && activeTab === 'output') {
-        var out = window._monacoOut.getValue();
-        if (out) convertedFiles[currentFile] = out;
+    function renderFileList(containerId, files, source) {
+      var container = document.getElementById(containerId);
+      container.innerHTML = '';
+      if (!files || !Object.keys(files).length) {
+        container.innerHTML = '<div class="empty-hint">No files</div>';
+        return;
       }
+      Object.keys(files).sort().forEach(function(path) {
+        var el = document.createElement('div');
+        el.className = 'file-item' + (activeFile && activeFile.path === path && activeFile.source === source ? ' active' : '');
+        el.innerHTML = '<span class="icon">' + iconFor(path) + '</span><span class="name">' + path + '</span>';
+        // Badge for original files.
+        if (source === 'original') {
+          var badge = document.createElement('span');
+          badge.className = 'badge';
+          if (outputFiles[path]) {
+            badge.className += ' converted';
+            badge.textContent = 'converted';
+          } else if (/\.innerHTML\s*[+=]/.test(files[path]) || /\bon[a-z]+="|style="/i.test(files[path])) {
+            badge.className += ' has-inner';
+            badge.textContent = 'unsafe';
+          } else {
+            badge.className += ' clean';
+            badge.textContent = 'clean';
+          }
+          el.appendChild(badge);
+        } else {
+          var badge = document.createElement('span');
+          badge.className = 'badge generated';
+          badge.textContent = 'generated';
+          el.appendChild(badge);
+        }
+        el.addEventListener('click', function() { selectFile(path, source); });
+        container.appendChild(el);
+      });
+    }
 
-      currentFile = path;
+    function renderOutputList() {
+      var container = document.getElementById('outputFiles');
+      if (!Object.keys(outputFiles).length) {
+        container.innerHTML = '<div class="empty-hint">Convert files to see output</div>';
+        return;
+      }
+      renderFileList('outputFiles', outputFiles, 'output');
+    }
+
+    // --- File selection ---
+    function selectFile(path, source) {
+      activeFile = { path: path, source: source };
+      var content = source === 'output' ? outputFiles[path] : folderFiles[path];
+      editor.setValue(content || '');
+      monaco.editor.setModelLanguage(editor.getModel(), langFor(path));
+      editor.updateOptions({ readOnly: source === 'output' });
+      document.getElementById('editorFilename').textContent = (source === 'output' ? '[output] ' : '') + path;
+      document.getElementById('downloadCurrent').disabled = source !== 'output';
+      renderSidebar();
+    }
+
+    // --- Conversion ---
+    function convertFile(path) {
       var content = folderFiles[path];
       if (/\.html?$/i.test(path)) {
         content = resolveScriptSrcs(content, path, folderFiles);
       }
-      window._monacoIn.setValue(content);
+      // Feed to htmldom.js converter via the editor.
+      var prev = activeFile;
+      editor.setValue(content);
+      // htmldom.js auto-converts on change, output captured in outputForCurrent.
 
-      // Show converted output if available.
-      if (convertedFiles[path]) {
-        window._monacoOut.setValue(convertedFiles[path]);
-      }
-
-      document.getElementById('downloadCurrent').disabled = !convertedFiles[path];
-      buildFileTree();
-    }
-
-    function convertCurrent() {
-      // Trigger the converter (htmldom.js listens on input change).
-      // Give it a tick to process, then capture the output.
-      setTimeout(function() {
-        if (currentFile && window._monacoOut) {
-          var out = window._monacoOut.getValue();
-          if (out && out !== '// (no nodes parsed)') {
-            convertedFiles[currentFile] = out;
+      return new Promise(function(resolve) {
+        setTimeout(function() {
+          var result = outputForCurrent || '';
+          if (!result || result === '// (no nodes parsed)') {
+            resolve(false);
+            return;
           }
-          document.getElementById('downloadCurrent').disabled = !convertedFiles[currentFile];
-          buildFileTree();
-          updateStatus();
-        }
-      }, 100);
+          // Parse output into separate files.
+          // The converter outputs "// === filename ===" separators for multi-file output.
+          var parts = result.split(/^\/\/ === (.+?) ===$/m);
+          if (parts.length > 1) {
+            // parts[0] is before first separator (usually empty), then alternating name/content.
+            for (var i = 1; i < parts.length; i += 2) {
+              var name = parts[i].trim();
+              var body = (parts[i + 1] || '').trim();
+              if (body) outputFiles[name] = body;
+            }
+          } else {
+            // Single output — use the path with .converted extension.
+            var outName = path.replace(/\.[^.]+$/, '.safe.js');
+            outputFiles[outName] = result;
+          }
+          resolve(true);
+        }, 150);
+      });
     }
 
-    function updateStatus() {
-      if (!folderFiles) return;
-      var total = Object.keys(folderFiles).length;
-      var converted = Object.keys(convertedFiles).length;
-      document.getElementById('folderName').textContent = converted + '/' + total + ' files converted';
-      document.getElementById('downloadAll').disabled = converted === 0;
-    }
+    // --- Event handlers ---
 
-    // Auto-convert on input change when in folder mode.
-    window._monacoIn.onDidChangeModelContent(function() {
-      if (folderFiles && currentFile) convertCurrent();
-    });
-
-    // Open Folder.
     document.getElementById('openFolder').addEventListener('click', async function() {
       if (!window.showDirectoryPicker) {
         alert('File System Access API not supported. Use Chrome or Edge.');
@@ -209,75 +204,68 @@
       try {
         var dirHandle = await window.showDirectoryPicker({ mode: 'read' });
         folderFiles = await readFolder(dirHandle, '');
-        convertedFiles = {};
+        outputFiles = {};
+        pasteMode = false;
         document.getElementById('sidebarPanel').style.display = '';
         document.getElementById('folderName').textContent = dirHandle.name;
         document.getElementById('processAll').disabled = false;
-        buildFileTree();
-        updateStatus();
-
+        renderSidebar();
         // Auto-select first HTML file.
-        var htmlFiles = Object.keys(folderFiles).filter(function(n) { return /\.html?$/i.test(n); });
-        if (htmlFiles.length) selectFile(htmlFiles[0]);
+        var first = Object.keys(folderFiles).sort().find(function(n) { return /\.html?$/i.test(n); });
+        if (first) selectFile(first, 'original');
       } catch (e) {
         if (e.name !== 'AbortError') console.error(e);
       }
     });
 
-    // Paste Mode — hide sidebar, clear folder state.
     document.getElementById('pasteMode').addEventListener('click', function() {
       folderFiles = null;
-      convertedFiles = {};
-      currentFile = null;
+      outputFiles = {};
+      activeFile = null;
+      pasteMode = true;
       document.getElementById('sidebarPanel').style.display = 'none';
       document.getElementById('processAll').disabled = true;
       document.getElementById('downloadCurrent').disabled = true;
       document.getElementById('downloadAll').disabled = true;
       document.getElementById('folderName').textContent = '';
-      document.getElementById('fileSelect').style.display = 'none';
-      window._monacoIn.setValue(defaultInput);
+      document.getElementById('editorFilename').textContent = 'Paste mode';
+      editor.setValue(defaultInput);
+      editor.updateOptions({ readOnly: false });
+      monaco.editor.setModelLanguage(editor.getModel(), 'html');
     });
 
-    // Convert All — process each file sequentially.
     document.getElementById('processAll').addEventListener('click', async function() {
       if (!folderFiles) return;
-      var btn = this;
-      btn.disabled = true;
-      btn.textContent = 'Converting...';
+      this.disabled = true;
+      this.textContent = 'Converting...';
       var paths = Object.keys(folderFiles).filter(function(p) {
-        return /\.(html?|js)$/i.test(p) && /\.innerHTML\s*[+=]/.test(folderFiles[p]);
+        return /\.(html?|js)$/i.test(p);
       });
       for (var i = 0; i < paths.length; i++) {
-        selectFile(paths[i]);
-        await new Promise(function(resolve) { setTimeout(resolve, 200); });
-        var out = window._monacoOut.getValue();
-        if (out && out !== '// (no nodes parsed)') {
-          convertedFiles[paths[i]] = out;
-        }
+        await convertFile(paths[i]);
       }
-      buildFileTree();
-      updateStatus();
-      btn.disabled = false;
-      btn.textContent = 'Convert All';
+      renderSidebar();
+      document.getElementById('downloadAll').disabled = !Object.keys(outputFiles).length;
+      this.disabled = false;
+      this.textContent = 'Convert All';
+      // Show first output file.
+      var firstOut = Object.keys(outputFiles).sort()[0];
+      if (firstOut) selectFile(firstOut, 'output');
     });
 
-    // Download current file.
     document.getElementById('downloadCurrent').addEventListener('click', function() {
-      if (!currentFile || !convertedFiles[currentFile]) return;
-      downloadFile(currentFile.replace(/\.[^.]+$/, '.converted.js'), convertedFiles[currentFile]);
+      if (!activeFile || activeFile.source !== 'output') return;
+      downloadFile(activeFile.path, outputFiles[activeFile.path]);
     });
 
-    // Download all converted files as individual downloads.
     document.getElementById('downloadAll').addEventListener('click', function() {
-      var paths = Object.keys(convertedFiles);
-      if (paths.length === 0) return;
-      paths.forEach(function(path) {
-        downloadFile(path.replace(/\.[^.]+$/, '.converted.js'), convertedFiles[path]);
+      Object.keys(outputFiles).forEach(function(path) {
+        downloadFile(path, outputFiles[path]);
       });
     });
 
     function downloadFile(name, content) {
-      var blob = new Blob([content], { type: 'text/javascript' });
+      var blob = new Blob([content], { type: 'text/plain' });
       var url = URL.createObjectURL(blob);
       var a = document.createElement('a');
       a.href = url;
@@ -286,16 +274,21 @@
       URL.revokeObjectURL(url);
     }
 
-    // Copy output.
     document.getElementById('copy').addEventListener('click', async function() {
-      var text = window._monacoOut.getValue();
-      if (!text) return;
       try {
-        await navigator.clipboard.writeText(text);
+        await navigator.clipboard.writeText(editor.getValue());
         this.textContent = 'Copied!';
         var btn = this;
-        setTimeout(function() { btn.textContent = 'Copy Output'; }, 1200);
+        setTimeout(function() { btn.textContent = 'Copy'; }, 1200);
       } catch (e) {}
+    });
+
+    // Auto-detect language in paste mode.
+    editor.onDidChangeModelContent(function() {
+      if (pasteMode) {
+        var text = editor.getValue();
+        monaco.editor.setModelLanguage(editor.getModel(), /^\s*</.test(text) ? 'html' : 'javascript');
+      }
     });
   });
 })();
