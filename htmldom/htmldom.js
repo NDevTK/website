@@ -5204,13 +5204,34 @@
       }
       return cleanedTag;
     });
-    const result = { html: processed, handlers: null };
+    const result = { html: processed, handlers: null, extractedScripts: [], extractedStyles: [] };
+    // Extract inline <script> blocks to external files.
+    let scriptIdx = 0;
+    processed = processed.replace(/<script\b(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi, function(match, body) {
+      const trimmed = body.trim();
+      if (!trimmed) return '';
+      const name = scriptIdx === 0 ? baseName + '.js' : baseName + '.' + scriptIdx + '.js';
+      scriptIdx++;
+      result.extractedScripts.push({ name: name, content: trimmed });
+      return '<script src="' + name + '"><\/script>';
+    });
+    // Extract inline <style> blocks to external files.
+    let styleIdx = 0;
+    processed = processed.replace(/<style\b[^>]*>([\s\S]*?)<\/style>/gi, function(match, body) {
+      const trimmed = body.trim();
+      if (!trimmed) return '';
+      const name = styleIdx === 0 ? baseName + '.css' : baseName + '.' + styleIdx + '.css';
+      styleIdx++;
+      result.extractedStyles.push({ name: name, content: trimmed });
+      return '<link rel="stylesheet" href="' + name + '">';
+    });
     if (jsLines.length) {
       if (processed.indexOf(handlersFile) < 0) {
-        result.html = processed.replace(/<\/body>/i, '<script src="' + handlersFile + '"><\/script>\n</body>');
+        processed = processed.replace(/<\/body>/i, '<script src="' + handlersFile + '"><\/script>\n</body>');
       }
       result.handlers = { name: handlersFile, content: jsLines.join('\n') };
     }
+    result.html = processed;
     return result;
   }
 
@@ -5226,11 +5247,17 @@
     }
     for (const page of htmlPages) {
       const markup = convertHtmlMarkup(files[page], page);
-      if (markup.html !== files[page]) output[page] = markup.html;
+      const dir = page.indexOf('/') >= 0 ? page.slice(0, page.lastIndexOf('/') + 1) : '';
+      // The HTML is always output (inline scripts/styles extracted).
+      output[page] = markup.html;
       if (markup.handlers) {
-        const dir = page.indexOf('/') >= 0 ? page.slice(0, page.lastIndexOf('/') + 1) : '';
         output[dir + markup.handlers.name] = markup.handlers.content;
       }
+      // Output extracted CSS files.
+      for (const style of markup.extractedStyles) {
+        output[dir + style.name] = style.content;
+      }
+      // Convert external JS files referenced by this page.
       const scripts = pageScriptMap[page] || [];
       let precedingCode = '';
       for (const sp of scripts) {
@@ -5239,17 +5266,11 @@
         if (converted) output[sp] = converted;
         precedingCode += (precedingCode ? '\n' : '') + files[sp];
       }
-      const inlineRe = /<script\b(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi;
-      let im;
-      while ((im = inlineRe.exec(files[page])) !== null) {
-        const inlineJs = im[1].trim();
-        if (!inlineJs) continue;
-        const converted = convertJsFile(inlineJs, precedingCode);
-        if (converted) {
-          const outHtml = output[page] || markup.html;
-          output[page] = outHtml.replace(im[1], '\n' + converted + '\n');
-        }
-        precedingCode += (precedingCode ? '\n' : '') + inlineJs;
+      // Convert extracted inline scripts (now external files).
+      for (const script of markup.extractedScripts) {
+        const converted = convertJsFile(script.content, precedingCode);
+        output[dir + script.name] = converted || script.content;
+        precedingCode += (precedingCode ? '\n' : '') + script.content;
       }
     }
     const standaloneJs = Object.keys(files).filter(function(p) { return /\.js$/i.test(p) && !referencedJs.has(p); }).sort();
