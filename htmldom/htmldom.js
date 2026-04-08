@@ -5167,7 +5167,7 @@
         const tagStart = i;
 
         // Comment: <!-- ... -->
-        if (src[i+1] === '!' && src[i+2] === '-' && src[i+3] === '-') {
+        if (i + 3 < n && src[i+1] === '!' && src[i+2] === '-' && src[i+3] === '-') {
           const endIdx = src.indexOf('-->', i + 4);
           const commentEnd = endIdx >= 0 ? endIdx + 3 : n;
           tokens.push({ type: 'comment', text: src.slice(i + 4, endIdx >= 0 ? endIdx : n), start: i, end: commentEnd });
@@ -5177,7 +5177,7 @@
         }
 
         // DOCTYPE: <!DOCTYPE ...>
-        if (src[i+1] === '!' && (src.slice(i+2, i+9).toUpperCase() === 'DOCTYPE')) {
+        if (i + 9 < n && src[i+1] === '!' && src.slice(i+2, i+9).toUpperCase() === 'DOCTYPE') {
           const endIdx = src.indexOf('>', i + 2);
           const dtEnd = endIdx >= 0 ? endIdx + 1 : n;
           tokens.push({ type: 'doctype', text: src.slice(i, dtEnd), start: i, end: dtEnd });
@@ -5187,7 +5187,7 @@
         }
 
         // Closing tag: </tag>
-        if (src[i+1] === '/') {
+        if (i + 1 < n && src[i+1] === '/') {
           let j = i + 2;
           let tag = '';
           while (j < n && src[j] !== '>' && src[j] !== ' ') { tag += src[j]; j++; }
