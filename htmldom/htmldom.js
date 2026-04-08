@@ -3013,6 +3013,16 @@
                         ek++;
                       }
                       ei = ek;
+                    } else {
+                      // else <single-statement>;
+                      let sd = 0, ek = ei + 1;
+                      while (ek < stop) {
+                        if (tokens[ek].type === 'open') sd++;
+                        else if (tokens[ek].type === 'close') sd--;
+                        else if (sd === 0 && tokens[ek].type === 'sep' && tokens[ek].char === ';') { ek++; break; }
+                        ek++;
+                      }
+                      ei = ek;
                     }
                   }
                   break;
@@ -4414,8 +4424,13 @@
       let output = '';
       let cursor = 0;
       const sharedUsed = new Set();
-      // Reserve all target identifiers so generated variable names
-      // don't shadow them.
+      // Reserve all identifiers from the source code so generated
+      // variable names don't collide with user variables.
+      const srcToks = extractions[0] && extractions[0]._tokens ? extractions[0]._tokens : tokenize(trimmed);
+      for (const st of srcToks) {
+        if (st.type === 'other' && IDENT_RE.test(st.text)) sharedUsed.add(st.text);
+      }
+      // Also reserve target identifier roots.
       for (const ex of extractions) {
         if (ex.target) {
           const root = ex.target.match(/^[A-Za-z_$][A-Za-z0-9_$]*/);

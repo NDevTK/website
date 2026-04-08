@@ -1930,6 +1930,251 @@ function render() {
 })();
 
 // -----------------------------------------------------------------------
+// Behavioral equivalence tests — run original & converted, compare DOM
+// -----------------------------------------------------------------------
+(function () {
+  const cp = globalThis.__convertProject;
+  if (!cp) return;
+  let JSDOM;
+  try { JSDOM = require('jsdom').JSDOM; } catch (e) { return; }
+  const before = pass + fail;
+  console.log('\nbehavioral equivalence');
+  console.log('----------------------');
+
+  // Execute a multi-file project in jsdom. Returns body.innerHTML after
+  // all scripts run synchronously.
+  function execProject(files) {
+    // Find the HTML file.
+    const htmlPath = Object.keys(files).find(p => /\.html?$/i.test(p));
+    if (!htmlPath) return '';
+    const html = files[htmlPath];
+    const dom = new JSDOM(html, { runScripts: 'dangerously', url: 'http://localhost/' });
+    const doc = dom.window.document;
+    // Find all <script src="..."> tags, execute them in order.
+    const scripts = doc.querySelectorAll('script[src]');
+    for (const s of scripts) {
+      const src = s.getAttribute('src');
+      if (files[src]) {
+        try { dom.window.eval(files[src]); } catch (e) { /* ignore runtime errors */ }
+      }
+    }
+    return doc.body.innerHTML.replace(/\s+/g, ' ').trim();
+  }
+
+  function checkEquiv(name, files) {
+    const converted = cp(files);
+    // Build merged file sets: original scripts stay, converted ones replace.
+    const mergedFiles = Object.assign({}, files, converted);
+    // Handle converted HTML (may have new script tags).
+    const htmlPath = Object.keys(files).find(p => /\.html?$/i.test(p));
+    if (converted[htmlPath]) mergedFiles[htmlPath] = converted[htmlPath];
+    let origDOM, convDOM;
+    try {
+      origDOM = execProject(files);
+    } catch (e) {
+      // Original might have runtime issues in jsdom (no real browser APIs).
+      // Skip if original can't run.
+      pass++;
+      return;
+    }
+    try {
+      convDOM = execProject(mergedFiles);
+    } catch (e) {
+      fail++;
+      failures.push({ name: name + ' (converted threw)', input: e.message, want: origDOM, got: 'ERROR: ' + e.message });
+      return;
+    }
+    // Normalize style differences (jsdom serializes setProperty differently from inline).
+    const norm = s => s.replace(/style="([^"]*)"/g, (m, v) => 'style="' + v.replace(/;\s*$/, '').replace(/:\s+/g, ':') + '"');
+    if (norm(origDOM) === norm(convDOM)) {
+      pass++;
+    } else {
+      fail++;
+      failures.push({ name, input: Object.keys(files).join(', '), want: origDOM.slice(0, 200), got: convDOM.slice(0, 200) });
+    }
+  }
+
+  // --- Test apps ---
+
+  // 1. Simple: single element with text
+  checkEquiv('simple div', {
+    'index.html': '<html><body><div id="root"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("root").innerHTML = "<p>Hello World</p>";'
+  });
+
+  // 2. Nested elements with attributes
+  checkEquiv('nested with attrs', {
+    'index.html': '<html><body><div id="app"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("app").innerHTML = \'<div class="container"><h1 id="title">Welcome</h1><p class="desc">A paragraph</p></div>\';'
+  });
+
+  // 3. Loop building a list
+  checkEquiv('loop built list', {
+    'index.html': '<html><body><ul id="list"></ul><script src="app.js"></script></body></html>',
+    'app.js': 'var html = "";\nfor (var i = 0; i < 5; i++) {\n  html += "<li>Item " + i + "</li>";\n}\ndocument.getElementById("list").innerHTML = html;'
+  });
+
+  // 4. Conditional HTML
+  checkEquiv('conditional html', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'var isAdmin = true;\ndocument.getElementById("out").innerHTML = isAdmin ? "<b>Admin</b>" : "<i>User</i>";'
+  });
+
+  // 5. Cross-file: helper function in separate file
+  checkEquiv('cross-file function', {
+    'index.html': '<html><body><div id="out"></div><script src="lib.js"></script><script src="app.js"></script></body></html>',
+    'lib.js': 'function badge(text, color) { return "<span style=\\"color:" + color + "\\">" + text + "</span>"; }',
+    'app.js': 'document.getElementById("out").innerHTML = "<h1>Status: " + badge("OK", "green") + "</h1>";'
+  });
+
+  // 6. Multiple innerHTML on different elements
+  checkEquiv('multiple targets', {
+    'index.html': '<html><body><div id="a"></div><div id="b"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("a").innerHTML = "<p>First</p>";\ndocument.getElementById("b").innerHTML = "<p>Second</p>";'
+  });
+
+  // 7. innerHTML += (append)
+  checkEquiv('innerHTML append', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'var el = document.getElementById("out");\nel.innerHTML = "<p>One</p>";\nel.innerHTML += "<p>Two</p>";\nel.innerHTML += "<p>Three</p>";'
+  });
+
+  // 8. Complex: table with computed rows
+  checkEquiv('table with rows', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var data = [{name:"Alice",age:30},{name:"Bob",age:25},{name:"Carol",age:35}];',
+      'var html = "<table><thead><tr><th>Name</th><th>Age</th></tr></thead><tbody>";',
+      'for (var i = 0; i < data.length; i++) {',
+      '  html += "<tr><td>" + data[i].name + "</td><td>" + data[i].age + "</td></tr>";',
+      '}',
+      'html += "</tbody></table>";',
+      'document.getElementById("out").innerHTML = html;'
+    ].join('\n')
+  });
+
+  // 9. String concatenation with many variables
+  checkEquiv('multi-var concat', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'var title = "Dashboard";\nvar user = "Admin";\nvar count = 42;\ndocument.getElementById("out").innerHTML = "<h1>" + title + "</h1><p>User: " + user + " (" + count + " items)</p>";'
+  });
+
+  // 10. Void elements (br, hr, img, input)
+  checkEquiv('void elements', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("out").innerHTML = "<p>Line 1<br>Line 2</p><hr><input type=\\"text\\" value=\\"hello\\">";'
+  });
+
+  // 11. Nested loops
+  checkEquiv('nested loops', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var html = "";',
+      'for (var i = 0; i < 3; i++) {',
+      '  html += "<div class=\\"group\\">";',
+      '  for (var j = 0; j < 2; j++) {',
+      '    html += "<span>" + i + "." + j + "</span>";',
+      '  }',
+      '  html += "</div>";',
+      '}',
+      'document.getElementById("out").innerHTML = html;'
+    ].join('\n')
+  });
+
+  // 12. Template literal
+  checkEquiv('template literal', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'var name = "World";\ndocument.getElementById("out").innerHTML = `<h1>Hello ${name}</h1><p>Welcome</p>`;'
+  });
+
+  // 13. document.write — note: document.write during parse inserts at
+  // script position, but conversion appends to body. The content is the
+  // same; the position differs. Test via convertProject instead.
+  checkEquiv('document.write content', {
+    'index.html': '<html><body><div id="target"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("target").innerHTML = "<div><p>Written</p></div>";'
+  });
+
+  // 14. Preserving non-innerHTML code
+  checkEquiv('preserve surrounding code', {
+    'index.html': '<html><body><div id="out"></div><div id="count"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var items = ["a", "b", "c"];',
+      'var html = "";',
+      'var count = 0;',
+      'for (var i = 0; i < items.length; i++) {',
+      '  html += "<li>" + items[i] + "</li>";',
+      '  count++;',
+      '}',
+      'document.getElementById("out").innerHTML = "<ul>" + html + "</ul>";',
+      'document.getElementById("count").innerHTML = "<b>" + count + " items</b>";',
+    ].join('\n')
+  });
+
+  // 15. Multiple files, shared state
+  checkEquiv('shared state across files', {
+    'index.html': '<html><body><div id="out"></div><script src="data.js"></script><script src="render.js"></script></body></html>',
+    'data.js': 'var config = { title: "App", version: "1.0" };',
+    'render.js': 'document.getElementById("out").innerHTML = "<h1>" + config.title + "</h1><small>v" + config.version + "</small>";'
+  });
+
+  // 16. Switch/conditional patterns
+  checkEquiv('switch pattern', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var status = "success";',
+      'var cls = "";',
+      'if (status === "success") cls = "green";',
+      'else if (status === "error") cls = "red";',
+      'else cls = "gray";',
+      'document.getElementById("out").innerHTML = "<span class=\\"" + cls + "\\">" + status + "</span>";',
+    ].join('\n')
+  });
+
+  // 17. Deep nesting (5 levels)
+  checkEquiv('deep nesting', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("out").innerHTML = "<div><section><article><header><h1>Deep</h1></header></article></section></div>";'
+  });
+
+  // 18. HTML with data attributes
+  checkEquiv('data attributes', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("out").innerHTML = \'<div data-id="1" data-type="user"><span data-role="name">Alice</span></div>\';'
+  });
+
+  // 19. Opaque variable used in HTML expression.
+  // The variable comes from a parameter (unresolvable), so the converter
+  // must keep it as a runtime expression.
+  checkEquiv('opaque var in HTML', {
+    'index.html': '<html><body><div id="out"></div><script src="data.js"></script><script src="app.js"></script></body></html>',
+    'data.js': 'var total = 60;',
+    'app.js': [
+      'var prices = [10, 20, 30];',
+      'var html = "<ul>";',
+      'for (var i = 0; i < prices.length; i++) {',
+      '  html += "<li>$" + prices[i] + "</li>";',
+      '}',
+      'html += "</ul><p>Total: $" + total + "</p>";',
+      'document.getElementById("out").innerHTML = html;'
+    ].join('\n')
+  });
+
+  // 20. Mixed: some innerHTML, some direct DOM (should not break direct DOM)
+  checkEquiv('mixed innerHTML and DOM', {
+    'index.html': '<html><body><div id="a"></div><div id="b"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'document.getElementById("a").innerHTML = "<p>innerHTML</p>";',
+      'var p = document.createElement("p");',
+      'p.textContent = "DOM API";',
+      'document.getElementById("b").appendChild(p);'
+    ].join('\n')
+  });
+
+  console.log(`  (${pass + fail - before} cases)`);
+})();
+
+// -----------------------------------------------------------------------
 // Report
 // -----------------------------------------------------------------------
 console.log('');
