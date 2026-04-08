@@ -5896,15 +5896,17 @@
       if (existingId) {
         sel = 'document.getElementById(\'' + existingId + '\')';
       } else {
-        // Generate a unique id, checking against existing ids in the HTML.
-        let genId;
+        // Add a data-handler attribute to identify this element.
+        // data-* attributes are standard HTML for machine-generated
+        // metadata and won't collide with the id namespace.
+        let handlerId;
         do {
-          genId = 'el' + (elemCounter++);
+          handlerId = String(elemCounter++);
         } while (htmlTokens.some(function(ht) {
-          return ht.type === 'openTag' && ht.attrs && ht.attrs.some(function(a) { return a.name === 'id' && a.value === genId; });
+          return ht.type === 'openTag' && ht.attrs && ht.attrs.some(function(a) { return a.name === 'data-handler' && a.value === handlerId; });
         }));
-        sel = 'document.getElementById(\'' + genId + '\')';
-        keepAttrs.push({ name: 'id', value: genId, nameRaw: 'id', start: 0, end: 0 });
+        sel = 'document.querySelector(\'[data-handler="' + handlerId + '"]\')';
+        keepAttrs.push({ name: 'data-handler', value: handlerId, nameRaw: 'data-handler', start: 0, end: 0 });
       }
 
       // Count operations for grouping.
