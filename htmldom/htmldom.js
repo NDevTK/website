@@ -329,11 +329,20 @@
         return out;
       };
       const mainTokens = expandChain(r.tokens);
+      // Skip conversion when the RHS is a single innerHTML/outerHTML read
+      // (e.g. el2.innerHTML = el1.innerHTML) — the READ must stay as-is
+      // because it produces the browser's serialized HTML from the DOM.
+      if (mainTokens.length === 1 && mainTokens[0].type === 'other' &&
+          /\.(innerHTML|outerHTML)$/.test(mainTokens[0].text)) {
+        return null;
+      }
       return { target, assignProp, assignOp, chainTokens: mainTokens, loopInfoMap: r.loopInfo, buildVarDeclStart: r.buildVarDeclStart };
     }
-    // Resolver returned the RHS tokens with per-identifier substitution but
-    // couldn't parse the full expression as a concat chain. Return the
-    // resolved tokens directly — they'll go through parseChainToVNodes.
+    // Same check for unparsed tokens.
+    if (r.tokens.length === 1 && r.tokens[0].type === 'other' &&
+        /\.(innerHTML|outerHTML)$/.test(r.tokens[0].text)) {
+      return null;
+    }
     return { target, assignProp, assignOp, chainTokens: r.tokens };
   }
 
@@ -5336,7 +5345,15 @@
           if (child.kind === 'text') {
             lines.push(v + '.textContent = ' + jsStr(child.text).code + ';');
           } else {
-            lines.push(v + '.textContent = ' + child.expr + ';');
+            // Use createTextNode for expression children: it coerces
+            // undefined/null to "undefined"/"null" strings, matching
+            // innerHTML's string concatenation behavior. textContent
+            // would set to empty string for undefined/null.
+            const tn = makeVar('text', used);
+            lines.push('const ' + tn + ' = document.createTextNode(' + child.expr + ');');
+            lines.push(v + '.appendChild(' + tn + ');');
+            lines.push(parentVar + '.appendChild(' + v + ');');
+            return;
           }
         } else {
           let tmpl = '';
