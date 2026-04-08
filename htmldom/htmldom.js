@@ -5896,7 +5896,14 @@
       if (existingId) {
         sel = 'document.getElementById(\'' + existingId + '\')';
       } else {
-        const hdId = 'hd' + (elemCounter++);
+        // Generate a unique data attribute ID, checking against existing
+        // data-hd values in the HTML to avoid collisions.
+        let hdId;
+        do {
+          hdId = 'hd' + (elemCounter++);
+        } while (htmlTokens.some(function(ht) {
+          return ht.type === 'openTag' && ht.attrs && ht.attrs.some(function(a) { return a.name === 'data-hd' && a.value === hdId; });
+        }));
         sel = 'document.querySelector(\'[data-hd="' + hdId + '"]\')';
         keepAttrs.push({ name: 'data-hd', value: hdId, nameRaw: 'data-hd', start: 0, end: 0 });
       }
