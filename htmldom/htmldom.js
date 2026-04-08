@@ -4786,6 +4786,7 @@
     const TEXT = 0, TAG_OPEN = 1, TAG_CLOSE = 2, ATTRS = 3;
     const ATTR_NAME = 4, ATTR_EQ = 5, ATTR_VALUE_DQ = 6, ATTR_VALUE_SQ = 7;
     const ATTR_VALUE_UQ = 8, COMMENT = 9;
+    let commentBuf = '';
 
     let state = TEXT;
     let tagName = '';
@@ -4877,7 +4878,7 @@
               flushText();
               if (text[i + 1] === '/') { state = TAG_CLOSE; closingTag = ''; i++; }
               else if (text[i + 1] === '!' && text[i + 2] === '-' && text[i + 3] === '-') {
-                state = COMMENT; i += 3;
+                state = COMMENT; commentBuf = ''; i += 3;
               }
               else { state = TAG_OPEN; tagName = ''; currentTagLoopId = loopId; }
             } else {
@@ -4956,7 +4957,10 @@
             break;
           case COMMENT:
             if (c === '-' && text[i + 1] === '-' && text[i + 2] === '>') {
+              addChild({ kind: 'comment', text: commentBuf });
               i += 2; state = TEXT;
+            } else {
+              commentBuf += c;
             }
             break;
         }
@@ -5143,6 +5147,13 @@
       if (opts.skipWhitespaceText && /^\s*$/.test(text)) return;
       const v = makeVar('text', used);
       lines.push('const ' + v + ' = document.createTextNode(' + jsStr(text).code + ');');
+      lines.push(parentVar + '.appendChild(' + v + ');');
+      return;
+    }
+
+    if (node.kind === 'comment') {
+      const v = makeVar('comment', used);
+      lines.push('const ' + v + ' = document.createComment(' + jsStr(node.text).code + ');');
       lines.push(parentVar + '.appendChild(' + v + ');');
       return;
     }
