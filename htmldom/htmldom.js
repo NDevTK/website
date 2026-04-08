@@ -5914,7 +5914,8 @@
         opCount += parseStyleDecls(styleVal).length;
       }
       const useVar = opCount > 1;
-      const varName = useVar ? makeVar('el', used) : null;
+      // Variable is scoped inside an IIFE so no collision possible.
+      const varName = useVar ? 'el' : null;
       const ref = useVar ? varName : sel;
 
       if (useVar) {
