@@ -2597,6 +2597,111 @@ function render() {
     'app.js': 'var page = 2; var q = "test"; document.getElementById("out").innerHTML = "<a href=\\"search?q=" + q + "&page=" + page + "\\">Next</a>";'
   });
 
+  // 61. Nested loop break (inner only)
+  checkEquiv('nested loop break', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'var h="";for(var i=0;i<3;i++){h+="<div>";for(var j=0;j<5;j++){if(j>2)break;h+="<span>"+j+"</span>";}h+="</div>";}document.getElementById("out").innerHTML=h;'
+  });
+
+  // 62. Try-catch with different HTML in each branch
+  checkEquiv('try-catch branches', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'var h="";try{h="<p>OK: "+riskyOp()+"</p>";}catch(e){h="<p class=\\"err\\">Error: "+e.message+"</p>";}document.getElementById("out").innerHTML=h;'
+  });
+
+  // 63. Builder function with non-html variable name
+  checkEquiv('builder fn any var name', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'function renderNav(links) {',
+      '  var s = "<nav>";',
+      '  for (var i = 0; i < links.length; i++) {',
+      '    s += "<a href=\\"" + links[i].url + "\\">" + links[i].text + "</a>";',
+      '  }',
+      '  s += "</nav>";',
+      '  return s;',
+      '}',
+      'var links = [{url:"/",text:"Home"},{url:"/about",text:"About"}];',
+      'document.getElementById("out").innerHTML = renderNav(links) + "<main><p>Content</p></main>";'
+    ].join('\n')
+  });
+
+  // 64. Table with tfoot after auto-tbody rows
+  checkEquiv('table with tfoot', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var rows = [{a:1,b:2},{a:3,b:4}];',
+      'var h = "<table><thead><tr><th>A</th><th>B</th></tr></thead>";',
+      'var total = 0;',
+      'for (var i = 0; i < rows.length; i++) {',
+      '  h += "<tr><td>" + rows[i].a + "</td><td>" + rows[i].b + "</td></tr>";',
+      '  total += rows[i].a + rows[i].b;',
+      '}',
+      'h += "<tfoot><tr><td colspan=\\"2\\">Total: " + total + "</td></tr></tfoot></table>";',
+      'document.getElementById("out").innerHTML = h;'
+    ].join('\n')
+  });
+
+  // 65. Complex state: continue + counter + flag
+  checkEquiv('continue counter flag', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var items = [{v:5,show:true},{v:10,show:false},{v:15,show:true},{v:20,show:true}];',
+      'var h = "<ul>";',
+      'var sum = 0;',
+      'var shown = 0;',
+      'for (var i = 0; i < items.length; i++) {',
+      '  sum += items[i].v;',
+      '  if (!items[i].show) continue;',
+      '  h += "<li>" + items[i].v + "</li>";',
+      '  shown++;',
+      '}',
+      'h += "</ul><p>Shown: " + shown + "/" + items.length + ", Sum: " + sum + "</p>";',
+      'document.getElementById("out").innerHTML = h;'
+    ].join('\n')
+  });
+
+  // 66. Multi-file: four files, builder fn, shared config
+  checkEquiv('four file with builder', {
+    'index.html': '<html><body><div id="h"></div><div id="b"></div><script src="cfg.js"></script><script src="util.js"></script><script src="head.js"></script><script src="main.js"></script></body></html>',
+    'cfg.js': 'var APP = {title: "MyApp", version: "2.0"};',
+    'util.js': 'function badge(t) { var r = "<span class=\\"badge\\">"; r += t; r += "</span>"; return r; }',
+    'head.js': 'document.getElementById("h").innerHTML = "<h1>" + APP.title + " " + badge("v" + APP.version) + "</h1>";',
+    'main.js': 'document.getElementById("b").innerHTML = "<p>Welcome to " + APP.title + "</p>";'
+  });
+
+  // 67. Select options built in loop
+  checkEquiv('select options loop', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var opts = [{v:"us",t:"United States"},{v:"uk",t:"United Kingdom"},{v:"de",t:"Germany"}];',
+      'var h = "<select>";',
+      'for (var i = 0; i < opts.length; i++) {',
+      '  h += "<option value=\\"" + opts[i].v + "\\">" + opts[i].t + "</option>";',
+      '}',
+      'h += "</select>";',
+      'document.getElementById("out").innerHTML = h;'
+    ].join('\n')
+  });
+
+  // 68. 8 levels deep nesting
+  checkEquiv('8 level nesting', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("out").innerHTML = "<div><section><article><main><aside><nav><header><footer>deep</footer></header></nav></aside></main></article></section></div>";'
+  });
+
+  // 69. innerHTML = then += then += on same element
+  checkEquiv('set then double append', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'var el = document.getElementById("out"); el.innerHTML = "<h1>Title</h1>"; el.innerHTML += "<p>P1</p>"; el.innerHTML += "<p>P2</p>";'
+  });
+
+  // 70. Many entities
+  checkEquiv('many entities', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("out").innerHTML = "<p>&lt;b&gt;bold&lt;/b&gt; &amp; &lt;i&gt;italic&lt;/i&gt; &copy; 2024</p>";'
+  });
+
   console.log(`  (${pass + fail - before} cases)`);
 })();
 

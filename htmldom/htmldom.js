@@ -4625,7 +4625,7 @@
 
   // Core conversion: takes a raw input string, returns the converted output.
   // sourceName: optional filename for naming output files (e.g. 'index.html').
-  function convertRaw(raw, sourceName) {
+  function convertRaw(raw, sourceName, externalDomFunctions) {
     // Derive the handlers filename from the source.
     const baseName = sourceName ? sourceName.replace(/\.[^.]+$/, '') : 'index';
     const handlersFile = baseName + '.handlers.js';
@@ -4693,6 +4693,11 @@
       // Pre-pass: convert HTML-building helper functions.
       const prepass = convertHtmlBuilderFunctions(raw);
       const processedRaw = prepass.source;
+      // Merge pre-pass converted names with externally known DOM functions.
+      const allDomFunctions = new Set(prepass.converted);
+      if (externalDomFunctions) {
+        for (const fn of externalDomFunctions) allDomFunctions.add(fn);
+      }
       const extractions = extractAllHTML(processedRaw);
       if (extractions.length === 0) {
         const summary = summarizeDomConstruction(processedRaw);
@@ -4723,7 +4728,7 @@
         const target = ex.target || 'document.body';
         const assignOp = ex.assignOp || '=';
 
-        const domBlock = convertOne(processedRaw, ex, false, false, sharedUsed, null, prepass.converted);
+        const domBlock = convertOne(processedRaw, ex, false, false, sharedUsed, null, allDomFunctions);
         let srcStart = ex.srcStart;
         let srcEnd = ex.srcEnd;
         // When the chain carries preserve tokens, the region starts at
@@ -5605,7 +5610,7 @@
     return scripts;
   }
 
-  function convertJsFile(jsContent, precedingCode) {
+  function convertJsFile(jsContent, precedingCode, knownDomFunctions) {
     // Use extractAllHTML to detect actual innerHTML/outerHTML assignments.
     // This uses the tokenizer (skipping comments/strings) AND verifies
     // the target is not a known non-element via scope resolution.
@@ -5614,7 +5619,7 @@
       : jsContent;
     const extractions = extractAllHTML(combined);
     if (extractions.length === 0) return null;
-    const converted = convertRaw(combined);
+    const converted = convertRaw(combined, undefined, knownDomFunctions);
     if (!converted || converted === '// (no nodes parsed)') return null;
     if (precedingCode) {
       const idx = converted.indexOf('/*__FILE_BOUNDARY__*/');
@@ -6029,19 +6034,48 @@
         output[dir + style.name] = style.content;
       }
       // Convert external JS files referenced by this page.
+      // Pass 1: convert builder functions across all files. A builder
+      // function in an earlier file (e.g. util.js) needs to be converted
+      // to return a DocumentFragment so later files can use it.
       const scripts = pageScriptMap[page] || [];
+      const workingFiles = {};
+      for (const sp of scripts) workingFiles[sp] = files[sp] || '';
+      for (const script of markup.extractedScripts) workingFiles[dir + script.name] = script.content;
+      const allConvertedFns = new Set();
+      let precedingForPrepass = '';
+      for (const sp of scripts) {
+        if (!workingFiles[sp]) continue;
+        const combined = precedingForPrepass ? precedingForPrepass + '\n' + workingFiles[sp] : workingFiles[sp];
+        const prepass = convertHtmlBuilderFunctions(combined);
+        for (const fn of prepass.converted) allConvertedFns.add(fn);
+        if (prepass.converted.size > 0 && prepass.source !== combined) {
+          // Extract only the current file's portion from the converted result.
+          const convertedFile = precedingForPrepass
+            ? prepass.source.slice(precedingForPrepass.length + 1)
+            : prepass.source;
+          if (convertedFile !== workingFiles[sp]) {
+            workingFiles[sp] = convertedFile;
+            output[sp] = convertedFile;
+          }
+        }
+        precedingForPrepass += (precedingForPrepass ? '\n' : '') + workingFiles[sp];
+      }
+      // Pass 2: convert innerHTML/outerHTML/document.write/insertAdjacentHTML.
+      // allConvertedFns collects builder function names from pass 1.
       let precedingCode = '';
       for (const sp of scripts) {
-        if (!files[sp]) continue;
-        const converted = convertJsFile(files[sp], precedingCode);
+        if (!workingFiles[sp]) continue;
+        const converted = convertJsFile(workingFiles[sp], precedingCode, allConvertedFns);
         if (converted) output[sp] = converted;
-        precedingCode += (precedingCode ? '\n' : '') + files[sp];
+        precedingCode += (precedingCode ? '\n' : '') + workingFiles[sp];
       }
       // Convert extracted inline scripts (now external files).
       for (const script of markup.extractedScripts) {
-        const converted = convertJsFile(script.content, precedingCode);
-        output[dir + script.name] = converted || script.content;
-        precedingCode += (precedingCode ? '\n' : '') + script.content;
+        const key = dir + script.name;
+        const content = workingFiles[key] || script.content;
+        const converted = convertJsFile(content, precedingCode, allConvertedFns);
+        output[key] = converted || content;
+        precedingCode += (precedingCode ? '\n' : '') + content;
       }
     }
     const standaloneJs = Object.keys(files).filter(function(p) { return /\.js$/i.test(p) && !referencedJs.has(p); }).sort();
