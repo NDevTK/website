@@ -4029,44 +4029,63 @@
           if (lastIdx < html.length) parts.push({ kind: 'html', text: html.slice(lastIdx) });
 
           // Separate HTML parts from script parts. HTML structure is
-          // preserved as-is — only unsafe attributes (inline event
-          // handlers, javascript: URLs) are rewritten.
+          // preserved — unsafe attributes (inline events, javascript:
+          // URLs, inline styles) are extracted to script blocks.
           const scriptParts = [];
           for (const part of parts) {
             if (part.kind === 'html') {
-              // Rewrite inline event handlers to addEventListener calls
-              // and javascript: URLs. Keep all other HTML as-is.
               let safeHtml = part.text;
-              // Collect all inline event rewrites into a trailing <script>.
-              const eventRewrites = [];
+              const rewrites = [];
               let elemCounter = 0;
               safeHtml = safeHtml.replace(/<([a-zA-Z][a-zA-Z0-9]*)((?:\s+[^>]*?)?)>/g, function(match, tag, attrsStr) {
                 const events = [];
-                const cleanAttrs = attrsStr.replace(/\s+on([a-z]+)="([^"]*)"/gi, function(_, evName, handler) {
+                let styleVal = null;
+                let jsHref = null;
+                // Extract inline event handlers.
+                let cleaned = attrsStr.replace(/\s+on([a-z]+)="([^"]*)"/gi, function(_, evName, handler) {
                   events.push({ event: evName.toLowerCase(), handler: handler.replace(/&quot;/g, '"').replace(/&amp;/g, '&') });
                   return '';
                 });
-                // Also handle javascript: hrefs.
-                let jsHref = null;
-                const cleanAttrs2 = cleanAttrs.replace(/\s+href="javascript:([^"]*)"/gi, function(_, code) {
+                // Extract javascript: hrefs.
+                cleaned = cleaned.replace(/\s+href="javascript:([^"]*)"/gi, function(_, code) {
                   jsHref = code.replace(/&quot;/g, '"').replace(/&amp;/g, '&');
                   return '';
                 });
-                if (events.length === 0 && !jsHref) return match;
-                // Add a data attribute to identify the element for the script.
+                // Extract inline styles.
+                cleaned = cleaned.replace(/\s+style="([^"]*)"/gi, function(_, val) {
+                  styleVal = val.replace(/&quot;/g, '"').replace(/&amp;/g, '&');
+                  return '';
+                });
+                if (events.length === 0 && !jsHref && !styleVal) return match;
                 const id = '__hdel' + (elemCounter++);
-                let result = '<' + tag + cleanAttrs2 + ' data-hd-id="' + id + '">';
+                var sel = 'document.querySelector(\'[data-hd-id="' + id + '"]\')';
                 for (const ev of events) {
-                  eventRewrites.push('document.querySelector(\'[data-hd-id="' + id + '"]\').addEventListener(\'' + ev.event + '\', function(event) { ' + ev.handler + ' });');
+                  rewrites.push(sel + '.addEventListener(\'' + ev.event + '\', function(event) { ' + ev.handler + ' });');
                 }
                 if (jsHref) {
-                  eventRewrites.push('document.querySelector(\'[data-hd-id="' + id + '"]\').addEventListener(\'click\', function(event) { event.preventDefault(); ' + jsHref + ' });');
+                  rewrites.push(sel + '.addEventListener(\'click\', function(event) { event.preventDefault(); ' + jsHref + ' });');
                 }
-                return result;
+                if (styleVal) {
+                  // Parse style declarations and emit setProperty calls.
+                  var decls = styleVal.split(';').map(function(d) { return d.trim(); }).filter(Boolean);
+                  for (var di = 0; di < decls.length; di++) {
+                    var colon = decls[di].indexOf(':');
+                    if (colon < 0) continue;
+                    var prop = decls[di].slice(0, colon).trim();
+                    var val = decls[di].slice(colon + 1).trim();
+                    var important = '';
+                    if (/!important\s*$/.test(val)) {
+                      val = val.replace(/\s*!important\s*$/, '');
+                      important = ', \'important\'';
+                    }
+                    rewrites.push(sel + '.style.setProperty(\'' + prop + '\', \'' + val.replace(/'/g, "\\'") + '\'' + important + ');');
+                  }
+                }
+                return '<' + tag + cleaned + ' data-hd-id="' + id + '">';
               });
               outputParts.push(safeHtml);
-              if (eventRewrites.length) {
-                outputParts.push('<script>\n' + eventRewrites.join('\n') + '\n</script>');
+              if (rewrites.length) {
+                outputParts.push('<script>\n' + rewrites.join('\n') + '\n</script>');
               }
             } else {
               scriptParts.push(part);
