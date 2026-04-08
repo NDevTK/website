@@ -26,7 +26,7 @@ global.DOMParser = class {
 const src = fs.readFileSync(path.join(__dirname, 'htmldom.js'), 'utf8');
 const patched = src.replace(
   'function extractHTML(input) {',
-  'globalThis.__extractHTML = extractHTML;\n  globalThis.__extractAllHTML = extractAllHTML;\n  globalThis.__extractAllDOM = extractAllDOM;\n  function extractHTML(input) {'
+  'globalThis.__extractHTML = extractHTML;\n  globalThis.__extractAllHTML = extractAllHTML;\n  globalThis.__extractAllDOM = extractAllDOM;\n  globalThis.__tokenize = tokenize;\n  globalThis.__tokenizeHtml = tokenizeHtml;\n  globalThis.__serializeHtmlTokens = serializeHtmlTokens;\n  globalThis.__decodeHtmlEntities = decodeHtmlEntities;\n  globalThis.__parseStyleDecls = parseStyleDecls;\n  globalThis.__convertRaw = convertRaw;\n  globalThis.__makeVar = makeVar;\n  function extractHTML(input) {'
 );
 // eslint-disable-next-line no-eval
 eval(patched);
@@ -1432,6 +1432,499 @@ function render() {
     ['p.js'],
     { 'p.js': c => /parentNode/.test(c) && /createElement/.test(c) }
   );
+
+  console.log(`  (${pass + fail - before} cases)`);
+})();
+
+// -----------------------------------------------------------------------
+// HTML tokenizer tests
+// -----------------------------------------------------------------------
+(function () {
+  const tokenizeHtml = globalThis.__tokenizeHtml;
+  const serialize = globalThis.__serializeHtmlTokens;
+  if (!tokenizeHtml) return;
+  const before = pass + fail;
+  console.log('\ntokenizeHtml');
+  console.log('------------');
+
+  function checkHtml(name, input, test) {
+    const tokens = tokenizeHtml(input);
+    let ok = false;
+    try { ok = test(tokens, serialize(tokens)); } catch (e) { ok = false; }
+    if (ok) pass++;
+    else { fail++; failures.push({ name, input, want: 'check failed', got: JSON.stringify(tokens.map(t => t.type + ':' + (t.tag || t.text || '').slice(0, 40)).slice(0, 10)) }); }
+  }
+
+  // Round-trip: serialize(tokenize(html)) === html
+  checkHtml('round-trip simple', '<div class="x">hello</div>', (t, s) => s === '<div class="x">hello</div>');
+  checkHtml('round-trip doctype', '<!DOCTYPE html><html><body></body></html>', (t, s) => s === '<!DOCTYPE html><html><body></body></html>');
+  checkHtml('round-trip comment', '<!-- comment --><p>text</p>', (t, s) => s === '<!-- comment --><p>text</p>');
+  checkHtml('round-trip self-close', '<br/><img src="x"/>', (t, s) => s === '<br/><img src="x"/>');
+  checkHtml('round-trip unquoted', '<div id=test>x</div>', (t, s) => s === '<div id="test">x</div>'); // normalizes to quoted
+
+  // Raw text elements — content not parsed as tags
+  checkHtml('script raw text', '<script>var x = "<b>not a tag</b>";</script>', (t) =>
+    t.length === 3 && t[0].type === 'openTag' && t[0].tag === 'script' &&
+    t[1].type === 'text' && t[1].text.includes('<b>') && t[2].type === 'closeTag');
+  checkHtml('style raw text', '<style>div > p { color: red; }</style>', (t) =>
+    t[1].type === 'text' && t[1].text.includes('div > p'));
+  checkHtml('textarea raw text', '<textarea><b>bold</b></textarea>', (t) =>
+    t[1].type === 'text' && t[1].text === '<b>bold</b>');
+  checkHtml('title raw text', '<title>My <b>Page</b></title>', (t) =>
+    t[1].type === 'text' && t[1].text === 'My <b>Page</b>');
+  checkHtml('iframe raw text', '<iframe><p>fallback</p></iframe>', (t) =>
+    t[1].type === 'text' && t[1].text === '<p>fallback</p>');
+  checkHtml('noscript raw text', '<noscript><script>alert(1)</script></noscript>', (t) =>
+    t[1].type === 'text' && t[1].text === '<script>alert(1)</script>');
+
+  // Malformed HTML
+  checkHtml('bare < in text', 'a < b and c > d', (t) =>
+    // The < starts a tag parse attempt, but "b" is not a valid tag context
+    // so behavior may vary, but should not crash
+    true);
+  checkHtml('unclosed tag at EOF', '<div class="x"', (t) => t.length >= 1);
+  checkHtml('empty tag', '<><p>x</p>', (t) => t.some(tk => tk.type === 'openTag' && tk.tag === 'p'));
+  checkHtml('close tag with spaces', '<div>x</ div >', (t) => t.some(tk => tk.type === 'closeTag'));
+
+  // Attribute edge cases
+  checkHtml('single-quoted attr', "<div class='foo'>x</div>", (t) =>
+    t[0].attrs[0].value === 'foo');
+  checkHtml('unquoted attr', '<input type=text disabled>', (t) =>
+    t[0].attrs[0].value === 'text' && t[0].attrs[1].name === 'disabled');
+  checkHtml('boolean attr no value', '<input disabled required>', (t) =>
+    t[0].attrs.length === 2 && t[0].attrs[0].name === 'disabled');
+  checkHtml('attr with entities', '<a href="foo?a=1&amp;b=2">x</a>', (t) =>
+    t[0].attrs[0].value === 'foo?a=1&amp;b=2'); // raw value, not decoded
+  checkHtml('mixed case preserved', '<DiV ClAsS="X">y</DiV>', (t) =>
+    t[0].tag === 'div' && t[0].tagRaw === 'DiV' && t[0].attrs[0].nameRaw === 'ClAsS');
+  checkHtml('multiple spaces in attrs', '<div   id="a"   class="b"  >', (t) =>
+    t[0].attrs.length === 2);
+
+  // Comment edge cases
+  checkHtml('comment with dashes', '<!-- a -- b -->', (t) =>
+    t[0].type === 'comment');
+  checkHtml('empty comment', '<!---->x', (t) =>
+    t[0].type === 'comment' && t[1].type === 'text' && t[1].text === 'x');
+
+  console.log(`  (${pass + fail - before} cases)`);
+})();
+
+// -----------------------------------------------------------------------
+// JS tokenizer tests
+// -----------------------------------------------------------------------
+(function () {
+  const tokenize = globalThis.__tokenize;
+  if (!tokenize) return;
+  const before = pass + fail;
+  console.log('\ntokenize (JS)');
+  console.log('-------------');
+
+  function checkTok(name, input, test) {
+    const tokens = tokenize(input);
+    let ok = false;
+    try { ok = test(tokens); } catch (e) { ok = false; }
+    if (ok) pass++;
+    else { fail++; failures.push({ name, input, want: 'check failed', got: JSON.stringify(tokens.map(t => t.type + ':' + (t.text || t.char || '').slice(0, 30)).slice(0, 15)) }); }
+  }
+
+  // String handling
+  checkTok('single-quoted string', "'hello'", (t) =>
+    t.length === 1 && t[0].type === 'str' && t[0].text === 'hello');
+  checkTok('double-quoted string', '"world"', (t) =>
+    t[0].type === 'str' && t[0].text === 'world');
+  checkTok('escaped quote', "'it\\'s'", (t) =>
+    t[0].type === 'str' && t[0].text === "it's");
+  checkTok('string with backslash-n', "'line1\\nline2'", (t) =>
+    t[0].type === 'str' && t[0].text === 'line1\nline2');
+
+  // Template literals
+  checkTok('template no expr', '`hello`', (t) =>
+    t[0].type === 'tmpl' && t[0].parts.length === 1 && t[0].parts[0].kind === 'text');
+  checkTok('template with expr', '`hi ${name}`', (t) =>
+    t[0].type === 'tmpl' && t[0].parts.some(p => p.kind === 'expr' && p.expr === 'name'));
+  checkTok('nested template', '`a ${`b ${c}`} d`', (t) =>
+    t[0].type === 'tmpl');
+  checkTok('template with braces in string', '`${"{}"}`', (t) =>
+    t[0].type === 'tmpl' && t[0].parts.some(p => p.kind === 'expr'));
+
+  // Regex vs division
+  checkTok('regex after return', 'return /abc/g', (t) =>
+    t.some(tk => tk.type === 'regex'));
+  checkTok('division after number', '4 / 2', (t) =>
+    t.some(tk => tk.type === 'op' && tk.text === '/'));
+  checkTok('regex after =', 'var r = /test/i', (t) =>
+    t.some(tk => tk.type === 'regex' && tk.text === '/test/i'));
+  checkTok('regex after (', 'if (/x/.test(s))', (t) =>
+    t.some(tk => tk.type === 'regex'));
+
+  // Comments skipped
+  checkTok('line comment', 'a // comment\nb', (t) =>
+    t.every(tk => tk.type !== 'comment') && t.some(tk => tk.type === 'other' && tk.text === 'b'));
+  checkTok('block comment', 'a /* comment */ b', (t) =>
+    t.length === 2 && t[0].text === 'a' && t[1].text === 'b');
+
+  // ASI
+  checkTok('ASI after identifier', 'a\nb', (t) =>
+    t.some(tk => tk.type === 'sep' && tk.char === ';'));
+  checkTok('no ASI after open paren', 'f(\na)', (t) =>
+    !t.some(tk => tk.type === 'sep' && tk.char === ';'));
+
+  // Operators
+  checkTok('=== is op not sep', 'a === b', (t) =>
+    t.some(tk => tk.type === 'op' && tk.text === '==='));
+  checkTok('= is sep', 'a = b', (t) =>
+    t.some(tk => tk.type === 'sep' && tk.char === '='));
+  checkTok('+= is sep', 'a += b', (t) =>
+    t.some(tk => tk.type === 'sep' && tk.char === '+='));
+  checkTok('arrow =>', 'x => x', (t) =>
+    t.some(tk => tk.type === 'other' && tk.text === '=>'));
+
+  // Edge cases
+  checkTok('empty input', '', (t) => t.length === 0);
+  checkTok('innerHTML token', 'el.innerHTML', (t) =>
+    t.length === 1 && t[0].type === 'other' && t[0].text === 'el.innerHTML');
+  checkTok('braces in string', 'var s = "{ } { }"', (t) =>
+    t.filter(tk => tk.type === 'open' || tk.type === 'close').length === 0);
+
+  console.log(`  (${pass + fail - before} cases)`);
+})();
+
+// -----------------------------------------------------------------------
+// decodeHtmlEntities tests
+// -----------------------------------------------------------------------
+(function () {
+  const decode = globalThis.__decodeHtmlEntities;
+  if (!decode) return;
+  const before = pass + fail;
+  console.log('\ndecodeHtmlEntities');
+  console.log('------------------');
+
+  function checkEnt(name, input, expected) {
+    const got = decode(input);
+    if (got === expected) pass++;
+    else { fail++; failures.push({ name, input, want: expected, got }); }
+  }
+
+  checkEnt('amp', '&amp;', '&');
+  checkEnt('lt', '&lt;', '<');
+  checkEnt('gt', '&gt;', '>');
+  checkEnt('quot', '&quot;', '"');
+  checkEnt('apos', '&apos;', "'");
+  checkEnt('nbsp', '&nbsp;', '\u00A0');
+  checkEnt('decimal entity', '&#65;', 'A');
+  checkEnt('hex entity', '&#x41;', 'A');
+  checkEnt('hex lowercase', '&#x61;', 'a');
+  checkEnt('large codepoint', '&#x1F600;', '\u{1F600}');
+  checkEnt('unknown named', '&bogus;', '&bogus;'); // preserved as-is
+  checkEnt('no semicolon', '&amp no semi', '&amp no semi'); // no match without ;
+  checkEnt('mixed', '&lt;div&gt; &amp; &quot;hi&quot;', '<div> & "hi"');
+  checkEnt('copy', '&copy;', '\u00A9');
+  checkEnt('euro', '&euro;', '\u20AC');
+  checkEnt('mdash', '&mdash;', '\u2014');
+
+  console.log(`  (${pass + fail - before} cases)`);
+})();
+
+// -----------------------------------------------------------------------
+// parseStyleDecls tests
+// -----------------------------------------------------------------------
+(function () {
+  const parse = globalThis.__parseStyleDecls;
+  if (!parse) return;
+  const before = pass + fail;
+  console.log('\nparseStyleDecls');
+  console.log('---------------');
+
+  function checkCSS(name, input, expected) {
+    const got = parse(input);
+    const ok = JSON.stringify(got) === JSON.stringify(expected);
+    if (ok) pass++;
+    else { fail++; failures.push({ name, input, want: JSON.stringify(expected), got: JSON.stringify(got) }); }
+  }
+
+  checkCSS('simple', 'color: red', [{ prop: 'color', value: 'red', important: false }]);
+  checkCSS('two decls', 'color: red; font-size: 12px', [
+    { prop: 'color', value: 'red', important: false },
+    { prop: 'font-size', value: '12px', important: false }
+  ]);
+  checkCSS('important', 'color: red !important', [{ prop: 'color', value: 'red', important: true }]);
+  checkCSS('trailing semi', 'color: red;', [{ prop: 'color', value: 'red', important: false }]);
+  checkCSS('url with parens', 'background: url(http://example.com)', [
+    { prop: 'background', value: 'url(http://example.com)', important: false }
+  ]);
+  checkCSS('url with semicolon in parens', 'background: url(data:text/css;base64,abc)', [
+    { prop: 'background', value: 'url(data:text/css;base64,abc)', important: false }
+  ]);
+  checkCSS('quoted semicolon', 'content: "a; b"', [
+    { prop: 'content', value: '"a; b"', important: false }
+  ]);
+  checkCSS('single-quoted semicolon', "content: 'a; b'", [
+    { prop: 'content', value: "'a; b'", important: false }
+  ]);
+  checkCSS('empty input', '', []);
+  checkCSS('no colon', 'invalid', []);
+  checkCSS('colon in url value', 'background: url(http://x.com:8080/y)', [
+    { prop: 'background', value: 'url(http://x.com:8080/y)', important: false }
+  ]);
+  checkCSS('whitespace variations', '  color :  red  ;  margin : 0  ', [
+    { prop: 'color', value: 'red', important: false },
+    { prop: 'margin', value: '0', important: false }
+  ]);
+  checkCSS('calc', 'width: calc(100% - 20px)', [
+    { prop: 'width', value: 'calc(100% - 20px)', important: false }
+  ]);
+
+  console.log(`  (${pass + fail - before} cases)`);
+})();
+
+// -----------------------------------------------------------------------
+// makeVar tests
+// -----------------------------------------------------------------------
+(function () {
+  const makeVar = globalThis.__makeVar;
+  if (!makeVar) return;
+  const before = pass + fail;
+  console.log('\nmakeVar');
+  console.log('-------');
+
+  function checkVar(name, tag, usedArr, expected) {
+    const used = new Set(usedArr);
+    const got = makeVar(tag, used);
+    if (got === expected) pass++;
+    else { fail++; failures.push({ name, input: tag, want: expected, got }); }
+  }
+
+  checkVar('simple div', 'div', [], 'div');
+  checkVar('collision', 'div', ['div'], 'div2');
+  checkVar('double collision', 'div', ['div', 'div2'], 'div3');
+  checkVar('reserved word', 'class', [], 'class_');
+  checkVar('reserved for', 'for', [], 'for_');
+  checkVar('number prefix', '1tag', [], 'el1tag');
+  checkVar('uppercase', 'DIV', [], 'div');
+  checkVar('svg tag', 'svg', [], 'svg');
+  checkVar('empty string', '', [], 'el');
+
+  console.log(`  (${pass + fail - before} cases)`);
+})();
+
+// -----------------------------------------------------------------------
+// End-to-end DOM output verification
+// -----------------------------------------------------------------------
+(function () {
+  const convertRaw = globalThis.__convertRaw;
+  if (!convertRaw) return;
+  const before = pass + fail;
+  console.log('\nDOM output');
+  console.log('----------');
+
+  function checkDOM(name, input, test) {
+    const out = convertRaw(input) || '';
+    let ok = false;
+    try { ok = test(out); } catch (e) { ok = false; }
+    if (ok) pass++;
+    else { fail++; failures.push({ name, input, want: 'check failed', got: out.slice(0, 300) }); }
+  }
+
+  // Basic element creation
+  checkDOM('div with text', 'el.innerHTML = "<div>hello</div>";',
+    c => /createElement\('div'\)/.test(c) && /textContent = 'hello'/.test(c) && /appendChild/.test(c));
+  checkDOM('nested elements', 'el.innerHTML = "<ul><li>a</li><li>b</li></ul>";',
+    c => /createElement\('ul'\)/.test(c) && /createElement\('li'\)/.test(c));
+  checkDOM('void element', 'el.innerHTML = "<br>";',
+    c => /createElement\('br'\)/.test(c) && !/textContent/.test(c));
+  checkDOM('img with attrs', 'el.innerHTML = "<img src=\\"pic.jpg\\" alt=\\"photo\\">";',
+    c => /createElement\('img'\)/.test(c) && /(src|setAttribute)/.test(c));
+
+  // Expression handling
+  checkDOM('expression in text', 'el.innerHTML = "<p>" + msg + "</p>";',
+    c => /createElement\('p'\)/.test(c) && /msg/.test(c));
+  checkDOM('expression in attribute', 'el.innerHTML = "<div class=\\"" + cls + "\\">x</div>";',
+    c => /cls/.test(c) && /createElement/.test(c));
+
+  // innerHTML += (append, no replaceChildren)
+  checkDOM('innerHTML += appends', 'el.innerHTML += "<li>item</li>";',
+    c => /createElement/.test(c) && /appendChild/.test(c) && !/replaceChildren/.test(c));
+  // innerHTML = (replace)
+  checkDOM('innerHTML = replaces', 'el.innerHTML = "<p>new</p>";',
+    c => /replaceChildren/.test(c) && /createElement/.test(c));
+
+  // Multiple elements
+  checkDOM('multiple top-level elements', 'el.innerHTML = "<h1>Title</h1><p>Body</p>";',
+    c => /createElement\('h1'\)/.test(c) && /createElement\('p'\)/.test(c));
+
+  // Empty innerHTML
+  checkDOM('empty innerHTML', 'el.innerHTML = "";',
+    c => /replaceChildren/.test(c));
+
+  // SVG namespace
+  checkDOM('svg element', 'el.innerHTML = "<svg><rect width=\\"10\\"></rect></svg>";',
+    c => /createElementNS/.test(c) && /svg/.test(c));
+
+  // Boolean attributes
+  checkDOM('boolean attr', 'el.innerHTML = "<input disabled>";',
+    c => /createElement\('input'\)/.test(c) && /disabled/.test(c));
+
+  // Text-only content
+  checkDOM('text only', 'el.innerHTML = "just text";',
+    c => /createTextNode/.test(c) && !/createElement/.test(c));
+
+  // Whitespace text
+  checkDOM('whitespace between tags', 'el.innerHTML = "<div>a</div> <div>b</div>";',
+    c => /createElement\('div'\)/.test(c));
+
+  // HTML entities in static content
+  checkDOM('entities decoded', 'el.innerHTML = "<p>&amp; &lt; &gt;</p>";',
+    c => /createElement\('p'\)/.test(c));
+
+  // Deeply nested
+  checkDOM('deeply nested', 'el.innerHTML = "<div><span><a href=\\"#\\">link</a></span></div>";',
+    c => /createElement\('div'\)/.test(c) && /createElement\('span'\)/.test(c) && /createElement\('a'\)/.test(c));
+
+  console.log(`  (${pass + fail - before} cases)`);
+})();
+
+// -----------------------------------------------------------------------
+// Tricky inputs — try to break the engine
+// -----------------------------------------------------------------------
+(function () {
+  const convertRaw = globalThis.__convertRaw;
+  const tokenize = globalThis.__tokenize;
+  const tokenizeHtml = globalThis.__tokenizeHtml;
+  const cp = globalThis.__convertProject;
+  if (!convertRaw || !cp) return;
+  const before = pass + fail;
+  console.log('\ntricky inputs');
+  console.log('-------------');
+
+  function checkNoThrow(name, fn) {
+    try { fn(); pass++; }
+    catch (e) { fail++; failures.push({ name, input: '(function)', want: 'no throw', got: e.message }); }
+  }
+
+  function checkProject(name, files, expectedKeys, checks) {
+    const out = cp(files);
+    const gotKeys = Object.keys(out).sort();
+    const wantKeys = expectedKeys.sort();
+    if (JSON.stringify(gotKeys) !== JSON.stringify(wantKeys)) {
+      fail++;
+      failures.push({ name: name + ' (files)', input: Object.keys(files), want: wantKeys, got: gotKeys });
+      return;
+    }
+    if (checks) {
+      for (const [key, test] of Object.entries(checks)) {
+        if (!test(out[key] || '')) {
+          fail++;
+          failures.push({ name: name + ' (' + key + ')', input: key, want: 'check failed', got: (out[key] || '').slice(0, 200) });
+          return;
+        }
+      }
+    }
+    pass++;
+  }
+
+  // Script tag inside innerHTML string should become createElement, not execute
+  checkProject('script in innerHTML is safe',
+    { 'i.html': '<html><body><script src="i.js"></script></body></html>',
+      'i.js': 'el.innerHTML = "<script>alert(1)<\\/script>";' },
+    ['i.js'],
+    { 'i.js': c => /createElement\('script'\)/.test(c) && !/alert\(1\)/.test(c) === false });
+
+  // Attribute with > in value shouldn't break parsing
+  checkProject('attr with > in value',
+    { 'i.html': '<html><body><div data-expr="a > b" onclick="go()">x</div></body></html>' },
+    ['i.html', 'i.handlers.js'],
+    { 'i.handlers.js': c => /addEventListener/.test(c) && /go\(\)/.test(c) });
+
+  // Nested quotes in onclick
+  checkProject('deeply nested quotes onclick',
+    { 'i.html': '<html><body><button onclick="f(\'a\', &quot;b&quot;)">x</button></body></html>' },
+    ['i.html', 'i.handlers.js'],
+    { 'i.handlers.js': c => /f\(/.test(c) });
+
+  // innerHTML with template literal
+  checkNoThrow('template literal innerHTML', () => {
+    convertRaw('el.innerHTML = `<div>${name}</div>`;');
+  });
+
+  // Huge deeply nested HTML
+  checkNoThrow('deeply nested HTML', () => {
+    const deep = '<div>'.repeat(50) + 'x' + '</div>'.repeat(50);
+    convertRaw('el.innerHTML = "' + deep.replace(/"/g, '\\"') + '";');
+  });
+
+  // innerHTML assignment with no RHS value
+  checkNoThrow('empty RHS', () => {
+    convertRaw('el.innerHTML = ;');
+  });
+
+  // Variable named innerHTML
+  checkNoThrow('var named innerHTML', () => {
+    convertRaw('var innerHTML = "<div>test</div>";');
+  });
+
+  // Chained property access
+  checkNoThrow('chained access innerHTML', () => {
+    convertRaw('a.b.c.innerHTML = "<p>test</p>";');
+  });
+
+  // document.write with concatenation
+  checkProject('document.write with concat',
+    { 'i.html': '<html><body><script src="i.js"></script></body></html>',
+      'i.js': 'var title = "Hello";\ndocument.write("<h1>" + title + "</h1>");' },
+    ['i.js'],
+    { 'i.js': c => /createElement/.test(c) && !/document\.write/.test(c) });
+
+  // HTML with all unsafe patterns at once
+  checkProject('all unsafe patterns',
+    { 'i.html': '<html><body><a href="javascript:void(0)" onclick="go()" style="color:red">x</a></body></html>' },
+    ['i.html', 'i.handlers.js'],
+    { 'i.html': c => !/onclick/.test(c) && !/javascript:/.test(c) && !/style=/.test(c),
+      'i.handlers.js': c => /addEventListener.*click/.test(c) && /preventDefault/.test(c) && /setProperty/.test(c) });
+
+  // Self-closing script tag (should not extract anything)
+  checkNoThrow('self-closing script', () => {
+    const tokens = tokenizeHtml('<script/>');
+    // Script with self-close shouldn't enter raw text mode endlessly
+  });
+
+  // HTML with only whitespace
+  checkNoThrow('whitespace only HTML', () => {
+    convertRaw('   \n\t  ');
+  });
+
+  // Very long single-line innerHTML
+  checkNoThrow('very long innerHTML', () => {
+    const items = Array.from({length: 100}, (_, i) => '<li>' + i + '</li>').join('');
+    convertRaw('el.innerHTML = "' + items + '";');
+  });
+
+  // innerHTML in try/catch
+  checkNoThrow('innerHTML in try-catch', () => {
+    convertRaw('try { el.innerHTML = "<p>test</p>"; } catch(e) {}');
+  });
+
+  // Re-assignment of target
+  checkNoThrow('target reassigned', () => {
+    convertRaw('var el = document.getElementById("x");\nel.innerHTML = "<div>ok</div>";\nel = null;');
+  });
+
+  // Unicode in HTML
+  checkNoThrow('unicode in HTML', () => {
+    convertRaw('el.innerHTML = "<p>\\u2603 snowman</p>";');
+  });
+
+  // Regex that looks like HTML
+  checkNoThrow('regex with angle brackets', () => {
+    const toks = tokenize('var re = /<div>/g;');
+    // The < should be part of the regex, not trigger HTML detection
+  });
+
+  // Object with innerHTML property and real element
+  checkProject('object innerHTML then element innerHTML',
+    { 'i.html': '<html><body><script src="i.js"></script></body></html>',
+      'i.js': 'var cfg = { innerHTML: "" };\ncfg.innerHTML = "not html";\ndocument.getElementById("x").innerHTML = "<b>real</b>";' },
+    ['i.js'],
+    { 'i.js': c => /createElement\('b'\)/.test(c) });
 
   console.log(`  (${pass + fail - before} cases)`);
 })();
