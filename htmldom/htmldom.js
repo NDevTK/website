@@ -5353,12 +5353,68 @@
         // Dynamic expression in attribute value.
         hAttrExprs.push({ pos: hAttrVal.length, expr: expr });
       } else if (hState === S_ATTRS || hState === S_TAG_OPEN) {
-        // Expression inside a tag (between attributes). This handles
-        // patterns like: <option value="x" + (cond ? " selected" : "") + ">
-        // The expression may add/remove attributes dynamically.
-        // Store it as a dynamic attribute name expression.
+        // Expression inside a tag (between attributes).
+        // Parse the expression at compile time to extract attribute
+        // name/value. Use the JS tokenizer to detect ternary patterns.
         hFinishAttr();
-        hAttrs.push({ kind: 'dynamic_name', nameExpr: expr });
+        var parsed = false;
+        // Detect ternary: cond ? " attr" : "" or cond ? "" : " attr"
+        var toks = tokenize(expr);
+        var qIdx = -1;
+        for (var ti = 0; ti < toks.length; ti++) {
+          if (toks[ti].type === 'other' && toks[ti].text === '?') { qIdx = ti; break; }
+        }
+        if (qIdx > 0) {
+          // Find the : separator (at depth 0)
+          var colonIdx = -1;
+          var depth = 0;
+          for (var ti = qIdx + 1; ti < toks.length; ti++) {
+            if (toks[ti].type === 'open') depth++;
+            else if (toks[ti].type === 'close') depth--;
+            else if (depth === 0 && toks[ti].type === 'other' && toks[ti].text === ':') { colonIdx = ti; break; }
+          }
+          if (colonIdx > 0) {
+            // Extract condition, ifTrue, ifFalse as source text
+            var condEnd = toks[qIdx].start;
+            var trueStart = toks[qIdx].end;
+            var trueEnd = toks[colonIdx].start;
+            var falseStart = toks[colonIdx].end;
+            var condExpr = expr.slice(0, condEnd).trim();
+            var trueExpr = expr.slice(trueStart, trueEnd).trim();
+            var falseExpr = expr.slice(falseStart).trim();
+            // Check if one branch is a string and the other is empty
+            var trueStr = null, falseStr = null;
+            if (trueExpr.length >= 2 && (trueExpr[0] === '"' || trueExpr[0] === "'")) {
+              trueStr = trueExpr.slice(1, -1).trim();
+            }
+            if (falseExpr.length >= 2 && (falseExpr[0] === '"' || falseExpr[0] === "'")) {
+              falseStr = falseExpr.slice(1, -1).trim();
+            }
+            if (trueStr !== null && (falseStr === '' || falseExpr === '""' || falseExpr === "''")) {
+              // cond ? " attr" : "" — conditional attribute
+              var eqPos = trueStr.indexOf('=');
+              if (eqPos >= 0) {
+                hAttrs.push({ kind: 'cond_attr', condExpr: condExpr, name: trueStr.slice(0, eqPos), value: trueStr.slice(eqPos + 1).replace(/^['"]/, '').replace(/['"]$/, '') });
+              } else if (trueStr) {
+                hAttrs.push({ kind: 'cond_attr', condExpr: condExpr, name: trueStr, value: '' });
+              }
+              parsed = true;
+            } else if (falseStr !== null && (trueStr === '' || trueExpr === '""' || trueExpr === "''")) {
+              // cond ? "" : " attr" — inverted conditional
+              var eqPos2 = falseStr.indexOf('=');
+              if (eqPos2 >= 0) {
+                hAttrs.push({ kind: 'cond_attr', condExpr: '!(' + condExpr + ')', name: falseStr.slice(0, eqPos2), value: falseStr.slice(eqPos2 + 1).replace(/^['"]/, '').replace(/['"]$/, '') });
+              } else if (falseStr) {
+                hAttrs.push({ kind: 'cond_attr', condExpr: '!(' + condExpr + ')', name: falseStr, value: '' });
+              }
+              parsed = true;
+            }
+          }
+        }
+        if (!parsed) {
+          // Not a ternary or not parseable — keep as dynamic_name
+          hAttrs.push({ kind: 'dynamic_name', nameExpr: expr });
+        }
       } else {
         // Text context — emit as text node or DOM call.
         hFlushText();
