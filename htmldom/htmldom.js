@@ -5144,21 +5144,37 @@
           }
           continue;
         }
-        // Dynamic attribute name: expression that produces attr text.
-        // Fallback for complex cases where compile-time parsing isn't possible.
+        // Dynamic attribute: the expression produces raw attribute text
+        // like " selected" or " class=active disabled". Parse at runtime
+        // using a proper character-by-character attribute tokenizer —
+        // the same approach as our compile-time HTML tokenizer.
         if (attr.kind === 'dynamic_name') {
-          // Runtime attribute: the expression produces text like
-          // " selected" or " class=active". Parse name=value at runtime.
-          var attrVar = makeVar('attr', used);
-          lines.push('var ' + attrVar + ' = (' + attr.nameExpr + ').trim();');
-          lines.push('if (' + attrVar + ') {');
-          lines.push('  var __eq = ' + attrVar + '.indexOf("=");');
-          lines.push('  if (__eq >= 0) {');
-          lines.push('    var __val = ' + attrVar + '.slice(__eq + 1);');
-          lines.push('    var __q = __val[0]; if (__q === String.fromCharCode(34) || __q === String.fromCharCode(39)) __val = __val.slice(1, -1);');
-          lines.push('    ' + v + '.setAttribute(' + attrVar + '.slice(0, __eq), __val);');
-          lines.push('  } else ' + v + '.setAttribute(' + attrVar + ', "");');
-          lines.push('}');
+          var srcVar = makeVar('attrSrc', used);
+          lines.push('var ' + srcVar + ' = ' + attr.nameExpr + ';');
+          lines.push('(function(el, s) {');
+          lines.push('  var i = 0, n = s.length;');
+          lines.push('  while (i < n) {');
+          lines.push('    while (i < n && (s[i] === " " || s[i] === "\\t" || s[i] === "\\n")) i++;');
+          lines.push('    if (i >= n) break;');
+          lines.push('    var name = "";');
+          lines.push('    while (i < n && s[i] !== "=" && s[i] !== " " && s[i] !== "\\t") { name += s[i]; i++; }');
+          lines.push('    if (!name) break;');
+          lines.push('    while (i < n && (s[i] === " " || s[i] === "\\t")) i++;');
+          lines.push('    if (i < n && s[i] === "=") {');
+          lines.push('      i++;');
+          lines.push('      while (i < n && (s[i] === " " || s[i] === "\\t")) i++;');
+          lines.push('      var val = "";');
+          lines.push('      if (i < n && (s[i] === "\\"" || s[i] === "\'")) {');
+          lines.push('        var q = s[i]; i++;');
+          lines.push('        while (i < n && s[i] !== q) { val += s[i]; i++; }');
+          lines.push('        if (i < n) i++;');
+          lines.push('      } else {');
+          lines.push('        while (i < n && s[i] !== " " && s[i] !== "\\t") { val += s[i]; i++; }');
+          lines.push('      }');
+          lines.push('      el.setAttribute(name, val);');
+          lines.push('    } else { el.setAttribute(name, ""); }');
+          lines.push('  }');
+          lines.push('})(' + v + ', ' + srcVar + ');');
           continue;
         }
         const name = attr.name;
