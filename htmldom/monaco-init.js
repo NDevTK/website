@@ -113,15 +113,24 @@
         if (source === 'original') {
           var badge = document.createElement('span');
           badge.className = 'badge';
-          if (outputFiles[path]) {
+          var isHtml = /\.html?$/i.test(path);
+          // Check if this page has output files.
+          var hasOutput = isHtml && Object.keys(outputFiles).some(function(op) { return op.indexOf(path.replace(/\.[^.]+$/, '')) === 0; });
+          if (hasOutput) {
             badge.className += ' converted';
             badge.textContent = 'converted';
-          } else if (/\.innerHTML\s*[+=]/.test(files[path]) || /\bon[a-z]+="|style="/i.test(files[path])) {
+          } else if (isHtml && (/\.innerHTML\s*[+=]/.test(files[path]) || /\bon[a-z]+="|style="/i.test(files[path]))) {
             badge.className += ' has-inner';
             badge.textContent = 'unsafe';
+          } else if (/\.js$/i.test(path)) {
+            badge.className += ' clean';
+            badge.textContent = 'script';
+          } else if (/\.css$/i.test(path)) {
+            badge.className += ' clean';
+            badge.textContent = 'style';
           } else {
             badge.className += ' clean';
-            badge.textContent = 'clean';
+            badge.textContent = isHtml ? 'clean' : '';
           }
           el.appendChild(badge);
         } else {
@@ -157,48 +166,56 @@
     }
 
     // --- Conversion ---
-    // Convert a single file and store results in outputFiles.
-    function convertFile(path) {
-      var content = folderFiles[path];
-      if (/\.html?$/i.test(path)) {
-        content = resolveScriptSrcs(content, path, folderFiles);
-      }
+    // Convert a single HTML page: resolve its script/CSS references,
+    // feed through the converter, store output files namespaced to the page.
+    function convertHtmlPage(htmlPath) {
+      var content = resolveScriptSrcs(folderFiles[htmlPath], htmlPath, folderFiles);
       editor.setValue(content);
       return new Promise(function(resolve) {
         setTimeout(function() {
           var result = outputForCurrent || '';
           if (!result || result === '// (no nodes parsed)') { resolve(); return; }
+          // Namespace output files by the HTML page's directory.
+          var dir = htmlPath.indexOf('/') >= 0 ? htmlPath.slice(0, htmlPath.lastIndexOf('/') + 1) : '';
+          var baseName = htmlPath.replace(/^.*\//, '').replace(/\.[^.]+$/, '');
           var parts = result.split(/^\/\/ === (.+?) ===$/m);
           if (parts.length > 1) {
             for (var i = 1; i < parts.length; i += 2) {
               var name = parts[i].trim();
               var body = (parts[i + 1] || '').trim();
-              if (body) outputFiles[name] = body;
+              if (!body) continue;
+              // Prefix output filenames with the page's directory.
+              // safe-handlers.js becomes pageName.safe.js to avoid collisions.
+              if (name === 'safe-handlers.js') {
+                outputFiles[dir + baseName + '.safe.js'] = body;
+              } else {
+                outputFiles[dir + name] = body;
+              }
             }
           } else {
-            outputFiles[path.replace(/\.[^.]+$/, '.safe.js')] = result;
+            outputFiles[dir + baseName + '.safe.js'] = result;
           }
           resolve();
         }, 150);
       });
     }
 
-    // Convert all files in the folder sequentially.
+    // Convert all HTML pages in the folder. Each page is an independent
+    // conversion unit with its own JS/CSS scope — no cross-page contamination.
     var convertAllRunning = false;
     async function convertAll() {
       if (convertAllRunning) return;
       convertAllRunning = true;
       outputFiles = {};
-      // Save current editor state.
       var savedFile = activeFile;
       var savedContent = editor.getValue();
-      var paths = Object.keys(folderFiles).filter(function(p) {
-        return /\.(html?|js)$/i.test(p);
-      });
-      for (var i = 0; i < paths.length; i++) {
-        await convertFile(paths[i]);
+      // Only process HTML files as entry points.
+      var htmlPages = Object.keys(folderFiles).filter(function(p) {
+        return /\.html?$/i.test(p);
+      }).sort();
+      for (var i = 0; i < htmlPages.length; i++) {
+        await convertHtmlPage(htmlPages[i]);
       }
-      // Restore editor to what the user was viewing.
       if (savedFile && folderFiles[savedFile.path]) {
         editor.setValue(savedFile.source === 'output' ? (outputFiles[savedFile.path] || '') : savedContent);
         editor.updateOptions({ readOnly: savedFile.source === 'output' });
