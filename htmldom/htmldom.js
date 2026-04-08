@@ -3800,10 +3800,36 @@
                 while (i < n && src[i] !== q) { if (src[i] === '\\') i += 2; else i++; }
                 i++;
               } else if (ch === '`') {
+                // Nested template literal: skip its content properly,
+                // handling strings and nested ${...} with brace tracking.
                 i++;
                 while (i < n && src[i] !== '`') {
-                  if (src[i] === '\\') { i += 2; }
-                  else if (src[i] === '$' && src[i + 1] === '{') { i += 2; let d = 1; while (i < n && d > 0) { if (src[i] === '{') d++; else if (src[i] === '}') d--; i++; } }
+                  if (src[i] === '\\' && i + 1 < n) { i += 2; }
+                  else if (src[i] === '$' && src[i + 1] === '{') {
+                    i += 2; let d = 1;
+                    while (i < n && d > 0) {
+                      if (src[i] === "'" || src[i] === '"') {
+                        const q = src[i]; i++;
+                        while (i < n && src[i] !== q) { if (src[i] === '\\') i += 2; else i++; }
+                        i++;
+                      } else if (src[i] === '`') {
+                        // Recurse: skip nested template. Use simple depth
+                        // tracking since deeply nested templates are rare.
+                        i++; let td = 0;
+                        while (i < n && !(src[i] === '`' && td === 0)) {
+                          if (src[i] === '\\' && i + 1 < n) i += 2;
+                          else if (src[i] === '$' && src[i + 1] === '{') { td++; i += 2; }
+                          else if (src[i] === '}' && td > 0) { td--; i++; }
+                          else i++;
+                        }
+                        if (i < n) i++; // past closing `
+                      } else {
+                        if (src[i] === '{') d++;
+                        else if (src[i] === '}') d--;
+                        if (d > 0) i++;
+                      }
+                    }
+                  }
                   else i++;
                 }
                 i++;
@@ -5226,10 +5252,12 @@
         i = j;
         textStart = i;
 
-        // Raw text elements: <script> and <style> content is NOT parsed
-        // for HTML tags. Consume everything as text until the matching
-        // closing tag.
-        if (!selfClose && (tagLower === 'script' || tagLower === 'style')) {
+        // Raw text elements (script, style, iframe, noscript) and escapable
+        // raw text elements (textarea, title): content is NOT parsed for
+        // HTML tags. Consume everything as text until the closing tag.
+        if (!selfClose && (tagLower === 'script' || tagLower === 'style' ||
+            tagLower === 'textarea' || tagLower === 'title' ||
+            tagLower === 'iframe' || tagLower === 'noscript')) {
           const closePattern = '</' + tagLower;
           const rawStart = i;
           while (i < n) {
