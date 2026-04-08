@@ -5116,6 +5116,7 @@
     // parent at each nesting level. No runtime parent pointer needed.
     var parentStack = [parent]; // stack of variable names
     var runtimeParentVars = new Set(); // variables that are runtime parent pointers
+    var inUnbalancedLoop = false; // true when inside a loop with unbalanced tags
     function curParent() { return parentStack[parentStack.length - 1]; }
     function isRuntimeVar(name) { return runtimeParentVars.has(name); }
 
@@ -5290,11 +5291,9 @@
       var parentExpr = curParent();
       lines.push(parentExpr + '.appendChild(' + v + ');');
       if (!selfClose) {
-        // If the current parent is a runtime variable, update it
-        // instead of just pushing (needed for unbalanced loops where
-        // the parent changes across iterations).
-        var isRuntimeParent = isRuntimeVar(parentExpr);
-        if (isRuntimeParent) {
+        // In unbalanced loops, update the runtime parent variable
+        // so the next iteration appends to the new element.
+        if (inUnbalancedLoop && isRuntimeVar(parentExpr)) {
           lines.push(parentExpr + ' = ' + v + ';');
         }
         parentStack.push(v);
@@ -5735,7 +5734,7 @@
 
       function emitLoopFooter() {
         const entry = openLoops.pop();
-        // If loop had a runtime parent, restore parent stack to use it.
+        if (entry.runtimeParent) inUnbalancedLoop = false;
         if (entry.runtimeParent && entry.preStack) {
           parentStack.length = 0;
           for (var ri = 0; ri < entry.preStack.length; ri++) parentStack.push(entry.preStack[ri]);
@@ -5790,6 +5789,7 @@
             // Record on the loop entry so emitLoopFooter can restore.
             openLoops[openLoops.length - 1].runtimeParent = loopParent;
             openLoops[openLoops.length - 1].preStack = preLoopStack;
+            inUnbalancedLoop = true;
           }
           emitChain([t]);
         } else if (loopId === null && currentLoop !== null) {
