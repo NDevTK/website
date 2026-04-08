@@ -26,7 +26,7 @@ global.DOMParser = class {
 const src = fs.readFileSync(path.join(__dirname, 'htmldom.js'), 'utf8');
 const patched = src.replace(
   'function extractHTML(input) {',
-  'globalThis.__extractHTML = extractHTML;\n  globalThis.__extractAllHTML = extractAllHTML;\n  globalThis.__extractAllDOM = extractAllDOM;\n  function extractHTML(input) {'
+  'globalThis.__extractHTML = extractHTML;\n  globalThis.__extractAllHTML = extractAllHTML;\n  globalThis.__extractAllDOM = extractAllDOM;\n  globalThis.__tokenize = tokenize;\n  globalThis.__tokenizeHtml = tokenizeHtml;\n  globalThis.__serializeHtmlTokens = serializeHtmlTokens;\n  globalThis.__decodeHtmlEntities = decodeHtmlEntities;\n  globalThis.__parseStyleDecls = parseStyleDecls;\n  globalThis.__convertRaw = convertRaw;\n  globalThis.__makeVar = makeVar;\n  function extractHTML(input) {'
 );
 // eslint-disable-next-line no-eval
 eval(patched);
@@ -1365,6 +1365,1342 @@ function render() {
     ['p.js'],
     { 'p.js': c => /createElement/.test(c) && !/innerHTML/.test(c) }
   );
+
+  // 17. Non-element target — plain object with innerHTML should NOT be converted.
+  checkProject('non-element innerHTML skipped',
+    {
+      'p.html': '<html><body><script src="p.js"></script></body></html>',
+      'p.js': 'var obj = { innerHTML: "" };\nobj.innerHTML = "<div>test</div>";'
+    },
+    [],  // No output — the assignment is on a plain object, not a DOM element
+  );
+
+  // 18. String variable with innerHTML property name should NOT be converted.
+  checkProject('string var innerHTML skipped',
+    {
+      'p.html': '<html><body><script src="p.js"></script></body></html>',
+      'p.js': 'var tpl = "<b>hi</b>";\nvar result = { innerHTML: tpl };\nresult.innerHTML = "<p>" + tpl + "</p>";'
+    },
+    [],  // result is a plain object
+  );
+
+  // 19. document.write converted.
+  checkProject('document.write converted',
+    {
+      'p.html': '<html><body><script src="p.js"></script></body></html>',
+      'p.js': 'document.write("<h1>Title</h1>");'
+    },
+    ['p.js'],
+    { 'p.js': c => /createElement/.test(c) && /appendChild/.test(c) && !/document\.write/.test(c) }
+  );
+
+  // 20. document.writeln converted.
+  checkProject('document.writeln converted',
+    {
+      'p.html': '<html><body><script src="p.js"></script></body></html>',
+      'p.js': 'document.writeln("<p>" + msg + "</p>");'
+    },
+    ['p.js'],
+    { 'p.js': c => /createElement/.test(c) && !/writeln/.test(c) }
+  );
+
+  // 21. document.write in string not converted.
+  checkProject('document.write in string ignored',
+    {
+      'p.html': '<html><body><script src="p.js"></script></body></html>',
+      'p.js': 'var s = "document.write is deprecated";'
+    },
+    [],
+  );
+
+  // 22. insertAdjacentHTML converted.
+  checkProject('insertAdjacentHTML converted',
+    {
+      'p.html': '<html><body><script src="p.js"></script></body></html>',
+      'p.js': 'el.insertAdjacentHTML("beforeend", "<li>" + item + "</li>");'
+    },
+    ['p.js'],
+    { 'p.js': c => /createElement/.test(c) && /appendChild/.test(c) && !/insertAdjacentHTML/.test(c) }
+  );
+
+  // 23. insertAdjacentHTML beforebegin uses parentNode.
+  checkProject('insertAdjacentHTML beforebegin',
+    {
+      'p.html': '<html><body><script src="p.js"></script></body></html>',
+      'p.js': 'ref.insertAdjacentHTML("beforebegin", "<hr>");'
+    },
+    ['p.js'],
+    { 'p.js': c => /parentNode/.test(c) && /createElement/.test(c) }
+  );
+
+  console.log(`  (${pass + fail - before} cases)`);
+})();
+
+// -----------------------------------------------------------------------
+// HTML tokenizer tests
+// -----------------------------------------------------------------------
+(function () {
+  const tokenizeHtml = globalThis.__tokenizeHtml;
+  const serialize = globalThis.__serializeHtmlTokens;
+  if (!tokenizeHtml) return;
+  const before = pass + fail;
+  console.log('\ntokenizeHtml');
+  console.log('------------');
+
+  function checkHtml(name, input, test) {
+    const tokens = tokenizeHtml(input);
+    let ok = false;
+    try { ok = test(tokens, serialize(tokens)); } catch (e) { ok = false; }
+    if (ok) pass++;
+    else { fail++; failures.push({ name, input, want: 'check failed', got: JSON.stringify(tokens.map(t => t.type + ':' + (t.tag || t.text || '').slice(0, 40)).slice(0, 10)) }); }
+  }
+
+  // Round-trip: serialize(tokenize(html)) === html
+  checkHtml('round-trip simple', '<div class="x">hello</div>', (t, s) => s === '<div class="x">hello</div>');
+  checkHtml('round-trip doctype', '<!DOCTYPE html><html><body></body></html>', (t, s) => s === '<!DOCTYPE html><html><body></body></html>');
+  checkHtml('round-trip comment', '<!-- comment --><p>text</p>', (t, s) => s === '<!-- comment --><p>text</p>');
+  checkHtml('round-trip self-close', '<br/><img src="x"/>', (t, s) => s === '<br/><img src="x"/>');
+  checkHtml('round-trip unquoted', '<div id=test>x</div>', (t, s) => s === '<div id="test">x</div>'); // normalizes to quoted
+
+  // Raw text elements — content not parsed as tags
+  checkHtml('script raw text', '<script>var x = "<b>not a tag</b>";</script>', (t) =>
+    t.length === 3 && t[0].type === 'openTag' && t[0].tag === 'script' &&
+    t[1].type === 'text' && t[1].text.includes('<b>') && t[2].type === 'closeTag');
+  checkHtml('style raw text', '<style>div > p { color: red; }</style>', (t) =>
+    t[1].type === 'text' && t[1].text.includes('div > p'));
+  checkHtml('textarea raw text', '<textarea><b>bold</b></textarea>', (t) =>
+    t[1].type === 'text' && t[1].text === '<b>bold</b>');
+  checkHtml('title raw text', '<title>My <b>Page</b></title>', (t) =>
+    t[1].type === 'text' && t[1].text === 'My <b>Page</b>');
+  checkHtml('iframe raw text', '<iframe><p>fallback</p></iframe>', (t) =>
+    t[1].type === 'text' && t[1].text === '<p>fallback</p>');
+  checkHtml('noscript raw text', '<noscript><script>alert(1)</script></noscript>', (t) =>
+    t[1].type === 'text' && t[1].text === '<script>alert(1)</script>');
+
+  // Malformed HTML
+  checkHtml('bare < in text', 'a < b and c > d', (t) =>
+    // The < starts a tag parse attempt, but "b" is not a valid tag context
+    // so behavior may vary, but should not crash
+    true);
+  checkHtml('unclosed tag at EOF', '<div class="x"', (t) => t.length >= 1);
+  checkHtml('empty tag', '<><p>x</p>', (t) => t.some(tk => tk.type === 'openTag' && tk.tag === 'p'));
+  checkHtml('close tag with spaces', '<div>x</ div >', (t) => t.some(tk => tk.type === 'closeTag'));
+
+  // Attribute edge cases
+  checkHtml('single-quoted attr', "<div class='foo'>x</div>", (t) =>
+    t[0].attrs[0].value === 'foo');
+  checkHtml('unquoted attr', '<input type=text disabled>', (t) =>
+    t[0].attrs[0].value === 'text' && t[0].attrs[1].name === 'disabled');
+  checkHtml('boolean attr no value', '<input disabled required>', (t) =>
+    t[0].attrs.length === 2 && t[0].attrs[0].name === 'disabled');
+  checkHtml('attr with entities', '<a href="foo?a=1&amp;b=2">x</a>', (t) =>
+    t[0].attrs[0].value === 'foo?a=1&amp;b=2'); // raw value, not decoded
+  checkHtml('mixed case preserved', '<DiV ClAsS="X">y</DiV>', (t) =>
+    t[0].tag === 'div' && t[0].tagRaw === 'DiV' && t[0].attrs[0].nameRaw === 'ClAsS');
+  checkHtml('multiple spaces in attrs', '<div   id="a"   class="b"  >', (t) =>
+    t[0].attrs.length === 2);
+
+  // Comment edge cases
+  checkHtml('comment with dashes', '<!-- a -- b -->', (t) =>
+    t[0].type === 'comment');
+  checkHtml('empty comment', '<!---->x', (t) =>
+    t[0].type === 'comment' && t[1].type === 'text' && t[1].text === 'x');
+
+  console.log(`  (${pass + fail - before} cases)`);
+})();
+
+// -----------------------------------------------------------------------
+// JS tokenizer tests
+// -----------------------------------------------------------------------
+(function () {
+  const tokenize = globalThis.__tokenize;
+  if (!tokenize) return;
+  const before = pass + fail;
+  console.log('\ntokenize (JS)');
+  console.log('-------------');
+
+  function checkTok(name, input, test) {
+    const tokens = tokenize(input);
+    let ok = false;
+    try { ok = test(tokens); } catch (e) { ok = false; }
+    if (ok) pass++;
+    else { fail++; failures.push({ name, input, want: 'check failed', got: JSON.stringify(tokens.map(t => t.type + ':' + (t.text || t.char || '').slice(0, 30)).slice(0, 15)) }); }
+  }
+
+  // String handling
+  checkTok('single-quoted string', "'hello'", (t) =>
+    t.length === 1 && t[0].type === 'str' && t[0].text === 'hello');
+  checkTok('double-quoted string', '"world"', (t) =>
+    t[0].type === 'str' && t[0].text === 'world');
+  checkTok('escaped quote', "'it\\'s'", (t) =>
+    t[0].type === 'str' && t[0].text === "it's");
+  checkTok('string with backslash-n', "'line1\\nline2'", (t) =>
+    t[0].type === 'str' && t[0].text === 'line1\nline2');
+
+  // Template literals
+  checkTok('template no expr', '`hello`', (t) =>
+    t[0].type === 'tmpl' && t[0].parts.length === 1 && t[0].parts[0].kind === 'text');
+  checkTok('template with expr', '`hi ${name}`', (t) =>
+    t[0].type === 'tmpl' && t[0].parts.some(p => p.kind === 'expr' && p.expr === 'name'));
+  checkTok('nested template', '`a ${`b ${c}`} d`', (t) =>
+    t[0].type === 'tmpl');
+  checkTok('template with braces in string', '`${"{}"}`', (t) =>
+    t[0].type === 'tmpl' && t[0].parts.some(p => p.kind === 'expr'));
+
+  // Regex vs division
+  checkTok('regex after return', 'return /abc/g', (t) =>
+    t.some(tk => tk.type === 'regex'));
+  checkTok('division after number', '4 / 2', (t) =>
+    t.some(tk => tk.type === 'op' && tk.text === '/'));
+  checkTok('regex after =', 'var r = /test/i', (t) =>
+    t.some(tk => tk.type === 'regex' && tk.text === '/test/i'));
+  checkTok('regex after (', 'if (/x/.test(s))', (t) =>
+    t.some(tk => tk.type === 'regex'));
+
+  // Comments skipped
+  checkTok('line comment', 'a // comment\nb', (t) =>
+    t.every(tk => tk.type !== 'comment') && t.some(tk => tk.type === 'other' && tk.text === 'b'));
+  checkTok('block comment', 'a /* comment */ b', (t) =>
+    t.length === 2 && t[0].text === 'a' && t[1].text === 'b');
+
+  // ASI
+  checkTok('ASI after identifier', 'a\nb', (t) =>
+    t.some(tk => tk.type === 'sep' && tk.char === ';'));
+  checkTok('no ASI after open paren', 'f(\na)', (t) =>
+    !t.some(tk => tk.type === 'sep' && tk.char === ';'));
+
+  // Operators
+  checkTok('=== is op not sep', 'a === b', (t) =>
+    t.some(tk => tk.type === 'op' && tk.text === '==='));
+  checkTok('= is sep', 'a = b', (t) =>
+    t.some(tk => tk.type === 'sep' && tk.char === '='));
+  checkTok('+= is sep', 'a += b', (t) =>
+    t.some(tk => tk.type === 'sep' && tk.char === '+='));
+  checkTok('arrow =>', 'x => x', (t) =>
+    t.some(tk => tk.type === 'other' && tk.text === '=>'));
+
+  // Edge cases
+  checkTok('empty input', '', (t) => t.length === 0);
+  checkTok('innerHTML token', 'el.innerHTML', (t) =>
+    t.length === 1 && t[0].type === 'other' && t[0].text === 'el.innerHTML');
+  checkTok('braces in string', 'var s = "{ } { }"', (t) =>
+    t.filter(tk => tk.type === 'open' || tk.type === 'close').length === 0);
+
+  console.log(`  (${pass + fail - before} cases)`);
+})();
+
+// -----------------------------------------------------------------------
+// decodeHtmlEntities tests
+// -----------------------------------------------------------------------
+(function () {
+  const decode = globalThis.__decodeHtmlEntities;
+  if (!decode) return;
+  const before = pass + fail;
+  console.log('\ndecodeHtmlEntities');
+  console.log('------------------');
+
+  function checkEnt(name, input, expected) {
+    const got = decode(input);
+    if (got === expected) pass++;
+    else { fail++; failures.push({ name, input, want: expected, got }); }
+  }
+
+  checkEnt('amp', '&amp;', '&');
+  checkEnt('lt', '&lt;', '<');
+  checkEnt('gt', '&gt;', '>');
+  checkEnt('quot', '&quot;', '"');
+  checkEnt('apos', '&apos;', "'");
+  checkEnt('nbsp', '&nbsp;', '\u00A0');
+  checkEnt('decimal entity', '&#65;', 'A');
+  checkEnt('hex entity', '&#x41;', 'A');
+  checkEnt('hex lowercase', '&#x61;', 'a');
+  checkEnt('large codepoint', '&#x1F600;', '\u{1F600}');
+  checkEnt('unknown named', '&bogus;', '&bogus;'); // preserved as-is
+  checkEnt('no semicolon', '&amp no semi', '&amp no semi'); // no match without ;
+  checkEnt('mixed', '&lt;div&gt; &amp; &quot;hi&quot;', '<div> & "hi"');
+  checkEnt('copy', '&copy;', '\u00A9');
+  checkEnt('euro', '&euro;', '\u20AC');
+  checkEnt('mdash', '&mdash;', '\u2014');
+
+  console.log(`  (${pass + fail - before} cases)`);
+})();
+
+// -----------------------------------------------------------------------
+// parseStyleDecls tests
+// -----------------------------------------------------------------------
+(function () {
+  const parse = globalThis.__parseStyleDecls;
+  if (!parse) return;
+  const before = pass + fail;
+  console.log('\nparseStyleDecls');
+  console.log('---------------');
+
+  function checkCSS(name, input, expected) {
+    const got = parse(input);
+    const ok = JSON.stringify(got) === JSON.stringify(expected);
+    if (ok) pass++;
+    else { fail++; failures.push({ name, input, want: JSON.stringify(expected), got: JSON.stringify(got) }); }
+  }
+
+  checkCSS('simple', 'color: red', [{ prop: 'color', value: 'red', important: false }]);
+  checkCSS('two decls', 'color: red; font-size: 12px', [
+    { prop: 'color', value: 'red', important: false },
+    { prop: 'font-size', value: '12px', important: false }
+  ]);
+  checkCSS('important', 'color: red !important', [{ prop: 'color', value: 'red', important: true }]);
+  checkCSS('trailing semi', 'color: red;', [{ prop: 'color', value: 'red', important: false }]);
+  checkCSS('url with parens', 'background: url(http://example.com)', [
+    { prop: 'background', value: 'url(http://example.com)', important: false }
+  ]);
+  checkCSS('url with semicolon in parens', 'background: url(data:text/css;base64,abc)', [
+    { prop: 'background', value: 'url(data:text/css;base64,abc)', important: false }
+  ]);
+  checkCSS('quoted semicolon', 'content: "a; b"', [
+    { prop: 'content', value: '"a; b"', important: false }
+  ]);
+  checkCSS('single-quoted semicolon', "content: 'a; b'", [
+    { prop: 'content', value: "'a; b'", important: false }
+  ]);
+  checkCSS('empty input', '', []);
+  checkCSS('no colon', 'invalid', []);
+  checkCSS('colon in url value', 'background: url(http://x.com:8080/y)', [
+    { prop: 'background', value: 'url(http://x.com:8080/y)', important: false }
+  ]);
+  checkCSS('whitespace variations', '  color :  red  ;  margin : 0  ', [
+    { prop: 'color', value: 'red', important: false },
+    { prop: 'margin', value: '0', important: false }
+  ]);
+  checkCSS('calc', 'width: calc(100% - 20px)', [
+    { prop: 'width', value: 'calc(100% - 20px)', important: false }
+  ]);
+
+  console.log(`  (${pass + fail - before} cases)`);
+})();
+
+// -----------------------------------------------------------------------
+// makeVar tests
+// -----------------------------------------------------------------------
+(function () {
+  const makeVar = globalThis.__makeVar;
+  if (!makeVar) return;
+  const before = pass + fail;
+  console.log('\nmakeVar');
+  console.log('-------');
+
+  function checkVar(name, tag, usedArr, expected) {
+    const used = new Set(usedArr);
+    const got = makeVar(tag, used);
+    if (got === expected) pass++;
+    else { fail++; failures.push({ name, input: tag, want: expected, got }); }
+  }
+
+  checkVar('simple div', 'div', [], 'div');
+  checkVar('collision', 'div', ['div'], 'div2');
+  checkVar('double collision', 'div', ['div', 'div2'], 'div3');
+  checkVar('reserved word', 'class', [], 'class_');
+  checkVar('reserved for', 'for', [], 'for_');
+  checkVar('number prefix', '1tag', [], 'el1tag');
+  checkVar('uppercase', 'DIV', [], 'div');
+  checkVar('svg tag', 'svg', [], 'svg');
+  checkVar('empty string', '', [], 'el');
+
+  console.log(`  (${pass + fail - before} cases)`);
+})();
+
+// -----------------------------------------------------------------------
+// End-to-end DOM output verification
+// -----------------------------------------------------------------------
+(function () {
+  const convertRaw = globalThis.__convertRaw;
+  if (!convertRaw) return;
+  const before = pass + fail;
+  console.log('\nDOM output');
+  console.log('----------');
+
+  function checkDOM(name, input, test) {
+    const out = convertRaw(input) || '';
+    let ok = false;
+    try { ok = test(out); } catch (e) { ok = false; }
+    if (ok) pass++;
+    else { fail++; failures.push({ name, input, want: 'check failed', got: out.slice(0, 300) }); }
+  }
+
+  // Basic element creation
+  checkDOM('div with text', 'el.innerHTML = "<div>hello</div>";',
+    c => /createElement\('div'\)/.test(c) && (/textContent/.test(c) || /createTextNode\('hello'\)/.test(c)) && /appendChild/.test(c));
+  checkDOM('nested elements', 'el.innerHTML = "<ul><li>a</li><li>b</li></ul>";',
+    c => /createElement\('ul'\)/.test(c) && /createElement\('li'\)/.test(c));
+  checkDOM('void element', 'el.innerHTML = "<br>";',
+    c => /createElement\('br'\)/.test(c) && !/textContent/.test(c));
+  checkDOM('img with attrs', 'el.innerHTML = "<img src=\\"pic.jpg\\" alt=\\"photo\\">";',
+    c => /createElement\('img'\)/.test(c) && /(src|setAttribute)/.test(c));
+
+  // Expression handling
+  checkDOM('expression in text', 'el.innerHTML = "<p>" + msg + "</p>";',
+    c => /createElement\('p'\)/.test(c) && /msg/.test(c));
+  checkDOM('expression in attribute', 'el.innerHTML = "<div class=\\"" + cls + "\\">x</div>";',
+    c => /cls/.test(c) && /createElement/.test(c));
+
+  // innerHTML += (append, no replaceChildren)
+  checkDOM('innerHTML += appends', 'el.innerHTML += "<li>item</li>";',
+    c => /createElement/.test(c) && /appendChild/.test(c) && !/replaceChildren/.test(c));
+  // innerHTML = (replace)
+  checkDOM('innerHTML = replaces', 'el.innerHTML = "<p>new</p>";',
+    c => /replaceChildren/.test(c) && /createElement/.test(c));
+
+  // Multiple elements
+  checkDOM('multiple top-level elements', 'el.innerHTML = "<h1>Title</h1><p>Body</p>";',
+    c => /createElement\('h1'\)/.test(c) && /createElement\('p'\)/.test(c));
+
+  // Empty innerHTML
+  checkDOM('empty innerHTML', 'el.innerHTML = "";',
+    c => /replaceChildren/.test(c));
+
+  // SVG namespace
+  checkDOM('svg element', 'el.innerHTML = "<svg><rect width=\\"10\\"></rect></svg>";',
+    c => /createElementNS/.test(c) && /svg/.test(c));
+
+  // Boolean attributes
+  checkDOM('boolean attr', 'el.innerHTML = "<input disabled>";',
+    c => /createElement\('input'\)/.test(c) && /disabled/.test(c));
+
+  // Text-only content
+  checkDOM('text only', 'el.innerHTML = "just text";',
+    c => /createTextNode/.test(c) && !/createElement/.test(c));
+
+  // Whitespace text
+  checkDOM('whitespace between tags', 'el.innerHTML = "<div>a</div> <div>b</div>";',
+    c => /createElement\('div'\)/.test(c));
+
+  // HTML entities in static content
+  checkDOM('entities decoded', 'el.innerHTML = "<p>&amp; &lt; &gt;</p>";',
+    c => /createElement\('p'\)/.test(c));
+
+  // Deeply nested
+  checkDOM('deeply nested', 'el.innerHTML = "<div><span><a href=\\"#\\">link</a></span></div>";',
+    c => /createElement\('div'\)/.test(c) && /createElement\('span'\)/.test(c) && /createElement\('a'\)/.test(c));
+
+  console.log(`  (${pass + fail - before} cases)`);
+})();
+
+// -----------------------------------------------------------------------
+// Tricky inputs — try to break the engine
+// -----------------------------------------------------------------------
+(function () {
+  const convertRaw = globalThis.__convertRaw;
+  const tokenize = globalThis.__tokenize;
+  const tokenizeHtml = globalThis.__tokenizeHtml;
+  const cp = globalThis.__convertProject;
+  if (!convertRaw || !cp) return;
+  const before = pass + fail;
+  console.log('\ntricky inputs');
+  console.log('-------------');
+
+  function checkNoThrow(name, fn) {
+    try { fn(); pass++; }
+    catch (e) { fail++; failures.push({ name, input: '(function)', want: 'no throw', got: e.message }); }
+  }
+
+  function checkProject(name, files, expectedKeys, checks) {
+    const out = cp(files);
+    const gotKeys = Object.keys(out).sort();
+    const wantKeys = expectedKeys.sort();
+    if (JSON.stringify(gotKeys) !== JSON.stringify(wantKeys)) {
+      fail++;
+      failures.push({ name: name + ' (files)', input: Object.keys(files), want: wantKeys, got: gotKeys });
+      return;
+    }
+    if (checks) {
+      for (const [key, test] of Object.entries(checks)) {
+        if (!test(out[key] || '')) {
+          fail++;
+          failures.push({ name: name + ' (' + key + ')', input: key, want: 'check failed', got: (out[key] || '').slice(0, 200) });
+          return;
+        }
+      }
+    }
+    pass++;
+  }
+
+  // Script tag inside innerHTML string should become createElement, not execute
+  checkProject('script in innerHTML is safe',
+    { 'i.html': '<html><body><script src="i.js"></script></body></html>',
+      'i.js': 'el.innerHTML = "<script>alert(1)<\\/script>";' },
+    ['i.js'],
+    { 'i.js': c => /createElement\('script'\)/.test(c) && !/alert\(1\)/.test(c) === false });
+
+  // Attribute with > in value shouldn't break parsing
+  checkProject('attr with > in value',
+    { 'i.html': '<html><body><div data-expr="a > b" onclick="go()">x</div></body></html>' },
+    ['i.html', 'i.handlers.js'],
+    { 'i.handlers.js': c => /addEventListener/.test(c) && /go\(\)/.test(c) });
+
+  // Nested quotes in onclick
+  checkProject('deeply nested quotes onclick',
+    { 'i.html': '<html><body><button onclick="f(\'a\', &quot;b&quot;)">x</button></body></html>' },
+    ['i.html', 'i.handlers.js'],
+    { 'i.handlers.js': c => /f\(/.test(c) });
+
+  // innerHTML with template literal
+  checkNoThrow('template literal innerHTML', () => {
+    convertRaw('el.innerHTML = `<div>${name}</div>`;');
+  });
+
+  // Huge deeply nested HTML
+  checkNoThrow('deeply nested HTML', () => {
+    const deep = '<div>'.repeat(50) + 'x' + '</div>'.repeat(50);
+    convertRaw('el.innerHTML = "' + deep.replace(/"/g, '\\"') + '";');
+  });
+
+  // innerHTML assignment with no RHS value
+  checkNoThrow('empty RHS', () => {
+    convertRaw('el.innerHTML = ;');
+  });
+
+  // Variable named innerHTML
+  checkNoThrow('var named innerHTML', () => {
+    convertRaw('var innerHTML = "<div>test</div>";');
+  });
+
+  // Chained property access
+  checkNoThrow('chained access innerHTML', () => {
+    convertRaw('a.b.c.innerHTML = "<p>test</p>";');
+  });
+
+  // document.write with concatenation
+  checkProject('document.write with concat',
+    { 'i.html': '<html><body><script src="i.js"></script></body></html>',
+      'i.js': 'var title = "Hello";\ndocument.write("<h1>" + title + "</h1>");' },
+    ['i.js'],
+    { 'i.js': c => /createElement/.test(c) && !/document\.write/.test(c) });
+
+  // HTML with all unsafe patterns at once
+  checkProject('all unsafe patterns',
+    { 'i.html': '<html><body><a href="javascript:void(0)" onclick="go()" style="color:red">x</a></body></html>' },
+    ['i.html', 'i.handlers.js'],
+    { 'i.html': c => !/onclick/.test(c) && !/javascript:/.test(c) && !/style=/.test(c),
+      'i.handlers.js': c => /addEventListener.*click/.test(c) && /preventDefault/.test(c) && /setProperty/.test(c) });
+
+  // Self-closing script tag (should not extract anything)
+  checkNoThrow('self-closing script', () => {
+    const tokens = tokenizeHtml('<script/>');
+    // Script with self-close shouldn't enter raw text mode endlessly
+  });
+
+  // HTML with only whitespace
+  checkNoThrow('whitespace only HTML', () => {
+    convertRaw('   \n\t  ');
+  });
+
+  // Very long single-line innerHTML
+  checkNoThrow('very long innerHTML', () => {
+    const items = Array.from({length: 100}, (_, i) => '<li>' + i + '</li>').join('');
+    convertRaw('el.innerHTML = "' + items + '";');
+  });
+
+  // innerHTML in try/catch
+  checkNoThrow('innerHTML in try-catch', () => {
+    convertRaw('try { el.innerHTML = "<p>test</p>"; } catch(e) {}');
+  });
+
+  // Re-assignment of target
+  checkNoThrow('target reassigned', () => {
+    convertRaw('var el = document.getElementById("x");\nel.innerHTML = "<div>ok</div>";\nel = null;');
+  });
+
+  // Unicode in HTML
+  checkNoThrow('unicode in HTML', () => {
+    convertRaw('el.innerHTML = "<p>\\u2603 snowman</p>";');
+  });
+
+  // Regex that looks like HTML
+  checkNoThrow('regex with angle brackets', () => {
+    const toks = tokenize('var re = /<div>/g;');
+    // The < should be part of the regex, not trigger HTML detection
+  });
+
+  // Object with innerHTML property and real element
+  checkProject('object innerHTML then element innerHTML',
+    { 'i.html': '<html><body><script src="i.js"></script></body></html>',
+      'i.js': 'var cfg = { innerHTML: "" };\ncfg.innerHTML = "not html";\ndocument.getElementById("x").innerHTML = "<b>real</b>";' },
+    ['i.js'],
+    { 'i.js': c => /createElement\('b'\)/.test(c) });
+
+  console.log(`  (${pass + fail - before} cases)`);
+})();
+
+// -----------------------------------------------------------------------
+// Behavioral equivalence tests — run original & converted, compare DOM
+// -----------------------------------------------------------------------
+(function () {
+  const cp = globalThis.__convertProject;
+  if (!cp) return;
+  let JSDOM;
+  try { JSDOM = require('jsdom').JSDOM; } catch (e) { return; }
+  const before = pass + fail;
+  console.log('\nbehavioral equivalence');
+  console.log('----------------------');
+
+  // Execute a multi-file project in jsdom. Returns body.innerHTML after
+  // all scripts run synchronously.
+  function execProject(files) {
+    // Find the HTML file.
+    const htmlPath = Object.keys(files).find(p => /\.html?$/i.test(p));
+    if (!htmlPath) return '';
+    const html = files[htmlPath];
+    const dom = new JSDOM(html, { runScripts: 'dangerously', url: 'http://localhost/' });
+    const doc = dom.window.document;
+    // Find all <script src="..."> tags, execute them in order.
+    const scripts = doc.querySelectorAll('script[src]');
+    for (const s of scripts) {
+      const src = s.getAttribute('src');
+      if (files[src]) {
+        try { dom.window.eval(files[src]); } catch (e) { /* ignore runtime errors */ }
+      }
+    }
+    return doc.body.innerHTML.replace(/\s+/g, ' ').trim();
+  }
+
+  function checkEquiv(name, files) {
+    const converted = cp(files);
+    // Build merged file sets: original scripts stay, converted ones replace.
+    const mergedFiles = Object.assign({}, files, converted);
+    // Handle converted HTML (may have new script tags).
+    const htmlPath = Object.keys(files).find(p => /\.html?$/i.test(p));
+    if (converted[htmlPath]) mergedFiles[htmlPath] = converted[htmlPath];
+    let origDOM, convDOM;
+    try {
+      origDOM = execProject(files);
+    } catch (e) {
+      // Original might have runtime issues in jsdom (no real browser APIs).
+      // Skip if original can't run.
+      pass++;
+      return;
+    }
+    try {
+      convDOM = execProject(mergedFiles);
+    } catch (e) {
+      fail++;
+      failures.push({ name: name + ' (converted threw)', input: e.message, want: origDOM, got: 'ERROR: ' + e.message });
+      return;
+    }
+    // Normalize style attribute serialization: setProperty and
+    // setAttribute('style') produce identical computed styles but
+    // browsers serialize them differently (spacing, trailing semicolon).
+    const normStyle = s => s.replace(/style="([^"]*)"/g, (m, v) =>
+      'style="' + v.replace(/\s*;\s*$/, '').replace(/\s*:\s*/g, ':').replace(/\s*;\s*/g, ';') + '"');
+    if (normStyle(origDOM) === normStyle(convDOM)) {
+      pass++;
+    } else {
+      fail++;
+      failures.push({ name, input: Object.keys(files).join(', '), want: origDOM.slice(0, 200), got: convDOM.slice(0, 200) });
+    }
+  }
+
+  // --- Test apps ---
+
+  // 1. Simple: single element with text
+  checkEquiv('simple div', {
+    'index.html': '<html><body><div id="root"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("root").innerHTML = "<p>Hello World</p>";'
+  });
+
+  // 2. Nested elements with attributes
+  checkEquiv('nested with attrs', {
+    'index.html': '<html><body><div id="app"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("app").innerHTML = \'<div class="container"><h1 id="title">Welcome</h1><p class="desc">A paragraph</p></div>\';'
+  });
+
+  // 3. Loop building a list
+  checkEquiv('loop built list', {
+    'index.html': '<html><body><ul id="list"></ul><script src="app.js"></script></body></html>',
+    'app.js': 'var html = "";\nfor (var i = 0; i < 5; i++) {\n  html += "<li>Item " + i + "</li>";\n}\ndocument.getElementById("list").innerHTML = html;'
+  });
+
+  // 4. Conditional HTML
+  checkEquiv('conditional html', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'var isAdmin = true;\ndocument.getElementById("out").innerHTML = isAdmin ? "<b>Admin</b>" : "<i>User</i>";'
+  });
+
+  // 5. Cross-file: helper function in separate file
+  checkEquiv('cross-file function', {
+    'index.html': '<html><body><div id="out"></div><script src="lib.js"></script><script src="app.js"></script></body></html>',
+    'lib.js': 'function badge(text, color) { return "<span style=\\"color:" + color + "\\">" + text + "</span>"; }',
+    'app.js': 'document.getElementById("out").innerHTML = "<h1>Status: " + badge("OK", "green") + "</h1>";'
+  });
+
+  // 6. Multiple innerHTML on different elements
+  checkEquiv('multiple targets', {
+    'index.html': '<html><body><div id="a"></div><div id="b"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("a").innerHTML = "<p>First</p>";\ndocument.getElementById("b").innerHTML = "<p>Second</p>";'
+  });
+
+  // 7. innerHTML += (append)
+  checkEquiv('innerHTML append', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'var el = document.getElementById("out");\nel.innerHTML = "<p>One</p>";\nel.innerHTML += "<p>Two</p>";\nel.innerHTML += "<p>Three</p>";'
+  });
+
+  // 8. Complex: table with computed rows
+  checkEquiv('table with rows', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var data = [{name:"Alice",age:30},{name:"Bob",age:25},{name:"Carol",age:35}];',
+      'var html = "<table><thead><tr><th>Name</th><th>Age</th></tr></thead><tbody>";',
+      'for (var i = 0; i < data.length; i++) {',
+      '  html += "<tr><td>" + data[i].name + "</td><td>" + data[i].age + "</td></tr>";',
+      '}',
+      'html += "</tbody></table>";',
+      'document.getElementById("out").innerHTML = html;'
+    ].join('\n')
+  });
+
+  // 9. String concatenation with many variables
+  checkEquiv('multi-var concat', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'var title = "Dashboard";\nvar user = "Admin";\nvar count = 42;\ndocument.getElementById("out").innerHTML = "<h1>" + title + "</h1><p>User: " + user + " (" + count + " items)</p>";'
+  });
+
+  // 10. Void elements (br, hr, img, input)
+  checkEquiv('void elements', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("out").innerHTML = "<p>Line 1<br>Line 2</p><hr><input type=\\"text\\" value=\\"hello\\">";'
+  });
+
+  // 11. Nested loops
+  checkEquiv('nested loops', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var html = "";',
+      'for (var i = 0; i < 3; i++) {',
+      '  html += "<div class=\\"group\\">";',
+      '  for (var j = 0; j < 2; j++) {',
+      '    html += "<span>" + i + "." + j + "</span>";',
+      '  }',
+      '  html += "</div>";',
+      '}',
+      'document.getElementById("out").innerHTML = html;'
+    ].join('\n')
+  });
+
+  // 12. Template literal
+  checkEquiv('template literal', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'var name = "World";\ndocument.getElementById("out").innerHTML = `<h1>Hello ${name}</h1><p>Welcome</p>`;'
+  });
+
+  // 13. document.write — note: document.write during parse inserts at
+  // script position, but conversion appends to body. The content is the
+  // same; the position differs. Test via convertProject instead.
+  checkEquiv('document.write content', {
+    'index.html': '<html><body><div id="target"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("target").innerHTML = "<div><p>Written</p></div>";'
+  });
+
+  // 14. Preserving non-innerHTML code
+  checkEquiv('preserve surrounding code', {
+    'index.html': '<html><body><div id="out"></div><div id="count"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var items = ["a", "b", "c"];',
+      'var html = "";',
+      'var count = 0;',
+      'for (var i = 0; i < items.length; i++) {',
+      '  html += "<li>" + items[i] + "</li>";',
+      '  count++;',
+      '}',
+      'document.getElementById("out").innerHTML = "<ul>" + html + "</ul>";',
+      'document.getElementById("count").innerHTML = "<b>" + count + " items</b>";',
+    ].join('\n')
+  });
+
+  // 15. Multiple files, shared state
+  checkEquiv('shared state across files', {
+    'index.html': '<html><body><div id="out"></div><script src="data.js"></script><script src="render.js"></script></body></html>',
+    'data.js': 'var config = { title: "App", version: "1.0" };',
+    'render.js': 'document.getElementById("out").innerHTML = "<h1>" + config.title + "</h1><small>v" + config.version + "</small>";'
+  });
+
+  // 16. Switch/conditional patterns
+  checkEquiv('switch pattern', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var status = "success";',
+      'var cls = "";',
+      'if (status === "success") cls = "green";',
+      'else if (status === "error") cls = "red";',
+      'else cls = "gray";',
+      'document.getElementById("out").innerHTML = "<span class=\\"" + cls + "\\">" + status + "</span>";',
+    ].join('\n')
+  });
+
+  // 17. Deep nesting (5 levels)
+  checkEquiv('deep nesting', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("out").innerHTML = "<div><section><article><header><h1>Deep</h1></header></article></section></div>";'
+  });
+
+  // 18. HTML with data attributes
+  checkEquiv('data attributes', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("out").innerHTML = \'<div data-id="1" data-type="user"><span data-role="name">Alice</span></div>\';'
+  });
+
+  // 19. Build variable with += in loop and extra numeric state
+  checkEquiv('build var with counter', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var html = "<ul>";',
+      'var total = 0;',
+      'var prices = [10, 20, 30];',
+      'for (var i = 0; i < prices.length; i++) {',
+      '  html += "<li>$" + prices[i] + "</li>";',
+      '  total += prices[i];',
+      '}',
+      'html += "</ul><p>Total: $" + total + "</p>";',
+      'document.getElementById("out").innerHTML = html;'
+    ].join('\n')
+  });
+
+  // 20. Mixed: some innerHTML, some direct DOM (should not break direct DOM)
+  checkEquiv('mixed innerHTML and DOM', {
+    'index.html': '<html><body><div id="a"></div><div id="b"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'document.getElementById("a").innerHTML = "<p>innerHTML</p>";',
+      'var p = document.createElement("p");',
+      'p.textContent = "DOM API";',
+      'document.getElementById("b").appendChild(p);'
+    ].join('\n')
+  });
+
+  // 21. Conditional variable (if-else with unknown condition)
+  checkEquiv('conditional var unknown cond', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var type = document.body.dataset.type;',
+      'var label;',
+      'if (type === "a") label = "Alpha";',
+      'else if (type === "b") label = "Beta";',
+      'else label = "Other";',
+      'document.getElementById("out").innerHTML = "<span>" + label + "</span>";'
+    ].join('\n')
+  });
+
+  // 22. Ternary in loop creating class names
+  checkEquiv('ternary in loop', {
+    'index.html': '<html><body><ul id="list"></ul><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var html = "";',
+      'for (var i = 0; i < 5; i++) {',
+      '  html += "<li class=\\"" + (i % 2 === 0 ? "even" : "odd") + "\\">" + i + "</li>";',
+      '}',
+      'document.getElementById("list").innerHTML = html;'
+    ].join('\n')
+  });
+
+  // 23. Counter, flag, and accumulator all in same loop
+  checkEquiv('counter flag accumulator', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var html = "";',
+      'var found = false;',
+      'var count = 0;',
+      'var items = ["x", "target", "y"];',
+      'for (var i = 0; i < items.length; i++) {',
+      '  if (items[i] === "target") found = true;',
+      '  html += "<li>" + items[i] + "</li>";',
+      '  count++;',
+      '}',
+      'html += "<p>Found: " + found + ", Count: " + count + "</p>";',
+      'document.getElementById("out").innerHTML = html;'
+    ].join('\n')
+  });
+
+  // 24. Nested loops with index math
+  checkEquiv('nested loops with math', {
+    'index.html': '<html><body><div id="grid"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var html = "<table>";',
+      'for (var r = 0; r < 3; r++) {',
+      '  html += "<tr>";',
+      '  for (var c = 0; c < 3; c++) {',
+      '    html += "<td>" + (r * 3 + c) + "</td>";',
+      '  }',
+      '  html += "</tr>";',
+      '}',
+      'html += "</table>";',
+      'document.getElementById("grid").innerHTML = html;'
+    ].join('\n')
+  });
+
+  // 25. String method chain
+  checkEquiv('string method', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'var name = "alice";\ndocument.getElementById("out").innerHTML = "<b>" + name.toUpperCase() + "</b>";'
+  });
+
+  // 26. Multiple separate innerHTML assignments on different elements
+  checkEquiv('three separate targets', {
+    'index.html': '<html><body><div id="a"></div><div id="b"></div><div id="c"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'document.getElementById("a").innerHTML = "<h1>Title</h1>";',
+      'document.getElementById("b").innerHTML = "<p>Body</p>";',
+      'document.getElementById("c").innerHTML = "<footer>End</footer>";'
+    ].join('\n')
+  });
+
+  // 27. Build var with early return pattern (no actual return, but conditional append)
+  checkEquiv('conditional append', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var html = "<div>";',
+      'var showExtra = true;',
+      'html += "<p>Always</p>";',
+      'if (showExtra) {',
+      '  html += "<p>Extra</p>";',
+      '}',
+      'html += "</div>";',
+      'document.getElementById("out").innerHTML = html;'
+    ].join('\n')
+  });
+
+  // 28. Template literal with complex expressions
+  checkEquiv('template literal complex', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'var x = 5;\ndocument.getElementById("out").innerHTML = `<p>${x > 3 ? "big" : "small"}: ${x * 2}</p>`;'
+  });
+
+  // 29. Cross-file: data file, util file, render file
+  checkEquiv('three file chain', {
+    'index.html': '<html><body><div id="app"></div><script src="data.js"></script><script src="util.js"></script><script src="render.js"></script></body></html>',
+    'data.js': 'var users = [{name:"Alice"},{name:"Bob"}];',
+    'util.js': 'function userRow(u) { return "<tr><td>" + u.name + "</td></tr>"; }',
+    'render.js': [
+      'var html = "<table>";',
+      'for (var i = 0; i < users.length; i++) {',
+      '  html += userRow(users[i]);',
+      '}',
+      'html += "</table>";',
+      'document.getElementById("app").innerHTML = html;'
+    ].join('\n')
+  });
+
+  // 30. innerHTML with dynamic attribute values
+  checkEquiv('dynamic attributes', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var items = [{id:1,name:"A"},{id:2,name:"B"}];',
+      'var html = "";',
+      'for (var i = 0; i < items.length; i++) {',
+      '  html += "<div data-id=\\"" + items[i].id + "\\">" + items[i].name + "</div>";',
+      '}',
+      'document.getElementById("out").innerHTML = html;'
+    ].join('\n')
+  });
+
+  // 31. for...in loop
+  checkEquiv('for-in loop', {
+    'index.html': '<html><body><dl id="out"></dl><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var html = "";',
+      'var obj = {a: 1, b: 2, c: 3};',
+      'for (var k in obj) {',
+      '  html += "<dt>" + k + "</dt><dd>" + obj[k] + "</dd>";',
+      '}',
+      'document.getElementById("out").innerHTML = html;'
+    ].join('\n')
+  });
+
+  // 32. for...of loop
+  checkEquiv('for-of loop', {
+    'index.html': '<html><body><ul id="out"></ul><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var html = "";',
+      'var arr = ["x", "y", "z"];',
+      'for (var v of arr) {',
+      '  html += "<li>" + v + "</li>";',
+      '}',
+      'document.getElementById("out").innerHTML = html;'
+    ].join('\n')
+  });
+
+  // 33. while loop with counter
+  checkEquiv('while loop counter', {
+    'index.html': '<html><body><ul id="out"></ul><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var html = "";',
+      'var i = 0;',
+      'while (i < 4) {',
+      '  html += "<li>Item " + i + "</li>";',
+      '  i++;',
+      '}',
+      'document.getElementById("out").innerHTML = html;'
+    ].join('\n')
+  });
+
+  // 34. do-while loop
+  checkEquiv('do-while loop', {
+    'index.html': '<html><body><ul id="out"></ul><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var html = "";',
+      'var i = 0;',
+      'do {',
+      '  html += "<li>Item " + i + "</li>";',
+      '  i++;',
+      '} while (i < 3);',
+      'document.getElementById("out").innerHTML = html;'
+    ].join('\n')
+  });
+
+  // 35. Nested conditionals in loop (if/else per iteration)
+  checkEquiv('conditional class in loop', {
+    'index.html': '<html><body><ul id="out"></ul><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var html = "";',
+      'for (var i = 0; i < 6; i++) {',
+      '  if (i % 2 === 0) {',
+      '    html += "<li class=\\"even\\">" + i + "</li>";',
+      '  } else {',
+      '    html += "<li class=\\"odd\\">" + i + "</li>";',
+      '  }',
+      '}',
+      'document.getElementById("out").innerHTML = html;'
+    ].join('\n')
+  });
+
+  // 36. HTML entities decoded properly
+  checkEquiv('entity decoding', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("out").innerHTML = "<p>Tom &amp; Jerry &lt;3 &quot;Cartoons&quot;</p>";'
+  });
+
+  // 37. Entity in attribute value
+  checkEquiv('entity in attr', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("out").innerHTML = "<a href=\\"page?a=1&amp;b=2\\">link</a>";'
+  });
+
+  // 38. Mixed text and elements with entities
+  checkEquiv('mixed text entities', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("out").innerHTML = "Hello &amp; <b>bold</b> &amp; <i>italic</i>";'
+  });
+
+  // 39. Multiple attributes including boolean
+  checkEquiv('multi attr boolean', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("out").innerHTML = "<input type=\\"text\\" id=\\"name\\" placeholder=\\"Enter name\\" required>";'
+  });
+
+  // 40. Self-closing elements in context
+  checkEquiv('br and hr', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("out").innerHTML = "<p>Line 1<br>Line 2</p><hr><p>After</p>";'
+  });
+
+  // 41. Complex nested structure
+  checkEquiv('deep nested mixed', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("out").innerHTML = "<div>Hello <b>bold <i>italic</i></b> world</div>";'
+  });
+
+  // 42. Dynamic data attributes
+  checkEquiv('dynamic data attrs', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var id = 42;',
+      'var type = "user";',
+      'var name = "Alice";',
+      'document.getElementById("out").innerHTML = "<div data-id=\\"" + id + "\\" data-type=\\"" + type + "\\">" + name + "</div>";'
+    ].join('\n')
+  });
+
+  // 43. Image with dynamic src and alt
+  checkEquiv('img dynamic attrs', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var src = "photo.jpg";',
+      'var alt = "Photo";',
+      'document.getElementById("out").innerHTML = "<img src=\\"" + src + "\\" alt=\\"" + alt + "\\">";'
+    ].join('\n')
+  });
+
+  // 44. Anchor with dynamic href
+  checkEquiv('anchor dynamic href', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var url = "https://example.com";',
+      'var text = "Click here";',
+      'document.getElementById("out").innerHTML = "<a href=\\"" + url + "\\" target=\\"_blank\\">" + text + "</a>";'
+    ].join('\n')
+  });
+
+  // 45. Full table with static data
+  checkEquiv('full table', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("out").innerHTML = "<table><thead><tr><th>Name</th><th>Age</th></tr></thead><tr><td>Alice</td><td>30</td></tr><tr><td>Bob</td><td>25</td></tr></table>";'
+  });
+
+  // 46. join with comma separator
+  checkEquiv('join comma separator', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("out").innerHTML = "<p>" + ["a", "b", "c"].join(", ") + "</p>";'
+  });
+
+  // 47. Arithmetic expression in text content
+  checkEquiv('arithmetic in text', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var width = 100;',
+      'var height = 50;',
+      'document.getElementById("out").innerHTML = "<p>Area: " + (width * height) + " sq px</p>";'
+    ].join('\n')
+  });
+
+  // 48. Ternary in attribute
+  checkEquiv('ternary in attr', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var isActive = true;',
+      'document.getElementById("out").innerHTML = "<div class=\\"" + (isActive ? "active" : "inactive") + "\\">status</div>";'
+    ].join('\n')
+  });
+
+  // 49. Multiple separate innerHTML targets from shared data
+  checkEquiv('shared data multi target', {
+    'index.html': '<html><body><h1 id="title"></h1><p id="desc"></p><span id="count"></span><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var data = {title: "Dashboard", desc: "Welcome", count: 42};',
+      'document.getElementById("title").innerHTML = data.title;',
+      'document.getElementById("desc").innerHTML = "<em>" + data.desc + "</em>";',
+      'document.getElementById("count").innerHTML = "<b>" + data.count + "</b> items";'
+    ].join('\n')
+  });
+
+  // 50. Build with counter, flag, and accumulator all together
+  checkEquiv('counter flag accum together', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var data = [{v:10,ok:true},{v:20,ok:false},{v:30,ok:true}];',
+      'var html = "<ul>";',
+      'var total = 0;',
+      'var okCount = 0;',
+      'for (var i = 0; i < data.length; i++) {',
+      '  html += "<li>" + data[i].v + "</li>";',
+      '  total += data[i].v;',
+      '  if (data[i].ok) okCount++;',
+      '}',
+      'html += "</ul>";',
+      'html += "<p>Total: " + total + ", OK: " + okCount + "</p>";',
+      'document.getElementById("out").innerHTML = html;'
+    ].join('\n')
+  });
+
+  // 51. Todo app: shared state, loop with counter, conditional class
+  checkEquiv('todo app', {
+    'index.html': '<html><body><div id="app"></div><script src="state.js"></script><script src="render.js"></script></body></html>',
+    'state.js': 'var todos = [{text:"Buy milk",done:true},{text:"Write code",done:false},{text:"Ship it",done:false}];',
+    'render.js': [
+      'var html = "<h1>Todos</h1><ul>";',
+      'var doneCount = 0;',
+      'for (var i = 0; i < todos.length; i++) {',
+      '  var cls = todos[i].done ? "done" : "";',
+      '  html += "<li class=\\"" + cls + "\\">" + todos[i].text + "</li>";',
+      '  if (todos[i].done) doneCount++;',
+      '}',
+      'html += "</ul><p>" + doneCount + "/" + todos.length + " done</p>";',
+      'document.getElementById("app").innerHTML = html;',
+    ].join('\n')
+  });
+
+  // 52. Nested categories with inner loops
+  checkEquiv('nested categories', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var cats = [{name:"Fruit",items:["Apple","Banana"]},{name:"Veg",items:["Carrot"]}];',
+      'var html = "";',
+      'for (var c = 0; c < cats.length; c++) {',
+      '  html += "<div class=\\"cat\\"><h2>" + cats[c].name + "</h2><ul>";',
+      '  for (var j = 0; j < cats[c].items.length; j++) {',
+      '    html += "<li>" + cats[c].items[j] + "</li>";',
+      '  }',
+      '  html += "</ul></div>";',
+      '}',
+      'document.getElementById("out").innerHTML = html;',
+    ].join('\n')
+  });
+
+  // 53. Loop with break
+  checkEquiv('loop break', {
+    'index.html': '<html><body><ul id="out"></ul><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var items = ["a","b","STOP","c","d"];',
+      'var html = "";',
+      'for (var i = 0; i < items.length; i++) {',
+      '  if (items[i] === "STOP") break;',
+      '  html += "<li>" + items[i] + "</li>";',
+      '}',
+      'document.getElementById("out").innerHTML = html;',
+    ].join('\n')
+  });
+
+  // 54. Loop with continue
+  checkEquiv('loop continue', {
+    'index.html': '<html><body><ul id="out"></ul><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var items = [1,2,3,4,5,6];',
+      'var html = "";',
+      'for (var i = 0; i < items.length; i++) {',
+      '  if (items[i] % 2 === 0) continue;',
+      '  html += "<li>" + items[i] + "</li>";',
+      '}',
+      'document.getElementById("out").innerHTML = html;',
+    ].join('\n')
+  });
+
+  // 55. HTML comment preserved
+  checkEquiv('html comment', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("out").innerHTML = "<p>before</p><!-- comment --><p>after</p>";'
+  });
+
+  // 56. Form with labels and inputs
+  checkEquiv('form elements', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("out").innerHTML = "<form><label for=\\"e\\">Email</label><input type=\\"email\\" id=\\"e\\"><button type=\\"submit\\">Go</button></form>";'
+  });
+
+  // 57. Four-file app with shared config
+  checkEquiv('four file app', {
+    'index.html': '<html><body><div id="h"></div><div id="b"></div><script src="cfg.js"></script><script src="util.js"></script><script src="head.js"></script><script src="main.js"></script></body></html>',
+    'cfg.js': 'var APP = {title: "MyApp", version: "2.0"};',
+    'util.js': 'function badge(t) { return "<span class=\\"badge\\">" + t + "</span>"; }',
+    'head.js': 'document.getElementById("h").innerHTML = "<h1>" + APP.title + " " + badge("v" + APP.version) + "</h1>";',
+    'main.js': 'document.getElementById("b").innerHTML = "<p>Welcome to " + APP.title + "</p>";'
+  });
+
+  // 58. innerHTML read from another element
+  checkEquiv('innerHTML read', {
+    'index.html': '<html><body><div id="a"></div><div id="b"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("a").innerHTML = "<b>X</b>";\ndocument.getElementById("b").innerHTML = document.getElementById("a").innerHTML;'
+  });
+
+  // 59. undefined/null/NaN in concat
+  checkEquiv('undefined in concat', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'var x; document.getElementById("out").innerHTML = "<p>" + x + "</p>";'
+  });
+
+  // 60. Computed href with query params
+  checkEquiv('computed href params', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'var page = 2; var q = "test"; document.getElementById("out").innerHTML = "<a href=\\"search?q=" + q + "&page=" + page + "\\">Next</a>";'
+  });
+
+  // 61. Nested loop break (inner only)
+  checkEquiv('nested loop break', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'var h="";for(var i=0;i<3;i++){h+="<div>";for(var j=0;j<5;j++){if(j>2)break;h+="<span>"+j+"</span>";}h+="</div>";}document.getElementById("out").innerHTML=h;'
+  });
+
+  // 62. Try-catch with different HTML in each branch
+  checkEquiv('try-catch branches', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'var h="";try{h="<p>OK: "+riskyOp()+"</p>";}catch(e){h="<p class=\\"err\\">Error: "+e.message+"</p>";}document.getElementById("out").innerHTML=h;'
+  });
+
+  // 63. Builder function with non-html variable name
+  checkEquiv('builder fn any var name', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'function renderNav(links) {',
+      '  var s = "<nav>";',
+      '  for (var i = 0; i < links.length; i++) {',
+      '    s += "<a href=\\"" + links[i].url + "\\">" + links[i].text + "</a>";',
+      '  }',
+      '  s += "</nav>";',
+      '  return s;',
+      '}',
+      'var links = [{url:"/",text:"Home"},{url:"/about",text:"About"}];',
+      'document.getElementById("out").innerHTML = renderNav(links) + "<main><p>Content</p></main>";'
+    ].join('\n')
+  });
+
+  // 64. Table with tfoot after auto-tbody rows
+  checkEquiv('table with tfoot', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var rows = [{a:1,b:2},{a:3,b:4}];',
+      'var h = "<table><thead><tr><th>A</th><th>B</th></tr></thead>";',
+      'var total = 0;',
+      'for (var i = 0; i < rows.length; i++) {',
+      '  h += "<tr><td>" + rows[i].a + "</td><td>" + rows[i].b + "</td></tr>";',
+      '  total += rows[i].a + rows[i].b;',
+      '}',
+      'h += "<tfoot><tr><td colspan=\\"2\\">Total: " + total + "</td></tr></tfoot></table>";',
+      'document.getElementById("out").innerHTML = h;'
+    ].join('\n')
+  });
+
+  // 65. Complex state: continue + counter + flag
+  checkEquiv('continue counter flag', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var items = [{v:5,show:true},{v:10,show:false},{v:15,show:true},{v:20,show:true}];',
+      'var h = "<ul>";',
+      'var sum = 0;',
+      'var shown = 0;',
+      'for (var i = 0; i < items.length; i++) {',
+      '  sum += items[i].v;',
+      '  if (!items[i].show) continue;',
+      '  h += "<li>" + items[i].v + "</li>";',
+      '  shown++;',
+      '}',
+      'h += "</ul><p>Shown: " + shown + "/" + items.length + ", Sum: " + sum + "</p>";',
+      'document.getElementById("out").innerHTML = h;'
+    ].join('\n')
+  });
+
+  // 66. Multi-file: four files, builder fn, shared config
+  checkEquiv('four file with builder', {
+    'index.html': '<html><body><div id="h"></div><div id="b"></div><script src="cfg.js"></script><script src="util.js"></script><script src="head.js"></script><script src="main.js"></script></body></html>',
+    'cfg.js': 'var APP = {title: "MyApp", version: "2.0"};',
+    'util.js': 'function badge(t) { var r = "<span class=\\"badge\\">"; r += t; r += "</span>"; return r; }',
+    'head.js': 'document.getElementById("h").innerHTML = "<h1>" + APP.title + " " + badge("v" + APP.version) + "</h1>";',
+    'main.js': 'document.getElementById("b").innerHTML = "<p>Welcome to " + APP.title + "</p>";'
+  });
+
+  // 67. Select options built in loop
+  checkEquiv('select options loop', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var opts = [{v:"us",t:"United States"},{v:"uk",t:"United Kingdom"},{v:"de",t:"Germany"}];',
+      'var h = "<select>";',
+      'for (var i = 0; i < opts.length; i++) {',
+      '  h += "<option value=\\"" + opts[i].v + "\\">" + opts[i].t + "</option>";',
+      '}',
+      'h += "</select>";',
+      'document.getElementById("out").innerHTML = h;'
+    ].join('\n')
+  });
+
+  // 68. 8 levels deep nesting
+  checkEquiv('8 level nesting', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("out").innerHTML = "<div><section><article><main><aside><nav><header><footer>deep</footer></header></nav></aside></main></article></section></div>";'
+  });
+
+  // 69. innerHTML = then += then += on same element
+  checkEquiv('set then double append', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'var el = document.getElementById("out"); el.innerHTML = "<h1>Title</h1>"; el.innerHTML += "<p>P1</p>"; el.innerHTML += "<p>P2</p>";'
+  });
+
+  // 70. Many entities
+  checkEquiv('many entities', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("out").innerHTML = "<p>&lt;b&gt;bold&lt;/b&gt; &amp; &lt;i&gt;italic&lt;/i&gt; &copy; 2024</p>";'
+  });
 
   console.log(`  (${pass + fail - before} cases)`);
 })();

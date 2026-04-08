@@ -82,9 +82,14 @@
     'svg', 'g', 'defs', 'symbol', 'use', 'path', 'rect', 'circle', 'ellipse',
     'line', 'polyline', 'polygon', 'text', 'tspan', 'textpath', 'image',
     'pattern', 'mask', 'clippath', 'lineargradient', 'radialgradient', 'stop',
-    'filter', 'feblend', 'fecolormatrix', 'fecomposite', 'fegaussianblur',
-    'femerge', 'femergenode', 'feoffset', 'foreignobject', 'marker',
-    'desc', 'view', 'switch', 'animate', 'animatemotion', 'animatetransform'
+    'filter', 'feblend', 'fecolormatrix', 'fecomposite', 'feconvolvematrix',
+    'fediffuselighting', 'fedisplacementmap', 'fedropshadow', 'feflood',
+    'fefunca', 'fefuncb', 'fefuncg', 'fefuncr', 'fegaussianblur',
+    'feimage', 'femerge', 'femergenode', 'femorphology', 'feoffset',
+    'fepointlight', 'fespecularlighting', 'fespotlight', 'fetile',
+    'feturbulence', 'foreignobject', 'marker', 'metadata',
+    'desc', 'view', 'switch', 'animate', 'animatemotion', 'animatetransform',
+    'set', 'mpath',
   ]);
 
   function $(id) { return document.getElementById(id); }
@@ -211,23 +216,224 @@
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   }
 
+  // Recursively expand loopVar references in a chain token array.
+  // lvByName: { varName → [loopVar, ...] } — stack of loopVar entries.
+  function expandLoopVars(toks, lvByName) {
+    const out = [];
+    for (const t of toks) {
+      if (t.type === 'other' && IDENT_RE.test(t.text) && lvByName[t.text] && lvByName[t.text].length) {
+        const lv = lvByName[t.text].pop();
+        for (const vt of expandLoopVars(lv.chain, lvByName)) out.push(vt);
+        lvByName[t.text].push(lv);
+      } else if (t.type === 'cond') {
+        out.push({ type: 'cond', condExpr: t.condExpr, ifTrue: expandLoopVars(t.ifTrue, lvByName), ifFalse: expandLoopVars(t.ifFalse, lvByName), loopId: t.loopId });
+      } else if (t.type === 'trycatch') {
+        out.push({ type: 'trycatch', tryBody: expandLoopVars(t.tryBody, lvByName), catchBody: expandLoopVars(t.catchBody, lvByName), catchParam: t.catchParam, loopId: t.loopId });
+      } else if (t.type === 'switch') {
+        out.push({ type: 'switch', discExpr: t.discExpr, branches: t.branches.map(function(br) { return { label: br.label, caseExpr: br.caseExpr, chain: expandLoopVars(br.chain, lvByName) }; }), loopId: t.loopId });
+      } else {
+        out.push(t);
+      }
+    }
+    return out;
+  }
+
   function extractAllHTML(input) {
     const trimmed = input.trim();
     if (!trimmed) return [];
     const tokens = tokenize(trimmed);
     const assigns = findAllHtmlAssignments(tokens);
-    return assigns.map((assign) => {
+
+    // Extract each assignment independently first.
+    const singles = [];
+    for (const assign of assigns) {
       const result = extractOneAssignment(tokens, assign);
+      if (!result) continue;
       result.srcStart = assign.srcStart;
       result.srcEnd = assign.srcEnd;
       result._assign = assign;
       result._tokens = tokens;
-      return result;
-    });
+      singles.push(result);
+    }
+
+    // Group by overlapping source regions. Two extractions overlap
+    // if one's build region contains or intersects the other's build
+    // region. This detects multi-target patterns where two build vars
+    // are constructed in the same loop.
+    const groups = [];
+    const assigned = new Set();
+    for (let si = 0; si < singles.length; si++) {
+      if (assigned.has(si)) continue;
+      const group = [singles[si]];
+      assigned.add(si);
+      const s = singles[si];
+      const sStart = s.buildVarDeclStart >= 0 ? s.buildVarDeclStart : s.srcStart;
+      const sEnd = s.srcEnd;
+      // Find other extractions whose build region overlaps.
+      for (let sj = si + 1; sj < singles.length; sj++) {
+        if (assigned.has(sj)) continue;
+        const s2 = singles[sj];
+        const s2Start = s2.buildVarDeclStart >= 0 ? s2.buildVarDeclStart : s2.srcStart;
+        const s2End = s2.srcEnd;
+        // Overlap: one region contains the start of the other.
+        if ((s2Start >= sStart && s2Start < sEnd) || (sStart >= s2Start && sStart < s2End)) {
+          group.push(s2);
+          assigned.add(sj);
+        }
+      }
+      groups.push(group);
+    }
+
+    // Convert groups to a format compatible with the rest of the code.
+    const byRegion = Object.create(null);
+    const regionOrder = [];
+    for (let gi = 0; gi < groups.length; gi++) {
+      const key = 'g' + gi;
+      byRegion[key] = groups[gi];
+      regionOrder.push(key);
+    }
+
+    const results = [];
+    for (const key of regionOrder) {
+      const group = byRegion[key];
+      if (group.length === 1) {
+        results.push(group[0]);
+        continue;
+      }
+
+      // Multi-target: re-resolve with ALL build vars tracked together.
+      // Collect all build var names and their targets.
+      const allBuildVars = [];
+      const varTargets = {}; // varName → { target, assignProp, assignOp }
+      for (const s of group) {
+        const assign = s._assign;
+        for (let j = assign.rhsStart; j < assign.rhsEnd; j++) {
+          const rt = tokens[j];
+          if (rt.type !== 'other' || !IDENT_RE.test(rt.text)) continue;
+          // Check if it's a build var (has += or = with HTML).
+          for (let bi = 0; bi < assign.eqIdx; bi++) {
+            if (tokens[bi].type !== 'other' || tokens[bi].text !== rt.text) continue;
+            const nt = tokens[bi + 1];
+            if (!nt || nt.type !== 'sep') continue;
+            if (nt.char === '+=' || nt.char === '=') {
+              if (!allBuildVars.includes(rt.text)) allBuildVars.push(rt.text);
+              varTargets[rt.text] = { target: s.target, assignProp: s.assignProp, assignOp: s.assignOp };
+              break;
+            }
+          }
+        }
+      }
+
+      // Build scope state with all build vars tracked.
+      const lastAssign = group[group.length - 1]._assign;
+      const extMut = scanMutations(tokens);
+      const state = buildScopeState(tokens, lastAssign.rhsStart, extMut, allBuildVars);
+
+      // Extract each build var's chain, expand loopVars, and build
+      // a mapping of varName → expanded chain.
+      const varChains = {};
+      for (const bv of allBuildVars) {
+        const binding = state.resolve(bv);
+        if (!binding || binding.kind !== 'chain') continue;
+        // Expand loopVars for this build var.
+        const lvByName = Object.create(null);
+        if (state.loopVars) {
+          for (const lv of state.loopVars) {
+            if (lv.name !== bv) continue;
+            if (!lvByName[lv.name]) lvByName[lv.name] = [];
+            lvByName[lv.name].push(lv);
+          }
+        }
+        varChains[bv] = expandLoopVars(binding.toks, lvByName);
+      }
+
+      // Merge chains: use the first build var's chain as the template.
+      // For each cond/trycatch/switch branch that is all preserves in
+      // the first chain but has DOM content in another chain, replace
+      // the preserves with the other chain's DOM tokens wrapped in
+      // target-switch markers.
+      const firstBV = allBuildVars[0];
+      const firstChain = varChains[firstBV] || [];
+
+      function branchIsPreserve(toks) {
+        return toks.every(function(t) { return t.type === 'preserve' || t.type === 'plus'; });
+      }
+      function branchHasDOM(toks) {
+        return toks.some(function(t) { return t.type === 'str' || t.type === 'other' || t.type === 'cond' || t.type === 'trycatch' || t.type === 'switch'; });
+      }
+
+      function mergeTokens(baseToks) {
+        const out = [];
+        for (const t of baseToks) {
+          if (t.type === 'cond') {
+            let ifTrue = mergeTokens(t.ifTrue);
+            let ifFalse = mergeTokens(t.ifFalse);
+            // Check if a branch is all preserves and another chain has DOM there.
+            for (let vi = 1; vi < allBuildVars.length; vi++) {
+              const otherBV = allBuildVars[vi];
+              const otherChain = varChains[otherBV] || [];
+              // Find matching cond in other chain.
+              const otherCond = otherChain.find(function(ot) { return ot.type === 'cond' && ot.condExpr === t.condExpr; });
+              if (!otherCond) continue;
+              if (branchIsPreserve(ifTrue) && branchHasDOM(otherCond.ifTrue)) {
+                const targetExpr = varTargets[otherBV].target;
+                ifTrue = [{ type: '_targetPush', target: targetExpr }].concat(mergeTokens(otherCond.ifTrue)).concat([{ type: '_targetPop' }]);
+              }
+              if (branchIsPreserve(ifFalse) && branchHasDOM(otherCond.ifFalse)) {
+                const targetExpr = varTargets[otherBV].target;
+                ifFalse = [{ type: '_targetPush', target: targetExpr }].concat(mergeTokens(otherCond.ifFalse)).concat([{ type: '_targetPop' }]);
+              }
+            }
+            out.push({ type: 'cond', condExpr: t.condExpr, ifTrue: ifTrue, ifFalse: ifFalse, loopId: t.loopId });
+          } else if (t.type === 'trycatch') {
+            out.push({ type: 'trycatch', tryBody: mergeTokens(t.tryBody), catchBody: mergeTokens(t.catchBody), catchParam: t.catchParam, loopId: t.loopId });
+          } else if (t.type === 'switch') {
+            out.push({ type: 'switch', discExpr: t.discExpr, branches: t.branches.map(function(br) { return { label: br.label, caseExpr: br.caseExpr, chain: mergeTokens(br.chain) }; }), loopId: t.loopId });
+          } else {
+            out.push(t);
+          }
+        }
+        return out;
+      }
+
+      const mergedChain = mergeTokens(firstChain);
+
+      // Produce merged extraction.
+      const firstTarget = varTargets[firstBV] || {};
+      let widestEnd = 0;
+      for (const s of group) { if (s.srcEnd > widestEnd) widestEnd = s.srcEnd; }
+
+      // Add replaceChildren for additional targets as preserve tokens
+      // at the start of the chain.
+      const initTokens = [];
+      for (let vi = 1; vi < allBuildVars.length; vi++) {
+        const info = varTargets[allBuildVars[vi]];
+        if (info && info.assignOp === '=') {
+          initTokens.push({ type: 'preserve', text: info.target + '.replaceChildren()' });
+          initTokens.push({ type: 'plus' });
+        }
+      }
+
+      results.push({
+        target: firstTarget.target || group[0].target,
+        assignProp: firstTarget.assignProp || 'innerHTML',
+        assignOp: firstTarget.assignOp || '=',
+        chainTokens: initTokens.concat(mergedChain),
+        loopInfoMap: state.loopInfo,
+        buildVarDeclStart: group[0].buildVarDeclStart,
+        srcStart: group[0].srcStart,
+        srcEnd: widestEnd,
+        _assign: group[0]._assign,
+        _tokens: tokens,
+      });
+    }
+
+    return results;
   }
 
   // Produce a { target, assignProp, assignOp, chainTokens, ... } record
   // for a single innerHTML/outerHTML assignment located in `tokens`.
+  // Returns null if the target is known to NOT be a DOM element.
   function extractOneAssignment(tokens, assign) {
     const target = assign.target;
     const assignProp = assign.prop;
@@ -235,13 +441,67 @@
     // Determine build variables from the RHS (single ident or concat of idents).
     const rhsToks = [];
     for (let j = assign.rhsStart; j < assign.rhsEnd; j++) rhsToks.push(tokens[j]);
-    // Collect all identifiers in the RHS that could be build variables.
+    // Collect identifiers in the RHS that are build variables: they
+    // were built up via `x += "..."` patterns, OR they are the sole
+    // RHS identifier and were assigned HTML strings (containing '<')
+    // via `x = "..."` before the innerHTML site. The second case
+    // handles try-catch/if-else patterns where x is assigned HTML
+    // in different branches via = instead of +=.
     const buildVars = [];
     for (const rt of rhsToks) {
-      if (rt.type === 'other' && IDENT_RE.test(rt.text)) buildVars.push(rt.text);
+      if (rt.type !== 'other' || !IDENT_RE.test(rt.text)) continue;
+      let isBuildVar = false;
+      for (let bi = 0; bi < assign.eqIdx; bi++) {
+        if (tokens[bi].type !== 'other' || tokens[bi].text !== rt.text) continue;
+        const nextTok = tokens[bi + 1];
+        if (!nextTok || nextTok.type !== 'sep') continue;
+        // += is always a build variable indicator.
+        if (nextTok.char === '+=') { isBuildVar = true; break; }
+        // = with an HTML string on the RHS.
+        if (nextTok.char === '=') {
+          // Scan the RHS of this assignment for a string containing '<'.
+          for (let rbi = bi + 2; rbi < tokens.length; rbi++) {
+            const rbt = tokens[rbi];
+            if (rbt.type === 'sep' && (rbt.char === ';' || rbt.char === ',')) break;
+            if (rbt.type === 'str' && /</.test(rbt.text)) { isBuildVar = true; break; }
+          }
+          if (isBuildVar) break;
+        }
+      }
+      if (isBuildVar) buildVars.push(rt.text);
     }
     const buildVar = buildVars.length === 1 ? buildVars[0] : null;
     const r = resolveIdentifiers(tokens, assign.rhsStart, assign.rhsEnd, buildVars.length ? buildVars : null);
+
+    // Verify the target is not a known non-element. Extract the base
+    // variable name from the target (e.g. "el" from "el.innerHTML").
+    if (r.resolve && target) {
+      const baseMatch = target.match(IDENT_RE);
+      if (baseMatch) {
+        const targetBind = r.resolve(baseMatch[0]);
+        // If the base variable resolves to a known non-element type
+        // (string, number, array, plain object), skip conversion.
+        if (targetBind && targetBind.kind === 'chain') {
+          // A chain binding is a string/value — not a DOM element.
+          // However, unresolved identifiers (like function params or
+          // globals like document.getElementById result) also appear
+          // as chain bindings with a single exprRef token. Those are
+          // unknown (could be elements) so we allow them.
+          const toks = targetBind.toks;
+          const isOpaque = toks.length === 1 && toks[0].type === 'other';
+          if (!isOpaque) {
+            // Target is a known string/value — not a DOM element.
+            return null;
+          }
+        } else if (targetBind && targetBind.kind === 'array') {
+          return null; // Arrays don't have innerHTML
+        } else if (targetBind && targetBind.kind === 'object') {
+          return null; // Plain objects don't have innerHTML
+        }
+        // targetBind is null (unknown/global), 'element', or opaque —
+        // proceed with conversion.
+      }
+    }
     if (r.parsed) {
       // Recursively expand loopVar references. Multiple loopVars may
       // share the same name (nested loops modifying the same build var).
@@ -250,36 +510,30 @@
       // so inner loops expand before outer ones.
       const lvByName = Object.create(null);
       if (r.loopVars) {
+        // Only expand build variables through loopVars. Non-build
+        // variables (counters, flags) should stay as runtime references.
+        const buildVarSet = new Set(buildVars);
         for (const lv of r.loopVars) {
+          if (!buildVarSet.has(lv.name)) continue;
           if (!lvByName[lv.name]) lvByName[lv.name] = [];
           lvByName[lv.name].push(lv);
         }
       }
-      const expandChain = (toks) => {
-        const out = [];
-        for (const t of toks) {
-          if (t.type === 'other' && IDENT_RE.test(t.text) && lvByName[t.text] && lvByName[t.text].length) {
-            const lv = lvByName[t.text].pop();
-            for (const vt of expandChain(lv.chain)) out.push(vt);
-            lvByName[t.text].push(lv);
-          } else if (t.type === 'cond') {
-            out.push({ type: 'cond', condExpr: t.condExpr, ifTrue: expandChain(t.ifTrue), ifFalse: expandChain(t.ifFalse), loopId: t.loopId });
-          } else if (t.type === 'trycatch') {
-            out.push({ type: 'trycatch', tryBody: expandChain(t.tryBody), catchBody: expandChain(t.catchBody), catchParam: t.catchParam, loopId: t.loopId });
-          } else if (t.type === 'switch') {
-            out.push({ type: 'switch', discExpr: t.discExpr, branches: t.branches.map(br => ({ label: br.label, caseExpr: br.caseExpr, chain: expandChain(br.chain) })), loopId: t.loopId });
-          } else {
-            out.push(t);
-          }
-        }
-        return out;
-      };
-      const mainTokens = expandChain(r.tokens);
+      const mainTokens = expandLoopVars(r.tokens, lvByName);
+      // Skip conversion when the RHS is a single innerHTML/outerHTML read
+      // (e.g. el2.innerHTML = el1.innerHTML) — the READ must stay as-is
+      // because it produces the browser's serialized HTML from the DOM.
+      if (mainTokens.length === 1 && mainTokens[0].type === 'other' &&
+          /\.(innerHTML|outerHTML)$/.test(mainTokens[0].text)) {
+        return null;
+      }
       return { target, assignProp, assignOp, chainTokens: mainTokens, loopInfoMap: r.loopInfo, buildVarDeclStart: r.buildVarDeclStart };
     }
-    // Resolver returned the RHS tokens with per-identifier substitution but
-    // couldn't parse the full expression as a concat chain. Return the
-    // resolved tokens directly — they'll go through parseChainToVNodes.
+    // Same check for unparsed tokens.
+    if (r.tokens.length === 1 && r.tokens[0].type === 'other' &&
+        /\.(innerHTML|outerHTML)$/.test(r.tokens[0].text)) {
+      return null;
+    }
     return { target, assignProp, assignOp, chainTokens: r.tokens };
   }
 
@@ -300,7 +554,9 @@
     // Resolve identifier references inside the RHS using the scope state at
     // the assignment site.
     if (assign) {
-      return extractOneAssignment(tokens, assign);
+      const result = extractOneAssignment(tokens, assign);
+      // If target is a known non-element, fall through to no-innerHTML path.
+      if (result) return result;
     }
 
     // No innerHTML assignment — resolve the entire input as an expression.
@@ -333,12 +589,117 @@
     return all.length ? all[0] : null;
   }
 
-  // Find every `X.innerHTML`/`X.outerHTML` `=` / `+=` assignment in the
-  // token stream. Returns an array in source order.
+  // Find every `X.innerHTML`/`X.outerHTML` `=` / `+=` assignment and
+  // `document.write(...)` / `document.writeln(...)` call in the token
+  // stream. Returns an array in source order.
   function findAllHtmlAssignments(tokens) {
     const out = [];
-    for (let i = 1; i < tokens.length; i++) {
+    for (let i = 0; i < tokens.length; i++) {
       const t = tokens[i];
+
+      // document.write(...) / document.writeln(...)
+      if (t.type === 'other' && (t.text === 'document.write' || t.text === 'document.writeln')) {
+        const openParen = tokens[i + 1];
+        if (!openParen || openParen.type !== 'open' || openParen.char !== '(') continue;
+        // Find matching close paren.
+        let depth = 1, j = i + 2;
+        while (j < tokens.length && depth > 0) {
+          if (tokens[j].type === 'open') depth++;
+          else if (tokens[j].type === 'close') depth--;
+          if (depth > 0) j++;
+        }
+        if (depth !== 0) continue;
+        const rhsStart = i + 2;
+        const rhsEnd = j; // points at )
+        const srcStart = t.start;
+        let srcEnd = tokens[j].end;
+        // Include trailing semicolon if present.
+        if (j + 1 < tokens.length && tokens[j + 1].type === 'sep' && tokens[j + 1].char === ';') {
+          srcEnd = tokens[j + 1].end;
+        }
+        // document.write appends to document.body; writeln adds a newline.
+        out.push({
+          target: 'document.body',
+          prop: 'innerHTML',
+          op: '+=',
+          rhsStart: rhsStart,
+          rhsEnd: rhsEnd,
+          srcStart: srcStart,
+          srcEnd: srcEnd,
+          eqIdx: i, // points at the document.write token
+          isDocWrite: true,
+          addsNewline: t.text === 'document.writeln',
+        });
+        continue;
+      }
+
+      // X.insertAdjacentHTML(position, html)
+      if (t.type === 'other' && /\.insertAdjacentHTML$/.test(t.text)) {
+        const openParen = tokens[i + 1];
+        if (!openParen || openParen.type !== 'open' || openParen.char !== '(') continue;
+        // Find the position argument (first arg before comma).
+        let j = i + 2;
+        let argDepth = 0;
+        let commaIdx = -1;
+        while (j < tokens.length) {
+          if (tokens[j].type === 'open') argDepth++;
+          else if (tokens[j].type === 'close') { if (argDepth === 0) break; argDepth--; }
+          else if (argDepth === 0 && tokens[j].type === 'sep' && tokens[j].char === ',') { commaIdx = j; break; }
+          j++;
+        }
+        if (commaIdx < 0) continue;
+        // Read the position argument.
+        const posTok = tokens[i + 2];
+        const position = posTok && posTok.type === 'str' ? posTok.text.toLowerCase() : null;
+        if (!position) continue; // Dynamic position — can't determine semantics.
+        // Find matching close paren for the full call.
+        let depth2 = 1, endJ = commaIdx + 1;
+        while (endJ < tokens.length && depth2 > 0) {
+          if (tokens[endJ].type === 'open') depth2++;
+          else if (tokens[endJ].type === 'close') depth2--;
+          if (depth2 > 0) endJ++;
+        }
+        if (depth2 !== 0) continue;
+        // Extract the target (everything before .insertAdjacentHTML).
+        const targetBase = t.text.replace(/\.insertAdjacentHTML$/, '');
+        let target = targetBase;
+        let targetSrcStart = -1;
+        if (target === '' || target.startsWith('.')) {
+          const r = reconstructTarget(tokens, i);
+          if (!r) continue;
+          target = target.startsWith('.') ? r.text + target : r.text;
+          targetSrcStart = r.srcStart;
+        }
+        // Map position to target+op:
+        // 'beforeend' → append to target (innerHTML +=)
+        // 'afterbegin' → prepend to target (innerHTML +=, but conceptually first child)
+        // 'beforebegin' → insert before target (target.parentNode, +=)
+        // 'afterend' → insert after target (target.parentNode, +=)
+        if (position === 'beforebegin' || position === 'afterend') {
+          target = target + '.parentNode';
+        }
+        const rhsStart = commaIdx + 1;
+        const rhsEnd = endJ; // points at )
+        const srcStart = targetSrcStart >= 0 ? targetSrcStart : t.start;
+        let srcEnd = tokens[endJ].end;
+        if (endJ + 1 < tokens.length && tokens[endJ + 1].type === 'sep' && tokens[endJ + 1].char === ';') {
+          srcEnd = tokens[endJ + 1].end;
+        }
+        out.push({
+          target: target,
+          prop: 'innerHTML',
+          op: '+=',
+          rhsStart: rhsStart,
+          rhsEnd: rhsEnd,
+          srcStart: srcStart,
+          srcEnd: srcEnd,
+          eqIdx: i,
+        });
+        continue;
+      }
+
+      // X.innerHTML = ... / X.outerHTML = ... / X.innerHTML += ...
+      if (i < 1) continue;
       if (t.type !== 'sep') continue;
       if (t.char !== '=' && t.char !== '+=') continue;
       const prev = tokens[i - 1];
@@ -435,7 +796,8 @@
     'setAttribute', 'removeAttribute', 'setAttributeNS', 'removeAttributeNS',
     'addEventListener', 'removeEventListener',
     'replaceWith', 'remove', 'insertAdjacentHTML', 'insertAdjacentElement',
-    'replaceChildren',
+    'insertAdjacentText', 'replaceChildren', 'toggleAttribute',
+    'focus', 'blur', 'click', 'scrollIntoView',
   ]);
 
   // Method names recognized on typed bindings (chain/array). Used by
@@ -687,6 +1049,18 @@
     // tokens are only injected at this depth — inner functions with their
     // own local `html` var are not affected.
     let trackBuildVarDepth = -1;
+
+    // Check if a token array starts with a given prefix (snapshot).
+    // Used by if-else, try-catch, and switch handlers to detect
+    // whether a branch appended to the snapshot (+=) or replaced it (=).
+    const chainStartsWith = (full, prefix) => {
+      if (full.length < prefix.length) return false;
+      for (let s = 0; s < prefix.length; s++) {
+        if (JSON.stringify(full[s]) !== JSON.stringify(prefix[s])) return false;
+      }
+      return true;
+    };
+    const stripLeadingPlus = (arr) => (arr.length && arr[0].type === 'plus') ? arr.slice(1) : arr;
     if (trackBuildVarInit) {
       if (Array.isArray(trackBuildVarInit)) {
         trackBuildVar = new Set(trackBuildVarInit);
@@ -1849,7 +2223,7 @@
 
       // .map(fn).join('') on an opaque iterable: extract the callback's
       // per-element return chain and produce an iter token that
-      // parseChainToVNodes converts into a forEach loop.
+      // The emitter converts map/join into a forEach loop.
       if (method === 'map') {
         const lp = tks[parenIdx];
         if (!lp || lp.type !== 'open' || lp.char !== '(') return null;
@@ -2533,10 +2907,38 @@
         }
         if (v !== null) return chainBinding([makeSynthStr(String(v))]);
       }
-      // `+` is overloaded in JS. When both operands aren't concrete numbers
-      // we decline here and let the caller (concat-chain parser) handle it
-      // as string concatenation.
-      if (op === '+') return null;
+      // `+` is overloaded in JS: numeric addition or string concatenation.
+      // Treat as arithmetic when both operands are single-token non-string
+      // references (identifiers, numbers, or arithmetic sub-expressions).
+      // Fall through to concat when either side contains a user string
+      // literal (quotes in the source) or a multi-token resolved chain
+      // (which came from string concatenation).
+      if (op === '+') {
+        // Check if either operand is definitively a source-level string
+        // (not a number that was stringified).
+        const isSourceString = (bind) => {
+          if (bind.toks.length > 1) return true; // multi-token = concat result
+          const t = bind.toks[0];
+          if (t.type === 'str') {
+            // A str token from a user string literal has a quote property.
+            // Synthetic str tokens from number folding don't.
+            // Check: if it parses as a number, it's numeric, not a string.
+            const n = Number(t.text);
+            if (!Number.isNaN(n) && String(n) === t.text) return false;
+            if (t.text === 'true' || t.text === 'false' || t.text === 'null' || t.text === 'undefined' || t.text === 'NaN') return false;
+            return true; // Real string value
+          }
+          return false;
+        };
+        if (!isSourceString(left) && !isSourceString(right)) {
+          const lt = chainAsExprText(left);
+          const rt = chainAsExprText(right);
+          if (lt !== null && rt !== null) {
+            return chainBinding([exprRef('(' + lt + ' + ' + rt + ')')]);
+          }
+        }
+        return null;
+      }
       // Short-circuit logical/nullish operators using whichever concrete
       // value (number or string) the left-hand side has.
       const lStr = lNum === null ? chainAsKnownString(left) : null;
@@ -2717,9 +3119,15 @@
       // as a named variable rather than inlining the one-iteration chain.
       while (loopStack.length > 0 && i >= loopStack[loopStack.length - 1].bodyEnd) {
         const entry = loopStack.pop();
+        // Collect names that were pre-scanned as opaque in the loop frame.
+        const preScanNames = entry.frame ? Object.keys(entry.frame.bindings) : [];
         const topIdx = stack.indexOf(entry.frame);
         if (topIdx >= 0) stack.splice(topIdx, 1);
-        for (const name of entry.modifiedVars) {
+        // Merge pre-scanned and modified variables: all need to be
+        // opaque in the outer scope after the loop exits.
+        const allModified = new Set(entry.modifiedVars);
+        for (const n of preScanNames) allModified.add(n);
+        for (const name of allModified) {
           const b = resolve(name);
           if (b && b.kind === 'chain') {
             // Store the chain UNSTRIPPED; strip the outer loop's tags only
@@ -2758,6 +3166,31 @@
       }
 
       if (t.type !== 'other') continue;
+
+      // break / continue — preserve as runtime flow control so they
+      // execute at the right point in the converted loop body.
+      if (t.text === 'break' || t.text === 'continue') {
+        if (trackBuildVar && loopStack.length > 0 && (trackBuildVarDepth < 0 || funcDepth() === trackBuildVarDepth)) {
+          // Include optional label and semicolon.
+          let stmtEnd = i + 1;
+          if (stmtEnd < endI && tokens[stmtEnd].type === 'other' && IDENT_RE.test(tokens[stmtEnd].text)) stmtEnd++;
+          if (stmtEnd < endI && tokens[stmtEnd].type === 'sep' && tokens[stmtEnd].char === ';') stmtEnd++;
+          const first = tokens[i];
+          const last = tokens[stmtEnd - 1];
+          const stmtSrc = first._src.slice(first.start, last.end);
+          for (const bv of trackBuildVar) {
+            const bCur = resolve(bv);
+            if (bCur && bCur.kind === 'chain') {
+              const loopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
+              const preserveTok = { type: 'preserve', text: stmtSrc };
+              if (loopId !== null) preserveTok.loopId = loopId;
+              assignName(bv, chainBinding([...bCur.toks, SYNTH_PLUS, preserveTok]));
+            }
+          }
+          i = stmtEnd - 1;
+          continue;
+        }
+      }
 
       // `if (cond) { ... } [else { ... }]` — when the condition is
       // concrete, walk only the matching branch. When opaque, walk both
@@ -2868,6 +3301,16 @@
                         ek++;
                       }
                       ei = ek;
+                    } else {
+                      // else <single-statement>;
+                      let sd = 0, ek = ei + 1;
+                      while (ek < stop) {
+                        if (tokens[ek].type === 'open') sd++;
+                        else if (tokens[ek].type === 'close') sd--;
+                        else if (sd === 0 && tokens[ek].type === 'sep' && tokens[ek].char === ';') { ek++; break; }
+                        ek++;
+                      }
+                      ei = ek;
                     }
                   }
                   break;
@@ -2974,20 +3417,10 @@
                 const snapB = snapshot[name];
                 if (snapB && snapB.kind === 'chain') {
                   const snapFull = snapB.toks;
-                  const stripPlus = (arr) => (arr.length && arr[0].type === 'plus') ? arr.slice(1) : arr;
-                  // Check if each branch starts with the snapshot prefix
-                  // (appended via +=) or is a full replacement (via =).
-                  const startsWithSnap = (full) => {
-                    if (full.length < snapFull.length) return false;
-                    for (let s = 0; s < snapFull.length; s++) {
-                      if (JSON.stringify(full[s]) !== JSON.stringify(snapFull[s])) return false;
-                    }
-                    return true;
-                  };
-                  const ifAppended = startsWithSnap(ifFull);
-                  const elAppended = startsWithSnap(elFull);
-                  const ifExtra = ifAppended ? stripPlus(ifFull.slice(snapFull.length)) : ifFull;
-                  const elExtra = elAppended ? stripPlus(elFull.slice(snapFull.length)) : elFull;
+                  const ifAppended = chainStartsWith(ifFull, snapFull);
+                  const elAppended = chainStartsWith(elFull, snapFull);
+                  const ifExtra = ifAppended ? stripLeadingPlus(ifFull.slice(snapFull.length)) : ifFull;
+                  const elExtra = elAppended ? stripLeadingPlus(elFull.slice(snapFull.length)) : elFull;
                   const currentLoopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
                   if (!ifAppended || !elAppended) {
                     // At least one branch did `html = ...` (full replacement).
@@ -3163,12 +3596,18 @@
             const snapB = snapshot[name];
             if (snapB && snapB.kind === 'chain') {
               if (trackBuildVar && trackBuildVar.has(name)) {
-                const tryExtra = tryFull.slice(snapB.toks.length);
-                const catchExtra = catchFull.slice(snapB.toks.length);
-                const stripPlus = (arr) => (arr.length && arr[0].type === 'plus') ? arr.slice(1) : arr;
-                // Use a 'trycatch' token that the parser/emitter handles.
-                const tryCatchTok = { type: 'trycatch', tryBody: stripPlus(tryExtra), catchBody: stripPlus(catchExtra), catchParam };
-                assignName(name, chainBinding([...snapB.toks, SYNTH_PLUS, tryCatchTok]));
+                const snapFull = snapB.toks;
+                const tryAppended = chainStartsWith(tryFull, snapFull);
+                const catchAppended = chainStartsWith(catchFull, snapFull);
+                const tryExtra = tryAppended ? stripLeadingPlus(tryFull.slice(snapFull.length)) : tryFull;
+                const catchExtra = catchAppended ? stripLeadingPlus(catchFull.slice(snapFull.length)) : catchFull;
+                const tryCatchTok = { type: 'trycatch', tryBody: tryExtra, catchBody: catchExtra, catchParam };
+                if (tryAppended && catchAppended) {
+                  assignName(name, chainBinding([...snapB.toks, SYNTH_PLUS, tryCatchTok]));
+                } else {
+                  // Full replacement in at least one branch.
+                  assignName(name, chainBinding([tryCatchTok]));
+                }
               } else {
                 assignName(name, chainBinding([exprRef(name)]));
               }
@@ -3249,30 +3688,46 @@
               for (const bv of trackBuildVar) {
                 const snapB = snapshot[bv];
                 if (!snapB || snapB.kind !== 'chain') continue;
+                const snapFull = snapB.toks;
                 const branches = [];
+                let allAppended = true;
                 for (const cr of caseResults) {
                   const b = cr.bindings[bv];
                   if (b && b.kind === 'chain') {
-                    const extra = b.toks.slice(snapB.toks.length);
-                    const stripPlus = (arr) => (arr.length && arr[0].type === 'plus') ? arr.slice(1) : arr;
-                    branches.push({ label: cr.label, caseExpr: cr.caseExpr, chain: stripPlus(extra) });
+                    const full = b.toks;
+                    const appended = chainStartsWith(full, snapFull);
+                    if (!appended) allAppended = false;
+                    const extra = appended ? stripLeadingPlus(full.slice(snapFull.length)) : full;
+                    branches.push({ label: cr.label, caseExpr: cr.caseExpr, chain: extra });
                   }
                 }
                 if (branches.length) {
                   const switchTok = { type: 'switch', discExpr: discExpr || '/* switch */', branches };
-                  assignName(bv, chainBinding([...snapB.toks, SYNTH_PLUS, switchTok]));
+                  if (allAppended) {
+                    assignName(bv, chainBinding([...snapB.toks, SYNTH_PLUS, switchTok]));
+                  } else {
+                    assignName(bv, chainBinding([switchTok]));
+                  }
                 }
               }
             }
-            // Non-build vars: make opaque.
-            for (const cr of caseResults) {
-              for (const name in cr.bindings) {
+            // Non-build vars that differ across cases: make opaque so
+            // the resolver doesn't statically pick the last case's value.
+            // Collect all names assigned in any case.
+            const switchChanged = new Set();
+            for (const cr2 of caseResults) {
+              for (const name in cr2.bindings) {
                 if (trackBuildVar && trackBuildVar.has(name)) continue;
-                const b = cr.bindings[name];
-                if (b && snapshot[name] && JSON.stringify(b) !== JSON.stringify(snapshot[name])) {
-                  assignName(name, chainBinding([exprRef(name)]));
+                const b = cr2.bindings[name];
+                const snap = snapshot[name];
+                // Changed if: exists in case but not snapshot, or differs.
+                if (b && (!snap || JSON.stringify(b) !== JSON.stringify(snap))) {
+                  switchChanged.add(name);
                 }
               }
+            }
+            for (const name of switchChanged) {
+              assignName(name, chainBinding([exprRef(name)]));
             }
             i = switchEnd - 1;
             continue;
@@ -3299,6 +3754,20 @@
               const id = nextLoopId++;
               loopInfo[id] = { kind: 'do', headerSrc };
               const loopFrame = { bindings: Object.create(null), isFunction: false };
+              // Pre-scan body for non-build modified variables (same as for/while).
+              for (let h = i + 1; h < bodyEnd; h++) {
+                const hk = tokens[h];
+                if (hk.type === 'other' && IDENT_RE.test(hk.text)) {
+                  if (trackBuildVar && trackBuildVar.has(hk.text)) continue;
+                  const hn = tokens[h + 1];
+                  if (hn && hn.type === 'sep' && (hn.char === '=' || hn.char === '+=' || hn.char === '-=' || hn.char === '*=' || hn.char === '/=')) {
+                    if (!loopFrame.bindings[hk.text]) loopFrame.bindings[hk.text] = chainBinding([exprRef(hk.text)]);
+                  }
+                  if (hn && hn.type === 'op' && (hn.text === '++' || hn.text === '--')) {
+                    if (!loopFrame.bindings[hk.text]) loopFrame.bindings[hk.text] = chainBinding([exprRef(hk.text)]);
+                  }
+                }
+              }
               stack.push(loopFrame);
               loopStack.push({
                 id, kind: 'do', headerSrc, bodyEnd: doEnd, frame: loopFrame,
@@ -3362,12 +3831,32 @@
             // works for both block-bodied (`for (...) { ... }`) and
             // single-statement (`for (...) stmt;`) loops.
             const loopFrame = { bindings: Object.create(null), isFunction: false };
+            // Scan the header for var/let/const declarations.
             for (let h = i + 2; h < j; h++) {
               const hk = tokens[h];
               if (hk.type === 'other' && (hk.text === 'var' || hk.text === 'let' || hk.text === 'const')) {
                 const nm = tokens[h + 1];
                 if (nm && nm.type === 'other' && IDENT_RE.test(nm.text)) {
                   loopFrame.bindings[nm.text] = chainBinding([exprRef(nm.text)]);
+                }
+              }
+            }
+            // Pre-scan the loop body for non-build variables modified by
+            // =, +=, ++, -- and make them opaque. This ensures references
+            // to loop counters like `i` resolve to the runtime value, not
+            // a stale initial value, even when the mutation (i++) comes
+            // after the reference (html += i). Build variables are excluded
+            // because their += mutations are tracked by the chain system.
+            for (let h = j + 1; h < bodyEnd; h++) {
+              const hk = tokens[h];
+              if (hk.type === 'other' && IDENT_RE.test(hk.text)) {
+                if (trackBuildVar && trackBuildVar.has(hk.text)) continue;
+                const hn = tokens[h + 1];
+                if (hn && hn.type === 'sep' && (hn.char === '=' || hn.char === '+=' || hn.char === '-=' || hn.char === '*=' || hn.char === '/=')) {
+                  if (!loopFrame.bindings[hk.text]) loopFrame.bindings[hk.text] = chainBinding([exprRef(hk.text)]);
+                }
+                if (hn && hn.type === 'op' && (hn.text === '++' || hn.text === '--')) {
+                  if (!loopFrame.bindings[hk.text]) loopFrame.bindings[hk.text] = chainBinding([exprRef(hk.text)]);
                 }
               }
             }
@@ -3568,6 +4057,8 @@
         if (eqTok && eqTok.type === 'sep' && eqTok.char === '=') {
           const stmtEndIdx = skipExpr(i + 2, stop);
           const r = readValue(i + 2, stop, TERMS_TOP);
+          // Detect prepend pattern: x = expr + x (builds string in reverse).
+          // Treat as equivalent to x += expr but with the new content prepended.
           assignName(t.text, r ? r.binding : null);
           // Preserve non-build-var assignments in the build var's chain
           // so the emitter outputs them at the correct position.
@@ -3600,6 +4091,28 @@
           }
           assignName(t.text, combined);
           if (loopStack.length > 0) loopStack[loopStack.length - 1].modifiedVars.add(t.text);
+          // For non-build variables modified by +=, preserve the statement
+          // in the build chain AND make the variable opaque. This prevents
+          // numeric accumulators (total += x) from being expanded as text
+          // nodes — the variable stays as a runtime reference.
+          if (trackBuildVar && !trackBuildVar.has(t.text) && (trackBuildVarDepth < 0 || funcDepth() === trackBuildVarDepth)) {
+            // Make the variable opaque so later references to it produce
+            // the variable name, not the expanded chain.
+            assignName(t.text, chainBinding([exprRef(t.text)]));
+            for (const bv of trackBuildVar) {
+              const bCur = resolve(bv);
+              if (bCur && bCur.kind === 'chain') {
+                const stmtEndIdx = skipExpr(i + 2, stop);
+                const first = tokens[i];
+                const last = tokens[stmtEndIdx - 1];
+                const stmtSrc = first._src.slice(first.start, last.end);
+                const loopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
+                const preserveTok = { type: 'preserve', text: stmtSrc };
+                if (loopId !== null) preserveTok.loopId = loopId;
+                assignName(bv, chainBinding([...bCur.toks, SYNTH_PLUS, preserveTok]));
+              }
+            }
+          }
           i = skipExpr(i + 2, stop) - 1;
           continue;
         }
@@ -3667,6 +4180,91 @@
           }
         }
       }
+
+      // Bracket-access statement: `ident[expr]...` — assignments
+      // (`items[i] = ...`, `items[i].prop = ...`) or method calls
+      // (`items[i].sort()`). Walk through the bracket and any trailing
+      // property/call chain to find the statement boundary, then preserve
+      // the full statement if it has side effects.
+      if (t.type === 'other' && IDENT_RE.test(t.text)) {
+        const bracketTok = tokens[i + 1];
+        if (bracketTok && bracketTok.type === 'open' && bracketTok.char === '[') {
+          // Walk past balanced [...] and any following .prop, [...], or (...)
+          let j = i + 1;
+          while (j < endI) {
+            const jt = tokens[j];
+            if (jt.type === 'open' && (jt.char === '[' || jt.char === '(')) {
+              const match = jt.char === '[' ? ']' : ')';
+              let d = 1; j++;
+              while (j < endI && d > 0) {
+                if (tokens[j].type === 'open' && tokens[j].char === jt.char) d++;
+                else if (tokens[j].type === 'close' && tokens[j].char === match) d--;
+                j++;
+              }
+            } else if (jt.type === 'other' && jt.text.startsWith('.')) {
+              j++;
+            } else {
+              break;
+            }
+          }
+          // Check what follows: = (assignment), += etc., or ; (expression stmt).
+          const afterTok = tokens[j];
+          if (afterTok && afterTok.type === 'sep' &&
+              (afterTok.char === '=' || afterTok.char === '+=' || afterTok.char === '-=' ||
+               afterTok.char === '*=' || afterTok.char === '/=')) {
+            // Bracket-access assignment: items[i].seen = true
+            const stmtEndIdx = skipExpr(j + 1, endI);
+            // Preserve the statement in build var chains.
+            if (trackBuildVar && (trackBuildVarDepth < 0 || funcDepth() === trackBuildVarDepth)) {
+              const first = tokens[i];
+              const last = tokens[stmtEndIdx - 1];
+              if (first && last && first._src) {
+                const stmtSrc = first._src.slice(first.start, last.end);
+                for (const bv of trackBuildVar) {
+                  const bCur = resolve(bv);
+                  if (bCur && bCur.kind === 'chain') {
+                    const loopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
+                    const preserveTok = { type: 'preserve', text: stmtSrc };
+                    if (loopId !== null) preserveTok.loopId = loopId;
+                    assignName(bv, chainBinding([...bCur.toks, SYNTH_PLUS, preserveTok]));
+                  }
+                }
+              }
+            }
+            i = stmtEndIdx - 1;
+            continue;
+          }
+          // Bracket-access followed by ; or end — expression statement
+          // (e.g. items[i].doSomething()). Skip to statement boundary.
+          let stmtEnd = j;
+          let sd = 0;
+          while (stmtEnd < endI) {
+            const st = tokens[stmtEnd];
+            if (st.type === 'open') sd++;
+            else if (st.type === 'close') sd--;
+            else if (sd === 0 && st.type === 'sep' && (st.char === ';' || st.char === ',')) { stmtEnd++; break; }
+            stmtEnd++;
+          }
+          if (trackBuildVar && (trackBuildVarDepth < 0 || funcDepth() === trackBuildVarDepth) && stmtEnd > i + 1) {
+            const first = tokens[i];
+            const last = tokens[stmtEnd - 1];
+            if (first && last && first._src) {
+              const stmtSrc = first._src.slice(first.start, last.end);
+              for (const bv of trackBuildVar) {
+                const bCur = resolve(bv);
+                if (bCur && bCur.kind === 'chain') {
+                  const loopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
+                  const preserveTok = { type: 'preserve', text: stmtSrc };
+                  if (loopId !== null) preserveTok.loopId = loopId;
+                  assignName(bv, chainBinding([...bCur.toks, SYNTH_PLUS, preserveTok]));
+                }
+              }
+            }
+          }
+          i = stmtEnd - 1;
+          continue;
+        }
+      }
     }
     };
     walkRange(0, stop);
@@ -3712,7 +4310,7 @@
     const externallyMutable = scanMutations(tokens);
     const state = buildScopeState(tokens, startIdx, externallyMutable, buildVarOrVars);
     const full = state.parseRange(startIdx, endIdx);
-    if (full) return { tokens: full, parsed: true, loopInfo: state.loopInfo, loopVars: state.loopVars, buildVarDeclStart: state.getBuildVarDeclStart(), inScope: state.inScope };
+    if (full) return { tokens: full, parsed: true, loopInfo: state.loopInfo, loopVars: state.loopVars, buildVarDeclStart: state.getBuildVarDeclStart(), inScope: state.inScope, resolve: state.resolve };
     const out = [];
     for (let i = startIdx; i < endIdx; i++) {
       const t = tokens[i];
@@ -3732,7 +4330,7 @@
       }
       out.push(t);
     }
-    return { tokens: out, parsed: false, loopInfo: state.loopInfo, loopVars: state.loopVars, inScope: state.inScope };
+    return { tokens: out, parsed: false, loopInfo: state.loopInfo, loopVars: state.loopVars, inScope: state.inScope, resolve: state.resolve };
   }
 
 
@@ -3800,10 +4398,36 @@
                 while (i < n && src[i] !== q) { if (src[i] === '\\') i += 2; else i++; }
                 i++;
               } else if (ch === '`') {
+                // Nested template literal: skip its content properly,
+                // handling strings and nested ${...} with brace tracking.
                 i++;
                 while (i < n && src[i] !== '`') {
-                  if (src[i] === '\\') { i += 2; }
-                  else if (src[i] === '$' && src[i + 1] === '{') { i += 2; let d = 1; while (i < n && d > 0) { if (src[i] === '{') d++; else if (src[i] === '}') d--; i++; } }
+                  if (src[i] === '\\' && i + 1 < n) { i += 2; }
+                  else if (src[i] === '$' && src[i + 1] === '{') {
+                    i += 2; let d = 1;
+                    while (i < n && d > 0) {
+                      if (src[i] === "'" || src[i] === '"') {
+                        const q = src[i]; i++;
+                        while (i < n && src[i] !== q) { if (src[i] === '\\') i += 2; else i++; }
+                        i++;
+                      } else if (src[i] === '`') {
+                        // Recurse: skip nested template. Use simple depth
+                        // tracking since deeply nested templates are rare.
+                        i++; let td = 0;
+                        while (i < n && !(src[i] === '`' && td === 0)) {
+                          if (src[i] === '\\' && i + 1 < n) i += 2;
+                          else if (src[i] === '$' && src[i + 1] === '{') { td++; i += 2; }
+                          else if (src[i] === '}' && td > 0) { td--; i++; }
+                          else i++;
+                        }
+                        if (i < n) i++; // past closing `
+                      } else {
+                        if (src[i] === '{') d++;
+                        else if (src[i] === '}') d--;
+                        if (d > 0) i++;
+                      }
+                    }
+                  }
                   else i++;
                 }
                 i++;
@@ -3974,33 +4598,56 @@
   }
 
   // Convert a style="..." attribute value into an array of style.* assignments.
-  function parseStyle(val) {
-    const out = [];
-    // Split on ; that are not inside parens (e.g. url(a;b)).
-    let depth = 0, cur = '';
-    for (let i = 0; i < val.length; i++) {
-      const c = val[i];
-      if (c === '(') depth++;
-      else if (c === ')') depth--;
-      if (c === ';' && depth === 0) { if (cur.trim()) out.push(cur.trim()); cur = ''; }
-      else cur += c;
-    }
-    if (cur.trim()) out.push(cur.trim());
-    const decls = [];
-    for (const d of out) {
-      const idx = d.indexOf(':');
-      if (idx === -1) continue;
-      const prop = d.slice(0, idx).trim().toLowerCase();
-      let value = d.slice(idx + 1).trim();
-      let priority = '';
-      const important = /!\s*important\s*$/i;
-      if (important.test(value)) {
-        value = value.replace(important, '').trim();
-        priority = 'important';
+  // Parse CSS declarations from a style attribute value.
+  // Handles quoted strings, parens (url(), calc()), and !important.
+  // Returns array of { prop, value, important }.
+  function parseStyleDecls(styleVal) {
+    // Split on ; respecting parens and quoted strings.
+    const parts = [];
+    let depth = 0, cur = '', quote = '';
+    for (let i = 0; i < styleVal.length; i++) {
+      const c = styleVal[i];
+      if (quote) {
+        cur += c;
+        if (c === '\\' && i + 1 < styleVal.length) {
+          i++;
+          cur += styleVal[i];
+        } else if (c === quote) {
+          quote = '';
+        }
+        continue;
       }
-      decls.push({ prop, value, priority });
+      if (c === '"' || c === "'") {
+        quote = c;
+        cur += c;
+        continue;
+      }
+      if (c === '(') depth++;
+      else if (c === ')' && depth > 0) depth--;
+      if (c === ';' && depth === 0) {
+        if (cur.trim()) parts.push(cur.trim());
+        cur = '';
+      } else {
+        cur += c;
+      }
     }
-    return decls;
+    if (cur.trim()) parts.push(cur.trim());
+
+    const result = [];
+    for (const d of parts) {
+      const colon = d.indexOf(':');
+      if (colon < 0) continue;
+      const prop = d.slice(0, colon).trim().toLowerCase();
+      let val = d.slice(colon + 1).trim();
+      let important = false;
+      const impIdx = val.toLowerCase().lastIndexOf('!important');
+      if (impIdx >= 0 && impIdx === val.length - '!important'.length) {
+        val = val.slice(0, impIdx).trim();
+        important = true;
+      }
+      result.push({ prop: prop, value: val, important: important });
+    }
+    return result;
   }
 
 
@@ -4008,66 +4655,134 @@
   // variable (var html = ''; html += ...; return html;). Convert each
   // independently to return a DocumentFragment with DOM operations.
   // This avoids multi-level inlining which flattens scopes.
-  // Returns the transformed source.
+  // Uses the JS tokenizer for proper function detection and brace
+  // matching (handles strings, comments, regex containing braces).
   function convertHtmlBuilderFunctions(source) {
-    // Use a simple regex scan to find function declarations with the
-    // build-and-return pattern. This is deliberately conservative —
-    // only matches straightforward cases.
     const result = { source: source, converted: new Set() };
-    const funcRe = /function\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(([^)]*)\)\s*\{/g;
-    let fm;
+    const toks = tokenize(source);
     const replacements = []; // { start, end, replacement }
-    while ((fm = funcRe.exec(source)) !== null) {
-      const funcName = fm[1];
-      const params = fm[2];
-      const bodyStart = fm.index + fm[0].length;
-      // Find matching closing brace.
-      let depth = 1, k = bodyStart;
-      while (k < source.length && depth > 0) {
-        if (source[k] === '{') depth++;
-        else if (source[k] === '}') depth--;
-        if (depth > 0) k++;
+
+    for (let i = 0; i < toks.length; i++) {
+      // Look for: function NAME ( params ) {
+      if (toks[i].type !== 'other' || toks[i].text !== 'function') continue;
+      const funcStart = toks[i].start;
+
+      // Skip to name.
+      let j = i + 1;
+      while (j < toks.length && toks[j].type === 'sep' && toks[j].char === ';') j++;
+      if (j >= toks.length || toks[j].type !== 'other') continue;
+      const funcName = toks[j].text;
+      j++;
+
+      // Skip to (.
+      if (j >= toks.length || toks[j].type !== 'open' || toks[j].char !== '(') continue;
+      const paramsStart = toks[j].end;
+      j++;
+
+      // Find matching ).
+      let parenDepth = 1;
+      while (j < toks.length && parenDepth > 0) {
+        if (toks[j].type === 'open' && toks[j].char === '(') parenDepth++;
+        else if (toks[j].type === 'close' && toks[j].char === ')') parenDepth--;
+        if (parenDepth > 0) j++;
       }
-      const bodyEnd = k;
-      const body = source.slice(bodyStart, bodyEnd);
-      // Check the pattern: has var html = ..., has html +=, has return html, no innerHTML.
-      if (!/\binnerHTML\b/.test(body) &&
-          /\bvar\s+html\s*=/.test(body) &&
-          /\bhtml\s*\+=/.test(body) &&
-          /\breturn\s+html\s*[;\n}]/.test(body)) {
-        // Convert: replace `return html;` with a synthetic innerHTML
-        // assignment, run through the converter, wrap in fragment.
-        const syntheticBody = body.replace(
-          /\breturn\s+html\s*;?/,
-          '__frag.innerHTML = html;'
-        );
-        const extractions = extractAllHTML(syntheticBody);
-        if (extractions.length > 0) {
-          const ex = extractions[0];
-          const used = new Set();
-          const domBlock = convertOne(syntheticBody, ex, false, false, used, '__frag', result.converted);
-          if (domBlock) {
-            // Build the new function body.
-            let converted = domBlock
-              .replace('__frag.replaceChildren();\n', '')
-              .replace(/__frag/g, '__f');
-            // Indent properly.
-            const indented = converted.split('\n').map(l => '  ' + l).join('\n');
-            const newBody = '  var __f = document.createDocumentFragment();\n' + indented + '\n  return __f;\n';
-            replacements.push({
-              start: fm.index,
-              end: bodyEnd + 1, // include closing }
-              replacement: 'function ' + funcName + '(' + params + ') {\n' + newBody + '}'
-            });
-            result.converted.add(funcName);
+      if (parenDepth !== 0 || j >= toks.length) continue;
+      const params = source.slice(paramsStart, toks[j].start);
+      j++;
+
+      // Skip to {.
+      if (j >= toks.length || toks[j].type !== 'open' || toks[j].char !== '{') continue;
+      const bodyStartPos = toks[j].end;
+      j++;
+
+      // Find matching } using the tokenizer's brace tracking.
+      let braceDepth = 1;
+      while (j < toks.length && braceDepth > 0) {
+        if (toks[j].type === 'open' && toks[j].char === '{') braceDepth++;
+        else if (toks[j].type === 'close' && toks[j].char === '}') braceDepth--;
+        if (braceDepth > 0) j++;
+      }
+      if (braceDepth !== 0 || j >= toks.length) continue;
+      const bodyEndPos = toks[j].start;
+      const funcEnd = toks[j].end;
+      const body = source.slice(bodyStartPos, bodyEndPos);
+
+      // Check the build-and-return pattern using the tokenizer to
+      // avoid matching inside strings or comments.
+      let hasInnerHTML = false;
+      // Tokenize the body to check for the build-and-return pattern.
+      // Find any variable that: (1) is declared with var/let X = ...,
+      // (2) has X += ..., and (3) has return X. The variable can have
+      // any name, not just "html".
+      const bodyToks = tokenize(body);
+      const declaredVars = new Set();
+      const concatVars = new Set();
+      const returnedVars = new Set();
+      for (let bi = 0; bi < bodyToks.length; bi++) {
+        const bt = bodyToks[bi];
+        if (bt.type === 'other' && /\.innerHTML$/.test(bt.text)) hasInnerHTML = true;
+        if (bt.type === 'other' && (bt.text === 'var' || bt.text === 'let') &&
+            bi + 1 < bodyToks.length && bodyToks[bi + 1].type === 'other' && IDENT_RE.test(bodyToks[bi + 1].text) &&
+            bi + 2 < bodyToks.length && bodyToks[bi + 2].type === 'sep' && bodyToks[bi + 2].char === '=') {
+          declaredVars.add(bodyToks[bi + 1].text);
+        }
+        if (bt.type === 'other' && IDENT_RE.test(bt.text) &&
+            bi + 1 < bodyToks.length && bodyToks[bi + 1].type === 'sep' && bodyToks[bi + 1].char === '+=') {
+          concatVars.add(bt.text);
+        }
+        if (bt.type === 'other' && bt.text === 'return' &&
+            bi + 1 < bodyToks.length && bodyToks[bi + 1].type === 'other' && IDENT_RE.test(bodyToks[bi + 1].text)) {
+          returnedVars.add(bodyToks[bi + 1].text);
+        }
+      }
+      // Find the build variable: declared, concatenated, and returned.
+      let buildVarName = null;
+      for (const v of declaredVars) {
+        if (concatVars.has(v) && returnedVars.has(v)) { buildVarName = v; break; }
+      }
+      if (hasInnerHTML || !buildVarName) continue;
+
+      // Convert: replace `return html` with a synthetic innerHTML
+      // assignment, run through the converter, wrap in fragment.
+      // Find the return html token position in body to do the replacement.
+      let syntheticBody = body;
+      for (let bi = 0; bi < bodyToks.length; bi++) {
+        if (bodyToks[bi].type === 'other' && bodyToks[bi].text === 'return' &&
+            bi + 1 < bodyToks.length && bodyToks[bi + 1].type === 'other' && bodyToks[bi + 1].text === buildVarName) {
+          const retStart = bodyToks[bi].start;
+          let retEnd = bodyToks[bi + 1].end;
+          if (bi + 2 < bodyToks.length && bodyToks[bi + 2].type === 'sep' && bodyToks[bi + 2].char === ';') {
+            retEnd = bodyToks[bi + 2].end;
           }
+          syntheticBody = body.slice(0, retStart) + '__frag.innerHTML = ' + buildVarName + ';' + body.slice(retEnd);
+          break;
+        }
+      }
+
+      const extractions = extractAllHTML(syntheticBody);
+      if (extractions.length > 0) {
+        const ex = extractions[0];
+        const used = new Set();
+        const domBlock = convertOne(syntheticBody, ex, false, false, used, '__frag', result.converted);
+        if (domBlock) {
+          let converted = domBlock
+            .replace('__frag.replaceChildren();\n', '')
+            .replace(/__frag/g, '__f');
+          const indented = converted.split('\n').map(function(l) { return '  ' + l; }).join('\n');
+          const newBody = '  var __f = document.createDocumentFragment();\n' + indented + '\n  return __f;\n';
+          replacements.push({
+            start: funcStart,
+            end: funcEnd,
+            replacement: 'function ' + funcName + '(' + params + ') {\n' + newBody + '}'
+          });
+          result.converted.add(funcName);
         }
       }
     }
     // Apply replacements in reverse order.
     if (replacements.length) {
       let s = source;
-      replacements.sort((a, b) => b.start - a.start);
+      replacements.sort(function(a, b) { return b.start - a.start; });
       for (const r of replacements) {
         s = s.slice(0, r.start) + r.replacement + s.slice(r.end);
       }
@@ -4078,198 +4793,79 @@
 
   // Core conversion: takes a raw input string, returns the converted output.
   // sourceName: optional filename for naming output files (e.g. 'index.html').
-  function convertRaw(raw, sourceName) {
+  function convertRaw(raw, sourceName, externalDomFunctions) {
     // Derive the handlers filename from the source.
     const baseName = sourceName ? sourceName.replace(/\.[^.]+$/, '') : 'index';
     const handlersFile = baseName + '.handlers.js';
     try {
-      // If input starts with HTML, split into HTML portions and <script>
-      // blocks. Convert HTML to DOM API, process script blocks for
-      // innerHTML replacements, preserve non-innerHTML script code as-is.
+      // If input starts with HTML, use the HTML tokenizer to split into
+      // HTML portions and <script> blocks. Convert inline scripts for
+      // innerHTML replacements, extract unsafe attributes (events, styles,
+      // javascript: URLs) into a separate JS file.
       if (/^\s*</.test(raw)) {
-        // Strip document structure (<!DOCTYPE>, <html>, <head>, <body>)
-        // and split into head-content vs body-content regions, then
-        // split each region into HTML portions and <script> blocks.
-        let processed = raw;
-        // Remove DOCTYPE.
-        processed = processed.replace(/<!DOCTYPE[^>]*>/i, '');
-        // Remove <html ...> and </html>.
-        processed = processed.replace(/<\/?html[^>]*>/gi, '');
-
-        // Split into head and body regions.
-        let headContent = '';
-        let bodyContent = processed;
-        const headMatch = processed.match(/<head[^>]*>([\s\S]*?)<\/head>/i);
-        if (headMatch) {
-          headContent = headMatch[1];
-          bodyContent = processed.slice(0, headMatch.index) + processed.slice(headMatch.index + headMatch[0].length);
-        }
-        // Remove <body ...> and </body> from body content.
-        bodyContent = bodyContent.replace(/<\/?body[^>]*>/gi, '');
-
+        const markup = convertHtmlMarkup(raw, sourceName || 'index.html');
+        // Combine inline script blocks and process innerHTML assignments.
         const jsFileLines = [];
-        let elemCounter = 0;
-        const processRegion = (html, parentTarget, outputParts, sharedUsed) => {
-          const scriptRe = /<script\b[^>]*>([\s\S]*?)<\/script>/gi;
-          let lastIdx = 0;
-          const parts = [];
-          let m;
-          while ((m = scriptRe.exec(html)) !== null) {
-            if (m.index > lastIdx) parts.push({ kind: 'html', text: html.slice(lastIdx, m.index) });
-            parts.push({ kind: 'script', text: m[1] });
-            lastIdx = scriptRe.lastIndex;
-          }
-          if (lastIdx < html.length) parts.push({ kind: 'html', text: html.slice(lastIdx) });
-
-          // Collect all unsafe-attribute rewrites into a separate JS file.
-          // HTML structure is preserved; only inline events, javascript:
-          // URLs, and inline styles are extracted.
-          const scriptParts = [];
-          for (const part of parts) {
-            if (part.kind === 'html') {
-              let safeHtml = part.text;
-              safeHtml = safeHtml.replace(/<([a-zA-Z][a-zA-Z0-9]*)((?:\s+[^>]*?)?)>/g, function(match, tag, attrsStr) {
-                const events = [];
-                let styleVal = null;
-                let jsHref = null;
-                let cleaned = attrsStr.replace(/\s+on([a-z]+)="([^"]*)"/gi, function(_, evName, handler) {
-                  events.push({ event: evName.toLowerCase(), handler: handler.replace(/&quot;/g, '"').replace(/&amp;/g, '&') });
-                  return '';
-                });
-                cleaned = cleaned.replace(/\s+href="javascript:([^"]*)"/gi, function(_, code) {
-                  jsHref = code.replace(/&quot;/g, '"').replace(/&amp;/g, '&');
-                  return '';
-                });
-                cleaned = cleaned.replace(/\s+style="([^"]*)"/gi, function(_, val) {
-                  styleVal = val.replace(/&quot;/g, '"').replace(/&amp;/g, '&');
-                  return '';
-                });
-                if (events.length === 0 && !jsHref && !styleVal) return match;
-                // Use existing id or add data-hd for targeting.
-                const idMatch = attrsStr.match(/\s+id="([^"]*)"/i);
-                var sel, cleanedTag;
-                if (idMatch) {
-                  sel = 'document.getElementById(\'' + idMatch[1] + '\')';
-                  cleanedTag = '<' + tag + cleaned + '>';
-                } else {
-                  const hdId = 'hd' + (elemCounter++);
-                  sel = 'document.querySelector(\'[data-hd="' + hdId + '"]\')';
-                  cleanedTag = '<' + tag + cleaned + ' data-hd="' + hdId + '">';
-                }
-                for (const ev of events) {
-                  var body = ev.handler.trim();
-                  if (/\breturn\b/.test(body)) {
-                    jsFileLines.push(sel + '.addEventListener(\'' + ev.event + '\', function(event) {');
-                    jsFileLines.push('  var __r = (function() { ' + body + ' }).call(this);');
-                    jsFileLines.push('  if (__r === false) event.preventDefault();');
-                    jsFileLines.push('});');
-                  } else {
-                    jsFileLines.push(sel + '.addEventListener(\'' + ev.event + '\', function(event) { ' + body + ' });');
-                  }
-                }
-                if (jsHref) {
-                  jsFileLines.push(sel + '.addEventListener(\'click\', function(event) {');
-                  jsFileLines.push('  event.preventDefault();');
-                  jsFileLines.push('  ' + jsHref);
-                  jsFileLines.push('});');
-                }
-                if (styleVal) {
-                  var decls = styleVal.split(';').map(function(d) { return d.trim(); }).filter(Boolean);
-                  for (var di = 0; di < decls.length; di++) {
-                    var colon = decls[di].indexOf(':');
-                    if (colon < 0) continue;
-                    var prop = decls[di].slice(0, colon).trim();
-                    var val = decls[di].slice(colon + 1).trim();
-                    var important = '';
-                    if (/!important\s*$/.test(val)) {
-                      val = val.replace(/\s*!important\s*$/, '');
-                      important = ', \'important\'';
-                    }
-                    jsFileLines.push(sel + '.style.setProperty(\'' + prop + '\', \'' + val.replace(/'/g, "\\'") + '\'' + important + ');');
-                  }
-                }
-                return cleanedTag;
-              });
-              outputParts.push(safeHtml);
-            } else {
-              scriptParts.push(part);
-            }
-          }
-
-          // Combine all script blocks into one for cross-file scope,
-          // then split the output back by tracking separator positions.
-          if (scriptParts.length > 0) {
-            // Build combined JS with separators we can split on later.
-            const separator = '\n/*__BLOCK_SEP__*/\n';
-            let combinedJs = scriptParts.map(p => p.text).join(separator);
-            // Pre-pass: convert HTML-building helper functions to return
-            // DOM fragments. This prevents multi-level inlining.
-            const prepass = convertHtmlBuilderFunctions(combinedJs);
-            combinedJs = prepass.source;
-            const extractions = extractAllHTML(combinedJs);
-            if (extractions.length === 0) {
-              // No innerHTML — keep script code as-is in the JS file.
-              for (const part of scriptParts) jsFileLines.push(part.text.trim());
-            } else {
-              const trimmed = combinedJs.trim();
-              let scriptOutput = '';
-              let cursor = 0;
-              for (const ex of extractions) {
-                if (ex.srcStart === undefined) continue;
-                const domBlock = convertOne(combinedJs, ex, false, false, sharedUsed, null, prepass.converted);
-                let srcStart = ex.srcStart;
-                let srcEnd = ex.srcEnd;
-                if (ex.buildVarDeclStart >= 0) {
-                  srcStart = ex.buildVarDeclStart;
-                }
-                let pre = trimmed.slice(cursor, srcStart);
-                pre = pre.replace(/\n\s*$/, '\n');
-                scriptOutput += pre;
-                if (domBlock) {
-                  let lineStart = srcStart;
-                  while (lineStart > 0 && trimmed[lineStart - 1] !== '\n') lineStart--;
-                  const indent = trimmed.slice(lineStart, srcStart).match(/^(\s*)/)[1];
-                  const indented = domBlock.split('\n').map((line) => indent + line).join('\n');
-                  scriptOutput += indented;
-                  if (!indented.endsWith('\n')) scriptOutput += '\n';
-                }
-                cursor = srcEnd;
-                while (cursor < trimmed.length && (trimmed[cursor] === ';' || trimmed[cursor] === ' ' || trimmed[cursor] === '\n')) cursor++;
-              }
-              scriptOutput += trimmed.slice(cursor);
-              scriptOutput = scriptOutput.replace(/\n\/\*__BLOCK_SEP__\*\/\n/g, '\n');
-              jsFileLines.push(scriptOutput.trim());
-            }
-          }
-        };
-
-        const outputParts = [];
         const sharedUsed = new Set();
-        // Reconstruct the document with safe HTML.
-        outputParts.push('<!DOCTYPE html>\n<html>\n<head>');
-        if (headContent.trim()) processRegion(headContent, 'document.head', outputParts, sharedUsed);
-        outputParts.push('</head>\n<body>');
-        if (bodyContent.trim()) processRegion(bodyContent, 'document.body', outputParts, sharedUsed);
-        // Add reference to the generated JS file if there are any rewrites.
-        if (jsFileLines.length) {
-          outputParts.push('<script src="' + handlersFile + '"></script>');
+        if (markup.extractedScripts.length > 0) {
+          const separator = '\n/*__BLOCK_SEP__*/\n';
+          let combinedJs = markup.extractedScripts.map(function(s) { return s.content; }).join(separator);
+          const prepass = convertHtmlBuilderFunctions(combinedJs);
+          combinedJs = prepass.source;
+          const extractions = extractAllHTML(combinedJs);
+          if (extractions.length === 0) {
+            for (const s of markup.extractedScripts) jsFileLines.push(s.content.trim());
+          } else {
+            const trimmed = combinedJs.trim();
+            let scriptOutput = '';
+            let cursor = 0;
+            for (const ex of extractions) {
+              if (ex.srcStart === undefined) continue;
+              const domBlock = convertOne(combinedJs, ex, false, false, sharedUsed, null, prepass.converted);
+              let srcStart = ex.srcStart;
+              let srcEnd = ex.srcEnd;
+              if (ex.buildVarDeclStart >= 0) {
+                srcStart = ex.buildVarDeclStart;
+              }
+              let pre = trimmed.slice(cursor, srcStart);
+              pre = pre.replace(/\n\s*$/, '\n');
+              scriptOutput += pre;
+              if (domBlock) {
+                let lineStart = srcStart;
+                while (lineStart > 0 && trimmed[lineStart - 1] !== '\n') lineStart--;
+                const indent = trimmed.slice(lineStart, srcStart).match(/^(\s*)/)[1];
+                const indented = domBlock.split('\n').map(function(line) { return indent + line; }).join('\n');
+                scriptOutput += indented;
+                if (!indented.endsWith('\n')) scriptOutput += '\n';
+              }
+              cursor = srcEnd;
+              while (cursor < trimmed.length && (trimmed[cursor] === ';' || trimmed[cursor] === ' ' || trimmed[cursor] === '\n')) cursor++;
+            }
+            scriptOutput += trimmed.slice(cursor);
+            scriptOutput = scriptOutput.replace(/\n\/\*__BLOCK_SEP__\*\/\n/g, '\n');
+            jsFileLines.push(scriptOutput.trim());
+          }
         }
-        outputParts.push('</body>\n</html>');
-        const cleanHtml = outputParts.join('\n').replace(/\n{3,}/g, '\n\n');
-        const jsFile = jsFileLines.length ? '// Generated by HTML to DOM API Converter\n// Extracted inline handlers, styles, and innerHTML conversions.\n\n' + jsFileLines.join('\n\n') + '\n' : '';
-        // Output both: HTML file, separator, JS file.
+        // Build output: cleaned HTML + handlers JS + extracted script JS.
+        const handlersContent = markup.handlers ? markup.handlers.content : '';
+        const allJs = [handlersContent].concat(jsFileLines).filter(Boolean);
+        const jsFile = allJs.length ? '// Generated by HTML to DOM API Converter\n// Extracted inline handlers, styles, and innerHTML conversions.\n\n' + allJs.join('\n\n') + '\n' : '';
         if (jsFile) {
-          return ('// === ' + (sourceName || 'index.html') + ' ===\n' + cleanHtml + '\n\n// === ' + handlersFile + ' ===\n' + jsFile);
+          return ('// === ' + (sourceName || 'index.html') + ' ===\n' + markup.html + '\n\n// === ' + handlersFile + ' ===\n' + jsFile);
         } else {
-          return (cleanHtml);
+          return (markup.html);
         }
-        return;
       }
 
       // Pure JS input (no leading <).
       // Pre-pass: convert HTML-building helper functions.
       const prepass = convertHtmlBuilderFunctions(raw);
       const processedRaw = prepass.source;
+      // Merge pre-pass converted names with externally known DOM functions.
+      const allDomFunctions = new Set(prepass.converted);
+      if (externalDomFunctions) {
+        for (const fn of externalDomFunctions) allDomFunctions.add(fn);
+      }
       const extractions = extractAllHTML(processedRaw);
       if (extractions.length === 0) {
         const summary = summarizeDomConstruction(processedRaw);
@@ -4282,8 +4878,13 @@
       let output = '';
       let cursor = 0;
       const sharedUsed = new Set();
-      // Reserve all target identifiers so generated variable names
-      // don't shadow them.
+      // Reserve all identifiers from the source code so generated
+      // variable names don't collide with user variables.
+      const srcToks = extractions[0] && extractions[0]._tokens ? extractions[0]._tokens : tokenize(trimmed);
+      for (const st of srcToks) {
+        if (st.type === 'other' && IDENT_RE.test(st.text)) sharedUsed.add(st.text);
+      }
+      // Also reserve target identifier roots.
       for (const ex of extractions) {
         if (ex.target) {
           const root = ex.target.match(/^[A-Za-z_$][A-Za-z0-9_$]*/);
@@ -4295,7 +4896,7 @@
         const target = ex.target || 'document.body';
         const assignOp = ex.assignOp || '=';
 
-        const domBlock = convertOne(processedRaw, ex, false, false, sharedUsed, null, prepass.converted);
+        const domBlock = convertOne(processedRaw, ex, false, false, sharedUsed, null, allDomFunctions);
         let srcStart = ex.srcStart;
         let srcEnd = ex.srcEnd;
         // When the chain carries preserve tokens, the region starts at
@@ -4369,644 +4970,23 @@
   // Direct chain-to-DOM converter: bypass DOMParser, work from chain tokens.
   // ---------------------------------------------------------------------------
 
-  // Parse chain tokens into a lightweight virtual DOM tree. Each str token
-  // is fed character-by-character through an HTML state machine; each other
-  // token (expression) is annotated with its HTML context (text content,
-  // attribute value, attribute name, etc.).
-  function parseChainToVNodes(chainTokens) {
-    // Split chain at plus tokens into operands.
-    const operands = [];
-    let cur = [];
-    for (const t of chainTokens) {
-      if (t.type === 'plus') { if (cur.length) operands.push(cur); cur = []; }
-      else cur.push(t);
-    }
-    if (cur.length) operands.push(cur);
-
-    // Resolve an operand to { kind: 'str', text, loopId } or { kind: 'expr', expr, loopId }.
-    const resolveOp = (toks) => {
-      const loopId = toks[0].loopId != null ? toks[0].loopId : null;
-      if (toks.length === 1 && toks[0].type === 'str') {
-        return { kind: 'str', text: toks[0].text, loopId };
-      }
-      if (toks.length === 1 && toks[0].type === 'tmpl') {
-        // Template literal — flatten parts into sub-operands.
-        const parts = [];
-        for (const p of toks[0].parts) {
-          if (p.kind === 'text') parts.push({ kind: 'str', text: decodeJsString(p.raw, '`'), loopId });
-          else parts.push({ kind: 'expr', expr: p.expr.trim(), loopId });
-        }
-        return { kind: 'tmpl', parts, loopId };
-      }
-      if (toks.length === 1 && toks[0].type === 'preserve') {
-        return { kind: 'preserve', text: toks[0].text, loopId };
-      }
-      if (toks.length === 1 && toks[0].type === 'trycatch') {
-        return { kind: 'trycatch', tryBody: toks[0].tryBody, catchBody: toks[0].catchBody, catchParam: toks[0].catchParam, loopId };
-      }
-      if (toks.length === 1 && toks[0].type === 'switch') {
-        return { kind: 'switch', discExpr: toks[0].discExpr, branches: toks[0].branches, loopId };
-      }
-      if (toks.length === 1 && (toks[0].type === 'cond' || toks[0].type === 'iter')) {
-        return Object.assign({ kind: toks[0].type, loopId }, toks[0]);
-      }
-      const first = toks[0];
-      const last = toks[toks.length - 1];
-      const expr = first._src.slice(first.start, last.end).trim();
-      return { kind: 'expr', expr, loopId };
-    };
-
-    const resolved = [];
-    for (const op of operands) {
-      const r = resolveOp(op);
-      if (r.kind === 'tmpl') {
-        for (const p of r.parts) resolved.push(p);
-      } else {
-        resolved.push(r);
-      }
-    }
-
-    // HTML state machine.
-    const TEXT = 0, TAG_OPEN = 1, TAG_CLOSE = 2, ATTRS = 3;
-    const ATTR_NAME = 4, ATTR_EQ = 5, ATTR_VALUE_DQ = 6, ATTR_VALUE_SQ = 7;
-    const ATTR_VALUE_UQ = 8, COMMENT = 9;
-
-    let state = TEXT;
-    let tagName = '';
-    let attrName = '';
-    let attrValue = '';
-    let attrExprs = [];  // {pos, expr} embedded in current attr value
-
-    // Virtual DOM construction.
-    const roots = [];
-    const elStack = [];  // stack of { tag, attrs, children }
-    const addChild = (node) => {
-      if (elStack.length) elStack[elStack.length - 1].children.push(node);
-      else roots.push(node);
-    };
-    let currentEl = null;  // element being built (receives attrs)
-    const openTag = (tag, loopId) => {
-      currentEl = { kind: 'element', tag, attrs: [], children: [], loopId };
-    };
-    // Called when `>` closes the opening tag — commit the element.
-    const commitTag = () => {
-      if (!currentEl) return;
-      addChild(currentEl);
-      if (!currentEl.tag || !VOID_ELEMENTS.has(currentEl.tag.toLowerCase())) elStack.push(currentEl);
-      currentEl = null;
-    };
-    const commitAndSelfClose = () => {
-      if (!currentEl) return;
-      addChild(currentEl);
-      // Don't push to stack — self-closing.
-      currentEl = null;
-    };
-    const popEl = () => { if (elStack.length) elStack.pop(); };
-    let textBuf = '';
-    const flushText = () => {
-      if (textBuf) { addChild({ kind: 'text', text: textBuf }); textBuf = ''; }
-    };
-    let currentTagLoopId = null;
-
-    const finishAttr = () => {
-      if (!attrName || !currentEl) { attrName = ''; attrValue = ''; attrExprs = []; return; }
-      if (attrExprs.length) {
-        currentEl.attrs.push({ kind: 'dynamic_value', name: attrName, value: attrValue, valueExprs: attrExprs.slice() });
-      } else {
-        currentEl.attrs.push({ kind: 'static', name: attrName, value: attrValue });
-      }
-      attrName = '';
-      attrValue = '';
-      attrExprs = [];
-    };
-
-    const startTag = (loopId) => {
-      openTag(tagName, loopId);
-      tagName = '';
-    };
-
-    // Feed a string through the state machine.
-    const feedStr = (text, loopId) => {
-      for (let i = 0; i < text.length; i++) {
-        const c = text[i];
-        switch (state) {
-          case TEXT:
-            if (c === '<') {
-              flushText();
-              if (text[i + 1] === '/') { state = TAG_CLOSE; i++; }
-              else if (text[i + 1] === '!' && text[i + 2] === '-' && text[i + 3] === '-') {
-                state = COMMENT; i += 3;
-              }
-              else { state = TAG_OPEN; tagName = ''; currentTagLoopId = loopId; }
-            } else {
-              textBuf += c;
-            }
-            break;
-          case TAG_OPEN:
-            if (c === ' ' || c === '\t' || c === '\n' || c === '\r') {
-              if (tagName) { startTag(currentTagLoopId); state = ATTRS; }
-            } else if (c === '>') {
-              startTag(currentTagLoopId); commitTag(); state = TEXT;
-            } else if (c === '/') {
-              if (text[i + 1] === '>') { startTag(currentTagLoopId); commitAndSelfClose(); state = TEXT; i++; }
-            } else {
-              tagName += c;
-            }
-            break;
-          case TAG_CLOSE:
-            if (c === '>') { popEl(); state = TEXT; }
-            break;
-          case ATTRS:
-            if (c === '>') {
-              finishAttr(); commitTag();
-              state = TEXT;
-            } else if (c === '/') {
-              if (text[i + 1] === '>') { finishAttr(); commitAndSelfClose(); state = TEXT; i++; }
-            } else if (c !== ' ' && c !== '\t' && c !== '\n' && c !== '\r') {
-              finishAttr();
-              attrName = c;
-              state = ATTR_NAME;
-            }
-            break;
-          case ATTR_NAME:
-            if (c === '=') { state = ATTR_EQ; }
-            else if (c === ' ' || c === '\t' || c === '\n' || c === '\r') {
-              // Boolean attribute or space before =
-              // Peek ahead to see if = follows
-              let j = i + 1;
-              while (j < text.length && (text[j] === ' ' || text[j] === '\t')) j++;
-              if (j < text.length && text[j] === '=') {
-                i = j; state = ATTR_EQ;
-              } else {
-                // Boolean attribute
-                finishAttr();
-                state = ATTRS;
-              }
-            } else if (c === '>') {
-              finishAttr(); commitTag(); state = TEXT;
-            } else if (c === '/' && text[i + 1] === '>') {
-              finishAttr(); commitAndSelfClose(); state = TEXT; i++;
-            } else {
-              attrName += c;
-            }
-            break;
-          case ATTR_EQ:
-            if (c === '"') { attrValue = ''; state = ATTR_VALUE_DQ; }
-            else if (c === "'") { attrValue = ''; state = ATTR_VALUE_SQ; }
-            else if (c !== ' ' && c !== '\t') {
-              attrValue = c; state = ATTR_VALUE_UQ;
-            }
-            break;
-          case ATTR_VALUE_DQ:
-            if (c === '"') { finishAttr(); state = ATTRS; }
-            else attrValue += c;
-            break;
-          case ATTR_VALUE_SQ:
-            if (c === "'") { finishAttr(); state = ATTRS; }
-            else attrValue += c;
-            break;
-          case ATTR_VALUE_UQ:
-            if (c === ' ' || c === '\t' || c === '\n' || c === '\r') { finishAttr(); state = ATTRS; }
-            else if (c === '>') { finishAttr(); commitTag(); state = TEXT; }
-            else if (c === '/' && text[i + 1] === '>') { finishAttr(); commitAndSelfClose(); state = TEXT; i++; }
-            else attrValue += c;
-            break;
-          case COMMENT:
-            if (c === '-' && text[i + 1] === '-' && text[i + 2] === '>') {
-              i += 2; state = TEXT;
-            }
-            break;
-        }
-      }
-    };
-
-    // Feed an expression into the current state.
-    const feedExpr = (expr, loopId) => {
-      switch (state) {
-        case TEXT:
-          flushText();
-          addChild({ kind: 'expr_text', expr, loopId });
-          break;
-        case TAG_OPEN:
-          // Expression is the tag name (e.g. `"<" + tag + ">"`).
-          tagName = null;
-          openTag(null, loopId);
-          currentEl.tagExpr = expr;
-          state = ATTRS;
-          break;
-        case ATTRS:
-          // Expression between attributes — conditional boolean attr.
-          if (currentEl) {
-            currentEl.attrs.push({ kind: 'dynamic_name', nameExpr: expr });
-          }
-          break;
-        case ATTR_NAME:
-          // Expression continues attribute name (unusual).
-          attrName += '${' + expr + '}';
-          break;
-        case ATTR_VALUE_DQ:
-        case ATTR_VALUE_SQ:
-        case ATTR_VALUE_UQ:
-          attrExprs.push({ pos: attrValue.length, expr });
-          break;
-        case ATTR_EQ:
-          // Expression is the entire unquoted attribute value.
-          attrExprs.push({ pos: 0, expr });
-          finishAttr();
-          state = ATTRS;
-          break;
-        default:
-          break;
-      }
-    };
-
-    // Convert chain tokens to a JS expression string (for attribute values
-    // and other non-structural contexts where DOM nodes can't be emitted).
-    const chainToksAsExpr = (toks) => {
-      const parts = [];
-      for (const t of toks) {
-        if (t.type === 'plus') continue;
-        if (t.type === 'str') parts.push(JSON.stringify(t.text));
-        else if (t.type === 'other') parts.push(t.text);
-        else if (t.type === 'cond') parts.push('(' + t.condExpr + ' ? ' + chainToksAsExpr(t.ifTrue) + ' : ' + chainToksAsExpr(t.ifFalse) + ')');
-        else if (t.type === 'preserve' || t.type === 'trycatch' || t.type === 'switch') { /* skip — control flow tokens don't produce values */ }
-      }
-      return parts.join(' + ') || '""';
-    };
-
-    for (const op of resolved) {
-      if (op.kind === 'str') feedStr(op.text, op.loopId);
-      else if (op.kind === 'iter') {
-        // Iteration: .map(fn).join('') — parse per-element chain and emit forEach loop.
-        if (state === TEXT) {
-          flushText();
-          const elemNodes = parseChainToVNodes(op.perElemChain);
-          addChild({ kind: 'iteration', iterExpr: op.iterExpr, paramName: op.paramName, children: elemNodes, loopId: op.loopId });
-        } else {
-          // Non-TEXT context — fall back to expression.
-          feedExpr(op.iterExpr + '.map(function(' + op.paramName + ') { return ' + chainToksAsExpr(op.perElemChain) + '; }).join(\'\')', op.loopId);
-        }
-      }
-      else if (op.kind === 'trycatch') {
-        if (state === TEXT) {
-          flushText();
-          const tryNodes = parseChainToVNodes(op.tryBody);
-          const catchNodes = parseChainToVNodes(op.catchBody);
-          addChild({ kind: 'trycatch', tryBody: tryNodes, catchBody: catchNodes, catchParam: op.catchParam, loopId: op.loopId });
-        }
-      }
-      else if (op.kind === 'switch') {
-        if (state === TEXT) {
-          flushText();
-          const branches = op.branches.map(br => ({
-            label: br.label, caseExpr: br.caseExpr,
-            nodes: parseChainToVNodes(br.chain),
-          }));
-          addChild({ kind: 'switch', discExpr: op.discExpr, branches, loopId: op.loopId });
-        }
-      }
-      else if (op.kind === 'preserve') {
-        flushText();
-        addChild({ kind: 'preserve', text: op.text, loopId: op.loopId });
-      }
-      else if (op.kind === 'cond') {
-        // Conditional HTML: recursively parse both branches into vnodes
-        // and emit a conditional vnode that the emitter renders as if/else.
-        if (state === TEXT) {
-          flushText();
-          const trueNodes = parseChainToVNodes(op.ifTrue);
-          const falseNodes = parseChainToVNodes(op.ifFalse);
-          addChild({ kind: 'conditional', condExpr: op.condExpr, ifTrue: trueNodes, ifFalse: falseNodes, loopId: op.loopId });
-        } else if (state === ATTR_VALUE_DQ || state === ATTR_VALUE_SQ || state === ATTR_VALUE_UQ) {
-          // Conditional inside attribute value — fall back to expression.
-          attrExprs.push({ pos: attrValue.length, expr: '(' + op.condExpr + ' ? ' + chainToksAsExpr(op.ifTrue) + ' : ' + chainToksAsExpr(op.ifFalse) + ')' });
-        } else if (state === ATTRS && currentEl) {
-          // Conditional in attribute-name position.
-          currentEl.attrs.push({ kind: 'dynamic_name', nameExpr: '(' + op.condExpr + ' ? ' + chainToksAsExpr(op.ifTrue) + ' : ' + chainToksAsExpr(op.ifFalse) + ')' });
-        } else {
-          feedExpr('(' + op.condExpr + ' ? ' + chainToksAsExpr(op.ifTrue) + ' : ' + chainToksAsExpr(op.ifFalse) + ')', op.loopId);
-        }
-      }
-      else feedExpr(op.expr, op.loopId);
-    }
-    flushText();
-
-    return roots;
-  }
-
-  // Emit DOM API code from a virtual DOM tree produced by parseChainToVNodes.
-  // Handles the same options as convertNode: useProps, classList, events, etc.
-  function emitVNodes(vnodes, parentVar, lines, used, opts, loopInfoMap, loopIds, nsCtx) {
-    // Reserve identifiers from preserve tokens so makeVar doesn't collide.
-    const reservePreserveIdents = (nodes) => {
-      for (const n of nodes) {
-        if (n.kind === 'preserve' && n.text) {
-          const ids = n.text.match(/[A-Za-z_$][A-Za-z0-9_$]*/g);
-          if (ids) for (const id of ids) used.add(id);
-        }
-        if (n.kind === 'conditional') { reservePreserveIdents(n.ifTrue); reservePreserveIdents(n.ifFalse); }
-        if (n.kind === 'iteration') reservePreserveIdents(n.children);
-        if (n.kind === 'trycatch') { reservePreserveIdents(n.tryBody); reservePreserveIdents(n.catchBody); }
-        if (n.kind === 'switch') for (const br of n.branches) reservePreserveIdents(br.nodes);
-        if (n.kind === 'element') reservePreserveIdents(n.children);
-      }
-    };
-    reservePreserveIdents(vnodes);
-
-    // Group nodes by loopId to wrap loop segments.
-    const groups = [];
-    let curGroup = null;
-    for (const node of vnodes) {
-      const lid = node.loopId != null ? node.loopId : null;
-      if (!curGroup || curGroup.loopId !== lid) {
-        curGroup = { loopId: lid, nodes: [] };
-        groups.push(curGroup);
-      }
-      curGroup.nodes.push(node);
-    }
-
-    for (const group of groups) {
-      if (group.loopId != null && loopInfoMap && loopInfoMap[group.loopId] && !(loopIds && loopIds.has(group.loopId))) {
-        const info = loopInfoMap[group.loopId];
-        if (info.kind === 'do') {
-          lines.push('do {');
-        } else {
-          const header = info.kind === 'while'
-            ? 'while (' + info.headerSrc + ')'
-            : 'for (' + info.headerSrc + ')';
-          lines.push(header + ' {');
-        }
-        const loopUsed = new Set(used);
-        const loopLines = [];
-        const innerLoopIds = new Set(loopIds || []);
-        innerLoopIds.add(group.loopId);
-        for (const node of group.nodes) emitVNode(node, parentVar, loopLines, loopUsed, opts, loopInfoMap, innerLoopIds, nsCtx);
-        for (const l of loopLines) lines.push('  ' + l);
-        if (info.kind === 'do') {
-          lines.push('} while (' + info.headerSrc + ');');
-        } else {
-          lines.push('}');
-        }
-      } else {
-        for (const node of group.nodes) emitVNode(node, parentVar, lines, used, opts, loopInfoMap, loopIds, nsCtx);
-      }
-    }
-  }
-
-  function emitVNode(node, parentVar, lines, used, opts, loopInfoMap, loopIds, nsCtx) {
-    if (node.kind === 'text') {
-      const text = node.text;
-      if (!text) return;
-      if (opts.skipWhitespaceText && /^\s*$/.test(text)) return;
-      const v = makeVar('text', used);
-      lines.push('const ' + v + ' = document.createTextNode(' + jsStr(text).code + ');');
-      lines.push(parentVar + '.appendChild(' + v + ');');
-      return;
-    }
-
-    if (node.kind === 'trycatch') {
-      const tryLines = [];
-      const catchLines = [];
-      const tryUsed = new Set(used);
-      const catchUsed = new Set(used);
-      emitVNodes(node.tryBody, parentVar, tryLines, tryUsed, opts, loopInfoMap, loopIds, nsCtx);
-      emitVNodes(node.catchBody, parentVar, catchLines, catchUsed, opts, loopInfoMap, loopIds, nsCtx);
-      lines.push('try {');
-      for (const l of tryLines) lines.push('  ' + l);
-      lines.push('} catch(' + (node.catchParam || 'e') + ') {');
-      for (const l of catchLines) lines.push('  ' + l);
-      lines.push('}');
-      return;
-    }
-
-    if (node.kind === 'switch') {
-      lines.push('switch (' + node.discExpr + ') {');
-      for (const br of node.branches) {
-        if (br.label === 'default') {
-          lines.push('  default:');
-        } else {
-          lines.push('  case ' + br.caseExpr + ':');
-        }
-        const caseLines = [];
-        const caseUsed = new Set(used);
-        emitVNodes(br.nodes, parentVar, caseLines, caseUsed, opts, loopInfoMap, loopIds, nsCtx);
-        for (const l of caseLines) lines.push('    ' + l);
-        lines.push('    break;');
-      }
-      lines.push('}');
-      return;
-    }
-
-    if (node.kind === 'preserve') {
-      lines.push(node.text);
-      return;
-    }
-
-    if (node.kind === 'iteration') {
-      const iterLines = [];
-      const iterUsed = new Set(used);
-      emitVNodes(node.children, parentVar, iterLines, iterUsed, opts, loopInfoMap, loopIds, nsCtx);
-      if (iterLines.length) {
-        lines.push(node.iterExpr + '.forEach(function(' + node.paramName + ') {');
-        for (const l of iterLines) lines.push('  ' + l);
-        lines.push('});');
-      }
-      return;
-    }
-
-    if (node.kind === 'conditional') {
-      const ifLines = [];
-      const elseLines = [];
-      const ifUsed = new Set(used);
-      const elseUsed = new Set(used);
-      emitVNodes(node.ifTrue, parentVar, ifLines, ifUsed, opts, loopInfoMap, loopIds, nsCtx);
-      emitVNodes(node.ifFalse, parentVar, elseLines, elseUsed, opts, loopInfoMap, loopIds, nsCtx);
-      if (ifLines.length || elseLines.length) {
-        lines.push('if (' + node.condExpr + ') {');
-        for (const l of ifLines) lines.push('  ' + l);
-        if (elseLines.length) {
-          lines.push('} else {');
-          for (const l of elseLines) lines.push('  ' + l);
-        }
-        lines.push('}');
-      }
-      return;
-    }
-
-    if (node.kind === 'expr_text') {
-      // Check if this expression is a call to a DOM-returning function
-      // (converted by the pre-pass). If so, appendChild directly.
-      const isDomCall = opts.domFunctions && opts.domFunctions.size > 0 &&
-        [...opts.domFunctions].some(fn => new RegExp('^' + fn.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*\\(').test(node.expr));
-      if (isDomCall) {
-        lines.push(parentVar + '.appendChild(' + node.expr + ');');
-      } else {
-        const v = makeVar('text', used);
-        lines.push('const ' + v + ' = document.createTextNode(' + node.expr + ');');
-        lines.push(parentVar + '.appendChild(' + v + ');');
-      }
-      return;
-    }
-
-    if (node.kind !== 'element') return;
-
-    const tag = node.tag;
-    const tagExpr = node.tagExpr || null;
-    const v = makeVar(tag || 'el', used);
-    const tagLower = tag ? tag.toLowerCase() : null;
-
-    let ns = nsCtx || null;
-    if (tagExpr) {
-      lines.push('const ' + v + ' = document.createElement(' + tagExpr + ');');
-    } else {
-      if (tagLower === 'svg') ns = SVG_NS;
-      else if (tagLower === 'math') ns = MATHML_NS;
-      else if (tagLower === 'foreignobject') ns = null;
-      else if (!ns && SVG_TAGS.has(tagLower)) ns = SVG_NS;
-
-      if (ns) {
-        lines.push('const ' + v + " = document.createElementNS('" + ns + "', '" + tag + "');");
-      } else {
-        lines.push('const ' + v + " = document.createElement('" + tagLower + "');");
-      }
-    }
-
-    // Emit attributes.
-    for (const attr of node.attrs) {
-      if (attr.kind === 'dynamic_name') {
-        // Conditional boolean attribute from expression in attr-name position.
-        const expr = attr.nameExpr;
-        const ternMatch = expr.match(/^\((.+?)\s*\?\s*"([^"]+)"\s*:\s*""\s*\)$/);
-        if (ternMatch) {
-          lines.push('if (' + ternMatch[1] + ') ' + v + ".setAttribute('" + ternMatch[2] + "', '');");
-        } else {
-          lines.push('{ const __a = ' + expr + '; if (__a) ' + v + ".setAttribute(__a, ''); }");
-        }
-        continue;
-      }
-
-      const name = attr.name;
-      const hasDynamic = attr.kind === 'dynamic_value' && attr.valueExprs.length > 0;
-
-      // Build the value expression.
-      let valCode;
-      if (hasDynamic) {
-        valCode = spliceExprs(attr.value, attr.valueExprs, false);
-      } else {
-        valCode = null;  // use attr.value directly via jsStr
-      }
-
-      // Event handler -> addEventListener.
-      const evMatch = /^on([a-z]+)$/i.exec(name);
-      if (evMatch && opts.eventsAsListeners) {
-        const evName = evMatch[1].toLowerCase();
-        const body = hasDynamic ? spliceExprs(attr.value, attr.valueExprs, true) : attr.value;
-        lines.push(v + ".addEventListener('" + evName + "', function (event) {");
-        for (const ln of body.split('\n')) lines.push('  ' + ln);
-        lines.push('});');
-        continue;
-      }
-
-      // Style -> style.setProperty.
-      if (name === 'style' && opts.splitStyle && !hasDynamic) {
-        const decls = parseStyle(attr.value);
-        if (decls.length) {
-          for (const d of decls) {
-            lines.push(v + '.style.setProperty(' + jsStr(d.prop).code + ', ' + jsStr(d.value).code + (d.priority ? ", 'important'" : '') + ');');
-          }
-          continue;
-        }
-      }
-
-      // Boolean attributes.
-      if (!ns && BOOLEAN_ATTRS.has(name.toLowerCase()) && !hasDynamic) {
-        lines.push(v + '.' + (ATTR_TO_PROP[name.toLowerCase()] || name) + ' = true;');
-        continue;
-      }
-
-      // Class attribute with classList.
-      if (name === 'class' && opts.useClassList && !ns) {
-        if (hasDynamic) {
-          lines.push(v + '.className = ' + valCode + ';');
-        } else {
-          const classes = attr.value.split(/\s+/).filter(Boolean);
-          if (classes.length === 0) continue;
-          if (classes.length === 1) lines.push(v + '.className = ' + jsStr(classes[0]).code + ';');
-          else lines.push(v + '.classList.add(' + classes.map(c => jsStr(c).code).join(', ') + ');');
-        }
-        continue;
-      }
-
-      // IDL property.
-      const idl = (opts.useProps && !ns) ? isIdlProp(name) : null;
-      if (hasDynamic) {
-        if (idl) lines.push(v + '.' + idl + ' = ' + valCode + ';');
-        else lines.push(v + ".setAttribute('" + name + "', " + valCode + ');');
-      } else {
-        const lit = jsStr(attr.value);
-        if (idl) lines.push(v + '.' + idl + ' = ' + lit.code + ';');
-        else lines.push(v + ".setAttribute('" + name + "', " + lit.code + ');');
-      }
-    }
-
-    // Recurse into children.
-    if (node.children.length) {
-      // textContent shortcut: if all children are text or expr_text (no
-      // nested elements), emit a single textContent assignment.
-      const canShortcut = opts.textContentShortcut &&
-        node.children.every(c => (c.kind === 'text' || c.kind === 'expr_text') && c.loopId == null) &&
-        !node.children.some(c => c.kind === 'expr_text' && opts.domFunctions && opts.domFunctions.size > 0 && [...opts.domFunctions].some(fn => new RegExp('^' + fn.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*\\(').test(c.expr)));
-      if (canShortcut) {
-        if (node.children.length === 1) {
-          const child = node.children[0];
-          if (child.kind === 'text') {
-            lines.push(v + '.textContent = ' + jsStr(child.text).code + ';');
-          } else {
-            lines.push(v + '.textContent = ' + child.expr + ';');
-          }
-        } else {
-          let tmpl = '';
-          for (const child of node.children) {
-            if (child.kind === 'text') tmpl += tmplEncode(child.text);
-            else tmpl += '${' + child.expr + '}';
-          }
-          lines.push(v + '.textContent = `' + tmpl + '`;');
-        }
-        lines.push(parentVar + '.appendChild(' + v + ');');
-        return;
-      }
-      // Children inherit namespace; <foreignObject> reverts to HTML.
-      const childNs = (tagLower === 'foreignobject') ? null : ns;
-      emitVNodes(node.children, v, lines, used, opts, loopInfoMap, loopIds, childNs);
-    }
-
-    lines.push(parentVar + '.appendChild(' + v + ');');
-  }
-
-  // Escape a string for embedding inside a template literal.
-  const tmplEncode = (t) => t.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$\{/g, '\\${');
-
-  // Splice expressions into a static value string. When `raw` is true,
-  // expressions are inlined directly (for event handler bodies); otherwise
-  // the result is wrapped as a JS template literal.
-  function spliceExprs(value, valueExprs, raw) {
-    if (valueExprs.length === 1 && valueExprs[0].pos === 0 && value === '') {
-      return valueExprs[0].expr;
-    }
-    const sorted = valueExprs.slice().sort((a, b) => a.pos - b.pos);
-    let out = '';
-    let cursor = 0;
-    for (const { pos, expr } of sorted) {
-      out += raw ? value.slice(cursor, pos) : tmplEncode(value.slice(cursor, pos));
-      out += raw ? expr : '${' + expr + '}';
-      cursor = pos;
-    }
-    out += raw ? value.slice(cursor) : tmplEncode(value.slice(cursor));
-    return raw ? out : '`' + out + '`';
-  }
-
   // Produce the DOM-API code block for a single innerHTML/outerHTML
-  // extraction. `multi` toggles the leading target-divider comment.
+  // extraction using the runtime parent stack approach.
+  //
+  // Instead of building a static VNode tree and emitting code from it,
+  // this directly generates DOM operations from the chain tokens.
+  // Each HTML string fragment is decomposed into tag operations at
+  // compile time, but the actual DOM tree is built at runtime using a
+  // parent pointer (__p) that tracks the current insertion point:
+  //   - Open tag: createElement, appendChild, __p = newEl
+  //   - Close tag: __p = __p.parentNode
+  //   - Text: createTextNode, appendChild to __p
+  //   - Expressions: createTextNode(expr), appendChild to __p
+  //   - Preserve: emitted verbatim (break, continue, mutations)
+  //   - Conditionals/loops: emitted as runtime if/for/while/switch
+  //
+  // This handles ALL patterns uniformly — static HTML, loops, state
+  // machines, cross-iteration tag pairing, multiple build variables.
   function convertOne(raw, result, multi, emitTitle, sharedUsed, parentOverride, domFunctions) {
     const { target, assignProp, assignOp } = result;
 
@@ -5017,18 +4997,7 @@
       parentFromAssignment = true;
     }
 
-    const opts = {
-      useProps: true,
-      splitStyle: true,
-      eventsAsListeners: true,
-      textContentShortcut: true,
-      useClassList: true,
-      skipWhitespaceText: $('skipWS').checked,
-      useFragment: $('useFragment').checked,
-      emitComments: $('emitComments').checked,
-      domFunctions: domFunctions || new Set(),
-    };
-
+    const domFuncs = domFunctions || new Set();
     const lines = [];
     const used = sharedUsed || new Set();
 
@@ -5038,34 +5007,438 @@
 
     if (parentFromAssignment && assignOp === '=' && assignProp === 'innerHTML') {
       lines.push(target + '.replaceChildren();');
-    } else if (parentFromAssignment && assignProp === 'outerHTML' && opts.emitComments) {
-      lines.push('// Note: ' + target + '.outerHTML = ... replaces ' + target + ' itself;');
-      lines.push('//       call ' + target + '.replaceWith(...) or adjust as needed.');
     }
 
     const chainTokens = result.chainTokens || [];
-    const vnodes = parseChainToVNodes(chainTokens);
-
-    if (vnodes.length === 0) {
+    if (chainTokens.length === 0 || (chainTokens.length === 1 && chainTokens[0].type === 'str' && chainTokens[0].text === '')) {
       return lines.length ? lines.join('\n') : '// (no nodes parsed)';
     }
 
-    let attachTarget = parent;
-    let fragVar = null;
-    if (opts.useFragment && vnodes.length > 1) {
-      fragVar = makeVar('frag', used);
-      lines.push('const ' + fragVar + ' = document.createDocumentFragment();');
-      attachTarget = fragVar;
+    var pVar = makeVar('__p', used);
+    const pVarStack = []; // for _targetPush/_targetPop
+    let needsP = false;
+    const SVG_NS_STR = "'http://www.w3.org/2000/svg'";
+    const MATHML_NS_STR = "'http://www.w3.org/1998/Math/MathML'";
+
+    // Stateful HTML parser that persists across chain tokens.
+    // States: TEXT, TAG_OPEN, ATTRS, ATTR_NAME, ATTR_EQ,
+    //         ATTR_VAL_DQ, ATTR_VAL_SQ, ATTR_VAL_UQ, TAG_CLOSE, COMMENT
+    const S_TEXT = 0, S_TAG_OPEN = 1, S_ATTRS = 2, S_ATTR_NAME = 3;
+    const S_ATTR_EQ = 4, S_ATTR_VAL_DQ = 5, S_ATTR_VAL_SQ = 6;
+    const S_ATTR_VAL_UQ = 7, S_TAG_CLOSE = 8, S_COMMENT = 9;
+    let hState = S_TEXT;
+    let hTag = '';
+    let hAttrName = '';
+    let hAttrVal = '';
+    let hAttrExprs = []; // dynamic expressions embedded in attribute value
+    let hAttrs = [];     // { name, value, dynamic:bool, exprs:[] }
+    let hTagVar = '';     // variable name for current element being built
+    let hCommentBuf = '';
+    let hTextBuf = '';
+    let hParentTags = []; // track parent tag names for auto-tbody
+    let hTbodyVar = null; // variable for auto-inserted tbody
+
+    function hFlushText() {
+      if (hTextBuf) {
+        const decoded = decodeHtmlEntities(hTextBuf);
+        lines.push(pVar + '.appendChild(document.createTextNode(' + jsStr(decoded).code + '));');
+        hTextBuf = '';
+      }
     }
 
-    emitVNodes(vnodes, attachTarget, lines, used, opts, result.loopInfoMap || null, null);
+    function hFinishAttr() {
+      if (hAttrName) {
+        hAttrs.push({
+          name: hAttrName.toLowerCase(),
+          value: decodeHtmlEntities(hAttrVal),
+          dynamic: hAttrExprs.length > 0,
+          exprs: hAttrExprs.slice(),
+        });
+      }
+      hAttrName = '';
+      hAttrVal = '';
+      hAttrExprs = [];
+    }
 
-    if (fragVar) {
-      lines.push(parent + '.appendChild(' + fragVar + ');');
+    function hCommitTag(selfClose) {
+      const tagLower = hTag.toLowerCase();
+      if (VOID_ELEMENTS.has(tagLower)) selfClose = true;
+
+      let nsExpr = null;
+      if (tagLower === 'svg') nsExpr = SVG_NS_STR;
+      else if (tagLower === 'math') nsExpr = MATHML_NS_STR;
+      else if (SVG_TAGS.has(tagLower)) nsExpr = SVG_NS_STR;
+
+      const v = makeVar(hTag, used);
+      hTagVar = v;
+      if (nsExpr) {
+        lines.push('const ' + v + ' = document.createElementNS(' + nsExpr + ', ' + jsStr(tagLower).code + ');');
+      } else {
+        lines.push('const ' + v + ' = document.createElement(' + jsStr(tagLower).code + ');');
+      }
+
+      const eventAttrs = [];
+      for (const attr of hAttrs) {
+        const name = attr.name;
+        // Extract inline event handlers and javascript: URLs.
+        if (name.length > 2 && name.slice(0, 2) === 'on' && !attr.dynamic) {
+          eventAttrs.push({ event: name.slice(2), handler: attr.value });
+          continue;
+        }
+        if (name === 'href' && !attr.dynamic && attr.value.slice(0, 11).toLowerCase() === 'javascript:') {
+          eventAttrs.push({ event: 'click', handler: attr.value.slice(11), preventDefault: true });
+          continue;
+        }
+        if (attr.dynamic) {
+          // Build expression from static parts + dynamic expressions.
+          const parts = [];
+          let cursor = 0;
+          const sorted = attr.exprs.slice().sort(function(a, b) { return a.pos - b.pos; });
+          for (const e of sorted) {
+            if (e.pos > cursor) parts.push(jsStr(decodeHtmlEntities(attr.value.slice(cursor, e.pos))).code);
+            parts.push(e.expr);
+            cursor = e.pos;
+          }
+          if (cursor < attr.value.length) parts.push(jsStr(decodeHtmlEntities(attr.value.slice(cursor))).code);
+          const valExpr = parts.length === 1 ? parts[0] : parts.join(' + ');
+
+          if (name === 'style') {
+            lines.push(v + '.setAttribute(' + jsStr(name).code + ', ' + valExpr + ');');
+          } else if (name === 'class') {
+            lines.push(v + '.className = ' + valExpr + ';');
+          } else if (!nsExpr && isIdlProp(name)) {
+            lines.push(v + '.' + (ATTR_TO_PROP[name] || name) + ' = ' + valExpr + ';');
+          } else {
+            lines.push(v + '.setAttribute(' + jsStr(name).code + ', ' + valExpr + ');');
+          }
+        } else {
+          const val = attr.value;
+          if (name === 'style') {
+            const decls = parseStyleDecls(val);
+            for (const d of decls) {
+              lines.push(v + '.style.setProperty(' + jsStr(d.prop).code + ', ' + jsStr(d.value).code + (d.important ? ", 'important'" : '') + ');');
+            }
+          } else if (name === 'class') {
+            const classes = val.split(/\s+/).filter(Boolean);
+            if (classes.length === 1) lines.push(v + '.className = ' + jsStr(val).code + ';');
+            else if (classes.length > 1) lines.push(v + '.classList.add(' + classes.map(function(c) { return jsStr(c).code; }).join(', ') + ');');
+          } else if (!nsExpr && BOOLEAN_ATTRS.has(name) && (val === '' || val === name)) {
+            lines.push(v + '.' + (ATTR_TO_PROP[name] || name) + ' = true;');
+          } else if (!nsExpr && isIdlProp(name)) {
+            lines.push(v + '.' + (ATTR_TO_PROP[name] || name) + ' = ' + jsStr(val).code + ';');
+          } else {
+            lines.push(v + '.setAttribute(' + jsStr(name).code + ', ' + jsStr(val).code + ');');
+          }
+        }
+      }
+
+      // Auto-insert <tbody> when <tr> is appended to <table>.
+      // Done at runtime to handle loops correctly.
+      if (tagLower === 'tr') {
+        lines.push('if (' + pVar + '.tagName === "TABLE") {');
+        lines.push('  var __tb = ' + pVar + '.lastElementChild;');
+        lines.push('  if (!__tb || __tb.tagName !== "TBODY") { __tb = document.createElement("tbody"); ' + pVar + '.appendChild(__tb); }');
+        lines.push('  ' + pVar + ' = __tb;');
+        lines.push('}');
+        needsP = true;
+      }
+      // Auto-close implicit <tbody> when table section elements appear.
+      if (tagLower === 'tfoot' || tagLower === 'thead' || tagLower === 'caption') {
+        lines.push('if (' + pVar + '.tagName === "TBODY") ' + pVar + ' = ' + pVar + '.parentNode;');
+      }
+
+      // Emit event listeners for extracted on* attributes.
+      for (const ev of eventAttrs) {
+        if (ev.preventDefault) {
+          lines.push(v + '.addEventListener(' + jsStr(ev.event).code + ', function(event) {');
+          lines.push('  event.preventDefault();');
+          lines.push('  ' + ev.handler);
+          lines.push('});');
+        } else {
+          lines.push(v + '.addEventListener(' + jsStr(ev.event).code + ', function(event) { ' + ev.handler + ' });');
+        }
+      }
+
+      lines.push(pVar + '.appendChild(' + v + ');');
+      if (!selfClose) {
+        needsP = true;
+        lines.push(pVar + ' = ' + v + ';');
+        hParentTags.push(tagLower);
+      }
+      hTag = '';
+      hAttrs = [];
+      hTagVar = '';
+    }
+
+    // Feed a character from a string literal through the HTML state machine.
+    function hFeedStr(text) {
+      for (let i = 0; i < text.length; i++) {
+        const c = text[i];
+        switch (hState) {
+          case S_TEXT:
+            if (c === '<') {
+              hFlushText();
+              if (text[i+1] === '/' && i+1 < text.length) { hState = S_TAG_CLOSE; hTag = ''; i++; }
+              else if (text[i+1] === '!' && text[i+2] === '-' && text[i+3] === '-') { hState = S_COMMENT; hCommentBuf = ''; i += 3; }
+              else { hState = S_TAG_OPEN; hTag = ''; }
+            } else {
+              hTextBuf += c;
+            }
+            break;
+          case S_TAG_OPEN:
+            if (c === ' ' || c === '\t' || c === '\n') { if (hTag) { hState = S_ATTRS; hAttrs = []; } }
+            else if (c === '>') { hAttrs = []; hCommitTag(false); hState = S_TEXT; }
+            else if (c === '/' && text[i+1] === '>') { hAttrs = []; hCommitTag(true); hState = S_TEXT; i++; }
+            else hTag += c;
+            break;
+          case S_TAG_CLOSE:
+            if (c === '>') {
+              needsP = true;
+              const closingTagLower = hTag.toLowerCase();
+              // Auto-close implicit <tbody> when closing <table>.
+              if (closingTagLower === 'table') {
+                lines.push('if (' + pVar + '.tagName === "TBODY") ' + pVar + ' = ' + pVar + '.parentNode;');
+              }
+              lines.push(pVar + ' = ' + pVar + '.parentNode;');
+              if (hParentTags.length > 0) hParentTags.pop();
+              hTag = '';
+              hState = S_TEXT;
+            } else {
+              hTag += c;
+            }
+            break;
+          case S_ATTRS:
+            if (c === '>') { hFinishAttr(); hCommitTag(false); hState = S_TEXT; }
+            else if (c === '/' && text[i+1] === '>') { hFinishAttr(); hCommitTag(true); hState = S_TEXT; i++; }
+            else if (c !== ' ' && c !== '\t' && c !== '\n') { hAttrName = c; hAttrVal = ''; hAttrExprs = []; hState = S_ATTR_NAME; }
+            break;
+          case S_ATTR_NAME:
+            if (c === '=') { hState = S_ATTR_EQ; }
+            else if (c === ' ' || c === '\t') { hFinishAttr(); hState = S_ATTRS; }
+            else if (c === '>') { hFinishAttr(); hCommitTag(false); hState = S_TEXT; }
+            else if (c === '/' && text[i+1] === '>') { hFinishAttr(); hCommitTag(true); hState = S_TEXT; i++; }
+            else hAttrName += c;
+            break;
+          case S_ATTR_EQ:
+            if (c === '"') hState = S_ATTR_VAL_DQ;
+            else if (c === "'") hState = S_ATTR_VAL_SQ;
+            else if (c !== ' ' && c !== '\t') { hAttrVal = c; hState = S_ATTR_VAL_UQ; }
+            break;
+          case S_ATTR_VAL_DQ:
+            if (c === '"') { hFinishAttr(); hState = S_ATTRS; }
+            else hAttrVal += c;
+            break;
+          case S_ATTR_VAL_SQ:
+            if (c === "'") { hFinishAttr(); hState = S_ATTRS; }
+            else hAttrVal += c;
+            break;
+          case S_ATTR_VAL_UQ:
+            if (c === ' ' || c === '\t') { hFinishAttr(); hState = S_ATTRS; }
+            else if (c === '>') { hFinishAttr(); hCommitTag(false); hState = S_TEXT; }
+            else hAttrVal += c;
+            break;
+          case S_COMMENT:
+            if (c === '-' && text[i+1] === '-' && text[i+2] === '>') {
+              lines.push(pVar + '.appendChild(document.createComment(' + jsStr(hCommentBuf).code + '));');
+              hState = S_TEXT; i += 2;
+            } else hCommentBuf += c;
+            break;
+        }
+      }
+    }
+
+    // Feed an expression token. If we're inside an attribute value,
+    // the expression becomes a dynamic part of that attribute.
+    // If we're in text context, it becomes a text node.
+    function hFeedExpr(expr) {
+      if (hState === S_ATTR_VAL_DQ || hState === S_ATTR_VAL_SQ || hState === S_ATTR_VAL_UQ) {
+        // Dynamic expression in attribute value.
+        hAttrExprs.push({ pos: hAttrVal.length, expr: expr });
+      } else {
+        // Text context — emit as text node or DOM call.
+        hFlushText();
+        const isDomCall = domFuncs.size > 0 &&
+          [...domFuncs].some(function(fn) { return new RegExp('^' + fn.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*\\(').test(expr); });
+        if (isDomCall) {
+          lines.push(pVar + '.appendChild(' + expr + ');');
+        } else {
+          lines.push(pVar + '.appendChild(document.createTextNode(' + expr + '));');
+        }
+      }
+    }
+
+    // Recursively process chain tokens.
+    function emitChain(tokens) {
+      for (let ti = 0; ti < tokens.length; ti++) {
+        const t = tokens[ti];
+        if (t.type === 'plus') continue;
+        // Multi-target: switch the active __p to a different target element.
+        if (t.type === '_targetPush') {
+          hFlushText();
+          pVarStack.push(pVar);
+          var newP = makeVar('__p', used);
+          lines.push('var ' + newP + ' = ' + t.target + ';');
+          pVar = newP;
+          needsP = true;
+          continue;
+        }
+        if (t.type === '_targetPop') {
+          hFlushText();
+          pVar = pVarStack.pop();
+          continue;
+        }
+        if (t.type === 'str') hFeedStr(t.text);
+        else if (t.type === 'other') hFeedExpr(t.text);
+        else if (t.type === 'preserve') { hFlushText(); lines.push(t.text); }
+        else if (t.type === 'cond') {
+          // If we're inside an attribute value, emit as ternary expression.
+          if (hState === S_ATTR_VAL_DQ || hState === S_ATTR_VAL_SQ || hState === S_ATTR_VAL_UQ) {
+            function condToExpr(ct) {
+              if (ct.length === 1 && ct[0].type === 'str') return JSON.stringify(ct[0].text);
+              if (ct.length === 1 && ct[0].type === 'other') return ct[0].text;
+              return ct.filter(function(x){return x.type!=='plus';}).map(function(x) {
+                return x.type === 'str' ? JSON.stringify(x.text) : x.text;
+              }).join(' + ');
+            }
+            var ternaryExpr = '(' + t.condExpr + ' ? ' + condToExpr(t.ifTrue) + ' : ' + condToExpr(t.ifFalse) + ')';
+            hAttrExprs.push({ pos: hAttrVal.length, expr: ternaryExpr });
+          } else {
+            hFlushText();
+            lines.push('if (' + t.condExpr + ') {');
+            emitChain(t.ifTrue);
+            lines.push('} else {');
+            emitChain(t.ifFalse);
+            lines.push('}');
+          }
+        } else if (t.type === 'trycatch') {
+          hFlushText();
+          var savedState1 = hState, savedParents1 = hParentTags.slice();
+          // Use a DocumentFragment for the try branch so partial DOM
+          // from a failed try doesn't pollute the main tree.
+          var tryFrag = makeVar('__tf', used);
+          lines.push('var ' + tryFrag + ' = document.createDocumentFragment();');
+          var savedP = makeVar('__sp', used);
+          lines.push('var ' + savedP + ' = ' + pVar + ';');
+          lines.push(pVar + ' = ' + tryFrag + ';');
+          lines.push('try {');
+          emitChain(t.tryBody);
+          hFlushText();
+          // Success: append fragment to parent.
+          lines.push(savedP + '.appendChild(' + tryFrag + ');');
+          lines.push(pVar + ' = ' + savedP + ';');
+          hState = savedState1; hParentTags = savedParents1.slice();
+          lines.push('} catch(' + (t.catchParam || 'e') + ') {');
+          // Failure: discard fragment, build catch content directly.
+          lines.push(pVar + ' = ' + savedP + ';');
+          emitChain(t.catchBody);
+          hFlushText();
+          lines.push('}');
+        } else if (t.type === 'switch') {
+          hFlushText();
+          lines.push('switch (' + t.discExpr + ') {');
+          for (const br of t.branches) {
+            if (br.label === 'default') lines.push('  default: {');
+            else lines.push('  case ' + br.caseExpr + ': {');
+            emitChain(br.chain);
+            lines.push('    break;');
+            lines.push('  }');
+          }
+          lines.push('}');
+        } else if (t.type === 'iter') {
+          hFlushText();
+          lines.push(t.iterExpr + '.forEach(function(' + t.paramName + ') {');
+          emitChain(t.perElemChain);
+          lines.push('});');
+        }
+      }
+    }
+
+    // Emit chain tokens with proper nested loop wrappers.
+    // Tokens carry loopId tags. When the loopId changes (increases),
+    // we've entered an inner loop. When it reverts to a previous id
+    // or null, we've exited. This handles arbitrary nesting depth.
+    function emitWithLoops(tokens, loopInfoMap) {
+      const toks = tokens.filter(function(t) { return t.type !== 'plus'; });
+      const openLoops = []; // stack of currently open loop IDs
+
+      function emitLoopHeader(id) {
+        const info = loopInfoMap ? loopInfoMap[id] : null;
+        if (info) {
+          if (info.kind === 'do') lines.push('do {');
+          else lines.push((info.kind === 'while' ? 'while' : 'for') + ' (' + info.headerSrc + ') {');
+        } else {
+          lines.push('/* loop */ {');
+        }
+        openLoops.push(id);
+      }
+
+      function emitLoopFooter() {
+        const id = openLoops.pop();
+        const info = loopInfoMap ? loopInfoMap[id] : null;
+        if (info && info.kind === 'do') {
+          lines.push('} while (' + info.headerSrc + ');');
+        } else {
+          lines.push('}');
+        }
+      }
+
+      for (let i = 0; i < toks.length; i++) {
+        const t = toks[i];
+        const loopId = t.loopId != null ? t.loopId : null;
+        const currentLoop = openLoops.length > 0 ? openLoops[openLoops.length - 1] : null;
+
+        if (loopId === currentLoop) {
+          // Same loop (or both null) — just emit.
+          emitChain([t]);
+        } else if (loopId !== null && currentLoop === null) {
+          // Entering a loop from non-loop context.
+          emitLoopHeader(loopId);
+          emitChain([t]);
+        } else if (loopId === null && currentLoop !== null) {
+          // Exiting all loops.
+          while (openLoops.length > 0) emitLoopFooter();
+          emitChain([t]);
+        } else if (loopId !== null && currentLoop !== null && loopId !== currentLoop) {
+          if (openLoops.includes(loopId)) {
+            // Returning to an outer loop — close inner loops.
+            while (openLoops.length > 0 && openLoops[openLoops.length - 1] !== loopId) {
+              emitLoopFooter();
+            }
+          } else {
+            // Entering a deeper/sibling loop — open new loop (keep outer open).
+            emitLoopHeader(loopId);
+          }
+          emitChain([t]);
+        }
+      }
+
+      // Close any remaining open loops.
+      while (openLoops.length > 0) emitLoopFooter();
+
+      hFlushText();
+    }
+
+    // Initialize parent pointer.
+    lines.push('var ' + pVar + ' = ' + parent + ';');
+
+    // Emit all chain tokens.
+    const loopInfoMap = result.loopInfoMap || null;
+    emitWithLoops(chainTokens, loopInfoMap);
+
+    // If we never needed __p (no nesting), optimize it out.
+    if (!needsP) {
+      // Replace all __p references with the parent directly.
+      for (let li = 0; li < lines.length; li++) {
+        lines[li] = lines[li].split(pVar).join(parent);
+      }
+      // Remove the var __p = parent; line.
+      const initLine = 'var ' + parent + ' = ' + parent + ';';
+      const idx = lines.indexOf(initLine);
+      if (idx >= 0) lines.splice(idx, 1);
     }
 
     let block = lines.join('\n');
-    if (emitTitle && opts.emitComments) {
+    if (emitTitle) {
       block = '// === ' + target + '.' + assignProp + ' ' + assignOp + ' ... ===\n' + block;
     }
     return block;
@@ -5110,33 +5483,28 @@
 
   function findPageScripts(htmlContent, htmlPath) {
     const scripts = [];
-    const re = /<script\s+src="([^"]+)"[^>]*><\/script>/gi;
-    let m;
-    while ((m = re.exec(htmlContent)) !== null) {
-      scripts.push(resolveRelativePath(m[1], htmlPath));
+    const tokens = tokenizeHtml(htmlContent);
+    for (const tok of tokens) {
+      if (tok.type !== 'openTag' || tok.tag !== 'script') continue;
+      for (const attr of tok.attrs) {
+        if (attr.name === 'src' && attr.value) {
+          scripts.push(resolveRelativePath(attr.value, htmlPath));
+        }
+      }
     }
     return scripts;
   }
 
-  function convertJsFile(jsContent, precedingCode) {
-    // Use the tokenizer to detect actual innerHTML/outerHTML assignments.
-    // The tokenizer skips comments and doesn't look inside strings,
-    // so commented-out and string-embedded innerHTML are ignored.
-    const toks = tokenize(jsContent.trim());
-    let hasAssignment = false;
-    for (let ti = 1; ti < toks.length; ti++) {
-      const t = toks[ti];
-      if (t.type !== 'sep' || (t.char !== '=' && t.char !== '+=')) continue;
-      const prev = toks[ti - 1];
-      if (prev && prev.type === 'other' && /\.(innerHTML|outerHTML)$/.test(prev.text)) {
-        hasAssignment = true;
-        break;
-      }
-    }
-    if (!hasAssignment) return null;
-    const sep = '\n/*__FILE_BOUNDARY__*/\n';
-    const combined = precedingCode ? precedingCode + sep + jsContent : jsContent;
-    const converted = convertRaw(combined);
+  function convertJsFile(jsContent, precedingCode, knownDomFunctions) {
+    // Use extractAllHTML to detect actual innerHTML/outerHTML assignments.
+    // This uses the tokenizer (skipping comments/strings) AND verifies
+    // the target is not a known non-element via scope resolution.
+    const combined = precedingCode
+      ? precedingCode + '\n/*__FILE_BOUNDARY__*/\n' + jsContent
+      : jsContent;
+    const extractions = extractAllHTML(combined);
+    if (extractions.length === 0) return null;
+    const converted = convertRaw(combined, undefined, knownDomFunctions);
     if (!converted || converted === '// (no nodes parsed)') return null;
     if (precedingCode) {
       const idx = converted.indexOf('/*__FILE_BOUNDARY__*/');
@@ -5150,53 +5518,326 @@
     return converted;
   }
 
+  // HTML tokenizer: produces a flat token stream from HTML source.
+  // Token types:
+  //   { type: 'text', text }          — text content
+  //   { type: 'openTag', tag, tagRaw, attrs, selfClose, start, end }
+  //   { type: 'closeTag', tag, start, end }
+  //   { type: 'comment', text, start, end }
+  //   { type: 'doctype', text, start, end }
+  // Each attr: { name (lowercase), value, nameRaw, start, end }
+  function tokenizeHtml(src) {
+    const tokens = [];
+    let i = 0;
+    const n = src.length;
+    let textStart = 0;
+
+    function flushText() {
+      if (i > textStart) {
+        tokens.push({ type: 'text', text: src.slice(textStart, i), start: textStart, end: i });
+      }
+    }
+
+    while (i < n) {
+      if (src[i] === '<') {
+        flushText();
+        const tagStart = i;
+
+        // Comment: <!-- ... -->
+        if (i + 3 < n && src[i+1] === '!' && src[i+2] === '-' && src[i+3] === '-') {
+          const endIdx = src.indexOf('-->', i + 4);
+          const commentEnd = endIdx >= 0 ? endIdx + 3 : n;
+          tokens.push({ type: 'comment', text: src.slice(i + 4, endIdx >= 0 ? endIdx : n), start: i, end: commentEnd });
+          i = commentEnd;
+          textStart = i;
+          continue;
+        }
+
+        // DOCTYPE: <!DOCTYPE ...>
+        if (i + 9 < n && src[i+1] === '!' && src.slice(i+2, i+9).toUpperCase() === 'DOCTYPE') {
+          const endIdx = src.indexOf('>', i + 2);
+          const dtEnd = endIdx >= 0 ? endIdx + 1 : n;
+          tokens.push({ type: 'doctype', text: src.slice(i, dtEnd), start: i, end: dtEnd });
+          i = dtEnd;
+          textStart = i;
+          continue;
+        }
+
+        // Closing tag: </tag>
+        if (i + 1 < n && src[i+1] === '/') {
+          let j = i + 2;
+          let tag = '';
+          while (j < n && src[j] !== '>' && src[j] !== ' ') { tag += src[j]; j++; }
+          while (j < n && src[j] !== '>') j++;
+          if (j < n) j++; // past >
+          tokens.push({ type: 'closeTag', tag: tag.toLowerCase(), start: tagStart, end: j });
+          i = j;
+          textStart = i;
+          continue;
+        }
+
+        // Opening tag: <tag attrs...> or <tag attrs.../>
+        let j = i + 1;
+        let tag = '';
+        while (j < n && src[j] !== '>' && src[j] !== ' ' && src[j] !== '\t' && src[j] !== '\n' && src[j] !== '\r' && src[j] !== '/') {
+          tag += src[j]; j++;
+        }
+        if (!tag) { i++; textStart = i; continue; } // bare < not a tag
+
+        // Parse attributes.
+        const attrs = [];
+        while (j < n) {
+          // Skip whitespace.
+          while (j < n && (src[j] === ' ' || src[j] === '\t' || src[j] === '\n' || src[j] === '\r')) j++;
+          if (j >= n || src[j] === '>' || (src[j] === '/' && j + 1 < n && src[j+1] === '>')) break;
+
+          // Attribute name.
+          const attrStart = j;
+          let attrName = '';
+          while (j < n && src[j] !== '=' && src[j] !== '>' && src[j] !== ' ' && src[j] !== '\t' && src[j] !== '\n' && src[j] !== '/') {
+            attrName += src[j]; j++;
+          }
+          if (!attrName) { j++; continue; }
+
+          // Skip whitespace around =.
+          while (j < n && (src[j] === ' ' || src[j] === '\t')) j++;
+
+          let attrValue = '';
+          if (j < n && src[j] === '=') {
+            j++; // past =
+            while (j < n && (src[j] === ' ' || src[j] === '\t')) j++;
+            if (j < n && (src[j] === '"' || src[j] === "'")) {
+              const q = src[j]; j++;
+              while (j < n && src[j] !== q) { attrValue += src[j]; j++; }
+              if (j < n) j++; // past closing quote
+            } else {
+              // Unquoted value.
+              while (j < n && src[j] !== ' ' && src[j] !== '>' && src[j] !== '\t' && src[j] !== '\n') {
+                attrValue += src[j]; j++;
+              }
+            }
+          }
+          attrs.push({ name: attrName.toLowerCase(), value: attrValue, nameRaw: attrName, start: attrStart, end: j });
+        }
+
+        let selfClose = false;
+        if (j < n && src[j] === '/') { selfClose = true; j++; }
+        if (j < n && src[j] === '>') j++;
+
+        const tagLower = tag.toLowerCase();
+        tokens.push({ type: 'openTag', tag: tagLower, tagRaw: tag, attrs: attrs, selfClose: selfClose, start: tagStart, end: j });
+        i = j;
+        textStart = i;
+
+        // Raw text elements (script, style, iframe, noscript) and escapable
+        // raw text elements (textarea, title): content is NOT parsed for
+        // HTML tags. Consume everything as text until the closing tag.
+        if (!selfClose && (tagLower === 'script' || tagLower === 'style' ||
+            tagLower === 'textarea' || tagLower === 'title' ||
+            tagLower === 'iframe' || tagLower === 'noscript')) {
+          const closePattern = '</' + tagLower;
+          const rawStart = i;
+          while (i < n) {
+            if (src[i] === '<' && src[i + 1] === '/' &&
+                src.slice(i, i + closePattern.length).toLowerCase() === closePattern) {
+              let k = i + closePattern.length;
+              while (k < n && (src[k] === ' ' || src[k] === '\t')) k++;
+              if (k < n && src[k] === '>') break;
+            }
+            i++;
+          }
+          if (i > rawStart) {
+            tokens.push({ type: 'text', text: src.slice(rawStart, i), start: rawStart, end: i });
+          }
+          textStart = i;
+        }
+        continue;
+      }
+      i++;
+    }
+    flushText();
+    return tokens;
+  }
+
+  // Decode HTML entities in attribute values.
+  // Handles named entities, decimal (&#123;), and hex (&#xA0;) numeric entities.
+  var HTML_ENTITIES = {
+    amp: '&', lt: '<', gt: '>', quot: '"', apos: "'",
+    nbsp: '\u00A0', ensp: '\u2002', emsp: '\u2003', thinsp: '\u2009',
+    mdash: '\u2014', ndash: '\u2013', lsquo: '\u2018', rsquo: '\u2019',
+    ldquo: '\u201C', rdquo: '\u201D', bull: '\u2022', hellip: '\u2026',
+    copy: '\u00A9', reg: '\u00AE', trade: '\u2122', deg: '\u00B0',
+    plusmn: '\u00B1', times: '\u00D7', divide: '\u00F7', micro: '\u00B5',
+    cent: '\u00A2', pound: '\u00A3', euro: '\u20AC', yen: '\u00A5',
+    laquo: '\u00AB', raquo: '\u00BB', larr: '\u2190', rarr: '\u2192',
+    uarr: '\u2191', darr: '\u2193', para: '\u00B6', sect: '\u00A7',
+    iexcl: '\u00A1', iquest: '\u00BF', frac12: '\u00BD', frac14: '\u00BC',
+    frac34: '\u00BE', sup1: '\u00B9', sup2: '\u00B2', sup3: '\u00B3',
+    acute: '\u00B4', cedil: '\u00B8',
+  };
+  function decodeHtmlEntities(s) {
+    return s.replace(/&(#x([0-9a-fA-F]+)|#([0-9]+)|([a-zA-Z]+));/g, function(match, _, hex, dec, named) {
+      if (hex) return String.fromCodePoint(parseInt(hex, 16));
+      if (dec) return String.fromCodePoint(parseInt(dec, 10));
+      if (named && HTML_ENTITIES[named]) return HTML_ENTITIES[named];
+      return match; // Unknown entity — preserve as-is.
+    });
+  }
+
+  // Serialize HTML tokens back to a string.
+  function serializeHtmlTokens(tokens) {
+    let out = '';
+    for (const tok of tokens) {
+      if (tok.type === 'text') out += tok.text;
+      else if (tok.type === 'comment') out += '<!--' + tok.text + '-->';
+      else if (tok.type === 'doctype') out += tok.text;
+      else if (tok.type === 'closeTag') out += '</' + tok.tag + '>';
+      else if (tok.type === 'openTag') {
+        out += '<' + tok.tagRaw;
+        for (const attr of tok.attrs) {
+          out += ' ' + attr.nameRaw + '="' + attr.value + '"';
+        }
+        if (tok.selfClose) out += '/';
+        out += '>';
+      }
+    }
+    return out;
+  }
+
   function convertHtmlMarkup(htmlContent, htmlPath) {
-    const baseName = (htmlPath.indexOf('/') >= 0 ? htmlPath.slice(htmlPath.lastIndexOf('/') + 1) : htmlPath).replace(/\.[^.]+$/, '');
+    // Derive filenames from source path.
+    let baseName = htmlPath;
+    const slashIdx = baseName.lastIndexOf('/');
+    if (slashIdx >= 0) baseName = baseName.slice(slashIdx + 1);
+    const dotIdx = baseName.lastIndexOf('.');
+    if (dotIdx >= 0) baseName = baseName.slice(0, dotIdx);
     const handlersFile = baseName + '.handlers.js';
-    let processed = htmlContent;
+
+    const htmlTokens = tokenizeHtml(htmlContent);
     let elemCounter = 0;
     const jsLines = [];
-    processed = processed.replace(/<([a-zA-Z][a-zA-Z0-9]*)((?:\s+[^>]*?)?)>/g, function(match, tag, attrsStr) {
+    const extractedScripts = [];
+    const extractedStyles = [];
+    let scriptIdx = 0;
+    let styleIdx = 0;
+
+    // Walk tokens and process each opening tag.
+    for (let ti = 0; ti < htmlTokens.length; ti++) {
+      const tok = htmlTokens[ti];
+      if (tok.type !== 'openTag') continue;
+
+      // Handle <script> without src — extract to external file.
+      if (tok.tag === 'script') {
+        const hasSrc = tok.attrs.some(function(a) { return a.name === 'src'; });
+        if (!hasSrc) {
+          // Find the closing </script> and extract the body.
+          let body = '';
+          let closeIdx = ti + 1;
+          while (closeIdx < htmlTokens.length) {
+            if (htmlTokens[closeIdx].type === 'closeTag' && htmlTokens[closeIdx].tag === 'script') break;
+            if (htmlTokens[closeIdx].type === 'text') body += htmlTokens[closeIdx].text;
+            closeIdx++;
+          }
+          body = body.trim();
+          if (body) {
+            const name = scriptIdx === 0 ? baseName + '.js' : baseName + '.' + scriptIdx + '.js';
+            scriptIdx++;
+            extractedScripts.push({ name: name, content: body });
+            // Add src attribute and remove text content.
+            tok.attrs.push({ name: 'src', value: name, nameRaw: 'src', start: 0, end: 0 });
+            for (let ri = ti + 1; ri < closeIdx; ri++) {
+              htmlTokens[ri] = { type: 'text', text: '', start: 0, end: 0 };
+            }
+          }
+        }
+        continue;
+      }
+
+      // Handle <style> — extract to external CSS file.
+      if (tok.tag === 'style') {
+        let body = '';
+        let closeIdx = ti + 1;
+        while (closeIdx < htmlTokens.length) {
+          if (htmlTokens[closeIdx].type === 'closeTag' && htmlTokens[closeIdx].tag === 'style') break;
+          if (htmlTokens[closeIdx].type === 'text') body += htmlTokens[closeIdx].text;
+          closeIdx++;
+        }
+        body = body.trim();
+        if (body) {
+          const name = styleIdx === 0 ? baseName + '.css' : baseName + '.' + styleIdx + '.css';
+          styleIdx++;
+          extractedStyles.push({ name: name, content: body });
+          // Replace <style>content</style> with <link rel="stylesheet" href="name">
+          htmlTokens[ti] = { type: 'openTag', tag: 'link', tagRaw: 'link', attrs: [
+            { name: 'rel', value: 'stylesheet', nameRaw: 'rel', start: 0, end: 0 },
+            { name: 'href', value: name, nameRaw: 'href', start: 0, end: 0 }
+          ], selfClose: false, start: tok.start, end: tok.end };
+          for (let ri = ti + 1; ri <= closeIdx && ri < htmlTokens.length; ri++) {
+            htmlTokens[ri] = { type: 'text', text: '', start: 0, end: 0 };
+          }
+        }
+        continue;
+      }
+
+      // Extract unsafe attributes from this element.
       const events = [];
       let styleVal = null;
       let jsHref = null;
-      let cleaned = attrsStr.replace(/\s+on([a-z]+)="([^"]*)"/gi, function(_, evName, handler) {
-        events.push({ event: evName.toLowerCase(), handler: handler.replace(/&quot;/g, '"').replace(/&amp;/g, '&') });
-        return '';
-      });
-      cleaned = cleaned.replace(/\s+href="javascript:([^"]*)"/gi, function(_, code) {
-        jsHref = code.replace(/&quot;/g, '"').replace(/&amp;/g, '&');
-        return '';
-      });
-      cleaned = cleaned.replace(/\s+style="([^"]*)"/gi, function(_, val) {
-        styleVal = val.replace(/&quot;/g, '"').replace(/&amp;/g, '&');
-        return '';
-      });
-      if (events.length === 0 && !jsHref && !styleVal) return match;
-      const idMatch = attrsStr.match(/\s+id="([^"]*)"/i);
-      let sel, cleanedTag;
-      if (idMatch) {
-        sel = 'document.getElementById(\'' + idMatch[1] + '\')';
-        cleanedTag = '<' + tag + cleaned + '>';
+      let existingId = null;
+      const keepAttrs = [];
+
+      for (const attr of tok.attrs) {
+        if (attr.name.length > 2 && attr.name.slice(0, 2) === 'on') {
+          events.push({ event: attr.name.slice(2), handler: decodeHtmlEntities(attr.value) });
+          continue;
+        }
+        if (attr.name === 'href' && attr.value.slice(0, 11).toLowerCase() === 'javascript:') {
+          jsHref = decodeHtmlEntities(attr.value.slice(11));
+          continue;
+        }
+        if (attr.name === 'style') {
+          styleVal = decodeHtmlEntities(attr.value);
+          continue;
+        }
+        if (attr.name === 'id') existingId = attr.value;
+        keepAttrs.push(attr);
+      }
+
+      if (events.length === 0 && !jsHref && !styleVal) continue;
+
+      // Build selector.
+      let sel;
+      if (existingId) {
+        sel = 'document.getElementById(\'' + existingId + '\')';
       } else {
         const hdId = 'hd' + (elemCounter++);
         sel = 'document.querySelector(\'[data-hd="' + hdId + '"]\')';
-        cleanedTag = '<' + tag + cleaned + ' data-hd="' + hdId + '">';
+        keepAttrs.push({ name: 'data-hd', value: hdId, nameRaw: 'data-hd', start: 0, end: 0 });
       }
-      // Count total operations for this element.
-      const opCount = events.length + (jsHref ? 1 : 0) +
-        (styleVal ? styleVal.split(';').filter(function(d) { return d.trim() && d.indexOf(':') >= 0; }).length : 0);
-      // Use a variable when multiple operations target the same element.
+
+      // Count operations for grouping.
+      let opCount = events.length + (jsHref ? 1 : 0);
+      if (styleVal) {
+        opCount += parseStyleDecls(styleVal).length;
+      }
       const useVar = opCount > 1;
       const varName = useVar ? ('__el' + (elemCounter - 1)) : null;
       const ref = useVar ? varName : sel;
+
       if (useVar) {
         jsLines.push('(function() {');
         jsLines.push('var ' + varName + ' = ' + sel + ';');
       }
+
+      // Emit event listeners.
       for (const ev of events) {
         const body = ev.handler.trim();
-        if (/\breturn\b/.test(body)) {
+        let hasReturn = false;
+        const returnToks = tokenize(body);
+        for (const rt of returnToks) {
+          if (rt.type === 'other' && rt.text === 'return') { hasReturn = true; break; }
+        }
+        if (hasReturn) {
           jsLines.push(ref + '.addEventListener(\'' + ev.event + '\', function(event) {');
           jsLines.push('  var __r = (function() { ' + body + ' }).call(this);');
           jsLines.push('  if (__r === false) event.preventDefault();');
@@ -5205,61 +5846,54 @@
           jsLines.push(ref + '.addEventListener(\'' + ev.event + '\', function(event) { ' + body + ' });');
         }
       }
+
       if (jsHref) {
         jsLines.push(ref + '.addEventListener(\'click\', function(event) {');
         jsLines.push('  event.preventDefault();');
         jsLines.push('  ' + jsHref);
         jsLines.push('});');
       }
+
       if (styleVal) {
-        const decls = styleVal.split(';').map(function(d) { return d.trim(); }).filter(Boolean);
+        const decls = parseStyleDecls(styleVal);
         for (const d of decls) {
-          const colon = d.indexOf(':');
-          if (colon < 0) continue;
-          const prop = d.slice(0, colon).trim();
-          let val = d.slice(colon + 1).trim();
-          let important = '';
-          if (/!important\s*$/.test(val)) {
-            val = val.replace(/\s*!important\s*$/, '');
-            important = ', \'important\'';
-          }
-          jsLines.push(ref + '.style.setProperty(\'' + prop + '\', \'' + val.replace(/'/g, "\\'") + '\'' + important + ');');
+          const escapedVal = d.value.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+          jsLines.push(ref + '.style.setProperty(\'' + d.prop + '\', \'' + escapedVal + '\'' + (d.important ? ', \'important\'' : '') + ');');
         }
       }
+
       if (useVar) {
         jsLines.push('})();');
       }
-      return cleanedTag;
-    });
-    const result = { html: processed, handlers: null, extractedScripts: [], extractedStyles: [] };
-    // Extract inline <script> blocks to external files.
-    let scriptIdx = 0;
-    processed = processed.replace(/<script\b(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi, function(match, body) {
-      const trimmed = body.trim();
-      if (!trimmed) return '';
-      const name = scriptIdx === 0 ? baseName + '.js' : baseName + '.' + scriptIdx + '.js';
-      scriptIdx++;
-      result.extractedScripts.push({ name: name, content: trimmed });
-      return '<script src="' + name + '"><\/script>';
-    });
-    // Extract inline <style> blocks to external files.
-    let styleIdx = 0;
-    processed = processed.replace(/<style\b[^>]*>([\s\S]*?)<\/style>/gi, function(match, body) {
-      const trimmed = body.trim();
-      if (!trimmed) return '';
-      const name = styleIdx === 0 ? baseName + '.css' : baseName + '.' + styleIdx + '.css';
-      styleIdx++;
-      result.extractedStyles.push({ name: name, content: trimmed });
-      return '<link rel="stylesheet" href="' + name + '">';
-    });
-    if (jsLines.length) {
-      if (processed.indexOf(handlersFile) < 0) {
-        processed = processed.replace(/<\/body>/i, '<script src="' + handlersFile + '"><\/script>\n</body>');
-      }
-      result.handlers = { name: handlersFile, content: jsLines.join('\n') };
+
+      // Update the token's attributes to only keep safe ones.
+      tok.attrs = keepAttrs;
     }
-    result.html = processed;
-    return result;
+
+    // Insert handlers script reference before </body> if needed.
+    if (jsLines.length) {
+      for (let ti = htmlTokens.length - 1; ti >= 0; ti--) {
+        if (htmlTokens[ti].type === 'closeTag' && htmlTokens[ti].tag === 'body') {
+          htmlTokens.splice(ti, 0, {
+            type: 'openTag', tag: 'script', tagRaw: 'script',
+            attrs: [{ name: 'src', value: handlersFile, nameRaw: 'src', start: 0, end: 0 }],
+            selfClose: false, start: 0, end: 0
+          }, {
+            type: 'closeTag', tag: 'script', start: 0, end: 0
+          }, {
+            type: 'text', text: '\n', start: 0, end: 0
+          });
+          break;
+        }
+      }
+    }
+
+    return {
+      html: serializeHtmlTokens(htmlTokens),
+      handlers: jsLines.length ? { name: handlersFile, content: jsLines.join('\n') } : null,
+      extractedScripts: extractedScripts,
+      extractedStyles: extractedStyles,
+    };
   }
 
   function convertProject(files) {
@@ -5285,19 +5919,48 @@
         output[dir + style.name] = style.content;
       }
       // Convert external JS files referenced by this page.
+      // Pass 1: convert builder functions across all files. A builder
+      // function in an earlier file (e.g. util.js) needs to be converted
+      // to return a DocumentFragment so later files can use it.
       const scripts = pageScriptMap[page] || [];
+      const workingFiles = {};
+      for (const sp of scripts) workingFiles[sp] = files[sp] || '';
+      for (const script of markup.extractedScripts) workingFiles[dir + script.name] = script.content;
+      const allConvertedFns = new Set();
+      let precedingForPrepass = '';
+      for (const sp of scripts) {
+        if (!workingFiles[sp]) continue;
+        const combined = precedingForPrepass ? precedingForPrepass + '\n' + workingFiles[sp] : workingFiles[sp];
+        const prepass = convertHtmlBuilderFunctions(combined);
+        for (const fn of prepass.converted) allConvertedFns.add(fn);
+        if (prepass.converted.size > 0 && prepass.source !== combined) {
+          // Extract only the current file's portion from the converted result.
+          const convertedFile = precedingForPrepass
+            ? prepass.source.slice(precedingForPrepass.length + 1)
+            : prepass.source;
+          if (convertedFile !== workingFiles[sp]) {
+            workingFiles[sp] = convertedFile;
+            output[sp] = convertedFile;
+          }
+        }
+        precedingForPrepass += (precedingForPrepass ? '\n' : '') + workingFiles[sp];
+      }
+      // Pass 2: convert innerHTML/outerHTML/document.write/insertAdjacentHTML.
+      // allConvertedFns collects builder function names from pass 1.
       let precedingCode = '';
       for (const sp of scripts) {
-        if (!files[sp]) continue;
-        const converted = convertJsFile(files[sp], precedingCode);
+        if (!workingFiles[sp]) continue;
+        const converted = convertJsFile(workingFiles[sp], precedingCode, allConvertedFns);
         if (converted) output[sp] = converted;
-        precedingCode += (precedingCode ? '\n' : '') + files[sp];
+        precedingCode += (precedingCode ? '\n' : '') + workingFiles[sp];
       }
       // Convert extracted inline scripts (now external files).
       for (const script of markup.extractedScripts) {
-        const converted = convertJsFile(script.content, precedingCode);
-        output[dir + script.name] = converted || script.content;
-        precedingCode += (precedingCode ? '\n' : '') + script.content;
+        const key = dir + script.name;
+        const content = workingFiles[key] || script.content;
+        const converted = convertJsFile(content, precedingCode, allConvertedFns);
+        output[key] = converted || content;
+        precedingCode += (precedingCode ? '\n' : '') + content;
       }
     }
     const standaloneJs = Object.keys(files).filter(function(p) { return /\.js$/i.test(p) && !referencedJs.has(p); }).sort();
