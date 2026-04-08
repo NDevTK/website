@@ -82,9 +82,14 @@
     'svg', 'g', 'defs', 'symbol', 'use', 'path', 'rect', 'circle', 'ellipse',
     'line', 'polyline', 'polygon', 'text', 'tspan', 'textpath', 'image',
     'pattern', 'mask', 'clippath', 'lineargradient', 'radialgradient', 'stop',
-    'filter', 'feblend', 'fecolormatrix', 'fecomposite', 'fegaussianblur',
-    'femerge', 'femergenode', 'feoffset', 'foreignobject', 'marker',
-    'desc', 'view', 'switch', 'animate', 'animatemotion', 'animatetransform'
+    'filter', 'feblend', 'fecolormatrix', 'fecomposite', 'feconvolvematrix',
+    'fediffuselighting', 'fedisplacementmap', 'fedropshadow', 'feflood',
+    'fefunca', 'fefuncb', 'fefuncg', 'fefuncr', 'fegaussianblur',
+    'feimage', 'femerge', 'femergenode', 'femorphology', 'feoffset',
+    'fepointlight', 'fespecularlighting', 'fespotlight', 'fetile',
+    'feturbulence', 'foreignobject', 'marker', 'metadata',
+    'desc', 'view', 'switch', 'animate', 'animatemotion', 'animatetransform',
+    'set', 'mpath',
   ]);
 
   function $(id) { return document.getElementById(id); }
@@ -218,16 +223,18 @@
     const assigns = findAllHtmlAssignments(tokens);
     return assigns.map((assign) => {
       const result = extractOneAssignment(tokens, assign);
+      if (!result) return null; // Target is a known non-element
       result.srcStart = assign.srcStart;
       result.srcEnd = assign.srcEnd;
       result._assign = assign;
       result._tokens = tokens;
       return result;
-    });
+    }).filter(Boolean);
   }
 
   // Produce a { target, assignProp, assignOp, chainTokens, ... } record
   // for a single innerHTML/outerHTML assignment located in `tokens`.
+  // Returns null if the target is known to NOT be a DOM element.
   function extractOneAssignment(tokens, assign) {
     const target = assign.target;
     const assignProp = assign.prop;
@@ -242,6 +249,36 @@
     }
     const buildVar = buildVars.length === 1 ? buildVars[0] : null;
     const r = resolveIdentifiers(tokens, assign.rhsStart, assign.rhsEnd, buildVars.length ? buildVars : null);
+
+    // Verify the target is not a known non-element. Extract the base
+    // variable name from the target (e.g. "el" from "el.innerHTML").
+    if (r.resolve && target) {
+      const baseMatch = target.match(IDENT_RE);
+      if (baseMatch) {
+        const targetBind = r.resolve(baseMatch[0]);
+        // If the base variable resolves to a known non-element type
+        // (string, number, array, plain object), skip conversion.
+        if (targetBind && targetBind.kind === 'chain') {
+          // A chain binding is a string/value — not a DOM element.
+          // However, unresolved identifiers (like function params or
+          // globals like document.getElementById result) also appear
+          // as chain bindings with a single exprRef token. Those are
+          // unknown (could be elements) so we allow them.
+          const toks = targetBind.toks;
+          const isOpaque = toks.length === 1 && toks[0].type === 'other';
+          if (!isOpaque) {
+            // Target is a known string/value — not a DOM element.
+            return null;
+          }
+        } else if (targetBind && targetBind.kind === 'array') {
+          return null; // Arrays don't have innerHTML
+        } else if (targetBind && targetBind.kind === 'object') {
+          return null; // Plain objects don't have innerHTML
+        }
+        // targetBind is null (unknown/global), 'element', or opaque —
+        // proceed with conversion.
+      }
+    }
     if (r.parsed) {
       // Recursively expand loopVar references. Multiple loopVars may
       // share the same name (nested loops modifying the same build var).
@@ -300,7 +337,9 @@
     // Resolve identifier references inside the RHS using the scope state at
     // the assignment site.
     if (assign) {
-      return extractOneAssignment(tokens, assign);
+      const result = extractOneAssignment(tokens, assign);
+      // If target is a known non-element, fall through to no-innerHTML path.
+      if (result) return result;
     }
 
     // No innerHTML assignment — resolve the entire input as an expression.
@@ -435,7 +474,8 @@
     'setAttribute', 'removeAttribute', 'setAttributeNS', 'removeAttributeNS',
     'addEventListener', 'removeEventListener',
     'replaceWith', 'remove', 'insertAdjacentHTML', 'insertAdjacentElement',
-    'replaceChildren',
+    'insertAdjacentText', 'replaceChildren', 'toggleAttribute',
+    'focus', 'blur', 'click', 'scrollIntoView',
   ]);
 
   // Method names recognized on typed bindings (chain/array). Used by
@@ -3712,7 +3752,7 @@
     const externallyMutable = scanMutations(tokens);
     const state = buildScopeState(tokens, startIdx, externallyMutable, buildVarOrVars);
     const full = state.parseRange(startIdx, endIdx);
-    if (full) return { tokens: full, parsed: true, loopInfo: state.loopInfo, loopVars: state.loopVars, buildVarDeclStart: state.getBuildVarDeclStart(), inScope: state.inScope };
+    if (full) return { tokens: full, parsed: true, loopInfo: state.loopInfo, loopVars: state.loopVars, buildVarDeclStart: state.getBuildVarDeclStart(), inScope: state.inScope, resolve: state.resolve };
     const out = [];
     for (let i = startIdx; i < endIdx; i++) {
       const t = tokens[i];
@@ -3732,7 +3772,7 @@
       }
       out.push(t);
     }
-    return { tokens: out, parsed: false, loopInfo: state.loopInfo, loopVars: state.loopVars, inScope: state.inScope };
+    return { tokens: out, parsed: false, loopInfo: state.loopInfo, loopVars: state.loopVars, inScope: state.inScope, resolve: state.resolve };
   }
 
 
@@ -5110,23 +5150,14 @@
   }
 
   function convertJsFile(jsContent, precedingCode) {
-    // Use the tokenizer to detect actual innerHTML/outerHTML assignments.
-    // The tokenizer skips comments and doesn't look inside strings,
-    // so commented-out and string-embedded innerHTML are ignored.
-    const toks = tokenize(jsContent.trim());
-    let hasAssignment = false;
-    for (let ti = 1; ti < toks.length; ti++) {
-      const t = toks[ti];
-      if (t.type !== 'sep' || (t.char !== '=' && t.char !== '+=')) continue;
-      const prev = toks[ti - 1];
-      if (prev && prev.type === 'other' && /\.(innerHTML|outerHTML)$/.test(prev.text)) {
-        hasAssignment = true;
-        break;
-      }
-    }
-    if (!hasAssignment) return null;
-    const sep = '\n/*__FILE_BOUNDARY__*/\n';
-    const combined = precedingCode ? precedingCode + sep + jsContent : jsContent;
+    // Use extractAllHTML to detect actual innerHTML/outerHTML assignments.
+    // This uses the tokenizer (skipping comments/strings) AND verifies
+    // the target is not a known non-element via scope resolution.
+    const combined = precedingCode
+      ? precedingCode + '\n/*__FILE_BOUNDARY__*/\n' + jsContent
+      : jsContent;
+    const extractions = extractAllHTML(combined);
+    if (extractions.length === 0) return null;
     const converted = convertRaw(combined);
     if (!converted || converted === '// (no nodes parsed)') return null;
     if (precedingCode) {

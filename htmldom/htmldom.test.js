@@ -1366,6 +1366,24 @@ function render() {
     { 'p.js': c => /createElement/.test(c) && !/innerHTML/.test(c) }
   );
 
+  // 17. Non-element target — plain object with innerHTML should NOT be converted.
+  checkProject('non-element innerHTML skipped',
+    {
+      'p.html': '<html><body><script src="p.js"></script></body></html>',
+      'p.js': 'var obj = { innerHTML: "" };\nobj.innerHTML = "<div>test</div>";'
+    },
+    [],  // No output — the assignment is on a plain object, not a DOM element
+  );
+
+  // 18. String variable with innerHTML property name should NOT be converted.
+  checkProject('string var innerHTML skipped',
+    {
+      'p.html': '<html><body><script src="p.js"></script></body></html>',
+      'p.js': 'var tpl = "<b>hi</b>";\nvar result = { innerHTML: tpl };\nresult.innerHTML = "<p>" + tpl + "</p>";'
+    },
+    [],  // result is a plain object
+  );
+
   console.log(`  (${pass + fail - before} cases)`);
 })();
 
