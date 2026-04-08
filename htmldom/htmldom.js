@@ -4060,7 +4060,15 @@
                 const id = '__hdel' + (elemCounter++);
                 var sel = 'document.querySelector(\'[data-hd-id="' + id + '"]\')';
                 for (const ev of events) {
-                  rewrites.push(sel + '.addEventListener(\'' + ev.event + '\', function(event) { ' + ev.handler + ' });');
+                  // Inline handlers: `return false` prevents default AND
+                  // stops propagation. Wrap the body to replicate this.
+                  var body = ev.handler.trim();
+                  var hasReturn = /\breturn\b/.test(body);
+                  if (hasReturn) {
+                    rewrites.push(sel + '.addEventListener(\'' + ev.event + '\', function(event) { var __r = (function() { ' + body + ' }).call(this); if (__r === false) { event.preventDefault(); } });');
+                  } else {
+                    rewrites.push(sel + '.addEventListener(\'' + ev.event + '\', function(event) { ' + body + ' });');
+                  }
                 }
                 if (jsHref) {
                   rewrites.push(sel + '.addEventListener(\'click\', function(event) { event.preventDefault(); ' + jsHref + ' });');
