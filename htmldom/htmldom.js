@@ -3856,7 +3856,28 @@
           if (j < stop && tokens[j].type === 'close' && tokens[j].char === ')' && j > i + 2) {
             const headerFirst = tokens[i + 2];
             const headerLast = tokens[j - 1];
-            const headerSrc = headerFirst._src.slice(headerFirst.start, headerLast.end);
+            // Build header text, resolving identifiers through scope
+            // (important for loops inside inlined functions where
+            // parameter names need to be replaced with argument values).
+            var headerParts = [];
+            for (var hi = i + 2; hi <= j - 1; hi++) {
+              var ht = tokens[hi];
+              if (ht.type === 'other' && (IDENT_RE.test(ht.text) || IDENT_OR_PATH_RE.test(ht.text))) {
+                var resolved = resolvePath(ht.text);
+                if (resolved && resolved.kind === 'chain') {
+                  var exprText = chainAsExprText(resolved);
+                  if (exprText !== null && exprText !== ht.text) {
+                    headerParts.push(exprText);
+                    continue;
+                  }
+                }
+              }
+              // Preserve original source text with surrounding whitespace.
+              var prevEnd = hi > i + 2 ? tokens[hi - 1].end : headerFirst.start;
+              var gap = ht._src.slice(prevEnd, ht.start);
+              headerParts.push(gap + ht._src.slice(ht.start, ht.end));
+            }
+            const headerSrc = headerParts.join('');
             const bodyTok = tokens[j + 1];
             let bodyEnd;
             if (bodyTok && bodyTok.type === 'open' && bodyTok.char === '{') {
@@ -5094,7 +5115,9 @@
     // Compile-time parent stack: tracks which variable is the current
     // parent at each nesting level. No runtime parent pointer needed.
     var parentStack = [parent]; // stack of variable names
+    var runtimeParentVars = new Set(); // variables that are runtime parent pointers
     function curParent() { return parentStack[parentStack.length - 1]; }
+    function isRuntimeVar(name) { return runtimeParentVars.has(name); }
 
     // Stateful HTML parser that persists across chain tokens.
     // States: TEXT, TAG_OPEN, ATTRS, ATTR_NAME, ATTR_EQ,
@@ -5264,8 +5287,16 @@
         }
       }
 
-      lines.push(curParent() + '.appendChild(' + v + ');');
+      var parentExpr = curParent();
+      lines.push(parentExpr + '.appendChild(' + v + ');');
       if (!selfClose) {
+        // If the current parent is a runtime variable, update it
+        // instead of just pushing (needed for unbalanced loops where
+        // the parent changes across iterations).
+        var isRuntimeParent = isRuntimeVar(parentExpr);
+        if (isRuntimeParent) {
+          lines.push(parentExpr + ' = ' + v + ';');
+        }
         parentStack.push(v);
         hParentTags.push(tagLower);
       }
@@ -5303,7 +5334,17 @@
                 parentStack.pop();
                 hParentTags.pop();
               }
+              // If the parent being popped is a runtime variable, emit
+              // a runtime parentNode assignment.
+              var poppedParent = curParent();
+              var isRT = isRuntimeVar(poppedParent) || isRuntimeVar(curParent());
               parentStack.pop();
+              if (isRT && parentStack.length > 0) {
+                var newParent = curParent();
+                if (isRuntimeVar(newParent)) {
+                  lines.push(newParent + ' = ' + newParent + '.parentNode;');
+                }
+              }
               if (hParentTags.length > 0) hParentTags.pop();
               hTag = '';
               hState = S_TEXT;
@@ -5548,8 +5589,9 @@
               // left the parent.
               // Reuse existing runtime parent if the current parent is
               // already a runtime variable (from a previous cond).
-              var existingRuntime = curParent().match(/^[a-z]+\d*$/) && !curParent().includes('.') && !curParent().includes('(');
+              var existingRuntime = isRuntimeVar(curParent());
               var condParent = existingRuntime ? curParent() : makeVar('current', used);
+              if (!existingRuntime) runtimeParentVars.add(condParent);
               // Insert assignment in branches that CHANGED the parent.
               // Branches that didn't change the stack (empty content)
               // should NOT set current — it preserves its previous value
@@ -5663,7 +5705,8 @@
     // or null, we've exited. This handles arbitrary nesting depth.
     function emitWithLoops(tokens, loopInfoMap) {
       const toks = tokens.filter(function(t) { return t.type !== 'plus'; });
-      const openLoops = []; // stack of currently open loop IDs
+      const openLoops = []; // stack of { id, runtimeParent, preStack }
+
 
       function emitLoopHeader(id, upcomingTokens) {
         // Pre-scan: if the loop body has <tr> that needs auto-tbody,
@@ -5687,11 +5730,18 @@
         } else {
           lines.push('/* loop */ {');
         }
-        openLoops.push(id);
+        openLoops.push({ id: id, runtimeParent: null, preStack: null });
       }
 
       function emitLoopFooter() {
-        const id = openLoops.pop();
+        const entry = openLoops.pop();
+        // If loop had a runtime parent, restore parent stack to use it.
+        if (entry.runtimeParent && entry.preStack) {
+          parentStack.length = 0;
+          for (var ri = 0; ri < entry.preStack.length; ri++) parentStack.push(entry.preStack[ri]);
+          parentStack.push(entry.runtimeParent);
+        }
+        const id = entry.id;
         const info = loopInfoMap ? loopInfoMap[id] : null;
         if (info && info.kind === 'do') {
           lines.push('} while (' + info.headerSrc + ');');
@@ -5703,25 +5753,53 @@
       for (let i = 0; i < toks.length; i++) {
         const t = toks[i];
         const loopId = t.loopId != null ? t.loopId : null;
-        const currentLoop = openLoops.length > 0 ? openLoops[openLoops.length - 1] : null;
+        const currentLoop = openLoops.length > 0 ? openLoops[openLoops.length - 1].id : null;
 
         if (loopId === currentLoop) {
           // Same loop (or both null) — just emit.
           emitChain([t]);
         } else if (loopId !== null && currentLoop === null) {
           // Entering a loop from non-loop context.
-          // Pass upcoming tokens so pre-scan can detect tbody needs.
           var upcoming = toks.slice(i);
+          var preLoopStack = parentStack.slice();
           emitLoopHeader(loopId, upcoming);
+          // Check if loop body has unbalanced tags by pre-scanning
+          // for open/close tag counts.
+          var loopOpenTags = 0, loopCloseTags = 0;
+          for (var si = i; si < toks.length; si++) {
+            if (toks[si].loopId !== loopId) break;
+            if (toks[si].type === 'str') {
+              var s = toks[si].text;
+              for (var ci = 0; ci < s.length; ci++) {
+                if (s[ci] === '<' && s[ci+1] !== '/' && s[ci+1] !== '!') loopOpenTags++;
+                if (s[ci] === '<' && s[ci+1] === '/') loopCloseTags++;
+              }
+            }
+          }
+          if (loopOpenTags !== loopCloseTags) {
+            // Unbalanced loop body — use runtime parent variable.
+            var loopParent = makeVar('current', used);
+            var existingRT = isRuntimeVar(curParent());
+            if (existingRT) {
+              loopParent = curParent();
+            } else {
+              runtimeParentVars.add(loopParent);
+              lines.splice(lines.length - 1, 0, 'var ' + loopParent + ' = ' + curParent() + ';');
+              parentStack.push(loopParent);
+            }
+            // Record on the loop entry so emitLoopFooter can restore.
+            openLoops[openLoops.length - 1].runtimeParent = loopParent;
+            openLoops[openLoops.length - 1].preStack = preLoopStack;
+          }
           emitChain([t]);
         } else if (loopId === null && currentLoop !== null) {
           // Exiting all loops.
           while (openLoops.length > 0) emitLoopFooter();
           emitChain([t]);
         } else if (loopId !== null && currentLoop !== null && loopId !== currentLoop) {
-          if (openLoops.includes(loopId)) {
+          if (openLoops.some(function(e) { return e.id === loopId; })) {
             // Returning to an outer loop — close inner loops.
-            while (openLoops.length > 0 && openLoops[openLoops.length - 1] !== loopId) {
+            while (openLoops.length > 0 && openLoops[openLoops.length - 1].id !== loopId) {
               emitLoopFooter();
             }
           } else {
