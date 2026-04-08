@@ -221,15 +221,211 @@
     if (!trimmed) return [];
     const tokens = tokenize(trimmed);
     const assigns = findAllHtmlAssignments(tokens);
-    return assigns.map((assign) => {
+
+    // Extract each assignment independently first.
+    const singles = [];
+    for (const assign of assigns) {
       const result = extractOneAssignment(tokens, assign);
-      if (!result) return null; // Target is a known non-element
+      if (!result) continue;
       result.srcStart = assign.srcStart;
       result.srcEnd = assign.srcEnd;
       result._assign = assign;
       result._tokens = tokens;
-      return result;
-    }).filter(Boolean);
+      singles.push(result);
+    }
+
+    // Group by overlapping source regions. Two extractions overlap
+    // if one's build region contains or intersects the other's build
+    // region. This detects multi-target patterns where two build vars
+    // are constructed in the same loop.
+    const groups = [];
+    const assigned = new Set();
+    for (let si = 0; si < singles.length; si++) {
+      if (assigned.has(si)) continue;
+      const group = [singles[si]];
+      assigned.add(si);
+      const s = singles[si];
+      const sStart = s.buildVarDeclStart >= 0 ? s.buildVarDeclStart : s.srcStart;
+      const sEnd = s.srcEnd;
+      // Find other extractions whose build region overlaps.
+      for (let sj = si + 1; sj < singles.length; sj++) {
+        if (assigned.has(sj)) continue;
+        const s2 = singles[sj];
+        const s2Start = s2.buildVarDeclStart >= 0 ? s2.buildVarDeclStart : s2.srcStart;
+        const s2End = s2.srcEnd;
+        // Overlap: one region contains the start of the other.
+        if ((s2Start >= sStart && s2Start < sEnd) || (sStart >= s2Start && sStart < s2End)) {
+          group.push(s2);
+          assigned.add(sj);
+        }
+      }
+      groups.push(group);
+    }
+
+    // Convert groups to a format compatible with the rest of the code.
+    const byRegion = Object.create(null);
+    const regionOrder = [];
+    for (let gi = 0; gi < groups.length; gi++) {
+      const key = 'g' + gi;
+      byRegion[key] = groups[gi];
+      regionOrder.push(key);
+    }
+
+    const results = [];
+    for (const key of regionOrder) {
+      const group = byRegion[key];
+      if (group.length === 1) {
+        results.push(group[0]);
+        continue;
+      }
+
+      // Multi-target: re-resolve with ALL build vars tracked together.
+      // Collect all build var names and their targets.
+      const allBuildVars = [];
+      const varTargets = {}; // varName → { target, assignProp, assignOp }
+      for (const s of group) {
+        const assign = s._assign;
+        for (let j = assign.rhsStart; j < assign.rhsEnd; j++) {
+          const rt = tokens[j];
+          if (rt.type !== 'other' || !IDENT_RE.test(rt.text)) continue;
+          // Check if it's a build var (has += or = with HTML).
+          for (let bi = 0; bi < assign.eqIdx; bi++) {
+            if (tokens[bi].type !== 'other' || tokens[bi].text !== rt.text) continue;
+            const nt = tokens[bi + 1];
+            if (!nt || nt.type !== 'sep') continue;
+            if (nt.char === '+=' || nt.char === '=') {
+              if (!allBuildVars.includes(rt.text)) allBuildVars.push(rt.text);
+              varTargets[rt.text] = { target: s.target, assignProp: s.assignProp, assignOp: s.assignOp };
+              break;
+            }
+          }
+        }
+      }
+
+      // Build scope state with all build vars tracked.
+      const lastAssign = group[group.length - 1]._assign;
+      const extMut = scanMutations(tokens);
+      const state = buildScopeState(tokens, lastAssign.rhsStart, extMut, allBuildVars);
+
+      // Extract each build var's chain, expand loopVars, and build
+      // a mapping of varName → expanded chain.
+      const varChains = {};
+      for (const bv of allBuildVars) {
+        const binding = state.resolve(bv);
+        if (!binding || binding.kind !== 'chain') continue;
+        // Expand loopVars for this build var.
+        const lvByName = Object.create(null);
+        if (state.loopVars) {
+          for (const lv of state.loopVars) {
+            if (lv.name !== bv) continue;
+            if (!lvByName[lv.name]) lvByName[lv.name] = [];
+            lvByName[lv.name].push(lv);
+          }
+        }
+        const expandChain = function(toks) {
+          const out = [];
+          for (const t of toks) {
+            if (t.type === 'other' && IDENT_RE.test(t.text) && lvByName[t.text] && lvByName[t.text].length) {
+              const lv = lvByName[t.text].pop();
+              for (const vt of expandChain(lv.chain)) out.push(vt);
+              lvByName[t.text].push(lv);
+            } else if (t.type === 'cond') {
+              out.push({ type: 'cond', condExpr: t.condExpr, ifTrue: expandChain(t.ifTrue), ifFalse: expandChain(t.ifFalse), loopId: t.loopId });
+            } else if (t.type === 'trycatch') {
+              out.push({ type: 'trycatch', tryBody: expandChain(t.tryBody), catchBody: expandChain(t.catchBody), catchParam: t.catchParam, loopId: t.loopId });
+            } else if (t.type === 'switch') {
+              out.push({ type: 'switch', discExpr: t.discExpr, branches: t.branches.map(function(br) { return { label: br.label, caseExpr: br.caseExpr, chain: expandChain(br.chain) }; }), loopId: t.loopId });
+            } else {
+              out.push(t);
+            }
+          }
+          return out;
+        };
+        varChains[bv] = expandChain(binding.toks);
+      }
+
+      // Merge chains: use the first build var's chain as the template.
+      // For each cond/trycatch/switch branch that is all preserves in
+      // the first chain but has DOM content in another chain, replace
+      // the preserves with the other chain's DOM tokens wrapped in
+      // target-switch markers.
+      const firstBV = allBuildVars[0];
+      const firstChain = varChains[firstBV] || [];
+
+      function branchIsPreserve(toks) {
+        return toks.every(function(t) { return t.type === 'preserve' || t.type === 'plus'; });
+      }
+      function branchHasDOM(toks) {
+        return toks.some(function(t) { return t.type === 'str' || t.type === 'other' || t.type === 'cond' || t.type === 'trycatch' || t.type === 'switch'; });
+      }
+
+      function mergeTokens(baseToks) {
+        const out = [];
+        for (const t of baseToks) {
+          if (t.type === 'cond') {
+            let ifTrue = mergeTokens(t.ifTrue);
+            let ifFalse = mergeTokens(t.ifFalse);
+            // Check if a branch is all preserves and another chain has DOM there.
+            for (let vi = 1; vi < allBuildVars.length; vi++) {
+              const otherBV = allBuildVars[vi];
+              const otherChain = varChains[otherBV] || [];
+              // Find matching cond in other chain.
+              const otherCond = otherChain.find(function(ot) { return ot.type === 'cond' && ot.condExpr === t.condExpr; });
+              if (!otherCond) continue;
+              if (branchIsPreserve(ifTrue) && branchHasDOM(otherCond.ifTrue)) {
+                const targetExpr = varTargets[otherBV].target;
+                ifTrue = [{ type: '_targetPush', target: targetExpr }].concat(mergeTokens(otherCond.ifTrue)).concat([{ type: '_targetPop' }]);
+              }
+              if (branchIsPreserve(ifFalse) && branchHasDOM(otherCond.ifFalse)) {
+                const targetExpr = varTargets[otherBV].target;
+                ifFalse = [{ type: '_targetPush', target: targetExpr }].concat(mergeTokens(otherCond.ifFalse)).concat([{ type: '_targetPop' }]);
+              }
+            }
+            out.push({ type: 'cond', condExpr: t.condExpr, ifTrue: ifTrue, ifFalse: ifFalse, loopId: t.loopId });
+          } else if (t.type === 'trycatch') {
+            out.push({ type: 'trycatch', tryBody: mergeTokens(t.tryBody), catchBody: mergeTokens(t.catchBody), catchParam: t.catchParam, loopId: t.loopId });
+          } else if (t.type === 'switch') {
+            out.push({ type: 'switch', discExpr: t.discExpr, branches: t.branches.map(function(br) { return { label: br.label, caseExpr: br.caseExpr, chain: mergeTokens(br.chain) }; }), loopId: t.loopId });
+          } else {
+            out.push(t);
+          }
+        }
+        return out;
+      }
+
+      const mergedChain = mergeTokens(firstChain);
+
+      // Produce merged extraction.
+      const firstTarget = varTargets[firstBV] || {};
+      let widestEnd = 0;
+      for (const s of group) { if (s.srcEnd > widestEnd) widestEnd = s.srcEnd; }
+
+      // Add replaceChildren for additional targets as preserve tokens
+      // at the start of the chain.
+      const initTokens = [];
+      for (let vi = 1; vi < allBuildVars.length; vi++) {
+        const info = varTargets[allBuildVars[vi]];
+        if (info && info.assignOp === '=') {
+          initTokens.push({ type: 'preserve', text: info.target + '.replaceChildren()' });
+          initTokens.push({ type: 'plus' });
+        }
+      }
+
+      results.push({
+        target: firstTarget.target || group[0].target,
+        assignProp: firstTarget.assignProp || 'innerHTML',
+        assignOp: firstTarget.assignOp || '=',
+        chainTokens: initTokens.concat(mergedChain),
+        loopInfoMap: state.loopInfo,
+        buildVarDeclStart: group[0].buildVarDeclStart,
+        srcStart: group[0].srcStart,
+        srcEnd: widestEnd,
+        _assign: group[0]._assign,
+        _tokens: tokens,
+      });
+    }
+
+    return results;
   }
 
   // Produce a { target, assignProp, assignOp, chainTokens, ... } record
@@ -5542,7 +5738,8 @@
       return lines.length ? lines.join('\n') : '// (no nodes parsed)';
     }
 
-    const pVar = makeVar('__p', used);
+    var pVar = makeVar('__p', used);
+    const pVarStack = []; // for _targetPush/_targetPop
     let needsP = false;
     const SVG_NS_STR = "'http://www.w3.org/2000/svg'";
     const MATHML_NS_STR = "'http://www.w3.org/1998/Math/MathML'";
@@ -5799,6 +5996,21 @@
       for (let ti = 0; ti < tokens.length; ti++) {
         const t = tokens[ti];
         if (t.type === 'plus') continue;
+        // Multi-target: switch the active __p to a different target element.
+        if (t.type === '_targetPush') {
+          hFlushText();
+          pVarStack.push(pVar);
+          var newP = makeVar('__p', used);
+          lines.push('var ' + newP + ' = ' + t.target + ';');
+          pVar = newP;
+          needsP = true;
+          continue;
+        }
+        if (t.type === '_targetPop') {
+          hFlushText();
+          pVar = pVarStack.pop();
+          continue;
+        }
         if (t.type === 'str') hFeedStr(t.text);
         else if (t.type === 'other') hFeedExpr(t.text);
         else if (t.type === 'preserve') { hFlushText(); lines.push(t.text); }
