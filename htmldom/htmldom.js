@@ -6164,21 +6164,38 @@
       tok.attrs = keepAttrs;
     }
 
-    // Insert handlers script reference before </body> if needed.
+    // Insert handlers script reference. Place before </body> if it
+    // exists, otherwise before the first <script> tag so handlers
+    // run before any scripts that might modify the DOM.
     if (jsLines.length) {
+      var handlerScriptTokens = [
+        { type: 'openTag', tag: 'script', tagRaw: 'script',
+          attrs: [{ name: 'src', value: handlersFile, nameRaw: 'src', start: 0, end: 0 }],
+          selfClose: false, start: 0, end: 0 },
+        { type: 'closeTag', tag: 'script', start: 0, end: 0 },
+        { type: 'text', text: '\n', start: 0, end: 0 }
+      ];
+      var inserted = false;
       for (let ti = htmlTokens.length - 1; ti >= 0; ti--) {
         if (htmlTokens[ti].type === 'closeTag' && htmlTokens[ti].tag === 'body') {
-          htmlTokens.splice(ti, 0, {
-            type: 'openTag', tag: 'script', tagRaw: 'script',
-            attrs: [{ name: 'src', value: handlersFile, nameRaw: 'src', start: 0, end: 0 }],
-            selfClose: false, start: 0, end: 0
-          }, {
-            type: 'closeTag', tag: 'script', start: 0, end: 0
-          }, {
-            type: 'text', text: '\n', start: 0, end: 0
-          });
+          htmlTokens.splice(ti, 0, ...handlerScriptTokens);
+          inserted = true;
           break;
         }
+      }
+      if (!inserted) {
+        // No </body> — insert before the first <script> tag.
+        for (let ti = 0; ti < htmlTokens.length; ti++) {
+          if (htmlTokens[ti].type === 'openTag' && htmlTokens[ti].tag === 'script') {
+            htmlTokens.splice(ti, 0, ...handlerScriptTokens);
+            inserted = true;
+            break;
+          }
+        }
+      }
+      if (!inserted) {
+        // No </body> and no <script> — append at the end.
+        htmlTokens.push(...handlerScriptTokens);
       }
     }
 
