@@ -5114,6 +5114,19 @@
     let hParentTags = []; // track parent tag names for auto-tbody
     let hTbodyVar = null; // variable for auto-inserted tbody
 
+    // Infer the target element's tag from the chain content. If the
+    // first HTML tag is <tr>, the target must be a table-like element.
+    // Initialize hParentTags so auto-tbody works correctly.
+    for (var ci = 0; ci < chainTokens.length; ci++) {
+      if (chainTokens[ci].type === 'str' && chainTokens[ci].text.trim()) {
+        var firstTag = chainTokens[ci].text.match(/<([a-zA-Z][a-zA-Z0-9]*)/);
+        if (firstTag && firstTag[1].toLowerCase() === 'tr') {
+          hParentTags = ['table'];
+        }
+        break;
+      }
+    }
+
     function hFlushText() {
       if (hTextBuf) {
         const decoded = decodeHtmlEntities(hTextBuf);
@@ -5497,13 +5510,68 @@
               if (falseStr) hAttrs.push({ kind: 'cond_attr', condExpr: '!(' + t.condExpr + ')', name: falseEq >= 0 ? falseStr.slice(0, falseEq) : falseStr, value: falseEq >= 0 ? falseStr.slice(falseEq + 1).replace(/^['"]/, '').replace(/['"]$/, '') : '' });
             }
           } else {
-            // Text context: emit if/else blocks.
+            // Text context: check for unbalanced tags in branches.
+            // An unbalanced open tag (like <b> without </b>) means the
+            // parent depends on runtime state after the cond.
             hFlushText();
+            var savedStack = parentStack.slice();
+            var savedHTags = hParentTags.slice();
+            var savedHState = hState;
+
+            // Process ifTrue branch, track stack changes.
             lines.push('if (' + t.condExpr + ') {');
             emitChain(t.ifTrue);
+            hFlushText();
+            var trueStack = parentStack.slice();
+            var trueHTags = hParentTags.slice();
+
+            // Restore and process ifFalse branch.
+            parentStack.length = 0;
+            for (var si = 0; si < savedStack.length; si++) parentStack.push(savedStack[si]);
+            hParentTags = savedHTags.slice();
+            hState = savedHState;
             lines.push('} else {');
             emitChain(t.ifFalse);
+            hFlushText();
+            var falseStack = parentStack.slice();
             lines.push('}');
+
+            // If both branches end with the same parent stack, use it.
+            if (JSON.stringify(trueStack) === JSON.stringify(falseStack)) {
+              // Balanced: both branches end at the same nesting level.
+              parentStack.length = 0;
+              for (var si2 = 0; si2 < trueStack.length; si2++) parentStack.push(trueStack[si2]);
+            } else {
+              // Unbalanced: branches end at different nesting levels.
+              // Introduce a runtime parent variable for subsequent code.
+              // The variable is set in each branch to wherever that branch
+              // left the parent.
+              var condParent = makeVar('current', used);
+              // Go back and insert the variable assignment at the end of each branch.
+              // Find the '} else {' line and insert before it.
+              var elseIdx = lines.lastIndexOf('} else {');
+              if (elseIdx >= 0) {
+                lines.splice(elseIdx, 0, condParent + ' = ' + trueStack[trueStack.length - 1] + ';');
+              }
+              // Insert at end of else branch (before the closing }).
+              var closeIdx = lines.lastIndexOf('}');
+              if (closeIdx >= 0) {
+                lines.splice(closeIdx, 0, condParent + ' = ' + falseStack[falseStack.length - 1] + ';');
+              }
+              // Add var declaration before the if.
+              var ifIdx = -1;
+              for (var li = lines.length - 1; li >= 0; li--) {
+                if (lines[li] === 'if (' + t.condExpr + ') {') { ifIdx = li; break; }
+              }
+              if (ifIdx >= 0) {
+                lines.splice(ifIdx, 0, 'var ' + condParent + ';');
+              }
+              // Replace parent stack with the runtime variable.
+              parentStack.length = 0;
+              var minLen = Math.min(trueStack.length, falseStack.length);
+              for (var si3 = 0; si3 < minLen; si3++) parentStack.push(savedStack[si3] || condParent);
+              parentStack.push(condParent);
+            }
           }
         } else if (t.type === 'trycatch') {
           hFlushText();
