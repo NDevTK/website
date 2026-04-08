@@ -4016,6 +4016,8 @@
         // Remove <body ...> and </body> from body content.
         bodyContent = bodyContent.replace(/<\/?body[^>]*>/gi, '');
 
+        const jsFileLines = [];
+        let elemCounter = 0;
         const processRegion = (html, parentTarget, outputParts, sharedUsed) => {
           const scriptRe = /<script\b[^>]*>([\s\S]*?)<\/script>/gi;
           let lastIdx = 0;
@@ -4028,53 +4030,59 @@
           }
           if (lastIdx < html.length) parts.push({ kind: 'html', text: html.slice(lastIdx) });
 
-          // Separate HTML parts from script parts. HTML structure is
-          // preserved — unsafe attributes (inline events, javascript:
-          // URLs, inline styles) are extracted to script blocks.
+          // Collect all unsafe-attribute rewrites into a separate JS file.
+          // HTML structure is preserved; only inline events, javascript:
+          // URLs, and inline styles are extracted.
           const scriptParts = [];
           for (const part of parts) {
             if (part.kind === 'html') {
               let safeHtml = part.text;
-              const rewrites = [];
-              let elemCounter = 0;
               safeHtml = safeHtml.replace(/<([a-zA-Z][a-zA-Z0-9]*)((?:\s+[^>]*?)?)>/g, function(match, tag, attrsStr) {
                 const events = [];
                 let styleVal = null;
                 let jsHref = null;
-                // Extract inline event handlers.
                 let cleaned = attrsStr.replace(/\s+on([a-z]+)="([^"]*)"/gi, function(_, evName, handler) {
                   events.push({ event: evName.toLowerCase(), handler: handler.replace(/&quot;/g, '"').replace(/&amp;/g, '&') });
                   return '';
                 });
-                // Extract javascript: hrefs.
                 cleaned = cleaned.replace(/\s+href="javascript:([^"]*)"/gi, function(_, code) {
                   jsHref = code.replace(/&quot;/g, '"').replace(/&amp;/g, '&');
                   return '';
                 });
-                // Extract inline styles.
                 cleaned = cleaned.replace(/\s+style="([^"]*)"/gi, function(_, val) {
                   styleVal = val.replace(/&quot;/g, '"').replace(/&amp;/g, '&');
                   return '';
                 });
                 if (events.length === 0 && !jsHref && !styleVal) return match;
-                const id = '__hdel' + (elemCounter++);
-                var sel = 'document.querySelector(\'[data-hd-id="' + id + '"]\')';
+                // Use existing id or add data-hd for targeting.
+                const idMatch = attrsStr.match(/\s+id="([^"]*)"/i);
+                var sel, cleanedTag;
+                if (idMatch) {
+                  sel = 'document.getElementById(\'' + idMatch[1] + '\')';
+                  cleanedTag = '<' + tag + cleaned + '>';
+                } else {
+                  const hdId = 'hd' + (elemCounter++);
+                  sel = 'document.querySelector(\'[data-hd="' + hdId + '"]\')';
+                  cleanedTag = '<' + tag + cleaned + ' data-hd="' + hdId + '">';
+                }
                 for (const ev of events) {
-                  // Inline handlers: `return false` prevents default AND
-                  // stops propagation. Wrap the body to replicate this.
                   var body = ev.handler.trim();
-                  var hasReturn = /\breturn\b/.test(body);
-                  if (hasReturn) {
-                    rewrites.push(sel + '.addEventListener(\'' + ev.event + '\', function(event) { var __r = (function() { ' + body + ' }).call(this); if (__r === false) { event.preventDefault(); } });');
+                  if (/\breturn\b/.test(body)) {
+                    jsFileLines.push(sel + '.addEventListener(\'' + ev.event + '\', function(event) {');
+                    jsFileLines.push('  var __r = (function() { ' + body + ' }).call(this);');
+                    jsFileLines.push('  if (__r === false) event.preventDefault();');
+                    jsFileLines.push('});');
                   } else {
-                    rewrites.push(sel + '.addEventListener(\'' + ev.event + '\', function(event) { ' + body + ' });');
+                    jsFileLines.push(sel + '.addEventListener(\'' + ev.event + '\', function(event) { ' + body + ' });');
                   }
                 }
                 if (jsHref) {
-                  rewrites.push(sel + '.addEventListener(\'click\', function(event) { event.preventDefault(); ' + jsHref + ' });');
+                  jsFileLines.push(sel + '.addEventListener(\'click\', function(event) {');
+                  jsFileLines.push('  event.preventDefault();');
+                  jsFileLines.push('  ' + jsHref);
+                  jsFileLines.push('});');
                 }
                 if (styleVal) {
-                  // Parse style declarations and emit setProperty calls.
                   var decls = styleVal.split(';').map(function(d) { return d.trim(); }).filter(Boolean);
                   for (var di = 0; di < decls.length; di++) {
                     var colon = decls[di].indexOf(':');
@@ -4086,15 +4094,12 @@
                       val = val.replace(/\s*!important\s*$/, '');
                       important = ', \'important\'';
                     }
-                    rewrites.push(sel + '.style.setProperty(\'' + prop + '\', \'' + val.replace(/'/g, "\\'") + '\'' + important + ');');
+                    jsFileLines.push(sel + '.style.setProperty(\'' + prop + '\', \'' + val.replace(/'/g, "\\'") + '\'' + important + ');');
                   }
                 }
-                return '<' + tag + cleaned + ' data-hd-id="' + id + '">';
+                return cleanedTag;
               });
               outputParts.push(safeHtml);
-              if (rewrites.length) {
-                outputParts.push('<script>\n' + rewrites.join('\n') + '\n</script>');
-              }
             } else {
               scriptParts.push(part);
             }
@@ -4108,8 +4113,8 @@
             const combinedJs = scriptParts.map(p => p.text).join(separator);
             const extractions = extractAllHTML(combinedJs);
             if (extractions.length === 0) {
-              // No innerHTML — output each block as-is.
-              for (const part of scriptParts) outputParts.push('<script>\n' + part.text.trim() + '\n</script>');
+              // No innerHTML — keep script code as-is in the JS file.
+              for (const part of scriptParts) jsFileLines.push(part.text.trim());
             } else {
               const trimmed = combinedJs.trim();
               let scriptOutput = '';
@@ -4137,9 +4142,8 @@
                 while (cursor < trimmed.length && (trimmed[cursor] === ';' || trimmed[cursor] === ' ' || trimmed[cursor] === '\n')) cursor++;
               }
               scriptOutput += trimmed.slice(cursor);
-              // Remove block separators from output.
               scriptOutput = scriptOutput.replace(/\n\/\*__BLOCK_SEP__\*\/\n/g, '\n');
-              outputParts.push('<script>\n' + scriptOutput.trim() + '\n</script>');
+              jsFileLines.push(scriptOutput.trim());
             }
           }
         };
@@ -4151,9 +4155,19 @@
         if (headContent.trim()) processRegion(headContent, 'document.head', outputParts, sharedUsed);
         outputParts.push('</head>\n<body>');
         if (bodyContent.trim()) processRegion(bodyContent, 'document.body', outputParts, sharedUsed);
+        // Add reference to the generated JS file if there are any rewrites.
+        if (jsFileLines.length) {
+          outputParts.push('<script src="safe-handlers.js"></script>');
+        }
         outputParts.push('</body>\n</html>');
-        // Clean up excessive blank lines.
-        setOutput(outputParts.join('\n').replace(/\n{3,}/g, '\n\n'));
+        const cleanHtml = outputParts.join('\n').replace(/\n{3,}/g, '\n\n');
+        const jsFile = jsFileLines.length ? '// Generated by HTML to DOM API Converter\n// Extracted inline handlers, styles, and innerHTML conversions.\n\n' + jsFileLines.join('\n\n') + '\n' : '';
+        // Output both: HTML file, separator, JS file.
+        if (jsFile) {
+          setOutput('// === index.html ===\n' + cleanHtml + '\n\n// === safe-handlers.js ===\n' + jsFile);
+        } else {
+          setOutput(cleanHtml);
+        }
         return;
       }
 
