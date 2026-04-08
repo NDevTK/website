@@ -216,6 +216,28 @@
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   }
 
+  // Recursively expand loopVar references in a chain token array.
+  // lvByName: { varName → [loopVar, ...] } — stack of loopVar entries.
+  function expandLoopVars(toks, lvByName) {
+    const out = [];
+    for (const t of toks) {
+      if (t.type === 'other' && IDENT_RE.test(t.text) && lvByName[t.text] && lvByName[t.text].length) {
+        const lv = lvByName[t.text].pop();
+        for (const vt of expandLoopVars(lv.chain, lvByName)) out.push(vt);
+        lvByName[t.text].push(lv);
+      } else if (t.type === 'cond') {
+        out.push({ type: 'cond', condExpr: t.condExpr, ifTrue: expandLoopVars(t.ifTrue, lvByName), ifFalse: expandLoopVars(t.ifFalse, lvByName), loopId: t.loopId });
+      } else if (t.type === 'trycatch') {
+        out.push({ type: 'trycatch', tryBody: expandLoopVars(t.tryBody, lvByName), catchBody: expandLoopVars(t.catchBody, lvByName), catchParam: t.catchParam, loopId: t.loopId });
+      } else if (t.type === 'switch') {
+        out.push({ type: 'switch', discExpr: t.discExpr, branches: t.branches.map(function(br) { return { label: br.label, caseExpr: br.caseExpr, chain: expandLoopVars(br.chain, lvByName) }; }), loopId: t.loopId });
+      } else {
+        out.push(t);
+      }
+    }
+    return out;
+  }
+
   function extractAllHTML(input) {
     const trimmed = input.trim();
     if (!trimmed) return [];
@@ -322,26 +344,7 @@
             lvByName[lv.name].push(lv);
           }
         }
-        const expandChain = function(toks) {
-          const out = [];
-          for (const t of toks) {
-            if (t.type === 'other' && IDENT_RE.test(t.text) && lvByName[t.text] && lvByName[t.text].length) {
-              const lv = lvByName[t.text].pop();
-              for (const vt of expandChain(lv.chain)) out.push(vt);
-              lvByName[t.text].push(lv);
-            } else if (t.type === 'cond') {
-              out.push({ type: 'cond', condExpr: t.condExpr, ifTrue: expandChain(t.ifTrue), ifFalse: expandChain(t.ifFalse), loopId: t.loopId });
-            } else if (t.type === 'trycatch') {
-              out.push({ type: 'trycatch', tryBody: expandChain(t.tryBody), catchBody: expandChain(t.catchBody), catchParam: t.catchParam, loopId: t.loopId });
-            } else if (t.type === 'switch') {
-              out.push({ type: 'switch', discExpr: t.discExpr, branches: t.branches.map(function(br) { return { label: br.label, caseExpr: br.caseExpr, chain: expandChain(br.chain) }; }), loopId: t.loopId });
-            } else {
-              out.push(t);
-            }
-          }
-          return out;
-        };
-        varChains[bv] = expandChain(binding.toks);
+        varChains[bv] = expandLoopVars(binding.toks, lvByName);
       }
 
       // Merge chains: use the first build var's chain as the template.
@@ -516,26 +519,7 @@
           lvByName[lv.name].push(lv);
         }
       }
-      const expandChain = (toks) => {
-        const out = [];
-        for (const t of toks) {
-          if (t.type === 'other' && IDENT_RE.test(t.text) && lvByName[t.text] && lvByName[t.text].length) {
-            const lv = lvByName[t.text].pop();
-            for (const vt of expandChain(lv.chain)) out.push(vt);
-            lvByName[t.text].push(lv);
-          } else if (t.type === 'cond') {
-            out.push({ type: 'cond', condExpr: t.condExpr, ifTrue: expandChain(t.ifTrue), ifFalse: expandChain(t.ifFalse), loopId: t.loopId });
-          } else if (t.type === 'trycatch') {
-            out.push({ type: 'trycatch', tryBody: expandChain(t.tryBody), catchBody: expandChain(t.catchBody), catchParam: t.catchParam, loopId: t.loopId });
-          } else if (t.type === 'switch') {
-            out.push({ type: 'switch', discExpr: t.discExpr, branches: t.branches.map(br => ({ label: br.label, caseExpr: br.caseExpr, chain: expandChain(br.chain) })), loopId: t.loopId });
-          } else {
-            out.push(t);
-          }
-        }
-        return out;
-      };
-      const mainTokens = expandChain(r.tokens);
+      const mainTokens = expandLoopVars(r.tokens, lvByName);
       // Skip conversion when the RHS is a single innerHTML/outerHTML read
       // (e.g. el2.innerHTML = el1.innerHTML) — the READ must stay as-is
       // because it produces the browser's serialized HTML from the DOM.
@@ -1065,6 +1049,18 @@
     // tokens are only injected at this depth — inner functions with their
     // own local `html` var are not affected.
     let trackBuildVarDepth = -1;
+
+    // Check if a token array starts with a given prefix (snapshot).
+    // Used by if-else, try-catch, and switch handlers to detect
+    // whether a branch appended to the snapshot (+=) or replaced it (=).
+    const chainStartsWith = (full, prefix) => {
+      if (full.length < prefix.length) return false;
+      for (let s = 0; s < prefix.length; s++) {
+        if (JSON.stringify(full[s]) !== JSON.stringify(prefix[s])) return false;
+      }
+      return true;
+    };
+    const stripLeadingPlus = (arr) => (arr.length && arr[0].type === 'plus') ? arr.slice(1) : arr;
     if (trackBuildVarInit) {
       if (Array.isArray(trackBuildVarInit)) {
         trackBuildVar = new Set(trackBuildVarInit);
@@ -2227,7 +2223,7 @@
 
       // .map(fn).join('') on an opaque iterable: extract the callback's
       // per-element return chain and produce an iter token that
-      // parseChainToVNodes converts into a forEach loop.
+      // The emitter converts map/join into a forEach loop.
       if (method === 'map') {
         const lp = tks[parenIdx];
         if (!lp || lp.type !== 'open' || lp.char !== '(') return null;
@@ -3421,20 +3417,10 @@
                 const snapB = snapshot[name];
                 if (snapB && snapB.kind === 'chain') {
                   const snapFull = snapB.toks;
-                  const stripPlus = (arr) => (arr.length && arr[0].type === 'plus') ? arr.slice(1) : arr;
-                  // Check if each branch starts with the snapshot prefix
-                  // (appended via +=) or is a full replacement (via =).
-                  const startsWithSnap = (full) => {
-                    if (full.length < snapFull.length) return false;
-                    for (let s = 0; s < snapFull.length; s++) {
-                      if (JSON.stringify(full[s]) !== JSON.stringify(snapFull[s])) return false;
-                    }
-                    return true;
-                  };
-                  const ifAppended = startsWithSnap(ifFull);
-                  const elAppended = startsWithSnap(elFull);
-                  const ifExtra = ifAppended ? stripPlus(ifFull.slice(snapFull.length)) : ifFull;
-                  const elExtra = elAppended ? stripPlus(elFull.slice(snapFull.length)) : elFull;
+                  const ifAppended = chainStartsWith(ifFull, snapFull);
+                  const elAppended = chainStartsWith(elFull, snapFull);
+                  const ifExtra = ifAppended ? stripLeadingPlus(ifFull.slice(snapFull.length)) : ifFull;
+                  const elExtra = elAppended ? stripLeadingPlus(elFull.slice(snapFull.length)) : elFull;
                   const currentLoopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
                   if (!ifAppended || !elAppended) {
                     // At least one branch did `html = ...` (full replacement).
@@ -3611,18 +3597,10 @@
             if (snapB && snapB.kind === 'chain') {
               if (trackBuildVar && trackBuildVar.has(name)) {
                 const snapFull = snapB.toks;
-                const stripPlus = (arr) => (arr.length && arr[0].type === 'plus') ? arr.slice(1) : arr;
-                const startsWithSnap = (full) => {
-                  if (full.length < snapFull.length) return false;
-                  for (let s = 0; s < snapFull.length; s++) {
-                    if (JSON.stringify(full[s]) !== JSON.stringify(snapFull[s])) return false;
-                  }
-                  return true;
-                };
-                const tryAppended = startsWithSnap(tryFull);
-                const catchAppended = startsWithSnap(catchFull);
-                const tryExtra = tryAppended ? stripPlus(tryFull.slice(snapFull.length)) : tryFull;
-                const catchExtra = catchAppended ? stripPlus(catchFull.slice(snapFull.length)) : catchFull;
+                const tryAppended = chainStartsWith(tryFull, snapFull);
+                const catchAppended = chainStartsWith(catchFull, snapFull);
+                const tryExtra = tryAppended ? stripLeadingPlus(tryFull.slice(snapFull.length)) : tryFull;
+                const catchExtra = catchAppended ? stripLeadingPlus(catchFull.slice(snapFull.length)) : catchFull;
                 const tryCatchTok = { type: 'trycatch', tryBody: tryExtra, catchBody: catchExtra, catchParam };
                 if (tryAppended && catchAppended) {
                   assignName(name, chainBinding([...snapB.toks, SYNTH_PLUS, tryCatchTok]));
@@ -3711,23 +3689,15 @@
                 const snapB = snapshot[bv];
                 if (!snapB || snapB.kind !== 'chain') continue;
                 const snapFull = snapB.toks;
-                const stripPlus = (arr) => (arr.length && arr[0].type === 'plus') ? arr.slice(1) : arr;
-                const startsWithSnap = (full) => {
-                  if (full.length < snapFull.length) return false;
-                  for (let s = 0; s < snapFull.length; s++) {
-                    if (JSON.stringify(full[s]) !== JSON.stringify(snapFull[s])) return false;
-                  }
-                  return true;
-                };
                 const branches = [];
                 let allAppended = true;
                 for (const cr of caseResults) {
                   const b = cr.bindings[bv];
                   if (b && b.kind === 'chain') {
                     const full = b.toks;
-                    const appended = startsWithSnap(full);
+                    const appended = chainStartsWith(full, snapFull);
                     if (!appended) allAppended = false;
-                    const extra = appended ? stripPlus(full.slice(snapFull.length)) : full;
+                    const extra = appended ? stripLeadingPlus(full.slice(snapFull.length)) : full;
                     branches.push({ label: cr.label, caseExpr: cr.caseExpr, chain: extra });
                   }
                 }
@@ -4999,700 +4969,6 @@
   // ---------------------------------------------------------------------------
   // Direct chain-to-DOM converter: bypass DOMParser, work from chain tokens.
   // ---------------------------------------------------------------------------
-
-  // Parse chain tokens into a lightweight virtual DOM tree. Each str token
-  // is fed character-by-character through an HTML state machine; each other
-  // token (expression) is annotated with its HTML context (text content,
-  // attribute value, attribute name, etc.).
-  function parseChainToVNodes(chainTokens) {
-    // Split chain at plus tokens into operands.
-    const operands = [];
-    let cur = [];
-    for (const t of chainTokens) {
-      if (t.type === 'plus') { if (cur.length) operands.push(cur); cur = []; }
-      else cur.push(t);
-    }
-    if (cur.length) operands.push(cur);
-
-    // Resolve an operand to { kind: 'str', text, loopId } or { kind: 'expr', expr, loopId }.
-    const resolveOp = (toks) => {
-      const loopId = toks[0].loopId != null ? toks[0].loopId : null;
-      if (toks.length === 1 && toks[0].type === 'str') {
-        return { kind: 'str', text: toks[0].text, loopId };
-      }
-      if (toks.length === 1 && toks[0].type === 'tmpl') {
-        // Template literal — flatten parts into sub-operands.
-        const parts = [];
-        for (const p of toks[0].parts) {
-          if (p.kind === 'text') parts.push({ kind: 'str', text: decodeJsString(p.raw, '`'), loopId });
-          else parts.push({ kind: 'expr', expr: p.expr.trim(), loopId });
-        }
-        return { kind: 'tmpl', parts, loopId };
-      }
-      if (toks.length === 1 && toks[0].type === 'preserve') {
-        return { kind: 'preserve', text: toks[0].text, loopId };
-      }
-      if (toks.length === 1 && toks[0].type === 'trycatch') {
-        return { kind: 'trycatch', tryBody: toks[0].tryBody, catchBody: toks[0].catchBody, catchParam: toks[0].catchParam, loopId };
-      }
-      if (toks.length === 1 && toks[0].type === 'switch') {
-        return { kind: 'switch', discExpr: toks[0].discExpr, branches: toks[0].branches, loopId };
-      }
-      if (toks.length === 1 && (toks[0].type === 'cond' || toks[0].type === 'iter')) {
-        return Object.assign({ kind: toks[0].type, loopId }, toks[0]);
-      }
-      const first = toks[0];
-      const last = toks[toks.length - 1];
-      const expr = first._src.slice(first.start, last.end).trim();
-      return { kind: 'expr', expr, loopId };
-    };
-
-    const resolved = [];
-    for (const op of operands) {
-      const r = resolveOp(op);
-      if (r.kind === 'tmpl') {
-        for (const p of r.parts) resolved.push(p);
-      } else {
-        resolved.push(r);
-      }
-    }
-
-    // HTML state machine.
-    const TEXT = 0, TAG_OPEN = 1, TAG_CLOSE = 2, ATTRS = 3;
-    const ATTR_NAME = 4, ATTR_EQ = 5, ATTR_VALUE_DQ = 6, ATTR_VALUE_SQ = 7;
-    const ATTR_VALUE_UQ = 8, COMMENT = 9;
-    let commentBuf = '';
-
-    let state = TEXT;
-    let tagName = '';
-    let attrName = '';
-    let attrValue = '';
-    let attrExprs = [];  // {pos, expr} embedded in current attr value
-
-    // Virtual DOM construction.
-    const roots = [];
-    const elStack = [];  // stack of { tag, attrs, children }
-    const addChild = (node) => {
-      if (elStack.length) elStack[elStack.length - 1].children.push(node);
-      else roots.push(node);
-    };
-    let currentEl = null;  // element being built (receives attrs)
-    const openTag = (tag, loopId) => {
-      currentEl = { kind: 'element', tag, attrs: [], children: [], loopId };
-    };
-    // Called when `>` closes the opening tag — commit the element.
-    const commitTag = () => {
-      if (!currentEl) return;
-      // Auto-insert <tbody> when <tr> is a direct child of <table>,
-      // matching innerHTML's HTML parser behavior. Reuse an existing
-      // <tbody> if the table already has one as its last child.
-      // Auto-close implicit <tbody> when a table section element
-      // (thead, tfoot, caption, colgroup) is encountered as a sibling.
-      const parentEl = elStack.length ? elStack[elStack.length - 1] : null;
-      if (parentEl && parentEl.tag === 'tbody' &&
-          (currentEl.tag === 'tfoot' || currentEl.tag === 'thead' ||
-           currentEl.tag === 'caption' || currentEl.tag === 'colgroup')) {
-        elStack.pop(); // pop implicit tbody
-      }
-      // Re-read parent after possible pop.
-      const parentEl2 = elStack.length ? elStack[elStack.length - 1] : null;
-      // Auto-insert <tbody> when <tr> is a direct child of <table>.
-      // The <tbody> is a structural wrapper — it does NOT carry loopId
-      // because it exists once, while the <tr> inside it repeats.
-      if (currentEl.tag === 'tr' && parentEl2 && parentEl2.tag === 'table') {
-        const lastChild = parentEl2.children[parentEl2.children.length - 1];
-        if (lastChild && lastChild.kind === 'element' && lastChild.tag === 'tbody') {
-          elStack.push(lastChild);
-        } else {
-          const tbody = { kind: 'element', tag: 'tbody', attrs: [], children: [] };
-          addChild(tbody);
-          elStack.push(tbody);
-        }
-      }
-      addChild(currentEl);
-      if (!currentEl.tag || !VOID_ELEMENTS.has(currentEl.tag.toLowerCase())) elStack.push(currentEl);
-      currentEl = null;
-    };
-    const commitAndSelfClose = () => {
-      if (!currentEl) return;
-      addChild(currentEl);
-      // Don't push to stack — self-closing.
-      currentEl = null;
-    };
-    let closingTag = '';
-    const popEl = () => {
-      if (!elStack.length) return;
-      // Auto-pop implicit <tbody> when closing </table>.
-      if (closingTag === 'table' && elStack[elStack.length - 1].tag === 'tbody') {
-        elStack.pop();
-      }
-      if (elStack.length) elStack.pop();
-    };
-    let textBuf = '';
-    const flushText = () => {
-      if (textBuf) { addChild({ kind: 'text', text: decodeHtmlEntities(textBuf) }); textBuf = ''; }
-    };
-    let currentTagLoopId = null;
-
-    const finishAttr = () => {
-      if (!attrName || !currentEl) { attrName = ''; attrValue = ''; attrExprs = []; return; }
-      if (attrExprs.length) {
-        // Dynamic attrs: decode the static portions, exprs stay as-is.
-        currentEl.attrs.push({ kind: 'dynamic_value', name: attrName, value: decodeHtmlEntities(attrValue), valueExprs: attrExprs.slice() });
-      } else {
-        currentEl.attrs.push({ kind: 'static', name: attrName, value: decodeHtmlEntities(attrValue) });
-      }
-      attrName = '';
-      attrValue = '';
-      attrExprs = [];
-    };
-
-    const startTag = (loopId) => {
-      openTag(tagName, loopId);
-      tagName = '';
-    };
-
-    // Feed a string through the state machine.
-    const feedStr = (text, loopId) => {
-      for (let i = 0; i < text.length; i++) {
-        const c = text[i];
-        switch (state) {
-          case TEXT:
-            if (c === '<') {
-              flushText();
-              if (text[i + 1] === '/') { state = TAG_CLOSE; closingTag = ''; i++; }
-              else if (text[i + 1] === '!' && text[i + 2] === '-' && text[i + 3] === '-') {
-                state = COMMENT; commentBuf = ''; i += 3;
-              }
-              else { state = TAG_OPEN; tagName = ''; currentTagLoopId = loopId; }
-            } else {
-              textBuf += c;
-            }
-            break;
-          case TAG_OPEN:
-            if (c === ' ' || c === '\t' || c === '\n' || c === '\r') {
-              if (tagName) { startTag(currentTagLoopId); state = ATTRS; }
-            } else if (c === '>') {
-              startTag(currentTagLoopId); commitTag(); state = TEXT;
-            } else if (c === '/') {
-              if (text[i + 1] === '>') { startTag(currentTagLoopId); commitAndSelfClose(); state = TEXT; i++; }
-            } else {
-              tagName += c;
-            }
-            break;
-          case TAG_CLOSE:
-            if (c === '>') { popEl(); state = TEXT; }
-            else { closingTag += c.toLowerCase(); }
-            break;
-          case ATTRS:
-            if (c === '>') {
-              finishAttr(); commitTag();
-              state = TEXT;
-            } else if (c === '/') {
-              if (text[i + 1] === '>') { finishAttr(); commitAndSelfClose(); state = TEXT; i++; }
-            } else if (c !== ' ' && c !== '\t' && c !== '\n' && c !== '\r') {
-              finishAttr();
-              attrName = c;
-              state = ATTR_NAME;
-            }
-            break;
-          case ATTR_NAME:
-            if (c === '=') { state = ATTR_EQ; }
-            else if (c === ' ' || c === '\t' || c === '\n' || c === '\r') {
-              // Boolean attribute or space before =
-              // Peek ahead to see if = follows
-              let j = i + 1;
-              while (j < text.length && (text[j] === ' ' || text[j] === '\t')) j++;
-              if (j < text.length && text[j] === '=') {
-                i = j; state = ATTR_EQ;
-              } else {
-                // Boolean attribute
-                finishAttr();
-                state = ATTRS;
-              }
-            } else if (c === '>') {
-              finishAttr(); commitTag(); state = TEXT;
-            } else if (c === '/' && text[i + 1] === '>') {
-              finishAttr(); commitAndSelfClose(); state = TEXT; i++;
-            } else {
-              attrName += c;
-            }
-            break;
-          case ATTR_EQ:
-            if (c === '"') { attrValue = ''; state = ATTR_VALUE_DQ; }
-            else if (c === "'") { attrValue = ''; state = ATTR_VALUE_SQ; }
-            else if (c !== ' ' && c !== '\t') {
-              attrValue = c; state = ATTR_VALUE_UQ;
-            }
-            break;
-          case ATTR_VALUE_DQ:
-            if (c === '"') { finishAttr(); state = ATTRS; }
-            else attrValue += c;
-            break;
-          case ATTR_VALUE_SQ:
-            if (c === "'") { finishAttr(); state = ATTRS; }
-            else attrValue += c;
-            break;
-          case ATTR_VALUE_UQ:
-            if (c === ' ' || c === '\t' || c === '\n' || c === '\r') { finishAttr(); state = ATTRS; }
-            else if (c === '>') { finishAttr(); commitTag(); state = TEXT; }
-            else if (c === '/' && text[i + 1] === '>') { finishAttr(); commitAndSelfClose(); state = TEXT; i++; }
-            else attrValue += c;
-            break;
-          case COMMENT:
-            if (c === '-' && text[i + 1] === '-' && text[i + 2] === '>') {
-              addChild({ kind: 'comment', text: commentBuf });
-              i += 2; state = TEXT;
-            } else {
-              commentBuf += c;
-            }
-            break;
-        }
-      }
-    };
-
-    // Feed an expression into the current state.
-    const feedExpr = (expr, loopId) => {
-      switch (state) {
-        case TEXT:
-          flushText();
-          addChild({ kind: 'expr_text', expr, loopId });
-          break;
-        case TAG_OPEN:
-          // Expression is the tag name (e.g. `"<" + tag + ">"`).
-          tagName = null;
-          openTag(null, loopId);
-          currentEl.tagExpr = expr;
-          state = ATTRS;
-          break;
-        case ATTRS:
-          // Expression between attributes — conditional boolean attr.
-          if (currentEl) {
-            currentEl.attrs.push({ kind: 'dynamic_name', nameExpr: expr });
-          }
-          break;
-        case ATTR_NAME:
-          // Expression continues attribute name (unusual).
-          attrName += '${' + expr + '}';
-          break;
-        case ATTR_VALUE_DQ:
-        case ATTR_VALUE_SQ:
-        case ATTR_VALUE_UQ:
-          attrExprs.push({ pos: attrValue.length, expr });
-          break;
-        case ATTR_EQ:
-          // Expression is the entire unquoted attribute value.
-          attrExprs.push({ pos: 0, expr });
-          finishAttr();
-          state = ATTRS;
-          break;
-        default:
-          break;
-      }
-    };
-
-    // Convert chain tokens to a JS expression string (for attribute values
-    // and other non-structural contexts where DOM nodes can't be emitted).
-    const chainToksAsExpr = (toks) => {
-      const parts = [];
-      for (const t of toks) {
-        if (t.type === 'plus') continue;
-        if (t.type === 'str') parts.push(JSON.stringify(t.text));
-        else if (t.type === 'other') parts.push(t.text);
-        else if (t.type === 'cond') parts.push('(' + t.condExpr + ' ? ' + chainToksAsExpr(t.ifTrue) + ' : ' + chainToksAsExpr(t.ifFalse) + ')');
-        else if (t.type === 'preserve' || t.type === 'trycatch' || t.type === 'switch') { /* skip — control flow tokens don't produce values */ }
-      }
-      return parts.join(' + ') || '""';
-    };
-
-    for (const op of resolved) {
-      if (op.kind === 'str') feedStr(op.text, op.loopId);
-      else if (op.kind === 'iter') {
-        // Iteration: .map(fn).join('') — parse per-element chain and emit forEach loop.
-        if (state === TEXT) {
-          flushText();
-          const elemNodes = parseChainToVNodes(op.perElemChain);
-          addChild({ kind: 'iteration', iterExpr: op.iterExpr, paramName: op.paramName, children: elemNodes, loopId: op.loopId });
-        } else {
-          // Non-TEXT context — fall back to expression.
-          feedExpr(op.iterExpr + '.map(function(' + op.paramName + ') { return ' + chainToksAsExpr(op.perElemChain) + '; }).join(\'\')', op.loopId);
-        }
-      }
-      else if (op.kind === 'trycatch') {
-        if (state === TEXT) {
-          flushText();
-          const tryNodes = parseChainToVNodes(op.tryBody);
-          const catchNodes = parseChainToVNodes(op.catchBody);
-          addChild({ kind: 'trycatch', tryBody: tryNodes, catchBody: catchNodes, catchParam: op.catchParam, loopId: op.loopId });
-        }
-      }
-      else if (op.kind === 'switch') {
-        if (state === TEXT) {
-          flushText();
-          const branches = op.branches.map(br => ({
-            label: br.label, caseExpr: br.caseExpr,
-            nodes: parseChainToVNodes(br.chain),
-          }));
-          addChild({ kind: 'switch', discExpr: op.discExpr, branches, loopId: op.loopId });
-        }
-      }
-      else if (op.kind === 'preserve') {
-        flushText();
-        addChild({ kind: 'preserve', text: op.text, loopId: op.loopId });
-      }
-      else if (op.kind === 'cond') {
-        // Conditional HTML: recursively parse both branches into vnodes
-        // and emit a conditional vnode that the emitter renders as if/else.
-        if (state === TEXT) {
-          flushText();
-          const trueNodes = parseChainToVNodes(op.ifTrue);
-          const falseNodes = parseChainToVNodes(op.ifFalse);
-          addChild({ kind: 'conditional', condExpr: op.condExpr, ifTrue: trueNodes, ifFalse: falseNodes, loopId: op.loopId });
-        } else if (state === ATTR_VALUE_DQ || state === ATTR_VALUE_SQ || state === ATTR_VALUE_UQ) {
-          // Conditional inside attribute value — fall back to expression.
-          attrExprs.push({ pos: attrValue.length, expr: '(' + op.condExpr + ' ? ' + chainToksAsExpr(op.ifTrue) + ' : ' + chainToksAsExpr(op.ifFalse) + ')' });
-        } else if (state === ATTRS && currentEl) {
-          // Conditional in attribute-name position.
-          currentEl.attrs.push({ kind: 'dynamic_name', nameExpr: '(' + op.condExpr + ' ? ' + chainToksAsExpr(op.ifTrue) + ' : ' + chainToksAsExpr(op.ifFalse) + ')' });
-        } else {
-          feedExpr('(' + op.condExpr + ' ? ' + chainToksAsExpr(op.ifTrue) + ' : ' + chainToksAsExpr(op.ifFalse) + ')', op.loopId);
-        }
-      }
-      else feedExpr(op.expr, op.loopId);
-    }
-    flushText();
-
-    return roots;
-  }
-
-  // Emit DOM API code from a virtual DOM tree produced by parseChainToVNodes.
-  // Handles the same options as convertNode: useProps, classList, events, etc.
-  function emitVNodes(vnodes, parentVar, lines, used, opts, loopInfoMap, loopIds, nsCtx) {
-    // Reserve identifiers from preserve tokens so makeVar doesn't collide.
-    const reservePreserveIdents = (nodes) => {
-      for (const n of nodes) {
-        if (n.kind === 'preserve' && n.text) {
-          const ids = n.text.match(/[A-Za-z_$][A-Za-z0-9_$]*/g);
-          if (ids) for (const id of ids) used.add(id);
-        }
-        if (n.kind === 'conditional') { reservePreserveIdents(n.ifTrue); reservePreserveIdents(n.ifFalse); }
-        if (n.kind === 'iteration') reservePreserveIdents(n.children);
-        if (n.kind === 'trycatch') { reservePreserveIdents(n.tryBody); reservePreserveIdents(n.catchBody); }
-        if (n.kind === 'switch') for (const br of n.branches) reservePreserveIdents(br.nodes);
-        if (n.kind === 'element') reservePreserveIdents(n.children);
-      }
-    };
-    reservePreserveIdents(vnodes);
-
-    // Group nodes by loopId to wrap loop segments.
-    const groups = [];
-    let curGroup = null;
-    for (const node of vnodes) {
-      const lid = node.loopId != null ? node.loopId : null;
-      if (!curGroup || curGroup.loopId !== lid) {
-        curGroup = { loopId: lid, nodes: [] };
-        groups.push(curGroup);
-      }
-      curGroup.nodes.push(node);
-    }
-
-    for (const group of groups) {
-      if (group.loopId != null && loopInfoMap && loopInfoMap[group.loopId] && !(loopIds && loopIds.has(group.loopId))) {
-        const info = loopInfoMap[group.loopId];
-        if (info.kind === 'do') {
-          lines.push('do {');
-        } else {
-          const header = info.kind === 'while'
-            ? 'while (' + info.headerSrc + ')'
-            : 'for (' + info.headerSrc + ')';
-          lines.push(header + ' {');
-        }
-        const loopUsed = new Set(used);
-        const loopLines = [];
-        const innerLoopIds = new Set(loopIds || []);
-        innerLoopIds.add(group.loopId);
-        for (const node of group.nodes) emitVNode(node, parentVar, loopLines, loopUsed, opts, loopInfoMap, innerLoopIds, nsCtx);
-        for (const l of loopLines) lines.push('  ' + l);
-        if (info.kind === 'do') {
-          lines.push('} while (' + info.headerSrc + ');');
-        } else {
-          lines.push('}');
-        }
-      } else {
-        for (const node of group.nodes) emitVNode(node, parentVar, lines, used, opts, loopInfoMap, loopIds, nsCtx);
-      }
-    }
-  }
-
-  function emitVNode(node, parentVar, lines, used, opts, loopInfoMap, loopIds, nsCtx) {
-    if (node.kind === 'text') {
-      const text = node.text;
-      if (!text) return;
-      if (opts.skipWhitespaceText && /^\s*$/.test(text)) return;
-      const v = makeVar('text', used);
-      lines.push('const ' + v + ' = document.createTextNode(' + jsStr(text).code + ');');
-      lines.push(parentVar + '.appendChild(' + v + ');');
-      return;
-    }
-
-    if (node.kind === 'comment') {
-      const v = makeVar('comment', used);
-      lines.push('const ' + v + ' = document.createComment(' + jsStr(node.text).code + ');');
-      lines.push(parentVar + '.appendChild(' + v + ');');
-      return;
-    }
-
-    if (node.kind === 'trycatch') {
-      const tryLines = [];
-      const catchLines = [];
-      const tryUsed = new Set(used);
-      const catchUsed = new Set(used);
-      emitVNodes(node.tryBody, parentVar, tryLines, tryUsed, opts, loopInfoMap, loopIds, nsCtx);
-      emitVNodes(node.catchBody, parentVar, catchLines, catchUsed, opts, loopInfoMap, loopIds, nsCtx);
-      lines.push('try {');
-      for (const l of tryLines) lines.push('  ' + l);
-      lines.push('} catch(' + (node.catchParam || 'e') + ') {');
-      for (const l of catchLines) lines.push('  ' + l);
-      lines.push('}');
-      return;
-    }
-
-    if (node.kind === 'switch') {
-      lines.push('switch (' + node.discExpr + ') {');
-      for (const br of node.branches) {
-        if (br.label === 'default') {
-          lines.push('  default:');
-        } else {
-          lines.push('  case ' + br.caseExpr + ':');
-        }
-        const caseLines = [];
-        const caseUsed = new Set(used);
-        emitVNodes(br.nodes, parentVar, caseLines, caseUsed, opts, loopInfoMap, loopIds, nsCtx);
-        // Wrap case body in { } block to scope const/let declarations.
-        lines.push('  {');
-        for (const l of caseLines) lines.push('    ' + l);
-        lines.push('    break;');
-        lines.push('  }');
-      }
-      lines.push('}');
-      return;
-    }
-
-    if (node.kind === 'preserve') {
-      lines.push(node.text);
-      return;
-    }
-
-    if (node.kind === 'iteration') {
-      const iterLines = [];
-      const iterUsed = new Set(used);
-      emitVNodes(node.children, parentVar, iterLines, iterUsed, opts, loopInfoMap, loopIds, nsCtx);
-      if (iterLines.length) {
-        lines.push(node.iterExpr + '.forEach(function(' + node.paramName + ') {');
-        for (const l of iterLines) lines.push('  ' + l);
-        lines.push('});');
-      }
-      return;
-    }
-
-    if (node.kind === 'conditional') {
-      const ifLines = [];
-      const elseLines = [];
-      const ifUsed = new Set(used);
-      const elseUsed = new Set(used);
-      emitVNodes(node.ifTrue, parentVar, ifLines, ifUsed, opts, loopInfoMap, loopIds, nsCtx);
-      emitVNodes(node.ifFalse, parentVar, elseLines, elseUsed, opts, loopInfoMap, loopIds, nsCtx);
-      if (ifLines.length || elseLines.length) {
-        lines.push('if (' + node.condExpr + ') {');
-        for (const l of ifLines) lines.push('  ' + l);
-        if (elseLines.length) {
-          lines.push('} else {');
-          for (const l of elseLines) lines.push('  ' + l);
-        }
-        lines.push('}');
-      }
-      return;
-    }
-
-    if (node.kind === 'expr_text') {
-      // Check if this expression is a call to a DOM-returning function
-      // (converted by the pre-pass). If so, appendChild directly.
-      const isDomCall = opts.domFunctions && opts.domFunctions.size > 0 &&
-        [...opts.domFunctions].some(fn => new RegExp('^' + fn.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*\\(').test(node.expr));
-      if (isDomCall) {
-        lines.push(parentVar + '.appendChild(' + node.expr + ');');
-      } else {
-        const v = makeVar('text', used);
-        lines.push('const ' + v + ' = document.createTextNode(' + node.expr + ');');
-        lines.push(parentVar + '.appendChild(' + v + ');');
-      }
-      return;
-    }
-
-    if (node.kind !== 'element') return;
-
-    const tag = node.tag;
-    const tagExpr = node.tagExpr || null;
-    const v = makeVar(tag || 'el', used);
-    const tagLower = tag ? tag.toLowerCase() : null;
-
-    let ns = nsCtx || null;
-    if (tagExpr) {
-      lines.push('const ' + v + ' = document.createElement(' + tagExpr + ');');
-    } else {
-      if (tagLower === 'svg') ns = SVG_NS;
-      else if (tagLower === 'math') ns = MATHML_NS;
-      else if (tagLower === 'foreignobject') ns = null;
-      else if (!ns && SVG_TAGS.has(tagLower)) ns = SVG_NS;
-
-      if (ns) {
-        lines.push('const ' + v + " = document.createElementNS('" + ns + "', '" + tag + "');");
-      } else {
-        lines.push('const ' + v + " = document.createElement('" + tagLower + "');");
-      }
-    }
-
-    // Emit attributes.
-    for (const attr of node.attrs) {
-      if (attr.kind === 'dynamic_name') {
-        // Conditional boolean attribute from expression in attr-name position.
-        const expr = attr.nameExpr;
-        const ternMatch = expr.match(/^\((.+?)\s*\?\s*"([^"]+)"\s*:\s*""\s*\)$/);
-        if (ternMatch) {
-          lines.push('if (' + ternMatch[1] + ') ' + v + ".setAttribute('" + ternMatch[2] + "', '');");
-        } else {
-          lines.push('{ const __a = ' + expr + '; if (__a) ' + v + ".setAttribute(__a, ''); }");
-        }
-        continue;
-      }
-
-      const name = attr.name;
-      const hasDynamic = attr.kind === 'dynamic_value' && attr.valueExprs.length > 0;
-
-      // Build the value expression.
-      let valCode;
-      if (hasDynamic) {
-        valCode = spliceExprs(attr.value, attr.valueExprs, false);
-      } else {
-        valCode = null;  // use attr.value directly via jsStr
-      }
-
-      // Event handler -> addEventListener.
-      const evMatch = /^on([a-z]+)$/i.exec(name);
-      if (evMatch && opts.eventsAsListeners) {
-        const evName = evMatch[1].toLowerCase();
-        const body = hasDynamic ? spliceExprs(attr.value, attr.valueExprs, true) : attr.value;
-        lines.push(v + ".addEventListener('" + evName + "', function (event) {");
-        for (const ln of body.split('\n')) lines.push('  ' + ln);
-        lines.push('});');
-        continue;
-      }
-
-      // Style -> style.setProperty per declaration.
-      if (name === 'style' && opts.splitStyle && !hasDynamic) {
-        const decls = parseStyleDecls(attr.value);
-        if (decls.length) {
-          for (const d of decls) {
-            lines.push(v + '.style.setProperty(' + jsStr(d.prop).code + ', ' + jsStr(d.value).code + (d.important ? ", 'important'" : '') + ');');
-          }
-          continue;
-        }
-      }
-
-      // Boolean attributes.
-      if (!ns && BOOLEAN_ATTRS.has(name.toLowerCase()) && !hasDynamic) {
-        lines.push(v + '.' + (ATTR_TO_PROP[name.toLowerCase()] || name) + ' = true;');
-        continue;
-      }
-
-      // Class attribute with classList.
-      if (name === 'class' && opts.useClassList && !ns) {
-        if (hasDynamic) {
-          lines.push(v + '.className = ' + valCode + ';');
-        } else {
-          const classes = attr.value.split(/\s+/).filter(Boolean);
-          if (classes.length === 0) continue;
-          if (classes.length === 1) lines.push(v + '.className = ' + jsStr(classes[0]).code + ';');
-          else lines.push(v + '.classList.add(' + classes.map(c => jsStr(c).code).join(', ') + ');');
-        }
-        continue;
-      }
-
-      // IDL property.
-      const idl = (opts.useProps && !ns) ? isIdlProp(name) : null;
-      if (hasDynamic) {
-        if (idl) lines.push(v + '.' + idl + ' = ' + valCode + ';');
-        else lines.push(v + ".setAttribute('" + name + "', " + valCode + ');');
-      } else {
-        const lit = jsStr(attr.value);
-        if (idl) lines.push(v + '.' + idl + ' = ' + lit.code + ';');
-        else lines.push(v + ".setAttribute('" + name + "', " + lit.code + ');');
-      }
-    }
-
-    // Recurse into children.
-    if (node.children.length) {
-      // textContent shortcut: if all children are text or expr_text (no
-      // nested elements), emit a single textContent assignment.
-      const canShortcut = opts.textContentShortcut &&
-        node.children.every(c => (c.kind === 'text' || c.kind === 'expr_text') && c.loopId == null) &&
-        !node.children.some(c => c.kind === 'expr_text' && opts.domFunctions && opts.domFunctions.size > 0 && [...opts.domFunctions].some(fn => new RegExp('^' + fn.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*\\(').test(c.expr)));
-      if (canShortcut) {
-        if (node.children.length === 1) {
-          const child = node.children[0];
-          if (child.kind === 'text') {
-            lines.push(v + '.textContent = ' + jsStr(child.text).code + ';');
-          } else {
-            // Use createTextNode for expression children: it coerces
-            // undefined/null to "undefined"/"null" strings, matching
-            // innerHTML's string concatenation behavior. textContent
-            // would set to empty string for undefined/null.
-            const tn = makeVar('text', used);
-            lines.push('const ' + tn + ' = document.createTextNode(' + child.expr + ');');
-            lines.push(v + '.appendChild(' + tn + ');');
-            lines.push(parentVar + '.appendChild(' + v + ');');
-            return;
-          }
-        } else {
-          let tmpl = '';
-          for (const child of node.children) {
-            if (child.kind === 'text') tmpl += tmplEncode(child.text);
-            else tmpl += '${' + child.expr + '}';
-          }
-          lines.push(v + '.textContent = `' + tmpl + '`;');
-        }
-        lines.push(parentVar + '.appendChild(' + v + ');');
-        return;
-      }
-      // Children inherit namespace; <foreignObject> reverts to HTML.
-      const childNs = (tagLower === 'foreignobject') ? null : ns;
-      emitVNodes(node.children, v, lines, used, opts, loopInfoMap, loopIds, childNs);
-    }
-
-    lines.push(parentVar + '.appendChild(' + v + ');');
-  }
-
-  // Escape a string for embedding inside a template literal.
-  const tmplEncode = (t) => t.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$\{/g, '\\${');
-
-  // Splice expressions into a static value string. When `raw` is true,
-  // expressions are inlined directly (for event handler bodies); otherwise
-  // the result is wrapped as a JS template literal.
-  function spliceExprs(value, valueExprs, raw) {
-    if (valueExprs.length === 1 && valueExprs[0].pos === 0 && value === '') {
-      return valueExprs[0].expr;
-    }
-    const sorted = valueExprs.slice().sort((a, b) => a.pos - b.pos);
-    let out = '';
-    let cursor = 0;
-    for (const { pos, expr } of sorted) {
-      out += raw ? value.slice(cursor, pos) : tmplEncode(value.slice(cursor, pos));
-      out += raw ? expr : '${' + expr + '}';
-      cursor = pos;
-    }
-    out += raw ? value.slice(cursor) : tmplEncode(value.slice(cursor));
-    return raw ? out : '`' + out + '`';
-  }
 
   // Produce the DOM-API code block for a single innerHTML/outerHTML
   // extraction using the runtime parent stack approach.
