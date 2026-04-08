@@ -46,11 +46,11 @@
     document.body.appendChild(s);
 
     // --- State ---
-    var folderFiles = null;      // { path: content } — original files
-    var outputFiles = {};         // { path: content } — generated output files
-    var outputForCurrent = '';    // output captured from htmldom.js convert()
-    var activeFile = null;        // { path, source: 'original'|'output' }
-    // Start with no folder open — editor shows default input.
+    // Start with the example as a single file.
+    var folderFiles = { 'example.html': defaultInput };
+    var outputFiles = {};
+    var outputForCurrent = '';
+    var activeFile = null;
 
     function langFor(name) {
       if (/\.html?$/i.test(name)) return 'html';
@@ -157,41 +157,57 @@
     }
 
     // --- Conversion ---
+    // Convert a single file and store results in outputFiles.
     function convertFile(path) {
       var content = folderFiles[path];
       if (/\.html?$/i.test(path)) {
         content = resolveScriptSrcs(content, path, folderFiles);
       }
-      // Feed to htmldom.js converter via the editor.
-      var prev = activeFile;
       editor.setValue(content);
-      // htmldom.js auto-converts on change, output captured in outputForCurrent.
-
       return new Promise(function(resolve) {
         setTimeout(function() {
           var result = outputForCurrent || '';
-          if (!result || result === '// (no nodes parsed)') {
-            resolve(false);
-            return;
-          }
-          // Parse output into separate files.
-          // The converter outputs "// === filename ===" separators for multi-file output.
+          if (!result || result === '// (no nodes parsed)') { resolve(); return; }
           var parts = result.split(/^\/\/ === (.+?) ===$/m);
           if (parts.length > 1) {
-            // parts[0] is before first separator (usually empty), then alternating name/content.
             for (var i = 1; i < parts.length; i += 2) {
               var name = parts[i].trim();
               var body = (parts[i + 1] || '').trim();
               if (body) outputFiles[name] = body;
             }
           } else {
-            // Single output — use the path with .converted extension.
-            var outName = path.replace(/\.[^.]+$/, '.safe.js');
-            outputFiles[outName] = result;
+            outputFiles[path.replace(/\.[^.]+$/, '.safe.js')] = result;
           }
-          resolve(true);
+          resolve();
         }, 150);
       });
+    }
+
+    // Convert all files in the folder sequentially.
+    var convertAllRunning = false;
+    async function convertAll() {
+      if (convertAllRunning) return;
+      convertAllRunning = true;
+      outputFiles = {};
+      // Save current editor state.
+      var savedFile = activeFile;
+      var savedContent = editor.getValue();
+      var paths = Object.keys(folderFiles).filter(function(p) {
+        return /\.(html?|js)$/i.test(p);
+      });
+      for (var i = 0; i < paths.length; i++) {
+        await convertFile(paths[i]);
+      }
+      // Restore editor to what the user was viewing.
+      if (savedFile && folderFiles[savedFile.path]) {
+        editor.setValue(savedFile.source === 'output' ? (outputFiles[savedFile.path] || '') : savedContent);
+        editor.updateOptions({ readOnly: savedFile.source === 'output' });
+      } else {
+        editor.setValue(savedContent);
+      }
+      renderSidebar();
+      document.getElementById('downloadAll').disabled = !Object.keys(outputFiles).length;
+      convertAllRunning = false;
     }
 
     // --- Event handlers ---
@@ -206,33 +222,14 @@
         folderFiles = await readFolder(dirHandle, '');
         outputFiles = {};
         document.getElementById('folderName').textContent = dirHandle.name;
-        document.getElementById('processAll').disabled = false;
         renderSidebar();
-        // Auto-select first HTML file.
+        // Convert all files, then show first HTML file.
+        await convertAll();
         var first = Object.keys(folderFiles).sort().find(function(n) { return /\.html?$/i.test(n); });
         if (first) selectFile(first, 'original');
       } catch (e) {
         if (e.name !== 'AbortError') console.error(e);
       }
-    });
-
-    document.getElementById('processAll').addEventListener('click', async function() {
-      if (!folderFiles) return;
-      this.disabled = true;
-      this.textContent = 'Converting...';
-      var paths = Object.keys(folderFiles).filter(function(p) {
-        return /\.(html?|js)$/i.test(p);
-      });
-      for (var i = 0; i < paths.length; i++) {
-        await convertFile(paths[i]);
-      }
-      renderSidebar();
-      document.getElementById('downloadAll').disabled = !Object.keys(outputFiles).length;
-      this.disabled = false;
-      this.textContent = 'Convert All';
-      // Show first output file.
-      var firstOut = Object.keys(outputFiles).sort()[0];
-      if (firstOut) selectFile(firstOut, 'output');
     });
 
     document.getElementById('downloadCurrent').addEventListener('click', function() {
@@ -265,12 +262,21 @@
       } catch (e) {}
     });
 
-    // Auto-detect language in paste mode.
+    // On editor change: update the source file and re-convert all.
+    var reconvertTimer = null;
     editor.onDidChangeModelContent(function() {
-      if (!folderFiles) {
-        var text = editor.getValue();
-        monaco.editor.setModelLanguage(editor.getModel(), /^\s*</.test(text) ? 'html' : 'javascript');
+      // Update the source file if editing an original.
+      if (activeFile && activeFile.source === 'original' && folderFiles[activeFile.path] !== undefined) {
+        folderFiles[activeFile.path] = editor.getValue();
       }
+      // Debounce re-conversion.
+      clearTimeout(reconvertTimer);
+      reconvertTimer = setTimeout(function() { convertAll(); }, 500);
+    });
+
+    // Initial conversion of the example file.
+    convertAll().then(function() {
+      selectFile('example.html', 'original');
     });
   });
 })();
