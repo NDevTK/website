@@ -2496,6 +2496,107 @@ function render() {
     ].join('\n')
   });
 
+  // 51. Todo app: shared state, loop with counter, conditional class
+  checkEquiv('todo app', {
+    'index.html': '<html><body><div id="app"></div><script src="state.js"></script><script src="render.js"></script></body></html>',
+    'state.js': 'var todos = [{text:"Buy milk",done:true},{text:"Write code",done:false},{text:"Ship it",done:false}];',
+    'render.js': [
+      'var html = "<h1>Todos</h1><ul>";',
+      'var doneCount = 0;',
+      'for (var i = 0; i < todos.length; i++) {',
+      '  var cls = todos[i].done ? "done" : "";',
+      '  html += "<li class=\\"" + cls + "\\">" + todos[i].text + "</li>";',
+      '  if (todos[i].done) doneCount++;',
+      '}',
+      'html += "</ul><p>" + doneCount + "/" + todos.length + " done</p>";',
+      'document.getElementById("app").innerHTML = html;',
+    ].join('\n')
+  });
+
+  // 52. Nested categories with inner loops
+  checkEquiv('nested categories', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var cats = [{name:"Fruit",items:["Apple","Banana"]},{name:"Veg",items:["Carrot"]}];',
+      'var html = "";',
+      'for (var c = 0; c < cats.length; c++) {',
+      '  html += "<div class=\\"cat\\"><h2>" + cats[c].name + "</h2><ul>";',
+      '  for (var j = 0; j < cats[c].items.length; j++) {',
+      '    html += "<li>" + cats[c].items[j] + "</li>";',
+      '  }',
+      '  html += "</ul></div>";',
+      '}',
+      'document.getElementById("out").innerHTML = html;',
+    ].join('\n')
+  });
+
+  // 53. Loop with break
+  checkEquiv('loop break', {
+    'index.html': '<html><body><ul id="out"></ul><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var items = ["a","b","STOP","c","d"];',
+      'var html = "";',
+      'for (var i = 0; i < items.length; i++) {',
+      '  if (items[i] === "STOP") break;',
+      '  html += "<li>" + items[i] + "</li>";',
+      '}',
+      'document.getElementById("out").innerHTML = html;',
+    ].join('\n')
+  });
+
+  // 54. Loop with continue
+  checkEquiv('loop continue', {
+    'index.html': '<html><body><ul id="out"></ul><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var items = [1,2,3,4,5,6];',
+      'var html = "";',
+      'for (var i = 0; i < items.length; i++) {',
+      '  if (items[i] % 2 === 0) continue;',
+      '  html += "<li>" + items[i] + "</li>";',
+      '}',
+      'document.getElementById("out").innerHTML = html;',
+    ].join('\n')
+  });
+
+  // 55. HTML comment preserved
+  checkEquiv('html comment', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("out").innerHTML = "<p>before</p><!-- comment --><p>after</p>";'
+  });
+
+  // 56. Form with labels and inputs
+  checkEquiv('form elements', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("out").innerHTML = "<form><label for=\\"e\\">Email</label><input type=\\"email\\" id=\\"e\\"><button type=\\"submit\\">Go</button></form>";'
+  });
+
+  // 57. Four-file app with shared config
+  checkEquiv('four file app', {
+    'index.html': '<html><body><div id="h"></div><div id="b"></div><script src="cfg.js"></script><script src="util.js"></script><script src="head.js"></script><script src="main.js"></script></body></html>',
+    'cfg.js': 'var APP = {title: "MyApp", version: "2.0"};',
+    'util.js': 'function badge(t) { return "<span class=\\"badge\\">" + t + "</span>"; }',
+    'head.js': 'document.getElementById("h").innerHTML = "<h1>" + APP.title + " " + badge("v" + APP.version) + "</h1>";',
+    'main.js': 'document.getElementById("b").innerHTML = "<p>Welcome to " + APP.title + "</p>";'
+  });
+
+  // 58. innerHTML read from another element
+  checkEquiv('innerHTML read', {
+    'index.html': '<html><body><div id="a"></div><div id="b"></div><script src="app.js"></script></body></html>',
+    'app.js': 'document.getElementById("a").innerHTML = "<b>X</b>";\ndocument.getElementById("b").innerHTML = document.getElementById("a").innerHTML;'
+  });
+
+  // 59. undefined/null/NaN in concat
+  checkEquiv('undefined in concat', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'var x; document.getElementById("out").innerHTML = "<p>" + x + "</p>";'
+  });
+
+  // 60. Computed href with query params
+  checkEquiv('computed href params', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'var page = 2; var q = "test"; document.getElementById("out").innerHTML = "<a href=\\"search?q=" + q + "&page=" + page + "\\">Next</a>";'
+  });
+
   console.log(`  (${pass + fail - before} cases)`);
 })();
 

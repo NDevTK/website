@@ -3100,6 +3100,47 @@
                 elseStart = ifEnd + 1; elseEnd = k;
               }
             }
+            // If the if-body or else-body contains break/continue and
+            // we're inside a loop building HTML, the entire if-statement
+            // must be preserved as runtime code — break/continue affect
+            // which iterations add to the HTML.
+            if (trackBuildVar && loopStack.length > 0 && (trackBuildVarDepth < 0 || funcDepth() === trackBuildVarDepth)) {
+              let hasFlowControl = false;
+              const scanRange = (start, end) => {
+                let sd = 0;
+                for (let s = start; s < end; s++) {
+                  // Don't look inside nested functions.
+                  if (tokens[s].type === 'other' && tokens[s].text === 'function') return;
+                  if (tokens[s].type === 'open' && tokens[s].char === '{') sd++;
+                  if (tokens[s].type === 'close' && tokens[s].char === '}') sd--;
+                  if (tokens[s].type === 'other' && (tokens[s].text === 'break' || tokens[s].text === 'continue')) {
+                    hasFlowControl = true;
+                  }
+                }
+              };
+              scanRange(j + 1, ifEnd);
+              if (elseStart > 0) scanRange(elseStart, elseEnd);
+              if (hasFlowControl) {
+                // Preserve the entire if/else statement.
+                const stmtEnd = elseEnd > 0 ? elseEnd : ifEnd;
+                const first = tokens[i];
+                const last = tokens[stmtEnd - 1];
+                if (first && last && first._src) {
+                  const stmtSrc = first._src.slice(first.start, last.end);
+                  for (const bv of trackBuildVar) {
+                    const bCur = resolve(bv);
+                    if (bCur && bCur.kind === 'chain') {
+                      const loopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
+                      const preserveTok = { type: 'preserve', text: stmtSrc };
+                      if (loopId !== null) preserveTok.loopId = loopId;
+                      assignName(bv, chainBinding([...bCur.toks, SYNTH_PLUS, preserveTok]));
+                    }
+                  }
+                }
+                i = stmtEnd - 1;
+                continue;
+              }
+            }
             if (concrete === true) {
               // Walk only if-body; skip else chain.
               walkRange(j + 1, ifEnd);
