@@ -5897,7 +5897,7 @@
     return out;
   }
 
-  function convertHtmlMarkup(htmlContent, htmlPath, reservedIdents) {
+  function convertHtmlMarkup(htmlContent, htmlPath, reservedIdents, bodyWillBeReplaced) {
     // Derive filenames from source path.
     let baseName = htmlPath;
     const slashIdx = baseName.lastIndexOf('/');
@@ -5934,8 +5934,12 @@
     }
 
     // Walk tokens and process each opening tag.
+    // Default to true if there's no explicit <body> tag (content is implicitly body).
+    let insideBody = !htmlTokens.some(function(t) { return t.type === 'openTag' && t.tag === 'body'; });
     for (let ti = 0; ti < htmlTokens.length; ti++) {
       const tok = htmlTokens[ti];
+      if (tok.type === 'openTag' && tok.tag === 'body') insideBody = true;
+      if (tok.type === 'closeTag' && tok.tag === 'body') insideBody = false;
       if (tok.type !== 'openTag') continue;
 
       // Handle <script> without src — extract to external file.
@@ -5990,6 +5994,10 @@
         }
         continue;
       }
+
+      // Skip handler extraction for body elements that will be wiped
+      // by a script replacing document.body.innerHTML.
+      if (bodyWillBeReplaced && insideBody && tok.tag !== 'script' && tok.tag !== 'style') continue;
 
       // Extract unsafe attributes from this element.
       const events = [];
@@ -6139,7 +6147,47 @@
           if (t.type === 'other' && IDENT_RE.test(t.text)) pageIdents.add(t.text);
         }
       }
-      const markup = convertHtmlMarkup(files[page], page, pageIdents);
+      // Check if any script on this page replaces document.body.innerHTML.
+      // If so, body elements will be wiped — don't extract handlers from them.
+      let bodyWillBeReplaced = false;
+      for (const sp of pageScripts) {
+        const content = files[sp] || '';
+        const toks2 = tokenize(content.trim());
+        for (let ti = 1; ti < toks2.length; ti++) {
+          if (toks2[ti].type === 'sep' && toks2[ti].char === '=' &&
+              toks2[ti - 1].type === 'other' && toks2[ti - 1].text === 'document.body.innerHTML') {
+            bodyWillBeReplaced = true;
+            break;
+          }
+        }
+        if (bodyWillBeReplaced) break;
+      }
+      // Also check inline scripts.
+      if (!bodyWillBeReplaced) {
+        const htmlToks = tokenizeHtml(files[page]);
+        for (const ht of htmlToks) {
+          if (ht.type === 'openTag' && ht.tag === 'script' && !ht.attrs.some(function(a) { return a.name === 'src'; })) {
+            // Find the script body.
+            let body = '';
+            for (let si = htmlToks.indexOf(ht) + 1; si < htmlToks.length; si++) {
+              if (htmlToks[si].type === 'closeTag' && htmlToks[si].tag === 'script') break;
+              if (htmlToks[si].type === 'text') body += htmlToks[si].text;
+            }
+            if (body.trim()) {
+              const toks3 = tokenize(body.trim());
+              for (let ti = 1; ti < toks3.length; ti++) {
+                if (toks3[ti].type === 'sep' && toks3[ti].char === '=' &&
+                    toks3[ti - 1].type === 'other' && toks3[ti - 1].text === 'document.body.innerHTML') {
+                  bodyWillBeReplaced = true;
+                  break;
+                }
+              }
+            }
+          }
+          if (bodyWillBeReplaced) break;
+        }
+      }
+      const markup = convertHtmlMarkup(files[page], page, pageIdents, bodyWillBeReplaced);
       const dir = page.indexOf('/') >= 0 ? page.slice(0, page.lastIndexOf('/') + 1) : '';
       // Only output HTML if it actually changed.
       if (markup.html !== files[page]) output[page] = markup.html;
