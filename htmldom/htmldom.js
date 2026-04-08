@@ -6147,41 +6147,44 @@
           if (t.type === 'other' && IDENT_RE.test(t.text)) pageIdents.add(t.text);
         }
       }
-      // Check if any script on this page replaces document.body.innerHTML.
-      // If so, body elements will be wiped — don't extract handlers from them.
+      // Check if any script replaces body content via any HTML sink:
+      // document.body.innerHTML =, document.body.outerHTML =,
+      // document.write(), document.writeln().
+      // If so, body elements will be wiped — don't extract handlers.
       let bodyWillBeReplaced = false;
-      for (const sp of pageScripts) {
-        const content = files[sp] || '';
-        const toks2 = tokenize(content.trim());
-        for (let ti = 1; ti < toks2.length; ti++) {
-          if (toks2[ti].type === 'sep' && toks2[ti].char === '=' &&
-              toks2[ti - 1].type === 'other' && toks2[ti - 1].text === 'document.body.innerHTML') {
-            bodyWillBeReplaced = true;
-            break;
+      function checkTokensForBodyReplace(toks2) {
+        for (let ti = 0; ti < toks2.length; ti++) {
+          var t = toks2[ti];
+          // document.body.innerHTML = or document.body.outerHTML =
+          if (ti > 0 && t.type === 'sep' && t.char === '=' &&
+              toks2[ti - 1].type === 'other' &&
+              (toks2[ti - 1].text === 'document.body.innerHTML' || toks2[ti - 1].text === 'document.body.outerHTML')) {
+            return true;
+          }
+          // document.write() or document.writeln()
+          if (t.type === 'other' && (t.text === 'document.write' || t.text === 'document.writeln') &&
+              ti + 1 < toks2.length && toks2[ti + 1].type === 'open' && toks2[ti + 1].char === '(') {
+            return true;
           }
         }
-        if (bodyWillBeReplaced) break;
+        return false;
+      }
+      for (const sp of pageScripts) {
+        const content = files[sp] || '';
+        if (checkTokensForBodyReplace(tokenize(content.trim()))) { bodyWillBeReplaced = true; break; }
       }
       // Also check inline scripts.
       if (!bodyWillBeReplaced) {
         const htmlToks = tokenizeHtml(files[page]);
         for (const ht of htmlToks) {
           if (ht.type === 'openTag' && ht.tag === 'script' && !ht.attrs.some(function(a) { return a.name === 'src'; })) {
-            // Find the script body.
             let body = '';
             for (let si = htmlToks.indexOf(ht) + 1; si < htmlToks.length; si++) {
               if (htmlToks[si].type === 'closeTag' && htmlToks[si].tag === 'script') break;
               if (htmlToks[si].type === 'text') body += htmlToks[si].text;
             }
-            if (body.trim()) {
-              const toks3 = tokenize(body.trim());
-              for (let ti = 1; ti < toks3.length; ti++) {
-                if (toks3[ti].type === 'sep' && toks3[ti].char === '=' &&
-                    toks3[ti - 1].type === 'other' && toks3[ti - 1].text === 'document.body.innerHTML') {
-                  bodyWillBeReplaced = true;
-                  break;
-                }
-              }
+            if (body.trim() && checkTokensForBodyReplace(tokenize(body.trim()))) {
+              bodyWillBeReplaced = true;
             }
           }
           if (bodyWillBeReplaced) break;
