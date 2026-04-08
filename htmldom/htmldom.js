@@ -242,10 +242,23 @@
     // Determine build variables from the RHS (single ident or concat of idents).
     const rhsToks = [];
     for (let j = assign.rhsStart; j < assign.rhsEnd; j++) rhsToks.push(tokens[j]);
-    // Collect all identifiers in the RHS that could be build variables.
+    // Collect identifiers in the RHS that are true build variables: they
+    // were built up via `var x = "..."; x += "...";` patterns, not just
+    // simple references. A build variable must have a `+=` assignment
+    // somewhere in the source preceding the innerHTML site.
     const buildVars = [];
     for (const rt of rhsToks) {
-      if (rt.type === 'other' && IDENT_RE.test(rt.text)) buildVars.push(rt.text);
+      if (rt.type !== 'other' || !IDENT_RE.test(rt.text)) continue;
+      // Check: is this identifier assigned via += anywhere before the innerHTML?
+      let isBuildVar = false;
+      for (let bi = 0; bi < assign.eqIdx; bi++) {
+        if (tokens[bi].type === 'other' && tokens[bi].text === rt.text &&
+            bi + 1 < tokens.length && tokens[bi + 1].type === 'sep' && tokens[bi + 1].char === '+=') {
+          isBuildVar = true;
+          break;
+        }
+      }
+      if (isBuildVar) buildVars.push(rt.text);
     }
     const buildVar = buildVars.length === 1 ? buildVars[0] : null;
     const r = resolveIdentifiers(tokens, assign.rhsStart, assign.rhsEnd, buildVars.length ? buildVars : null);
@@ -2174,10 +2187,26 @@
       }
       if (t.type === 'regex') return { bind: chainBinding([exprRef(t.text)]), next: k + 1 };
       if (t.type === 'open' && t.char === '(') {
+        // First try the normal concat parse.
         const r = readConcatExpr(k + 1, stop, { sep: [], close: [')'] });
         if (!r) return null;
         const rp = tks[r.next];
         if (!rp || rp.type !== 'close' || rp.char !== ')') return null;
+        // If the result is a multi-operand concat chain (has plus tokens)
+        // AND the parenthesized expression contains no string literals,
+        // this is likely arithmetic (r * 3 + c), not string concatenation.
+        // Return it as a single opaque expression instead.
+        if (r.toks.some(rt => rt.type === 'plus')) {
+          let hasStr = false;
+          for (let pi = k + 1; pi < r.next; pi++) {
+            if (tks[pi].type === 'str' || tks[pi].type === 'tmpl') { hasStr = true; break; }
+          }
+          if (!hasStr) {
+            const first = tks[k];
+            const last = tks[r.next];
+            return { bind: chainBinding([exprRef(first._src.slice(first.start, last.end))]), next: r.next + 1 };
+          }
+        }
         return { bind: chainBinding(r.toks), next: r.next + 1 };
       }
       if (t.type === 'open' && t.char === '[') {

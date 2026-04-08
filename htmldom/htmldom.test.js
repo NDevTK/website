@@ -1984,8 +1984,12 @@ function render() {
       failures.push({ name: name + ' (converted threw)', input: e.message, want: origDOM, got: 'ERROR: ' + e.message });
       return;
     }
-    // Normalize style differences (jsdom serializes setProperty differently from inline).
-    const norm = s => s.replace(/style="([^"]*)"/g, (m, v) => 'style="' + v.replace(/;\s*$/, '').replace(/:\s+/g, ':') + '"');
+    // Normalize differences between innerHTML parsing and DOM API:
+    // - Style serialization (jsdom adds space/semicolon for setProperty)
+    // - tbody auto-insertion (innerHTML inserts tbody, appendChild doesn't)
+    const norm = s => s
+      .replace(/style="([^"]*)"/g, (m, v) => 'style="' + v.replace(/;\s*$/, '').replace(/:\s+/g, ':') + '"')
+      .replace(/<\/?tbody>/g, '');
     if (norm(origDOM) === norm(convDOM)) {
       pass++;
     } else {
@@ -2167,6 +2171,131 @@ function render() {
       'var p = document.createElement("p");',
       'p.textContent = "DOM API";',
       'document.getElementById("b").appendChild(p);'
+    ].join('\n')
+  });
+
+  // 21. Conditional variable (if-else with unknown condition)
+  checkEquiv('conditional var unknown cond', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var type = document.body.dataset.type;',
+      'var label;',
+      'if (type === "a") label = "Alpha";',
+      'else if (type === "b") label = "Beta";',
+      'else label = "Other";',
+      'document.getElementById("out").innerHTML = "<span>" + label + "</span>";'
+    ].join('\n')
+  });
+
+  // 22. Ternary in loop creating class names
+  checkEquiv('ternary in loop', {
+    'index.html': '<html><body><ul id="list"></ul><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var html = "";',
+      'for (var i = 0; i < 5; i++) {',
+      '  html += "<li class=\\"" + (i % 2 === 0 ? "even" : "odd") + "\\">" + i + "</li>";',
+      '}',
+      'document.getElementById("list").innerHTML = html;'
+    ].join('\n')
+  });
+
+  // 23. Counter, flag, and accumulator all in same loop
+  checkEquiv('counter flag accumulator', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var html = "";',
+      'var found = false;',
+      'var count = 0;',
+      'var items = ["x", "target", "y"];',
+      'for (var i = 0; i < items.length; i++) {',
+      '  if (items[i] === "target") found = true;',
+      '  html += "<li>" + items[i] + "</li>";',
+      '  count++;',
+      '}',
+      'html += "<p>Found: " + found + ", Count: " + count + "</p>";',
+      'document.getElementById("out").innerHTML = html;'
+    ].join('\n')
+  });
+
+  // 24. Nested loops with index math
+  checkEquiv('nested loops with math', {
+    'index.html': '<html><body><div id="grid"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var html = "<table>";',
+      'for (var r = 0; r < 3; r++) {',
+      '  html += "<tr>";',
+      '  for (var c = 0; c < 3; c++) {',
+      '    html += "<td>" + (r * 3 + c) + "</td>";',
+      '  }',
+      '  html += "</tr>";',
+      '}',
+      'html += "</table>";',
+      'document.getElementById("grid").innerHTML = html;'
+    ].join('\n')
+  });
+
+  // 25. String method chain
+  checkEquiv('string method', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'var name = "alice";\ndocument.getElementById("out").innerHTML = "<b>" + name.toUpperCase() + "</b>";'
+  });
+
+  // 26. Multiple separate innerHTML assignments on different elements
+  checkEquiv('three separate targets', {
+    'index.html': '<html><body><div id="a"></div><div id="b"></div><div id="c"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'document.getElementById("a").innerHTML = "<h1>Title</h1>";',
+      'document.getElementById("b").innerHTML = "<p>Body</p>";',
+      'document.getElementById("c").innerHTML = "<footer>End</footer>";'
+    ].join('\n')
+  });
+
+  // 27. Build var with early return pattern (no actual return, but conditional append)
+  checkEquiv('conditional append', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var html = "<div>";',
+      'var showExtra = true;',
+      'html += "<p>Always</p>";',
+      'if (showExtra) {',
+      '  html += "<p>Extra</p>";',
+      '}',
+      'html += "</div>";',
+      'document.getElementById("out").innerHTML = html;'
+    ].join('\n')
+  });
+
+  // 28. Template literal with complex expressions
+  checkEquiv('template literal complex', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': 'var x = 5;\ndocument.getElementById("out").innerHTML = `<p>${x > 3 ? "big" : "small"}: ${x * 2}</p>`;'
+  });
+
+  // 29. Cross-file: data file, util file, render file
+  checkEquiv('three file chain', {
+    'index.html': '<html><body><div id="app"></div><script src="data.js"></script><script src="util.js"></script><script src="render.js"></script></body></html>',
+    'data.js': 'var users = [{name:"Alice"},{name:"Bob"}];',
+    'util.js': 'function userRow(u) { return "<tr><td>" + u.name + "</td></tr>"; }',
+    'render.js': [
+      'var html = "<table>";',
+      'for (var i = 0; i < users.length; i++) {',
+      '  html += userRow(users[i]);',
+      '}',
+      'html += "</table>";',
+      'document.getElementById("app").innerHTML = html;'
+    ].join('\n')
+  });
+
+  // 30. innerHTML with dynamic attribute values
+  checkEquiv('dynamic attributes', {
+    'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+    'app.js': [
+      'var items = [{id:1,name:"A"},{id:2,name:"B"}];',
+      'var html = "";',
+      'for (var i = 0; i < items.length; i++) {',
+      '  html += "<div data-id=\\"" + items[i].id + "\\">" + items[i].name + "</div>";',
+      '}',
+      'document.getElementById("out").innerHTML = html;'
     ].join('\n')
   });
 
