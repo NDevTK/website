@@ -33,12 +33,9 @@
       automaticLayout: true,
     });
 
-    // Expose for htmldom.js (it reads _monacoIn / _monacoOut).
+    // Expose for htmldom.js paste-mode auto-convert.
     window._monacoIn = editor;
-    window._monacoOut = {
-      setValue: function(v) { outputForCurrent = v; },
-      getValue: function() { return outputForCurrent; }
-    };
+    window._monacoOut = { setValue: function() {}, getValue: function() { return ''; } };
 
     // Load htmldom.js.
     var s = document.createElement('script');
@@ -49,7 +46,7 @@
     // Start with the example as a single file.
     var folderFiles = { 'example.html': defaultInput };
     var outputFiles = {};
-    var outputForCurrent = '';
+
     var activeFile = null;
 
     function langFor(name) {
@@ -79,18 +76,7 @@
       return files;
     }
 
-    function resolveScriptSrcs(html, htmlPath, files) {
-      var dir = htmlPath.indexOf('/') >= 0 ? htmlPath.slice(0, htmlPath.lastIndexOf('/')) : '';
-      return html.replace(/<script\s+src="([^"]+)"[^>]*><\/script>/gi, function(match, src) {
-        var parts = (dir ? dir + '/' + src : src).split('/');
-        var norm = [];
-        for (var i = 0; i < parts.length; i++) {
-          if (parts[i] === '..') norm.pop();
-          else if (parts[i] !== '.') norm.push(parts[i]);
-        }
-        return files[norm.join('/')] ? '<script>\n' + files[norm.join('/')] + '\n<\/script>' : match;
-      });
-    }
+    // resolveScriptSrcs and convertPage are in htmldom.js — use the exported API.
 
     // --- Sidebar rendering ---
     function renderSidebar() {
@@ -166,62 +152,13 @@
     }
 
     // --- Conversion ---
-    // Convert a single HTML page: resolve its script/CSS references,
-    // feed through the converter, store output files namespaced to the page.
-    function convertHtmlPage(htmlPath) {
-      var content = resolveScriptSrcs(folderFiles[htmlPath], htmlPath, folderFiles);
-      editor.setValue(content);
-      return new Promise(function(resolve) {
-        setTimeout(function() {
-          var result = outputForCurrent || '';
-          if (!result || result === '// (no nodes parsed)') { resolve(); return; }
-          // Namespace output files by the HTML page's directory.
-          var dir = htmlPath.indexOf('/') >= 0 ? htmlPath.slice(0, htmlPath.lastIndexOf('/') + 1) : '';
-          var baseName = htmlPath.replace(/^.*\//, '').replace(/\.[^.]+$/, '');
-          var parts = result.split(/^\/\/ === (.+?) ===$/m);
-          if (parts.length > 1) {
-            for (var i = 1; i < parts.length; i += 2) {
-              var name = parts[i].trim();
-              var body = (parts[i + 1] || '').trim();
-              if (!body) continue;
-              // Prefix output filenames with the page's directory.
-              // safe-handlers.js becomes pageName.safe.js to avoid collisions.
-              if (name === 'safe-handlers.js') {
-                outputFiles[dir + baseName + '.safe.js'] = body;
-              } else {
-                outputFiles[dir + name] = body;
-              }
-            }
-          } else {
-            outputFiles[dir + baseName + '.safe.js'] = result;
-          }
-          resolve();
-        }, 150);
-      });
-    }
-
-    // Convert all HTML pages in the folder. Each page is an independent
-    // conversion unit with its own JS/CSS scope — no cross-page contamination.
+    // Use the project-level API from htmldom.js.
     var convertAllRunning = false;
-    async function convertAll() {
-      if (convertAllRunning) return;
+    function convertAll() {
+      if (convertAllRunning || !folderFiles) return;
       convertAllRunning = true;
-      outputFiles = {};
-      var savedFile = activeFile;
-      var savedContent = editor.getValue();
-      // Only process HTML files as entry points.
-      var htmlPages = Object.keys(folderFiles).filter(function(p) {
-        return /\.html?$/i.test(p);
-      }).sort();
-      for (var i = 0; i < htmlPages.length; i++) {
-        await convertHtmlPage(htmlPages[i]);
-      }
-      if (savedFile && folderFiles[savedFile.path]) {
-        editor.setValue(savedFile.source === 'output' ? (outputFiles[savedFile.path] || '') : savedContent);
-        editor.updateOptions({ readOnly: savedFile.source === 'output' });
-      } else {
-        editor.setValue(savedContent);
-      }
+      // __convertProject processes each HTML page independently.
+      outputFiles = globalThis.__convertProject ? globalThis.__convertProject(folderFiles) : {};
       renderSidebar();
       document.getElementById('downloadAll').disabled = !Object.keys(outputFiles).length;
       convertAllRunning = false;
@@ -240,8 +177,7 @@
         outputFiles = {};
         document.getElementById('folderName').textContent = dirHandle.name;
         renderSidebar();
-        // Convert all files, then show first HTML file.
-        await convertAll();
+        convertAll();
         var first = Object.keys(folderFiles).sort().find(function(n) { return /\.html?$/i.test(n); });
         if (first) selectFile(first, 'original');
       } catch (e) {
@@ -292,8 +228,13 @@
     });
 
     // Initial conversion of the example file.
-    convertAll().then(function() {
-      selectFile('example.html', 'original');
-    });
+    // Wait for htmldom.js to load before converting.
+    var initTimer = setInterval(function() {
+      if (globalThis.__convertProject) {
+        clearInterval(initTimer);
+        convertAll();
+        selectFile('example.html', 'original');
+      }
+    }, 50);
   });
 })();
