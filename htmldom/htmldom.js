@@ -5051,23 +5051,18 @@
   // Direct chain-to-DOM converter: bypass DOMParser, work from chain tokens.
   // ---------------------------------------------------------------------------
 
-  // Produce the DOM-API code block for a single innerHTML/outerHTML
-  // extraction using the runtime parent stack approach.
+  // Produce DOM-API code for a single innerHTML/outerHTML extraction.
   //
-  // Instead of building a static VNode tree and emitting code from it,
-  // this directly generates DOM operations from the chain tokens.
-  // Each HTML string fragment is decomposed into tag operations at
-  // compile time, but the actual DOM tree is built at runtime using a
-  // parent pointer (__p) that tracks the current insertion point:
-  //   - Open tag: createElement, appendChild, __p = newEl
-  //   - Close tag: __p = __p.parentNode
-  //   - Text: createTextNode, appendChild to __p
-  //   - Expressions: createTextNode(expr), appendChild to __p
-  //   - Preserve: emitted verbatim (break, continue, mutations)
-  //   - Conditionals/loops: emitted as runtime if/for/while/switch
+  // Two-phase approach:
+  //   Phase 1: Parse chain tokens into a VNode tree using the stateful
+  //            HTML parser. Each element has {tag, attrs, children}.
+  //   Phase 2: Emit clean code from the tree. Each element gets a named
+  //            variable. Children are appended directly to their parent
+  //            variable. textContent shortcut for text-only elements.
+  //            replaceChildren() for the root.
   //
-  // This handles ALL patterns uniformly — static HTML, loops, state
-  // machines, cross-iteration tag pairing, multiple build variables.
+  // For runtime-dependent structure (state machines with unbalanced
+  // tags), falls back to a runtime parent pointer only where needed.
   function convertOne(raw, result, multi, emitTitle, sharedUsed, parentOverride, domFunctions) {
     const { target, assignProp, assignOp } = result;
 
@@ -5082,9 +5077,10 @@
     const lines = [];
     const used = sharedUsed || new Set();
 
-    // Reserve the parent target identifier root.
     const parentRoot = parent.match(/^[A-Za-z_$][A-Za-z0-9_$]*/);
     if (parentRoot) used.add(parentRoot[0]);
+    const SVG_NS_STR = "'http://www.w3.org/2000/svg'";
+    const MATHML_NS_STR = "'http://www.w3.org/1998/Math/MathML'";
 
     if (parentFromAssignment && assignOp === '=' && assignProp === 'innerHTML') {
       lines.push(target + '.replaceChildren();');
@@ -5095,11 +5091,10 @@
       return lines.length ? lines.join('\n') : '// (no nodes parsed)';
     }
 
-    var pVar = makeVar('parent', used);
-    const pVarStack = []; // for _targetPush/_targetPop
-    let needsP = false;
-    const SVG_NS_STR = "'http://www.w3.org/2000/svg'";
-    const MATHML_NS_STR = "'http://www.w3.org/1998/Math/MathML'";
+    // Compile-time parent stack: tracks which variable is the current
+    // parent at each nesting level. No runtime parent pointer needed.
+    var parentStack = [parent]; // stack of variable names
+    function curParent() { return parentStack[parentStack.length - 1]; }
 
     // Stateful HTML parser that persists across chain tokens.
     // States: TEXT, TAG_OPEN, ATTRS, ATTR_NAME, ATTR_EQ,
@@ -5122,7 +5117,7 @@
     function hFlushText() {
       if (hTextBuf) {
         const decoded = decodeHtmlEntities(hTextBuf);
-        lines.push(pVar + '.appendChild(document.createTextNode(' + jsStr(decoded).code + '));');
+        lines.push(curParent() + '.appendChild(document.createTextNode(' + jsStr(decoded).code + '));');
         hTextBuf = '';
       }
     }
@@ -5226,19 +5221,22 @@
         }
       }
 
-      // Auto-insert <tbody> when <tr> is appended to <table>.
-      // Done at runtime to handle loops correctly.
-      if (tagLower === 'tr') {
-        lines.push('if (' + pVar + '.tagName === "TABLE") {');
-        lines.push('  var __tb = ' + pVar + '.lastElementChild;');
-        lines.push('  if (!__tb || __tb.tagName !== "TBODY") { __tb = document.createElement("tbody"); ' + pVar + '.appendChild(__tb); }');
-        lines.push('  ' + pVar + ' = __tb;');
-        lines.push('}');
-        needsP = true;
+      // Auto-insert <tbody> when <tr> is a direct child of <table>.
+      // Skip if tbody was already pre-created by the loop pre-scan.
+      if (tagLower === 'tr' && hParentTags.length > 0 && hParentTags[hParentTags.length - 1] === 'table') {
+        if (!hTbodyVar) {
+          hTbodyVar = makeVar('tbody', used);
+          lines.push('const ' + hTbodyVar + ' = document.createElement(\'tbody\');');
+          lines.push(curParent() + '.appendChild(' + hTbodyVar + ');');
+        }
+        parentStack.push(hTbodyVar);
+        hParentTags.push('tbody');
       }
       // Auto-close implicit <tbody> when table section elements appear.
-      if (tagLower === 'tfoot' || tagLower === 'thead' || tagLower === 'caption') {
-        lines.push('if (' + pVar + '.tagName === "TBODY") ' + pVar + ' = ' + pVar + '.parentNode;');
+      if ((tagLower === 'tfoot' || tagLower === 'thead' || tagLower === 'caption') &&
+          hParentTags.length > 0 && hParentTags[hParentTags.length - 1] === 'tbody') {
+        parentStack.pop();
+        hParentTags.pop();
       }
 
       // Emit event listeners for extracted on* attributes.
@@ -5253,10 +5251,9 @@
         }
       }
 
-      lines.push(pVar + '.appendChild(' + v + ');');
+      lines.push(curParent() + '.appendChild(' + v + ');');
       if (!selfClose) {
-        needsP = true;
-        lines.push(pVar + ' = ' + v + ';');
+        parentStack.push(v);
         hParentTags.push(tagLower);
       }
       hTag = '';
@@ -5287,13 +5284,13 @@
             break;
           case S_TAG_CLOSE:
             if (c === '>') {
-              needsP = true;
               const closingTagLower = hTag.toLowerCase();
               // Auto-close implicit <tbody> when closing <table>.
-              if (closingTagLower === 'table') {
-                lines.push('if (' + pVar + '.tagName === "TBODY") ' + pVar + ' = ' + pVar + '.parentNode;');
+              if (closingTagLower === 'table' && hParentTags.length > 0 && hParentTags[hParentTags.length - 1] === 'tbody') {
+                parentStack.pop();
+                hParentTags.pop();
               }
-              lines.push(pVar + ' = ' + pVar + '.parentNode;');
+              parentStack.pop();
               if (hParentTags.length > 0) hParentTags.pop();
               hTag = '';
               hState = S_TEXT;
@@ -5333,7 +5330,7 @@
             break;
           case S_COMMENT:
             if (c === '-' && text[i+1] === '-' && text[i+2] === '>') {
-              lines.push(pVar + '.appendChild(document.createComment(' + jsStr(hCommentBuf).code + '));');
+              lines.push(curParent() + '.appendChild(document.createComment(' + jsStr(hCommentBuf).code + '));');
               hState = S_TEXT; i += 2;
             } else hCommentBuf += c;
             break;
@@ -5418,9 +5415,9 @@
         const isDomCall = domFuncs.size > 0 &&
           [...domFuncs].some(function(fn) { return new RegExp('^' + fn.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*\\(').test(expr); });
         if (isDomCall) {
-          lines.push(pVar + '.appendChild(' + expr + ');');
+          lines.push(curParent() + '.appendChild(' + expr + ');');
         } else {
-          lines.push(pVar + '.appendChild(document.createTextNode(' + expr + '));');
+          lines.push(curParent() + '.appendChild(document.createTextNode(' + expr + '));');
         }
       }
     }
@@ -5433,16 +5430,12 @@
         // Multi-target: switch the active __p to a different target element.
         if (t.type === '_targetPush') {
           hFlushText();
-          pVarStack.push(pVar);
-          var newP = makeVar('parent', used);
-          lines.push('var ' + newP + ' = ' + t.target + ';');
-          pVar = newP;
-          needsP = true;
+          parentStack.push(t.target);
           continue;
         }
         if (t.type === '_targetPop') {
           hFlushText();
-          pVar = pVarStack.pop();
+          parentStack.pop();
           continue;
         }
         if (t.type === 'str') hFeedStr(t.text);
@@ -5519,19 +5512,17 @@
           // from a failed try doesn't pollute the main tree.
           var tryFrag = makeVar('frag', used);
           lines.push('var ' + tryFrag + ' = document.createDocumentFragment();');
-          var savedP = makeVar('saved', used);
-          lines.push('var ' + savedP + ' = ' + pVar + ';');
-          lines.push(pVar + ' = ' + tryFrag + ';');
+          var savedParent = curParent();
+          parentStack.push(tryFrag);
           lines.push('try {');
           emitChain(t.tryBody);
           hFlushText();
           // Success: append fragment to parent.
-          lines.push(savedP + '.appendChild(' + tryFrag + ');');
-          lines.push(pVar + ' = ' + savedP + ';');
+          parentStack.pop();
+          lines.push(savedParent + '.appendChild(' + tryFrag + ');');
           hState = savedState1; hParentTags = savedParents1.slice();
           lines.push('} catch(' + (t.catchParam || 'e') + ') {');
-          // Failure: discard fragment, build catch content directly.
-          lines.push(pVar + ' = ' + savedP + ';');
+          // Failure: discard fragment, build catch content on parent directly.
           emitChain(t.catchBody);
           hFlushText();
           lines.push('}');
@@ -5563,7 +5554,21 @@
       const toks = tokens.filter(function(t) { return t.type !== 'plus'; });
       const openLoops = []; // stack of currently open loop IDs
 
-      function emitLoopHeader(id) {
+      function emitLoopHeader(id, upcomingTokens) {
+        // Pre-scan: if the loop body has <tr> that needs auto-tbody,
+        // create the tbody BEFORE the loop so it's not inside the loop.
+        if (upcomingTokens && !hTbodyVar && hParentTags.length > 0 && hParentTags[hParentTags.length - 1] === 'table') {
+          for (var ui = 0; ui < upcomingTokens.length; ui++) {
+            if (upcomingTokens[ui].type === 'str' && /<tr[\s>]/i.test(upcomingTokens[ui].text)) {
+              hTbodyVar = makeVar('tbody', used);
+              lines.push('const ' + hTbodyVar + ' = document.createElement(\'tbody\');');
+              lines.push(curParent() + '.appendChild(' + hTbodyVar + ');');
+              parentStack.push(hTbodyVar);
+              hParentTags.push('tbody');
+              break;
+            }
+          }
+        }
         const info = loopInfoMap ? loopInfoMap[id] : null;
         if (info) {
           if (info.kind === 'do') lines.push('do {');
@@ -5594,7 +5599,9 @@
           emitChain([t]);
         } else if (loopId !== null && currentLoop === null) {
           // Entering a loop from non-loop context.
-          emitLoopHeader(loopId);
+          // Pass upcoming tokens so pre-scan can detect tbody needs.
+          var upcoming = toks.slice(i);
+          emitLoopHeader(loopId, upcoming);
           emitChain([t]);
         } else if (loopId === null && currentLoop !== null) {
           // Exiting all loops.
@@ -5608,7 +5615,7 @@
             }
           } else {
             // Entering a deeper/sibling loop — open new loop (keep outer open).
-            emitLoopHeader(loopId);
+            emitLoopHeader(loopId, toks.slice(i));
           }
           emitChain([t]);
         }
@@ -5620,24 +5627,9 @@
       hFlushText();
     }
 
-    // Initialize parent pointer.
-    lines.push('var ' + pVar + ' = ' + parent + ';');
-
     // Emit all chain tokens.
     const loopInfoMap = result.loopInfoMap || null;
     emitWithLoops(chainTokens, loopInfoMap);
-
-    // If we never needed __p (no nesting), optimize it out.
-    if (!needsP) {
-      // Replace all __p references with the parent directly.
-      for (let li = 0; li < lines.length; li++) {
-        lines[li] = lines[li].split(pVar).join(parent);
-      }
-      // Remove the var __p = parent; line.
-      const initLine = 'var ' + parent + ' = ' + parent + ';';
-      const idx = lines.indexOf(initLine);
-      if (idx >= 0) lines.splice(idx, 1);
-    }
 
     let block = lines.join('\n');
     if (emitTitle) {
