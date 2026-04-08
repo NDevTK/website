@@ -1168,6 +1168,208 @@ function render() {
 })();
 
 // -----------------------------------------------------------------------
+// Adversarial tests: try to trick the converter
+// -----------------------------------------------------------------------
+(function () {
+  if (!globalThis.__convertProject) return;
+  const cp = globalThis.__convertProject;
+  const before = pass + fail;
+  console.log('\nadversarial');
+  console.log('-----------');
+
+  function checkProject(name, files, expectedKeys, checks) {
+    const out = cp(files);
+    const gotKeys = Object.keys(out).sort();
+    const wantKeys = expectedKeys.sort();
+    if (JSON.stringify(gotKeys) !== JSON.stringify(wantKeys)) {
+      fail++;
+      failures.push({ name: name + ' (files)', input: Object.keys(files), want: wantKeys, got: gotKeys });
+      return;
+    }
+    if (checks) {
+      for (const [key, test] of Object.entries(checks)) {
+        if (!test(out[key] || '')) {
+          fail++;
+          failures.push({ name: name + ' (' + key + ')', input: key, want: 'check failed', got: (out[key] || '').slice(0, 200) });
+          return;
+        }
+      }
+    }
+    pass++;
+  }
+
+  // 1. XSS via innerHTML that looks safe.
+  checkProject('innerHTML XSS converted',
+    {
+      'x.html': '<html><body><script src="x.js"></script></body></html>',
+      'x.js': 'var safe = "ok";\ndocument.body.innerHTML = "<img src=x onerror=alert(1)>";'
+    },
+    ['x.js'],
+    { 'x.js': c => /createElement/.test(c) && !/innerHTML/.test(c) && !/onerror/.test(c) }
+  );
+
+  // 2. Inline event with HTML entities trying to break out.
+  checkProject('encoded onclick',
+    {
+      'p.html': '<html><body><div onclick="x=&quot;);alert(1)//&quot;">click</div></body></html>'
+    },
+    ['p.html', 'p.handlers.js'],
+    {
+      'p.html': c => !/onclick/.test(c),
+      'p.handlers.js': c => /addEventListener/.test(c)
+    }
+  );
+
+  // 3. Style with CSS injection payload.
+  checkProject('CSS injection via style',
+    {
+      'p.html': '<html><body><div style="background:url(javascript:alert(1))">x</div></body></html>'
+    },
+    ['p.html', 'p.handlers.js'],
+    {
+      'p.html': c => !/style=/.test(c),
+      'p.handlers.js': c => /setProperty/.test(c)
+    }
+  );
+
+  // 4. javascript: URL.
+  checkProject('javascript: URL extracted',
+    {
+      'p.html': '<html><body><a href="javascript:void(document.cookie)">x</a></body></html>'
+    },
+    ['p.html', 'p.handlers.js'],
+    {
+      'p.html': c => !/javascript:/.test(c),
+      'p.handlers.js': c => /preventDefault/.test(c)
+    }
+  );
+
+  // 5. Variable named innerHTML — should NOT trigger conversion.
+  checkProject('var named innerHTML ignored',
+    {
+      'p.html': '<html><body><script src="p.js"></script></body></html>',
+      'p.js': 'var innerHTML = "<p>safe</p>";\nconsole.log(innerHTML);'
+    },
+    [],
+    {}
+  );
+
+  // 6. innerHTML inside a comment — should NOT trigger.
+  checkProject('commented innerHTML ignored',
+    {
+      'p.html': '<html><body><script src="p.js"></script></body></html>',
+      'p.js': '// el.innerHTML = "<b>xss</b>";\nconsole.log("safe");'
+    },
+    [],
+    {}
+  );
+
+  // 7. innerHTML inside a string literal — should NOT trigger.
+  checkProject('innerHTML in string ignored',
+    {
+      'p.html': '<html><body><script src="p.js"></script></body></html>',
+      'p.js': 'var s = "el.innerHTML = bad";\nconsole.log(s);'
+    },
+    [],
+    {}
+  );
+
+  // 8. Multiple innerHTML on same element.
+  checkProject('double innerHTML',
+    {
+      'p.html': '<html><body><script src="p.js"></script></body></html>',
+      'p.js': 'el.innerHTML = "<a>" + x + "</a>";\nel.innerHTML = "<b>" + y + "</b>";'
+    },
+    ['p.js'],
+    { 'p.js': c => /createElement/.test(c) && !/innerHTML/.test(c) }
+  );
+
+  // 9. Empty innerHTML.
+  checkProject('empty innerHTML',
+    {
+      'p.html': '<html><body><script src="p.js"></script></body></html>',
+      'p.js': 'el.innerHTML = "";'
+    },
+    ['p.js'],
+    { 'p.js': c => /replaceChildren/.test(c) && !/innerHTML/.test(c) }
+  );
+
+  // 10. outerHTML.
+  checkProject('outerHTML converted',
+    {
+      'p.html': '<html><body><script src="p.js"></script></body></html>',
+      'p.js': 'el.outerHTML = "<div id=\\"new\\">" + text + "</div>";'
+    },
+    ['p.js'],
+    { 'p.js': c => /createElement/.test(c) && /parentNode/.test(c) && !/outerHTML/.test(c) }
+  );
+
+  // 11. innerHTML += append.
+  checkProject('innerHTML += append',
+    {
+      'p.html': '<html><body><script src="p.js"></script></body></html>',
+      'p.js': 'el.innerHTML += "<li>" + item + "</li>";'
+    },
+    ['p.js'],
+    { 'p.js': c => /createElement/.test(c) && /appendChild/.test(c) && !/innerHTML/.test(c) }
+  );
+
+  // 12. Nested quotes in onclick.
+  checkProject('nested quotes onclick',
+    {
+      'p.html': '<html><body><button onclick="alert(&quot;hello&quot;)">x</button></body></html>'
+    },
+    ['p.html', 'p.handlers.js'],
+    {
+      'p.html': c => !/onclick/.test(c),
+      'p.handlers.js': c => /addEventListener/.test(c) && /alert/.test(c)
+    }
+  );
+
+  // 13. Multi-statement onclick.
+  checkProject('multi-statement onclick',
+    {
+      'p.html': '<html><body><button onclick="var x=1; x++; doStuff(x)">x</button></body></html>'
+    },
+    ['p.html', 'p.handlers.js'],
+    {
+      'p.handlers.js': c => /var x=1/.test(c) && /doStuff/.test(c)
+    }
+  );
+
+  // 14. __proto__ in innerHTML.
+  checkProject('__proto__ in innerHTML',
+    {
+      'p.html': '<html><body><script src="p.js"></script></body></html>',
+      'p.js': 'el.innerHTML = "<div class=\\"" + obj.__proto__ + "\\">x</div>";'
+    },
+    ['p.js'],
+    { 'p.js': c => /createElement/.test(c) && /obj\.__proto__/.test(c) }
+  );
+
+  // 15. Clean file — no output.
+  checkProject('no unsafe content',
+    {
+      'p.html': '<html><body><p>Hello</p></body></html>',
+      'p.js': 'console.log("no innerHTML here");'
+    },
+    []
+  );
+
+  // 16. Script tag in innerHTML string — createElement is safe.
+  checkProject('script tag in innerHTML',
+    {
+      'p.html': '<html><body><script src="p.js"></script></body></html>',
+      'p.js': 'el.innerHTML = "<scr" + "ipt>alert(1)</" + "script>";'
+    },
+    ['p.js'],
+    { 'p.js': c => /createElement/.test(c) && !/innerHTML/.test(c) }
+  );
+
+  console.log(`  (${pass + fail - before} cases)`);
+})();
+
+// -----------------------------------------------------------------------
 // Report
 // -----------------------------------------------------------------------
 console.log('');

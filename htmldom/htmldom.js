@@ -5047,7 +5047,7 @@
     const vnodes = parseChainToVNodes(chainTokens);
 
     if (vnodes.length === 0) {
-      return '// (no nodes parsed)';
+      return lines.length ? lines.join('\n') : '// (no nodes parsed)';
     }
 
     let attachTarget = parent;
@@ -5119,8 +5119,21 @@
   }
 
   function convertJsFile(jsContent, precedingCode) {
-    // Only process if there's innerHTML usage in this file.
-    if (!/\.innerHTML\s*[+=]/.test(jsContent)) return null;
+    // Use the tokenizer to detect actual innerHTML/outerHTML assignments.
+    // The tokenizer skips comments and doesn't look inside strings,
+    // so commented-out and string-embedded innerHTML are ignored.
+    const toks = tokenize(jsContent.trim());
+    let hasAssignment = false;
+    for (let ti = 1; ti < toks.length; ti++) {
+      const t = toks[ti];
+      if (t.type !== 'sep' || (t.char !== '=' && t.char !== '+=')) continue;
+      const prev = toks[ti - 1];
+      if (prev && prev.type === 'other' && /\.(innerHTML|outerHTML)$/.test(prev.text)) {
+        hasAssignment = true;
+        break;
+      }
+    }
+    if (!hasAssignment) return null;
     const sep = '\n/*__FILE_BOUNDARY__*/\n';
     const combined = precedingCode ? precedingCode + sep + jsContent : jsContent;
     const converted = convertRaw(combined);
