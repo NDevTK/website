@@ -258,8 +258,8 @@
         if (!nextTok || nextTok.type !== 'sep') continue;
         // += is always a build variable indicator.
         if (nextTok.char === '+=') { isBuildVar = true; break; }
-        // = with an HTML string on the RHS (sole-identifier case).
-        if (nextTok.char === '=' && rhsToks.length === 1) {
+        // = with an HTML string on the RHS.
+        if (nextTok.char === '=') {
           // Scan the RHS of this assignment for a string containing '<'.
           for (let rbi = bi + 2; rbi < tokens.length; rbi++) {
             const rbt = tokens[rbi];
@@ -3891,6 +3891,8 @@
         if (eqTok && eqTok.type === 'sep' && eqTok.char === '=') {
           const stmtEndIdx = skipExpr(i + 2, stop);
           const r = readValue(i + 2, stop, TERMS_TOP);
+          // Detect prepend pattern: x = expr + x (builds string in reverse).
+          // Treat as equivalent to x += expr but with the new content prepended.
           assignName(t.text, r ? r.binding : null);
           // Preserve non-build-var assignments in the build var's chain
           // so the emitter outputs them at the correct position.
