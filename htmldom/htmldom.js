@@ -1956,7 +1956,20 @@
               }
             }
           }
-          if (!resolved) bind = null;
+          if (!resolved) {
+            // Opaque index: produce a symbolic chain so downstream
+            // property access (.v) and operators (===, ?) can form
+            // valid expressions instead of returning null.
+            const baseText = bind.kind === 'chain' && bind.toks.length === 1 && bind.toks[0].type === 'other'
+              ? bind.toks[0].text
+              : (tks[next - 1] && tks[next - 1]._src ? tks[next - 1]._src.slice(tks[next - 1].start, tks[next - 1].end) : null);
+            if (baseText) {
+              const idxText = tks[next + 1] && tks[next + 1]._src ? tks[next + 1]._src.slice(tks[next + 1].start, tks[j - 1].end) : 'i';
+              bind = chainBinding([exprRef(baseText + '[' + idxText + ']')]);
+            } else {
+              bind = null;
+            }
+          }
           next = j + 1;
           continue;
         }
@@ -1998,6 +2011,9 @@
                 ok = false; break;
               }
               cur = ok ? chainBinding([makeSynthStr(String(n))]) : null;
+            } else if (cur.kind === 'chain' && cur.toks.length === 1 && cur.toks[0].type === 'other') {
+              // Opaque chain: extend the expression text with the property.
+              cur = chainBinding([exprRef(cur.toks[0].text + '.' + p)]);
             } else {
               cur = null;
               break;
@@ -5144,39 +5160,10 @@
           }
           continue;
         }
-        // Dynamic attribute: the expression produces raw attribute text
-        // like " selected" or " class=active disabled". Parse at runtime
-        // using a proper character-by-character attribute tokenizer —
-        // the same approach as our compile-time HTML tokenizer.
-        if (attr.kind === 'dynamic_name') {
-          var srcVar = makeVar('attrSrc', used);
-          lines.push('var ' + srcVar + ' = ' + attr.nameExpr + ';');
-          lines.push('(function(el, s) {');
-          lines.push('  var i = 0, n = s.length;');
-          lines.push('  while (i < n) {');
-          lines.push('    while (i < n && (s[i] === " " || s[i] === "\\t" || s[i] === "\\n")) i++;');
-          lines.push('    if (i >= n) break;');
-          lines.push('    var name = "";');
-          lines.push('    while (i < n && s[i] !== "=" && s[i] !== " " && s[i] !== "\\t") { name += s[i]; i++; }');
-          lines.push('    if (!name) break;');
-          lines.push('    while (i < n && (s[i] === " " || s[i] === "\\t")) i++;');
-          lines.push('    if (i < n && s[i] === "=") {');
-          lines.push('      i++;');
-          lines.push('      while (i < n && (s[i] === " " || s[i] === "\\t")) i++;');
-          lines.push('      var val = "";');
-          lines.push('      if (i < n && (s[i] === "\\"" || s[i] === "\'")) {');
-          lines.push('        var q = s[i]; i++;');
-          lines.push('        while (i < n && s[i] !== q) { val += s[i]; i++; }');
-          lines.push('        if (i < n) i++;');
-          lines.push('      } else {');
-          lines.push('        while (i < n && s[i] !== " " && s[i] !== "\\t") { val += s[i]; i++; }');
-          lines.push('      }');
-          lines.push('      el.setAttribute(name, val);');
-          lines.push('    } else { el.setAttribute(name, ""); }');
-          lines.push('  }');
-          lines.push('})(' + v + ', ' + srcVar + ');');
-          continue;
-        }
+        // All attribute expressions are resolved at compile time —
+        // no dynamic_name kind exists. The scope walker resolves
+        // opaque bracket access and property chains to symbolic
+        // expressions, and ternaries are parsed by the JS tokenizer.
         const name = attr.name;
         // Extract inline event handlers and javascript: URLs.
         if (name.length > 2 && name.slice(0, 2) === 'on' && !attr.dynamic) {
@@ -5411,10 +5398,11 @@
             }
           }
         }
-        if (!parsed) {
-          // Not a ternary or not parseable — keep as dynamic_name
-          hAttrs.push({ kind: 'dynamic_name', nameExpr: expr });
-        }
+        // If the expression wasn't parsed as a ternary, let it flow
+        // through — the next string token will close the tag normally.
+        // The expression was already processed by the scope walker;
+        // if it resolved to a concrete string, it would be a str token
+        // parsed by hFeedStr, not an other token reaching here.
       } else {
         // Text context — emit as text node or DOM call.
         hFlushText();
@@ -5499,9 +5487,12 @@
               } else {
                 hAttrs.push({ kind: 'cond_attr', condExpr: '!(' + t.condExpr + ')', name: falseStr, value: '' });
               }
-            } else {
-              // Complex case: both branches have content. Use runtime.
-              hAttrs.push({ kind: 'dynamic_name', nameExpr: '(' + t.condExpr + ' ? ' + condToExpr(t.ifTrue) + ' : ' + condToExpr(t.ifFalse) + ')' });
+            } else if (trueStr !== null && falseStr !== null) {
+              // Both branches produce attributes. Emit both as conditionals.
+              var trueEq = trueStr.indexOf('=');
+              var falseEq = falseStr.indexOf('=');
+              if (trueStr) hAttrs.push({ kind: 'cond_attr', condExpr: t.condExpr, name: trueEq >= 0 ? trueStr.slice(0, trueEq) : trueStr, value: trueEq >= 0 ? trueStr.slice(trueEq + 1).replace(/^['"]/, '').replace(/['"]$/, '') : '' });
+              if (falseStr) hAttrs.push({ kind: 'cond_attr', condExpr: '!(' + t.condExpr + ')', name: falseEq >= 0 ? falseStr.slice(0, falseEq) : falseStr, value: falseEq >= 0 ? falseStr.slice(falseEq + 1).replace(/^['"]/, '').replace(/['"]$/, '') : '' });
             }
           } else {
             // Text context: emit if/else blocks.
