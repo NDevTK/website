@@ -2692,24 +2692,36 @@
         if (v !== null) return chainBinding([makeSynthStr(String(v))]);
       }
       // `+` is overloaded in JS: numeric addition or string concatenation.
-      // If neither operand is a known string, treat as arithmetic (symbolic).
-      // Only fall through to the concat-chain parser when at least one side
-      // could be a string (known string literal or multi-token chain that
-      // likely contains HTML).
+      // Treat as arithmetic when both operands are single-token non-string
+      // references (identifiers, numbers, or arithmetic sub-expressions).
+      // Fall through to concat when either side contains a user string
+      // literal (quotes in the source) or a multi-token resolved chain
+      // (which came from string concatenation).
       if (op === '+') {
-        const lStr = chainAsKnownString(left);
-        const rStr = chainAsKnownString(right);
-        const lIsStr = lStr !== null || (left.toks.length > 1);
-        const rIsStr = rStr !== null || (right.toks.length > 1);
-        if (!lIsStr && !rIsStr) {
-          // Neither side is a known string — treat as arithmetic.
+        // Check if either operand is definitively a source-level string
+        // (not a number that was stringified).
+        const isSourceString = (bind) => {
+          if (bind.toks.length > 1) return true; // multi-token = concat result
+          const t = bind.toks[0];
+          if (t.type === 'str') {
+            // A str token from a user string literal has a quote property.
+            // Synthetic str tokens from number folding don't.
+            // Check: if it parses as a number, it's numeric, not a string.
+            const n = Number(t.text);
+            if (!Number.isNaN(n) && String(n) === t.text) return false;
+            if (t.text === 'true' || t.text === 'false' || t.text === 'null' || t.text === 'undefined' || t.text === 'NaN') return false;
+            return true; // Real string value
+          }
+          return false;
+        };
+        if (!isSourceString(left) && !isSourceString(right)) {
           const lt = chainAsExprText(left);
           const rt = chainAsExprText(right);
           if (lt !== null && rt !== null) {
             return chainBinding([exprRef('(' + lt + ' + ' + rt + ')')]);
           }
         }
-        return null; // Let concat-chain parser handle string concatenation.
+        return null;
       }
       // Short-circuit logical/nullish operators using whichever concrete
       // value (number or string) the left-hand side has.
