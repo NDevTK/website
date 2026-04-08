@@ -1384,6 +1384,55 @@ function render() {
     [],  // result is a plain object
   );
 
+  // 19. document.write converted.
+  checkProject('document.write converted',
+    {
+      'p.html': '<html><body><script src="p.js"></script></body></html>',
+      'p.js': 'document.write("<h1>Title</h1>");'
+    },
+    ['p.js'],
+    { 'p.js': c => /createElement/.test(c) && /appendChild/.test(c) && !/document\.write/.test(c) }
+  );
+
+  // 20. document.writeln converted.
+  checkProject('document.writeln converted',
+    {
+      'p.html': '<html><body><script src="p.js"></script></body></html>',
+      'p.js': 'document.writeln("<p>" + msg + "</p>");'
+    },
+    ['p.js'],
+    { 'p.js': c => /createElement/.test(c) && !/writeln/.test(c) }
+  );
+
+  // 21. document.write in string not converted.
+  checkProject('document.write in string ignored',
+    {
+      'p.html': '<html><body><script src="p.js"></script></body></html>',
+      'p.js': 'var s = "document.write is deprecated";'
+    },
+    [],
+  );
+
+  // 22. insertAdjacentHTML converted.
+  checkProject('insertAdjacentHTML converted',
+    {
+      'p.html': '<html><body><script src="p.js"></script></body></html>',
+      'p.js': 'el.insertAdjacentHTML("beforeend", "<li>" + item + "</li>");'
+    },
+    ['p.js'],
+    { 'p.js': c => /createElement/.test(c) && /appendChild/.test(c) && !/insertAdjacentHTML/.test(c) }
+  );
+
+  // 23. insertAdjacentHTML beforebegin uses parentNode.
+  checkProject('insertAdjacentHTML beforebegin',
+    {
+      'p.html': '<html><body><script src="p.js"></script></body></html>',
+      'p.js': 'ref.insertAdjacentHTML("beforebegin", "<hr>");'
+    },
+    ['p.js'],
+    { 'p.js': c => /parentNode/.test(c) && /createElement/.test(c) }
+  );
+
   console.log(`  (${pass + fail - before} cases)`);
 })();
 

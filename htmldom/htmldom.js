@@ -372,12 +372,117 @@
     return all.length ? all[0] : null;
   }
 
-  // Find every `X.innerHTML`/`X.outerHTML` `=` / `+=` assignment in the
-  // token stream. Returns an array in source order.
+  // Find every `X.innerHTML`/`X.outerHTML` `=` / `+=` assignment and
+  // `document.write(...)` / `document.writeln(...)` call in the token
+  // stream. Returns an array in source order.
   function findAllHtmlAssignments(tokens) {
     const out = [];
-    for (let i = 1; i < tokens.length; i++) {
+    for (let i = 0; i < tokens.length; i++) {
       const t = tokens[i];
+
+      // document.write(...) / document.writeln(...)
+      if (t.type === 'other' && (t.text === 'document.write' || t.text === 'document.writeln')) {
+        const openParen = tokens[i + 1];
+        if (!openParen || openParen.type !== 'open' || openParen.char !== '(') continue;
+        // Find matching close paren.
+        let depth = 1, j = i + 2;
+        while (j < tokens.length && depth > 0) {
+          if (tokens[j].type === 'open') depth++;
+          else if (tokens[j].type === 'close') depth--;
+          if (depth > 0) j++;
+        }
+        if (depth !== 0) continue;
+        const rhsStart = i + 2;
+        const rhsEnd = j; // points at )
+        const srcStart = t.start;
+        let srcEnd = tokens[j].end;
+        // Include trailing semicolon if present.
+        if (j + 1 < tokens.length && tokens[j + 1].type === 'sep' && tokens[j + 1].char === ';') {
+          srcEnd = tokens[j + 1].end;
+        }
+        // document.write appends to document.body; writeln adds a newline.
+        out.push({
+          target: 'document.body',
+          prop: 'innerHTML',
+          op: '+=',
+          rhsStart: rhsStart,
+          rhsEnd: rhsEnd,
+          srcStart: srcStart,
+          srcEnd: srcEnd,
+          eqIdx: i, // points at the document.write token
+          isDocWrite: true,
+          addsNewline: t.text === 'document.writeln',
+        });
+        continue;
+      }
+
+      // X.insertAdjacentHTML(position, html)
+      if (t.type === 'other' && /\.insertAdjacentHTML$/.test(t.text)) {
+        const openParen = tokens[i + 1];
+        if (!openParen || openParen.type !== 'open' || openParen.char !== '(') continue;
+        // Find the position argument (first arg before comma).
+        let j = i + 2;
+        let argDepth = 0;
+        let commaIdx = -1;
+        while (j < tokens.length) {
+          if (tokens[j].type === 'open') argDepth++;
+          else if (tokens[j].type === 'close') { if (argDepth === 0) break; argDepth--; }
+          else if (argDepth === 0 && tokens[j].type === 'sep' && tokens[j].char === ',') { commaIdx = j; break; }
+          j++;
+        }
+        if (commaIdx < 0) continue;
+        // Read the position argument.
+        const posTok = tokens[i + 2];
+        const position = posTok && posTok.type === 'str' ? posTok.text.toLowerCase() : null;
+        if (!position) continue; // Dynamic position — can't determine semantics.
+        // Find matching close paren for the full call.
+        let depth2 = 1, endJ = commaIdx + 1;
+        while (endJ < tokens.length && depth2 > 0) {
+          if (tokens[endJ].type === 'open') depth2++;
+          else if (tokens[endJ].type === 'close') depth2--;
+          if (depth2 > 0) endJ++;
+        }
+        if (depth2 !== 0) continue;
+        // Extract the target (everything before .insertAdjacentHTML).
+        const targetBase = t.text.replace(/\.insertAdjacentHTML$/, '');
+        let target = targetBase;
+        let targetSrcStart = -1;
+        if (target === '' || target.startsWith('.')) {
+          const r = reconstructTarget(tokens, i);
+          if (!r) continue;
+          target = target.startsWith('.') ? r.text + target : r.text;
+          targetSrcStart = r.srcStart;
+        }
+        // Map position to target+op:
+        // 'beforeend' → append to target (innerHTML +=)
+        // 'afterbegin' → prepend to target (innerHTML +=, but conceptually first child)
+        // 'beforebegin' → insert before target (target.parentNode, +=)
+        // 'afterend' → insert after target (target.parentNode, +=)
+        if (position === 'beforebegin' || position === 'afterend') {
+          target = target + '.parentNode';
+        }
+        const rhsStart = commaIdx + 1;
+        const rhsEnd = endJ; // points at )
+        const srcStart = targetSrcStart >= 0 ? targetSrcStart : t.start;
+        let srcEnd = tokens[endJ].end;
+        if (endJ + 1 < tokens.length && tokens[endJ + 1].type === 'sep' && tokens[endJ + 1].char === ';') {
+          srcEnd = tokens[endJ + 1].end;
+        }
+        out.push({
+          target: target,
+          prop: 'innerHTML',
+          op: '+=',
+          rhsStart: rhsStart,
+          rhsEnd: rhsEnd,
+          srcStart: srcStart,
+          srcEnd: srcEnd,
+          eqIdx: i,
+        });
+        continue;
+      }
+
+      // X.innerHTML = ... / X.outerHTML = ... / X.innerHTML += ...
+      if (i < 1) continue;
       if (t.type !== 'sep') continue;
       if (t.char !== '=' && t.char !== '+=') continue;
       const prev = tokens[i - 1];
