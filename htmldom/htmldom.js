@@ -2244,7 +2244,13 @@
             const args = readConcatArgs(k + 1, stop);
             if (!args) return null;
             const toks = instantiateFunction(b, args.args.map((a) => chainBinding(a)));
-            if (!toks) return null;
+            if (!toks) {
+              // Function couldn't be inlined (e.g. pre-pass converted).
+              // Produce an opaque call expression.
+              const first = tks[k];
+              const last = tks[args.next - 1];
+              return { bind: chainBinding([exprRef(first._src.slice(first.start, last.end))]), next: args.next };
+            }
             return { bind: chainBinding(toks), next: args.next };
           }
           return { bind: b, next: k + 1 };
@@ -2279,6 +2285,16 @@
       }
       let result = null;
       if (fn.isBlock) {
+        // Skip functions already converted by the pre-pass to return
+        // DocumentFragments — inlining them produces nonsense.
+        if (tks[fn.bodyStart] && tks[fn.bodyStart]._src) {
+          const peekSrc = tks[fn.bodyStart]._src.slice(tks[fn.bodyStart].start, tks[fn.bodyStart].start + 80);
+          if (/var __f\s*=\s*document\.createDocumentFragment/.test(peekSrc)) {
+            tks = savedTks;
+            stack.pop();
+            return null;
+          }
+        }
         // Walk the function body to process var declarations, assignments,
         // and control flow. This ensures inner `var html` declarations are
         // bound in the function frame, not resolved from outer scope.
@@ -3988,6 +4004,78 @@
   }
 
 
+  // Pre-pass: find functions that build and return HTML via a build
+  // variable (var html = ''; html += ...; return html;). Convert each
+  // independently to return a DocumentFragment with DOM operations.
+  // This avoids multi-level inlining which flattens scopes.
+  // Returns the transformed source.
+  function convertHtmlBuilderFunctions(source) {
+    // Use a simple regex scan to find function declarations with the
+    // build-and-return pattern. This is deliberately conservative —
+    // only matches straightforward cases.
+    const result = { source: source, converted: new Set() };
+    const funcRe = /function\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(([^)]*)\)\s*\{/g;
+    let fm;
+    const replacements = []; // { start, end, replacement }
+    while ((fm = funcRe.exec(source)) !== null) {
+      const funcName = fm[1];
+      const params = fm[2];
+      const bodyStart = fm.index + fm[0].length;
+      // Find matching closing brace.
+      let depth = 1, k = bodyStart;
+      while (k < source.length && depth > 0) {
+        if (source[k] === '{') depth++;
+        else if (source[k] === '}') depth--;
+        if (depth > 0) k++;
+      }
+      const bodyEnd = k;
+      const body = source.slice(bodyStart, bodyEnd);
+      // Check the pattern: has var html = ..., has html +=, has return html, no innerHTML.
+      if (!/\binnerHTML\b/.test(body) &&
+          /\bvar\s+html\s*=/.test(body) &&
+          /\bhtml\s*\+=/.test(body) &&
+          /\breturn\s+html\s*[;\n}]/.test(body)) {
+        // Convert: replace `return html;` with a synthetic innerHTML
+        // assignment, run through the converter, wrap in fragment.
+        const syntheticBody = body.replace(
+          /\breturn\s+html\s*;?/,
+          '__frag.innerHTML = html;'
+        );
+        const extractions = extractAllHTML(syntheticBody);
+        if (extractions.length > 0) {
+          const ex = extractions[0];
+          const used = new Set();
+          const domBlock = convertOne(syntheticBody, ex, false, false, used, '__frag', result.converted);
+          if (domBlock) {
+            // Build the new function body.
+            let converted = domBlock
+              .replace('__frag.replaceChildren();\n', '')
+              .replace(/__frag/g, '__f');
+            // Indent properly.
+            const indented = converted.split('\n').map(l => '  ' + l).join('\n');
+            const newBody = '  var __f = document.createDocumentFragment();\n' + indented + '\n  return __f;\n';
+            replacements.push({
+              start: fm.index,
+              end: bodyEnd + 1, // include closing }
+              replacement: 'function ' + funcName + '(' + params + ') {\n' + newBody + '}'
+            });
+            result.converted.add(funcName);
+          }
+        }
+      }
+    }
+    // Apply replacements in reverse order.
+    if (replacements.length) {
+      let s = source;
+      replacements.sort((a, b) => b.start - a.start);
+      for (const r of replacements) {
+        s = s.slice(0, r.start) + r.replacement + s.slice(r.end);
+      }
+      result.source = s;
+    }
+    return result;
+  }
+
   function convert() {
     try {
       const raw = (typeof window !== 'undefined' && window._monacoIn) ? window._monacoIn.getValue() : ($('in') ? $('in').value : '');
@@ -4110,7 +4198,11 @@
           if (scriptParts.length > 0) {
             // Build combined JS with separators we can split on later.
             const separator = '\n/*__BLOCK_SEP__*/\n';
-            const combinedJs = scriptParts.map(p => p.text).join(separator);
+            let combinedJs = scriptParts.map(p => p.text).join(separator);
+            // Pre-pass: convert HTML-building helper functions to return
+            // DOM fragments. This prevents multi-level inlining.
+            const prepass = convertHtmlBuilderFunctions(combinedJs);
+            combinedJs = prepass.source;
             const extractions = extractAllHTML(combinedJs);
             if (extractions.length === 0) {
               // No innerHTML — keep script code as-is in the JS file.
@@ -4121,7 +4213,7 @@
               let cursor = 0;
               for (const ex of extractions) {
                 if (ex.srcStart === undefined) continue;
-                const domBlock = convertOne(combinedJs, ex, false, false, sharedUsed);
+                const domBlock = convertOne(combinedJs, ex, false, false, sharedUsed, null, prepass.converted);
                 let srcStart = ex.srcStart;
                 let srcEnd = ex.srcEnd;
                 if (ex.buildVarDeclStart >= 0) {
@@ -4172,15 +4264,18 @@
       }
 
       // Pure JS input (no leading <).
-      const extractions = extractAllHTML(raw);
+      // Pre-pass: convert HTML-building helper functions.
+      const prepass = convertHtmlBuilderFunctions(raw);
+      const processedRaw = prepass.source;
+      const extractions = extractAllHTML(processedRaw);
       if (extractions.length === 0) {
-        const summary = summarizeDomConstruction(raw);
+        const summary = summarizeDomConstruction(processedRaw);
         if (summary) { setOutput(summary); return; }
-        setOutput(convertOne(raw, extractHTML(raw), false, false) || '');
+        setOutput(convertOne(processedRaw, extractHTML(processedRaw), false, false) || '');
         return;
       }
       // Inline rewriting: preserve original code, replace innerHTML sites.
-      const trimmed = raw.trim();
+      const trimmed = processedRaw.trim();
       let output = '';
       let cursor = 0;
       const sharedUsed = new Set();
@@ -4197,7 +4292,7 @@
         const target = ex.target || 'document.body';
         const assignOp = ex.assignOp || '=';
 
-        const domBlock = convertOne(raw, ex, false, false, sharedUsed);
+        const domBlock = convertOne(processedRaw, ex, false, false, sharedUsed, null, prepass.converted);
         let srcStart = ex.srcStart;
         let srcEnd = ex.srcEnd;
         // When the chain carries preserve tokens, the region starts at
@@ -4730,9 +4825,17 @@
     }
 
     if (node.kind === 'expr_text') {
-      const v = makeVar('text', used);
-      lines.push('const ' + v + ' = document.createTextNode(' + node.expr + ');');
-      lines.push(parentVar + '.appendChild(' + v + ');');
+      // Check if this expression is a call to a DOM-returning function
+      // (converted by the pre-pass). If so, appendChild directly.
+      const isDomCall = opts.domFunctions && opts.domFunctions.size > 0 &&
+        [...opts.domFunctions].some(fn => new RegExp('^' + fn.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*\\(').test(node.expr));
+      if (isDomCall) {
+        lines.push(parentVar + '.appendChild(' + node.expr + ');');
+      } else {
+        const v = makeVar('text', used);
+        lines.push('const ' + v + ' = document.createTextNode(' + node.expr + ');');
+        lines.push(parentVar + '.appendChild(' + v + ');');
+      }
       return;
     }
 
@@ -4841,7 +4944,10 @@
     if (node.children.length) {
       // textContent shortcut: if all children are text or expr_text (no
       // nested elements), emit a single textContent assignment.
-      if (opts.textContentShortcut && node.children.every(c => c.kind === 'text' || c.kind === 'expr_text')) {
+      const canShortcut = opts.textContentShortcut &&
+        node.children.every(c => (c.kind === 'text' || c.kind === 'expr_text') && c.loopId == null) &&
+        !node.children.some(c => c.kind === 'expr_text' && opts.domFunctions && opts.domFunctions.size > 0 && [...opts.domFunctions].some(fn => new RegExp('^' + fn.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*\\(').test(c.expr)));
+      if (canShortcut) {
         if (node.children.length === 1) {
           const child = node.children[0];
           if (child.kind === 'text') {
@@ -4892,7 +4998,7 @@
 
   // Produce the DOM-API code block for a single innerHTML/outerHTML
   // extraction. `multi` toggles the leading target-divider comment.
-  function convertOne(raw, result, multi, emitTitle, sharedUsed, parentOverride) {
+  function convertOne(raw, result, multi, emitTitle, sharedUsed, parentOverride, domFunctions) {
     const { target, assignProp, assignOp } = result;
 
     let parent = parentOverride || 'document.body';
@@ -4911,6 +5017,7 @@
       skipWhitespaceText: $('skipWS').checked,
       useFragment: $('useFragment').checked,
       emitComments: $('emitComments').checked,
+      domFunctions: domFunctions || new Set(),
     };
 
     const lines = [];
