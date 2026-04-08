@@ -3856,37 +3856,7 @@
           if (j < stop && tokens[j].type === 'close' && tokens[j].char === ')' && j > i + 2) {
             const headerFirst = tokens[i + 2];
             const headerLast = tokens[j - 1];
-            // Build header text, resolving identifiers through scope
-            // (important for loops inside inlined functions where
-            // parameter names need to be replaced with argument values).
-            var headerParts = [];
-            for (var hi = i + 2; hi <= j - 1; hi++) {
-              var ht = tokens[hi];
-              if (ht.type === 'other' && (IDENT_RE.test(ht.text) || IDENT_OR_PATH_RE.test(ht.text))) {
-                // Don't resolve build variables (or paths rooted in them)
-                // in loop headers - their value changes each iteration.
-                var htRoot = ht.text.split('.')[0];
-                if (trackBuildVar && trackBuildVar.has(htRoot)) {
-                  var prevEnd2 = hi > i + 2 ? tokens[hi - 1].end : headerFirst.start;
-                  var gap2 = ht._src.slice(prevEnd2, ht.start);
-                  headerParts.push(gap2 + ht._src.slice(ht.start, ht.end));
-                  continue;
-                }
-                var resolved = resolvePath(ht.text);
-                if (resolved && resolved.kind === 'chain') {
-                  var exprText = chainAsExprText(resolved);
-                  if (exprText !== null && exprText !== ht.text) {
-                    headerParts.push(exprText);
-                    continue;
-                  }
-                }
-              }
-              // Preserve original source text with surrounding whitespace.
-              var prevEnd = hi > i + 2 ? tokens[hi - 1].end : headerFirst.start;
-              var gap = ht._src.slice(prevEnd, ht.start);
-              headerParts.push(gap + ht._src.slice(ht.start, ht.end));
-            }
-            const headerSrc = headerParts.join('');
+            // Detect body range first so we can find mutated variables.
             const bodyTok = tokens[j + 1];
             let bodyEnd;
             if (bodyTok && bodyTok.type === 'open' && bodyTok.char === '{') {
@@ -3909,6 +3879,63 @@
               }
               bodyEnd = k;
             }
+            // Collect variables mutated in the loop body (=, +=, ++, --)
+            // so we don't resolve them in the header to their initial value.
+            var mutatedInBody = new Set();
+            if (trackBuildVar) for (const bv of trackBuildVar) mutatedInBody.add(bv);
+            for (var bi = j + 1; bi < bodyEnd; bi++) {
+              var bt = tokens[bi];
+              if (bt.type === 'other' && IDENT_RE.test(bt.text)) {
+                var bnext = tokens[bi + 1];
+                if (bnext && bnext.type === 'op' && (bnext.text === '=' || bnext.text === '+=' || bnext.text === '-=' || bnext.text === '++' || bnext.text === '--')) {
+                  mutatedInBody.add(bt.text);
+                }
+                var bprev = tokens[bi - 1];
+                if (bprev && bprev.type === 'op' && (bprev.text === '++' || bprev.text === '--')) {
+                  mutatedInBody.add(bt.text);
+                }
+              }
+            }
+            // Also check the for-loop update clause (third part after second ;)
+            if (t.text === 'for') {
+              var semiCount = 0;
+              for (var fi = i + 2; fi < j; fi++) {
+                if (tokens[fi].type === 'sep' && tokens[fi].char === ';') semiCount++;
+                if (semiCount >= 2 && tokens[fi].type === 'other' && IDENT_RE.test(tokens[fi].text)) {
+                  mutatedInBody.add(tokens[fi].text);
+                }
+              }
+            }
+            // Build header text, resolving identifiers through scope
+            // (important for loops inside inlined functions where
+            // parameter names need to be replaced with argument values).
+            var headerParts = [];
+            for (var hi = i + 2; hi <= j - 1; hi++) {
+              var ht = tokens[hi];
+              if (ht.type === 'other' && (IDENT_RE.test(ht.text) || IDENT_OR_PATH_RE.test(ht.text))) {
+                // Don't resolve variables mutated in the loop body/header.
+                var htRoot = ht.text.split('.')[0];
+                if (mutatedInBody.has(htRoot)) {
+                  var prevEnd2 = hi > i + 2 ? tokens[hi - 1].end : headerFirst.start;
+                  var gap2 = ht._src.slice(prevEnd2, ht.start);
+                  headerParts.push(gap2 + ht._src.slice(ht.start, ht.end));
+                  continue;
+                }
+                var resolved = resolvePath(ht.text);
+                if (resolved && resolved.kind === 'chain') {
+                  var exprText = chainAsExprText(resolved);
+                  if (exprText !== null && exprText !== ht.text) {
+                    headerParts.push(exprText);
+                    continue;
+                  }
+                }
+              }
+              // Preserve original source text with surrounding whitespace.
+              var prevEnd = hi > i + 2 ? tokens[hi - 1].end : headerFirst.start;
+              var gap = ht._src.slice(prevEnd, ht.start);
+              headerParts.push(gap + ht._src.slice(ht.start, ht.end));
+            }
+            const headerSrc = headerParts.join('');
             const id = nextLoopId++;
             loopInfo[id] = { kind: t.text, headerSrc };
             // Extract loop variables from the init clause (`var/let/const X`)
@@ -5342,16 +5369,11 @@
                 parentStack.pop();
                 hParentTags.pop();
               }
-              // If the parent being popped is a runtime variable, emit
-              // a runtime parentNode assignment.
-              var poppedParent = curParent();
-              var isRT = isRuntimeVar(poppedParent) || isRuntimeVar(curParent());
+              // Pop the parent stack and, if the new current parent is a
+              // runtime variable, emit a parentNode walk so it tracks correctly.
               parentStack.pop();
-              if (isRT && parentStack.length > 0) {
-                var newParent = curParent();
-                if (isRuntimeVar(newParent)) {
-                  lines.push(newParent + ' = ' + newParent + '.parentNode;');
-                }
+              if (parentStack.length > 0 && isRuntimeVar(curParent())) {
+                lines.push(curParent() + ' = ' + curParent() + '.parentNode;');
               }
               if (hParentTags.length > 0) hParentTags.pop();
               hTag = '';
@@ -5760,6 +5782,8 @@
 
       for (let i = 0; i < toks.length; i++) {
         const t = toks[i];
+        // plus tokens don't carry loopId — inherit from surrounding context.
+        if (t.type === 'plus') { emitChain([t]); continue; }
         const loopId = t.loopId != null ? t.loopId : null;
         const currentLoop = openLoops.length > 0 ? openLoops[openLoops.length - 1].id : null;
 
@@ -5775,6 +5799,7 @@
           // for open/close tag counts.
           var loopOpenTags = 0, loopCloseTags = 0;
           for (var si = i; si < toks.length; si++) {
+            if (toks[si].type === 'plus') continue; // plus tokens don't carry loopId
             if (toks[si].loopId !== loopId) break;
             if (toks[si].type === 'str') {
               var s = toks[si].text;

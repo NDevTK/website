@@ -1948,17 +1948,27 @@ function render() {
     const htmlPath = Object.keys(files).find(p => /\.html?$/i.test(p));
     if (!htmlPath) return '';
     const html = files[htmlPath];
-    const dom = new JSDOM(html, { runScripts: 'dangerously', url: 'http://localhost/' });
-    const doc = dom.window.document;
-    // Find all <script src="..."> tags, execute them in order.
-    const scripts = doc.querySelectorAll('script[src]');
-    for (const s of scripts) {
-      const src = s.getAttribute('src');
-      if (files[src]) {
-        try { dom.window.eval(files[src]); } catch (e) { /* ignore runtime errors */ }
+    // Run in a child process to avoid jsdom memory leaks accumulating.
+    const cp2 = require('child_process');
+    const script = `
+      const { JSDOM } = require('jsdom');
+      const files = JSON.parse(process.argv[1]);
+      const htmlPath = ${JSON.stringify(htmlPath)};
+      const dom = new JSDOM(files[htmlPath], { runScripts: 'dangerously', url: 'http://localhost/' });
+      const doc = dom.window.document;
+      const scripts = doc.querySelectorAll('script[src]');
+      for (const s of scripts) {
+        const src = s.getAttribute('src');
+        if (files[src]) {
+          try { dom.window.eval(files[src]); } catch (e) {}
+        }
       }
-    }
-    return doc.body.innerHTML.replace(/\s+/g, ' ').trim();
+      process.stdout.write(doc.body.innerHTML.replace(/\\s+/g, ' ').trim());
+      dom.window.close();
+    `;
+    return cp2.execFileSync(process.execPath, ['-e', script, JSON.stringify(files)], {
+      encoding: 'utf8', timeout: 10000
+    });
   }
 
   function checkEquiv(name, files) {
