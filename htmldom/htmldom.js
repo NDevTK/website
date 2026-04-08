@@ -4028,21 +4028,49 @@
           }
           if (lastIdx < html.length) parts.push({ kind: 'html', text: html.slice(lastIdx) });
 
-          // Separate HTML parts from script parts.
-          const htmlParts = [];
+          // Separate HTML parts from script parts. HTML structure is
+          // preserved as-is — only unsafe attributes (inline event
+          // handlers, javascript: URLs) are rewritten.
           const scriptParts = [];
           for (const part of parts) {
-            if (part.kind === 'html') htmlParts.push(part);
-            else scriptParts.push(part);
-          }
-
-          // Convert HTML parts.
-          for (const part of htmlParts) {
-            const htmlTrimmed = part.text.trim();
-            if (!htmlTrimmed) continue;
-            const result = extractHTML(htmlTrimmed);
-            const block = convertOne(htmlTrimmed, result, false, false, sharedUsed, parentTarget);
-            if (block) outputParts.push(block);
+            if (part.kind === 'html') {
+              // Rewrite inline event handlers to addEventListener calls
+              // and javascript: URLs. Keep all other HTML as-is.
+              let safeHtml = part.text;
+              // Collect all inline event rewrites into a trailing <script>.
+              const eventRewrites = [];
+              let elemCounter = 0;
+              safeHtml = safeHtml.replace(/<([a-zA-Z][a-zA-Z0-9]*)((?:\s+[^>]*?)?)>/g, function(match, tag, attrsStr) {
+                const events = [];
+                const cleanAttrs = attrsStr.replace(/\s+on([a-z]+)="([^"]*)"/gi, function(_, evName, handler) {
+                  events.push({ event: evName.toLowerCase(), handler: handler.replace(/&quot;/g, '"').replace(/&amp;/g, '&') });
+                  return '';
+                });
+                // Also handle javascript: hrefs.
+                let jsHref = null;
+                const cleanAttrs2 = cleanAttrs.replace(/\s+href="javascript:([^"]*)"/gi, function(_, code) {
+                  jsHref = code.replace(/&quot;/g, '"').replace(/&amp;/g, '&');
+                  return '';
+                });
+                if (events.length === 0 && !jsHref) return match;
+                // Add a data attribute to identify the element for the script.
+                const id = '__hdel' + (elemCounter++);
+                let result = '<' + tag + cleanAttrs2 + ' data-hd-id="' + id + '">';
+                for (const ev of events) {
+                  eventRewrites.push('document.querySelector(\'[data-hd-id="' + id + '"]\').addEventListener(\'' + ev.event + '\', function(event) { ' + ev.handler + ' });');
+                }
+                if (jsHref) {
+                  eventRewrites.push('document.querySelector(\'[data-hd-id="' + id + '"]\').addEventListener(\'click\', function(event) { event.preventDefault(); ' + jsHref + ' });');
+                }
+                return result;
+              });
+              outputParts.push(safeHtml);
+              if (eventRewrites.length) {
+                outputParts.push('<script>\n' + eventRewrites.join('\n') + '\n</script>');
+              }
+            } else {
+              scriptParts.push(part);
+            }
           }
 
           // Combine all script blocks into one for cross-file scope,
@@ -4054,7 +4082,7 @@
             const extractions = extractAllHTML(combinedJs);
             if (extractions.length === 0) {
               // No innerHTML — output each block as-is.
-              for (const part of scriptParts) outputParts.push(part.text);
+              for (const part of scriptParts) outputParts.push('<script>\n' + part.text.trim() + '\n</script>');
             } else {
               const trimmed = combinedJs.trim();
               let scriptOutput = '';
@@ -4084,16 +4112,21 @@
               scriptOutput += trimmed.slice(cursor);
               // Remove block separators from output.
               scriptOutput = scriptOutput.replace(/\n\/\*__BLOCK_SEP__\*\/\n/g, '\n');
-              outputParts.push(scriptOutput);
+              outputParts.push('<script>\n' + scriptOutput.trim() + '\n</script>');
             }
           }
         };
 
         const outputParts = [];
         const sharedUsed = new Set();
+        // Reconstruct the document with safe HTML.
+        outputParts.push('<!DOCTYPE html>\n<html>\n<head>');
         if (headContent.trim()) processRegion(headContent, 'document.head', outputParts, sharedUsed);
+        outputParts.push('</head>\n<body>');
         if (bodyContent.trim()) processRegion(bodyContent, 'document.body', outputParts, sharedUsed);
-        setOutput(outputParts.join('\n'));
+        outputParts.push('</body>\n</html>');
+        // Clean up excessive blank lines.
+        setOutput(outputParts.join('\n').replace(/\n{3,}/g, '\n\n'));
         return;
       }
 
