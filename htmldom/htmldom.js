@@ -2658,6 +2658,7 @@
         }
       }
       let result = null;
+      var fnLoopVars = null;
       if (fn.isBlock) {
         // Skip functions already converted by the pre-pass to return
         // DocumentFragments — inlining them produces nonsense.
@@ -2676,16 +2677,39 @@
         let bodyEnd = fn.bodyEnd;
         if (tks[bodyStart] && tks[bodyStart].type === 'open' && tks[bodyStart].char === '{') bodyStart++;
         if (tks[bodyEnd - 1] && tks[bodyEnd - 1].type === 'close' && tks[bodyEnd - 1].char === '}') bodyEnd--;
-        // Save and disable trackBuildVar inside inlined functions —
-        // inner functions' variables are not build vars.
+        // Find the return statement first so we know which variable
+        // to track as the build var inside the function body.
+        let returnVar = null;
+        for (let ri = bodyStart; ri < bodyEnd; ri++) {
+          if (tks[ri] && tks[ri].type === 'other' && tks[ri].text === 'return') {
+            const nextTok = tks[ri + 1];
+            if (nextTok && nextTok.type === 'other' && IDENT_RE.test(nextTok.text)) {
+              returnVar = nextTok.text;
+            }
+            break;
+          }
+          if (tks[ri] && tks[ri].type === 'open' && tks[ri].char === '{') {
+            let d = 1; ri++;
+            while (ri < bodyEnd && d > 0) { if (tks[ri].type === 'open' && tks[ri].char === '{') d++; else if (tks[ri].type === 'close' && tks[ri].char === '}') d--; ri++; }
+            continue;
+          }
+        }
+        // Enable trackBuildVar for the returned variable so loops
+        // inside the function body properly tag chain tokens.
         const savedTrackBuildVar = trackBuildVar;
         const savedTrackDepth = trackBuildVarDepth;
-        trackBuildVar = null;
+        if (returnVar) {
+          trackBuildVar = new Set([returnVar]);
+          trackBuildVarDepth = funcDepth();
+        } else {
+          trackBuildVar = null;
+        }
+        const lvBefore = loopVars.length;
         walkRange(bodyStart, bodyEnd);
+        fnLoopVars = loopVars.splice(lvBefore);
         trackBuildVar = savedTrackBuildVar;
         trackBuildVarDepth = savedTrackDepth;
-        // Find the return value: look for `return` at the top level of
-        // the function body and resolve the returned expression.
+        // Find the return value and resolve the returned expression.
         let ri = bodyStart;
         while (ri < bodyEnd) {
           const t = tks[ri];
@@ -2711,6 +2735,15 @@
       }
       tks = savedTks;
       stack.pop();
+      // Expand any loopVars created during the function body walk.
+      if (result && fnLoopVars && fnLoopVars.length > 0) {
+        const lvByName = Object.create(null);
+        for (const lv of fnLoopVars) {
+          if (!lvByName[lv.name]) lvByName[lv.name] = [];
+          lvByName[lv.name].push(lv);
+        }
+        result = expandLoopVars(result, lvByName);
+      }
       return result;
     };
 
@@ -4858,11 +4891,11 @@
       }
 
       // Pure JS input (no leading <).
-      // Pre-pass: convert HTML-building helper functions.
-      const prepass = convertHtmlBuilderFunctions(raw);
-      const processedRaw = prepass.source;
-      // Merge pre-pass converted names with externally known DOM functions.
-      const allDomFunctions = new Set(prepass.converted);
+      // The scope walker handles function inlining (including complex
+      // builder functions with loops). External DOM function names
+      // from cross-file pre-pass are passed via externalDomFunctions.
+      const processedRaw = raw;
+      const allDomFunctions = new Set();
       if (externalDomFunctions) {
         for (const fn of externalDomFunctions) allDomFunctions.add(fn);
       }
@@ -5926,24 +5959,38 @@
       const workingFiles = {};
       for (const sp of scripts) workingFiles[sp] = files[sp] || '';
       for (const script of markup.extractedScripts) workingFiles[dir + script.name] = script.content;
+      // Pass 1: convert builder functions in PRECEDING files only.
+      // Same-file functions are inlined by the scope walker and should
+      // NOT be pre-converted (that would make them return DocumentFragment,
+      // breaking string concatenation at call sites the walker can inline).
+      // For each file, run the pre-pass on ONLY that file. Collect
+      // converted function names. Output the converted file.
+      // The scope walker inlines same-file builder functions properly
+      // (including those with loops). For cross-file builders (function
+      // defined in an earlier file), the pre-pass converts the function
+      // to return a DocumentFragment and marks it as a DOM function so
+      // call sites use appendChild instead of createTextNode.
+      // Only pre-convert files that DON'T have innerHTML (pure utility files).
       const allConvertedFns = new Set();
-      let precedingForPrepass = '';
       for (const sp of scripts) {
         if (!workingFiles[sp]) continue;
-        const combined = precedingForPrepass ? precedingForPrepass + '\n' + workingFiles[sp] : workingFiles[sp];
-        const prepass = convertHtmlBuilderFunctions(combined);
-        for (const fn of prepass.converted) allConvertedFns.add(fn);
-        if (prepass.converted.size > 0 && prepass.source !== combined) {
-          // Extract only the current file's portion from the converted result.
-          const convertedFile = precedingForPrepass
-            ? prepass.source.slice(precedingForPrepass.length + 1)
-            : prepass.source;
-          if (convertedFile !== workingFiles[sp]) {
-            workingFiles[sp] = convertedFile;
-            output[sp] = convertedFile;
+        // Check: does this file have innerHTML/outerHTML assignments?
+        const fileToks = tokenize(workingFiles[sp].trim());
+        let fileHasInnerHTML = false;
+        for (let ti = 1; ti < fileToks.length; ti++) {
+          if (fileToks[ti].type === 'sep' && (fileToks[ti].char === '=' || fileToks[ti].char === '+=') &&
+              fileToks[ti-1].type === 'other' && /\.(innerHTML|outerHTML)$/.test(fileToks[ti-1].text)) {
+            fileHasInnerHTML = true; break;
           }
         }
-        precedingForPrepass += (precedingForPrepass ? '\n' : '') + workingFiles[sp];
+        // Skip pre-pass for files with innerHTML — scope walker handles them.
+        if (fileHasInnerHTML) continue;
+        const prepass = convertHtmlBuilderFunctions(workingFiles[sp]);
+        for (const fn of prepass.converted) allConvertedFns.add(fn);
+        if (prepass.converted.size > 0 && prepass.source !== workingFiles[sp]) {
+          workingFiles[sp] = prepass.source;
+          output[sp] = prepass.source;
+        }
       }
       // Pass 2: convert innerHTML/outerHTML/document.write/insertAdjacentHTML.
       // allConvertedFns collects builder function names from pass 1.
