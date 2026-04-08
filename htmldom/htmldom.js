@@ -4798,6 +4798,23 @@
     // Called when `>` closes the opening tag — commit the element.
     const commitTag = () => {
       if (!currentEl) return;
+      // Auto-insert <tbody> when <tr> is a direct child of <table>,
+      // matching innerHTML's HTML parser behavior. Reuse an existing
+      // <tbody> if the table already has one as its last child.
+      // Auto-insert <tbody> when <tr> is a direct child of <table>.
+      // The <tbody> is a structural wrapper — it does NOT carry loopId
+      // because it exists once, while the <tr> inside it repeats.
+      const parentEl = elStack.length ? elStack[elStack.length - 1] : null;
+      if (currentEl.tag === 'tr' && parentEl && parentEl.tag === 'table') {
+        const lastChild = parentEl.children[parentEl.children.length - 1];
+        if (lastChild && lastChild.kind === 'element' && lastChild.tag === 'tbody') {
+          elStack.push(lastChild);
+        } else {
+          const tbody = { kind: 'element', tag: 'tbody', attrs: [], children: [] };
+          addChild(tbody);
+          elStack.push(tbody);
+        }
+      }
       addChild(currentEl);
       if (!currentEl.tag || !VOID_ELEMENTS.has(currentEl.tag.toLowerCase())) elStack.push(currentEl);
       currentEl = null;
@@ -4808,7 +4825,15 @@
       // Don't push to stack — self-closing.
       currentEl = null;
     };
-    const popEl = () => { if (elStack.length) elStack.pop(); };
+    let closingTag = '';
+    const popEl = () => {
+      if (!elStack.length) return;
+      // Auto-pop implicit <tbody> when closing </table>.
+      if (closingTag === 'table' && elStack[elStack.length - 1].tag === 'tbody') {
+        elStack.pop();
+      }
+      if (elStack.length) elStack.pop();
+    };
     let textBuf = '';
     const flushText = () => {
       if (textBuf) { addChild({ kind: 'text', text: decodeHtmlEntities(textBuf) }); textBuf = ''; }
@@ -4841,7 +4866,7 @@
           case TEXT:
             if (c === '<') {
               flushText();
-              if (text[i + 1] === '/') { state = TAG_CLOSE; i++; }
+              if (text[i + 1] === '/') { state = TAG_CLOSE; closingTag = ''; i++; }
               else if (text[i + 1] === '!' && text[i + 2] === '-' && text[i + 3] === '-') {
                 state = COMMENT; i += 3;
               }
@@ -4863,6 +4888,7 @@
             break;
           case TAG_CLOSE:
             if (c === '>') { popEl(); state = TEXT; }
+            else { closingTag += c.toLowerCase(); }
             break;
           case ATTRS:
             if (c === '>') {
@@ -5255,7 +5281,7 @@
         continue;
       }
 
-      // Style -> style.setProperty.
+      // Style -> style.setProperty per declaration.
       if (name === 'style' && opts.splitStyle && !hasDynamic) {
         const decls = parseStyleDecls(attr.value);
         if (decls.length) {

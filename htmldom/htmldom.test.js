@@ -1984,13 +1984,12 @@ function render() {
       failures.push({ name: name + ' (converted threw)', input: e.message, want: origDOM, got: 'ERROR: ' + e.message });
       return;
     }
-    // Normalize differences between innerHTML parsing and DOM API:
-    // - Style serialization (jsdom adds space/semicolon for setProperty)
-    // - tbody auto-insertion (innerHTML inserts tbody, appendChild doesn't)
-    const norm = s => s
-      .replace(/style="([^"]*)"/g, (m, v) => 'style="' + v.replace(/;\s*$/, '').replace(/:\s+/g, ':') + '"')
-      .replace(/<\/?tbody>/g, '');
-    if (norm(origDOM) === norm(convDOM)) {
+    // Normalize style attribute serialization: setProperty and
+    // setAttribute('style') produce identical computed styles but
+    // browsers serialize them differently (spacing, trailing semicolon).
+    const normStyle = s => s.replace(/style="([^"]*)"/g, (m, v) =>
+      'style="' + v.replace(/\s*;\s*$/, '').replace(/\s*:\s*/g, ':').replace(/\s*;\s*/g, ';') + '"');
+    if (normStyle(origDOM) === normStyle(convDOM)) {
       pass++;
     } else {
       fail++;
