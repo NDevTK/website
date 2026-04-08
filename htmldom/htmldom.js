@@ -5966,7 +5966,7 @@
     return out;
   }
 
-  function convertHtmlMarkup(htmlContent, htmlPath, reservedIdents, bodyWillBeReplaced) {
+  function convertHtmlMarkup(htmlContent, htmlPath, reservedIdents) {
     // Derive filenames from source path.
     let baseName = htmlPath;
     const slashIdx = baseName.lastIndexOf('/');
@@ -6003,12 +6003,8 @@
     }
 
     // Walk tokens and process each opening tag.
-    // Default to true if there's no explicit <body> tag (content is implicitly body).
-    let insideBody = !htmlTokens.some(function(t) { return t.type === 'openTag' && t.tag === 'body'; });
     for (let ti = 0; ti < htmlTokens.length; ti++) {
       const tok = htmlTokens[ti];
-      if (tok.type === 'openTag' && tok.tag === 'body') insideBody = true;
-      if (tok.type === 'closeTag' && tok.tag === 'body') insideBody = false;
       if (tok.type !== 'openTag') continue;
 
       // Handle <script> without src — extract to external file.
@@ -6064,9 +6060,9 @@
         continue;
       }
 
-      // Skip handler extraction for body elements that will be wiped
-      // by a script replacing document.body.innerHTML.
-      if (bodyWillBeReplaced && insideBody && tok.tag !== 'script' && tok.tag !== 'style') continue;
+      // Process all elements regardless of whether body will be replaced.
+      // Elements exist during initial render and their handlers are active
+      // until the script replaces body content.
 
       // Extract unsafe attributes from this element.
       const events = [];
@@ -6216,50 +6212,7 @@
           if (t.type === 'other' && IDENT_RE.test(t.text)) pageIdents.add(t.text);
         }
       }
-      // Check if any script replaces body content via any HTML sink:
-      // document.body.innerHTML =, document.body.outerHTML =,
-      // document.write(), document.writeln().
-      // If so, body elements will be wiped — don't extract handlers.
-      let bodyWillBeReplaced = false;
-      function checkTokensForBodyReplace(toks2) {
-        for (let ti = 0; ti < toks2.length; ti++) {
-          var t = toks2[ti];
-          // document.body.innerHTML = or document.body.outerHTML =
-          if (ti > 0 && t.type === 'sep' && t.char === '=' &&
-              toks2[ti - 1].type === 'other' &&
-              (toks2[ti - 1].text === 'document.body.innerHTML' || toks2[ti - 1].text === 'document.body.outerHTML')) {
-            return true;
-          }
-          // document.write() or document.writeln()
-          if (t.type === 'other' && (t.text === 'document.write' || t.text === 'document.writeln') &&
-              ti + 1 < toks2.length && toks2[ti + 1].type === 'open' && toks2[ti + 1].char === '(') {
-            return true;
-          }
-        }
-        return false;
-      }
-      for (const sp of pageScripts) {
-        const content = files[sp] || '';
-        if (checkTokensForBodyReplace(tokenize(content.trim()))) { bodyWillBeReplaced = true; break; }
-      }
-      // Also check inline scripts.
-      if (!bodyWillBeReplaced) {
-        const htmlToks = tokenizeHtml(files[page]);
-        for (const ht of htmlToks) {
-          if (ht.type === 'openTag' && ht.tag === 'script' && !ht.attrs.some(function(a) { return a.name === 'src'; })) {
-            let body = '';
-            for (let si = htmlToks.indexOf(ht) + 1; si < htmlToks.length; si++) {
-              if (htmlToks[si].type === 'closeTag' && htmlToks[si].tag === 'script') break;
-              if (htmlToks[si].type === 'text') body += htmlToks[si].text;
-            }
-            if (body.trim() && checkTokensForBodyReplace(tokenize(body.trim()))) {
-              bodyWillBeReplaced = true;
-            }
-          }
-          if (bodyWillBeReplaced) break;
-        }
-      }
-      const markup = convertHtmlMarkup(files[page], page, pageIdents, bodyWillBeReplaced);
+      const markup = convertHtmlMarkup(files[page], page, pageIdents);
       const dir = page.indexOf('/') >= 0 ? page.slice(0, page.lastIndexOf('/') + 1) : '';
       // Only output HTML if it actually changed.
       if (markup.html !== files[page]) output[page] = markup.html;
