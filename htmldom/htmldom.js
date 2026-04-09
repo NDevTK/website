@@ -2630,6 +2630,11 @@
           const rp = tks[fnNext];
           if (!rp || rp.type !== 'close' || rp.char !== ')') return null;
           if (method === 'forEach') {
+            // Walk callback for each element to detect side effects
+            // (e.g. el.innerHTML = item inside the callback).
+            for (const el of bind.elems) {
+              if (el) instantiateFunction(fn, [el]);
+            }
             return { bind: chainBinding([makeSynthStr('undefined')]), next: fnNext + 1 };
           }
           const results = [];
@@ -3284,7 +3289,12 @@
       const parsed = parseArithExpr(k, stop);
       if (parsed) {
         const boundary = skipOperand(parsed.next, stop, terms);
-        if (boundary === parsed.next) return { toks: parsed.bind.toks.slice(), next: parsed.next };
+        if (boundary === parsed.next) {
+          if (parsed.bind.kind === 'chain') return { toks: parsed.bind.toks.slice(), next: parsed.next };
+          // Non-chain binding (function/array/object): return opaque ref
+          // so concat chains can include it without crashing.
+          return { toks: [exprRef(tks[k]._src.slice(tks[k].start, tks[parsed.next - 1].end))], next: parsed.next };
+        }
       }
       const end = skipOperand(k, stop, terms);
       if (end === k) return null;
@@ -3357,7 +3367,11 @@
         cur = combined;
         next = right.next;
       }
-      if (!cur || cur.kind !== 'chain') return null;
+      if (!cur) return null;
+      // Non-chain bindings (function, array, object) pass through as-is
+      // when no operators were applied. This lets call arguments like
+      // apply(sink, val) where sink is a function binding flow correctly.
+      if (cur.kind !== 'chain') return { bind: cur, next };
       // Ternary at the lowest precedence: `cond ? a : b`.
       const q = tks[next];
       if (minPrec === 0 && q && q.type === 'other' && q.text === '?') {
@@ -4822,14 +4836,12 @@
         if (callParen && callParen.type === 'open' && callParen.char === '(') {
           var calleeBind = resolvePath(t.text);
           if (calleeBind && calleeBind.kind === 'function') {
-            var callArgs = readConcatArgs(i + 1, stop);
+            var callArgs = readCallArgBindings(i + 1, stop);
             if (callArgs) {
-              instantiateFunction(calleeBind, callArgs.args.map(function(a) { return chainBinding(a); }));
-              // Also check for trailing .prop = value (e.g. returned element).
+              instantiateFunction(calleeBind, callArgs.bindings);
               i = callArgs.next - 1;
-              // Check for call-based sinks.
               if (taintEnabled && TAINT_CALL_SINKS[t.text] && !declaredNames.has(t.text.split('.')[0])) {
-                checkSinkCall(t.text, callArgs.args.map(function(a) { return chainBinding(a); }), t);
+                checkSinkCall(t.text, callArgs.bindings, t);
               }
               continue;
             }
@@ -5004,7 +5016,15 @@
                 continue;
               }
             }
-            // Array mutation: arr.push(x), arr.unshift(x) — add elements.
+            // Array methods as statements: forEach, push, unshift.
+            if (baseBind && baseBind.kind === 'array' && (method === 'forEach' || method === 'map' || method === 'filter')) {
+              // Use applyMethod to handle the call — it walks forEach callbacks.
+              var arrMethodResult = applyMethod(baseBind, method, i + 1, stop);
+              if (arrMethodResult) {
+                i = arrMethodResult.next - 1;
+                continue;
+              }
+            }
             if (baseBind && baseBind.kind === 'array' && (method === 'push' || method === 'unshift')) {
               var arrArgs = readCallArgBindings(i + 1, stop);
               if (arrArgs) {
@@ -7483,16 +7503,8 @@
         allFindings.push(f3);
       }
     }
-    // Deduplicate findings.
-    var seen = new Set();
-    var deduped = [];
-    for (var finding of allFindings) {
-      var key = finding.file + ':' + finding.type + ':' + (finding.sink.prop || '') + ':' + finding.sources.join(',');
-      if (!seen.has(key)) {
-        seen.add(key);
-        deduped.push(finding);
-      }
-    }
+    // No dedup — each finding is a distinct code path.
+    var deduped = allFindings;
     return {
       findings: deduped,
       summary: {
