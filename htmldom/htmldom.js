@@ -5004,6 +5004,20 @@
                 continue;
               }
             }
+            // Array mutation: arr.push(x), arr.unshift(x) — add elements.
+            if (baseBind && baseBind.kind === 'array' && (method === 'push' || method === 'unshift')) {
+              var arrArgs = readCallArgBindings(i + 1, stop);
+              if (arrArgs) {
+                for (var _ai = 0; _ai < arrArgs.bindings.length; _ai++) {
+                  if (arrArgs.bindings[_ai]) {
+                    if (method === 'push') baseBind.elems.push(arrArgs.bindings[_ai]);
+                    else baseBind.elems.unshift(arrArgs.bindings[_ai]);
+                  }
+                }
+                i = arrArgs.next - 1;
+                continue;
+              }
+            }
             // Taint: detect addEventListener on ANY object (window, document, element).
             // readCallArgBindings now handles function expressions and arrows
             // via readValue → readFunctionExpr, so no special parser needed.
