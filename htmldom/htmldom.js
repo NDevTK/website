@@ -1749,6 +1749,10 @@
     // outer-scope variables inside handlers produce values that depend
     // on the number of handler invocations (attacker-controlled).
     var inEventHandler = false;
+    // Track function scope depth for taint. Findings inside function
+    // bodies walked at definition time (not via instantiateFunction)
+    // should be suppressed because there's no calling context.
+    var taintFnDepth = 0;
     // Loop detection stack: each entry is `{ id, kind, headerSrc, bodyEnd,
     // frame, modifiedVars }` recording an enclosing `for`/`while`. Operands
     // added to a binding's chain while a loop is active carry a `loopId` tag
@@ -1819,6 +1823,9 @@
     };
     const recordTaintFinding = (sinkType, severity, prop, elementTag, taintLabels, pathConditions, location) => {
       if (!taintFindings) return;
+      // Suppress findings inside function bodies walked at definition time.
+      // These are re-walked via instantiateFunction with proper context.
+      if (taintFnDepth > 0) return;
       taintFindings.push({
         type: sinkType,
         severity: severity,
@@ -3597,8 +3604,10 @@
     const instantiateFunction = (fn, argBindings) => {
       stack.push({ bindings: Object.create(null), isFunction: true });
       const frame = stack[stack.length - 1];
-      // Body indices are into the original `tokens` array; swap `tks` if we
-      // happen to be evaluating a re-tokenized expression right now.
+      // instantiateFunction walks the body with calling context —
+      // taint findings are valid here (unlike definition-time walks).
+      var savedTaintFnDepth = taintFnDepth;
+      taintFnDepth = 0;
       const savedTks = tks;
       tks = tokens;
       for (let p = 0; p < fn.params.length; p++) {
@@ -3695,6 +3704,7 @@
         if (r && r.next === fn.bodyEnd) result = r.toks;
       }
       tks = savedTks;
+      taintFnDepth = savedTaintFnDepth;
       stack.pop();
       // Expand any loopVars created during the function body walk.
       if (result && fnLoopVars && fnLoopVars.length > 0) {
@@ -4189,6 +4199,7 @@
 
       if (t.type === 'open' && t.char === '{') {
         const frame = { bindings: Object.create(null), isFunction: pendingFunctionBrace };
+        if (taintEnabled && pendingFunctionBrace) taintFnDepth++;
         if (pendingFunctionBrace && pendingFunctionParams) {
           // Bind function parameters as references to their own names so
           // uses within the body surface when the body is
@@ -4204,7 +4215,10 @@
         continue;
       }
       if (t.type === 'close' && t.char === '}') {
-        if (stack.length > 1) stack.pop();
+        if (stack.length > 1) {
+          var _popped = stack.pop();
+          if (taintEnabled && _popped.isFunction) taintFnDepth--;
+        }
         continue;
       }
 

@@ -3286,7 +3286,7 @@ function render() {
 
   // --- Cross-handler state ---
   checkTaint('cross-handler state', { 'a.js': 'var saved; window.addEventListener("message", function(e) { saved = e.data; }); window.addEventListener("hashchange", function() { document.getElementById("o").innerHTML = saved; });' }, 1, { sources: ['postMessage'] });
-  checkTaint('handler sets, fn reads', { 'a.js': 'var data; window.addEventListener("message", function(e) { data = e.data; }); function render() { document.getElementById("o").innerHTML = data; } render();' }, 2);
+  checkTaint('handler sets, fn reads', { 'a.js': 'var data; window.addEventListener("message", function(e) { data = e.data; }); function render() { document.getElementById("o").innerHTML = data; } render();' }, 1);
   checkTaint('postMessage + url combine', { 'a.js': 'var config = {}; window.addEventListener("message", function(e) { config.template = e.data; }); document.getElementById("o").innerHTML = config.template + location.search;' }, 1);
 
   // --- Filter tracks taint from source elements ---
@@ -3344,6 +3344,10 @@ function render() {
   checkTaint('switch dead case', { 'a.js': 'var x = location.search; switch(true) { case x > 5 && x < 3: document.getElementById("o").innerHTML = x; break; }' }, 0);
   checkTaint('handler path unsat', { 'a.js': 'window.addEventListener("message", function(e) { var x = e.data; if (x > 5) { if (x < 3) { document.getElementById("o").innerHTML = x; } } });' }, 0);
   checkTaint('fn path unsat', { 'a.js': 'function render(x) { if (x > 5) { if (x < 3) { document.getElementById("o").innerHTML = x; } } } render(location.search);' }, 0);
+
+  // --- SMT cross-function path constraints ---
+  checkTaint('fn1 constrains fn2', { 'a.js': 'var x = location.search; function validate() { if (x > 5) { render(); } } function render() { if (x < 3) { document.getElementById("o").innerHTML = x; } } validate();' }, 0);
+  checkTaint('fn sets then checks', { 'a.js': 'var x; function init() { x = location.search; } init(); if (x > 5 && x < 3) { document.getElementById("o").innerHTML = x; }' }, 0);
   checkTaint('satisfiable: obj.prop++ count', { 'a.js': 'var state = {count:0}; window.addEventListener("message", function(e) { state.count++; if (state.count > 3) { document.getElementById("o").innerHTML = e.data; } });' }, 1);
   checkTaint('satisfiable: ident++ in handler', { 'a.js': 'var n = 0; window.addEventListener("message", function(e) { n++; if (n > 5) { document.getElementById("o").innerHTML = e.data; } });' }, 1);
 
@@ -3355,7 +3359,7 @@ function render() {
 
   // --- Object property mutation ---
   checkTaint('obj.prop = tainted', { 'a.js': 'var state = { msg: "" }; state.msg = location.search; document.getElementById("o").innerHTML = state.msg;' }, 1);
-  checkTaint('obj prop via handler', { 'a.js': 'var state = { msg: "" }; window.addEventListener("message", function(e) { state.msg = e.data; }); function render() { document.getElementById("o").innerHTML = state.msg; } render();' }, 2);
+  checkTaint('obj prop via handler', { 'a.js': 'var state = { msg: "" }; window.addEventListener("message", function(e) { state.msg = e.data; }); function render() { document.getElementById("o").innerHTML = state.msg; } render();' }, 1);
 
   // --- Multi-step accumulation ---
   checkTaint('handler push + url join', { 'a.js': 'var parts = [];\nwindow.addEventListener("message", function(e) { parts.push(e.data); });\nvar url = location.search;\nvar html = parts.join("") + url;\ndocument.getElementById("o").innerHTML = html;' }, 1);
