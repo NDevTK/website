@@ -2914,6 +2914,12 @@
           }
         }
         const b = resolvePath(t.text);
+        // Taint: check call-based sinks even in expression position
+        // (e.g. var x = eval(tainted)).
+        if (taintEnabled && isCall && TAINT_CALL_SINKS[t.text]) {
+          var _sinkCallArgs = readCallArgBindings(k + 1, stop);
+          if (_sinkCallArgs) checkSinkCall(t.text, _sinkCallArgs.bindings);
+        }
         if (!b) {
           // Unresolved identifier: return it as an opaque chain carrying
           // its source text. If followed by a balanced `(...)` (call) or
@@ -4492,9 +4498,37 @@
           let k = j + 1;
           if (eqTok && eqTok.type === 'sep' && eqTok.char === '=') {
             hasInit = true;
-            const r = readValue(j + 2, stop, TERMS_TOP);
-            value = r ? r.binding : null;
-            k = skipExpr(j + 2, stop);
+            // Check for function expression: var x = function(params) { body }
+            var _rhsTok = tokens[j + 2];
+            if (_rhsTok && _rhsTok.type === 'other' && _rhsTok.text === 'function') {
+              var _fk = j + 3;
+              if (tokens[_fk] && tokens[_fk].type === 'other' && IDENT_RE.test(tokens[_fk].text) && tokens[_fk].text !== 'function') _fk++;
+              if (tokens[_fk] && tokens[_fk].type === 'open' && tokens[_fk].char === '(') {
+                var _fParams = [];
+                var _fj = _fk + 1;
+                while (_fj < stop) {
+                  var _pt = tokens[_fj];
+                  if (_pt && _pt.type === 'close' && _pt.char === ')') { _fj++; break; }
+                  if (_pt && _pt.type === 'other' && IDENT_RE.test(_pt.text)) _fParams.push({ name: _pt.text });
+                  _fj++;
+                }
+                if (tokens[_fj] && tokens[_fj].type === 'open' && tokens[_fj].char === '{') {
+                  var _fd = 1, _fbe = _fj + 1;
+                  while (_fbe < stop && _fd > 0) {
+                    if (tokens[_fbe].type === 'open' && tokens[_fbe].char === '{') _fd++;
+                    else if (tokens[_fbe].type === 'close' && tokens[_fbe].char === '}') _fd--;
+                    _fbe++;
+                  }
+                  value = functionBinding(_fParams, _fj, _fbe, true);
+                  k = _fbe;
+                }
+              }
+            }
+            if (!value) {
+              const r = readValue(j + 2, stop, TERMS_TOP);
+              value = r ? r.binding : null;
+              k = skipExpr(j + 2, stop);
+            }
           }
           if (hasInit) {
             declBind(nameTok.text, value);
