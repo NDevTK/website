@@ -3281,6 +3281,19 @@ function render() {
   // --- Inline script line numbers ---
   checkTaint('inline script line', { 'e.html': '<div>hi</div>\n<script>\nvar x = location.search;\ndocument.body.innerHTML = x;\n</script>' }, 1, { hasLine: true });
 
+  // --- Array methods with function expression callbacks ---
+  checkTaint('filter fn expr', { 'a.js': 'var items = [location.search, "safe"]; var filtered = items.filter(function(x){ return x.length > 0; }); document.getElementById("o").innerHTML = filtered[0];' }, 1);
+  checkTaint('reduce fn expr', { 'a.js': 'var items = ["a", location.search]; var result = items.reduce(function(acc, x){ return acc + x; }, ""); document.getElementById("o").innerHTML = result;' }, 1);
+
+  // --- Advanced patterns ---
+  checkTaint('reassign in fn', { 'a.js': 'var x = "safe"; function f() { x = location.search; } f(); document.getElementById("o").innerHTML = x;' }, 1);
+  checkTaint('loop html builder', { 'a.js': 'var input = location.search; var rows = ""; for (var i = 0; i < 5; i++) { rows += "<tr><td>" + input + "</td></tr>"; } document.getElementById("table").innerHTML = "<table>" + rows + "</table>";' }, 1);
+  checkTaint('ternary to sink', { 'a.js': 'var x = location.search; var html = x ? "<b>" + x + "</b>" : "<b>empty</b>"; document.getElementById("o").innerHTML = html;' }, 1);
+  checkTaint('3 sources combine', { 'a.js': 'window.addEventListener("message", function(e) { var x = e.data + location.search + document.cookie; document.getElementById("o").innerHTML = x; });' }, 1);
+  checkTaint('eval built string', { 'a.js': 'var cmd = "alert(" + location.search + ")"; eval(cmd);' }, 1);
+  checkTaint('postMessage getElementById', { 'a.js': 'window.addEventListener("message", function(event) { var target = document.getElementById("output"); target.innerHTML = event.data; });' }, 1);
+  checkTaint('split then join', { 'a.js': 'var x = location.search; var parts = x.split("&"); document.getElementById("o").innerHTML = parts.join("");' }, 1);
+
   console.log(`  (${pass + fail - before} cases)`);
 })();
 

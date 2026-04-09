@@ -2653,8 +2653,7 @@
             const s = n === null ? chainAsKnownString(resChain) : null;
             const truthy = (n !== null && n !== 0) || (s !== null && s !== '' && s !== 'false' && s !== 'null' && s !== 'undefined' && s !== '0' && s !== 'NaN');
             const falsy = n === 0 || s === '' || s === 'false' || s === 'null' || s === 'undefined' || s === '0' || s === 'NaN';
-            if (truthy) results.push(el);
-            else if (!falsy) return null;
+            if (truthy || !falsy) results.push(el);
           }
           return { bind: arrayBinding(results), next: fnNext + 1 };
         }
@@ -2664,17 +2663,32 @@
         if (method === 'reduce') {
           const lp = tks[parenIdx];
           if (!lp || lp.type !== 'open' || lp.char !== '(') return null;
+          // Try arrow, function expression, or identifier.
+          var reduceFn = null, reduceFnNext = 0;
           const arrow = peekArrow(parenIdx + 1, stop);
-          if (!arrow || arrow.params.length !== 2) return null;
-          const body = readArrowBody(arrow.arrowNext, stop);
-          if (!body) return null;
-          const sep = tks[body.next];
+          if (arrow && arrow.params.length === 2) {
+            const body = readArrowBody(arrow.arrowNext, stop);
+            if (body) { reduceFn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock); reduceFnNext = body.next; }
+          }
+          if (!reduceFn) {
+            var rfexpr = readFunctionExpr(parenIdx + 1, stop);
+            if (rfexpr && rfexpr.binding.params && rfexpr.binding.params.length === 2) { reduceFn = rfexpr.binding; reduceFnNext = rfexpr.next; }
+          }
+          if (!reduceFn) {
+            var rcbTok = tks[parenIdx + 1];
+            if (rcbTok && rcbTok.type === 'other' && IDENT_RE.test(rcbTok.text)) {
+              var rrefB = resolve(rcbTok.text);
+              if (rrefB && rrefB.kind === 'function' && rrefB.params && rrefB.params.length === 2) { reduceFn = rrefB; reduceFnNext = parenIdx + 2; }
+            }
+          }
+          if (!reduceFn) return null;
+          const sep = tks[reduceFnNext];
           if (!sep || sep.type !== 'sep' || sep.char !== ',') return null;
-          const init = readConcatExpr(body.next + 1, stop, { sep: [], close: [')'] });
+          const init = readConcatExpr(reduceFnNext + 1, stop, { sep: [], close: [')'] });
           if (!init) return null;
           const rp = tks[init.next];
           if (!rp || rp.type !== 'close' || rp.char !== ')') return null;
-          const fn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock);
+          const fn = reduceFn;
           let accBind = chainBinding(init.toks);
           for (const el of bind.elems) {
             if (!el) return null;
