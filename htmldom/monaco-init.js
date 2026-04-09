@@ -201,7 +201,8 @@
         sev.className = 'finding-severity ' + finding.severity;
         sev.textContent = finding.severity.toUpperCase();
         el.appendChild(sev);
-        var desc = document.createTextNode(finding.sources.join(', ') + ' \u2192 ' + finding.sink.prop + (finding.sink.elementTag ? ' on <' + finding.sink.elementTag + '>' : ''));
+        var typeLabel = finding.type === 'navigation' ? ' [nav]' : finding.type === 'code' ? ' [code exec]' : finding.type === 'html' ? ' [XSS]' : '';
+        var desc = document.createTextNode(finding.sources.join(', ') + ' \u2192 ' + finding.sink.prop + (finding.sink.elementTag ? ' on <' + finding.sink.elementTag + '>' : '') + typeLabel);
         el.appendChild(desc);
         if (finding.file) {
           var flow = document.createElement('div');

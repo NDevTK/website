@@ -161,7 +161,10 @@
     'setInterval':            { type: 'code', severity: 'high' },
     'document.write':         { type: 'html', severity: 'high' },
     'document.writeln':       { type: 'html', severity: 'high' },
-    'window.open':            { type: 'url',  severity: 'medium' },
+    'window.open':            { type: 'navigation', severity: 'medium' },
+    'location.assign':        { type: 'navigation', severity: 'high' },
+    'location.replace':       { type: 'navigation', severity: 'high' },
+    'navigation.navigate':    { type: 'navigation', severity: 'high' },
   };
   // setAttribute sinks: attr name → classification.
   const ATTR_SINKS = {
@@ -316,6 +319,95 @@
     }
     return null;
   }
+
+  // -----------------------------------------------------------------------
+  // Navigation Sink Infrastructure
+  // -----------------------------------------------------------------------
+
+  // Global navigation objects — expressions that are always navigation-related
+  // when they appear unbound (not shadowed by a local variable).
+  const NAV_GLOBALS = {
+    'location':                   'location',
+    'window.location':            'location',
+    'document.location':          'location',
+    'self.location':              'location',
+    'globalThis.location':        'location',
+    'opener':                     'opener',
+    'window.opener':              'opener',
+    'opener.location':            'opener.location',
+    'window.opener.location':     'opener.location',
+    'parent':                     'parent',
+    'window.parent':              'parent',
+    'parent.location':            'parent.location',
+    'window.parent.location':     'parent.location',
+    'top':                        'top',
+    'window.top':                 'top',
+    'top.location':               'top.location',
+    'window.top.location':        'top.location',
+    'navigation':                 'navigation',
+    'window.navigation':          'navigation',
+  };
+
+  // Navigation sink patterns: property assignments or method calls that
+  // cause navigation and are vulnerable to javascript: protocol XSS.
+  // Each entry: { kind: 'assign'|'call', severity, check }.
+  const NAV_SINKS = {
+    // Direct location assignments
+    'location.href':     { kind: 'assign', severity: 'high' },
+    'location':          { kind: 'assign', severity: 'high' },  // location = url
+    // Location methods
+    'location.assign':   { kind: 'call', severity: 'high' },
+    'location.replace':  { kind: 'call', severity: 'high' },
+    // window.open
+    'window.open':       { kind: 'call', severity: 'medium' },
+    'open':              { kind: 'call', severity: 'medium' },
+    // Navigation API
+    'navigation.navigate': { kind: 'call', severity: 'high' },
+  };
+
+  // Properties on frame/iframe elements that are navigation sinks.
+  const FRAME_NAV_PROPS = new Set(['src']);
+  // Properties on opener/parent/top.location that are navigation sinks.
+  const LOCATION_NAV_PROPS = new Set(['href', '']);  // '' = direct assignment
+
+  // Check if an expression is a known global navigation object.
+  // Returns the nav type or null. Only matches when the name isn't
+  // shadowed by a local binding in the provided resolve function.
+  function isNavGlobal(expr, resolveLocal) {
+    // Direct match (e.g. 'location', 'opener', 'opener.location').
+    if (NAV_GLOBALS[expr]) {
+      var root = expr.split('.')[0];
+      if (root === 'window' || root === 'self' || root === 'globalThis') return NAV_GLOBALS[expr];
+      if (resolveLocal) {
+        var b = resolveLocal(root);
+        if (b && !(b.kind === 'chain' && b.toks.length === 1 && b.toks[0].type === 'other' && b.toks[0].text === root)) {
+          return null; // shadowed by local
+        }
+      }
+      return NAV_GLOBALS[expr];
+    }
+    // Check if the expression is a property on a nav global.
+    // e.g. 'location.href' → root 'location' is nav, property 'href'.
+    var parts = expr.split('.');
+    for (var pi = parts.length - 1; pi >= 1; pi--) {
+      var prefix = parts.slice(0, pi).join('.');
+      if (NAV_GLOBALS[prefix]) {
+        var root2 = parts[0];
+        if (root2 !== 'window' && root2 !== 'self' && root2 !== 'globalThis' && resolveLocal) {
+          var b2 = resolveLocal(root2);
+          if (b2 && !(b2.kind === 'chain' && b2.toks.length === 1 && b2.toks[0].type === 'other' && b2.toks[0].text === root2)) {
+            return null;
+          }
+        }
+        return NAV_GLOBALS[prefix] + '.' + parts.slice(pi).join('.');
+      }
+    }
+    return null;
+  }
+
+  // Protocol filter code for safe navigation: validates URL is http(s).
+  var NAV_SAFE_FILTER = 'function __safeNav(url){try{var u=new URL(url,location.href);if(u.protocol===\"https:\"||u.protocol===\"http:\")return url}catch(e){}return undefined}';
+  var NAV_SAFE_FILTER_USED = false;
 
   // -----------------------------------------------------------------------
   // End Taint Analysis Infrastructure
@@ -4792,6 +4884,66 @@
         }
       }
 
+      // Navigation sink detection: location.href = expr, location.assign(expr),
+      // opener.location = expr, frame.contentWindow.location.href = expr, etc.
+      if (t.type === 'other' && PATH_RE.test(t.text)) {
+        var _navType = isNavGlobal(t.text, resolve);
+        // Check for navigation property assignment: location.href = expr, location = expr
+        if (_navType) {
+          var _navEq = tokens[i + 1];
+          if (_navEq && _navEq.type === 'sep' && (_navEq.char === '=' || _navEq.char === '+=')) {
+            var _navR = readValue(i + 2, stop, TERMS_TOP);
+            var _navVal = _navR ? _navR.binding : null;
+            // Record as navigation sink finding.
+            if (taintEnabled && _navVal && _navVal.kind === 'chain') {
+              var _navTaint = collectChainTaint(_navVal.toks);
+              if (_navTaint && _navTaint.size) {
+                recordTaintFinding('navigation', 'high', t.text, null, _navTaint, taintCondStack,
+                  { expr: t.text, line: countLines(t._src, t.start) });
+              }
+            }
+            i = skipExpr(i + 2, stop) - 1;
+            continue;
+          }
+          // Check for navigation method call: location.assign(expr), location.replace(expr)
+          var _navParen = tokens[i + 1];
+          if (_navParen && _navParen.type === 'open' && _navParen.char === '(') {
+            var _navCallArgs = readCallArgBindings(i + 1, stop);
+            if (_navCallArgs && taintEnabled) {
+              checkSinkCall(t.text, _navCallArgs.bindings);
+            }
+            if (_navCallArgs) { i = _navCallArgs.next - 1; continue; }
+          }
+        }
+        // Check: frame.contentWindow.location[.href] = expr
+        // or opener.location[.href] = expr (handled by navType above for globals).
+        // For element-based: el.contentWindow.location.href = expr
+        if (t.text.endsWith('.contentWindow.location') || t.text.endsWith('.contentWindow.location.href')) {
+          var _cwParts = t.text.split('.');
+          var _cwBase = _cwParts[0];
+          var _cwBind = resolve(_cwBase);
+          if (_cwBind && _cwBind.kind === 'element') {
+            var _cwTag = getElementTag(_cwBind);
+            if (_cwTag === 'iframe' || _cwTag === 'frame') {
+              var _cwEq = tokens[i + 1];
+              if (_cwEq && _cwEq.type === 'sep' && _cwEq.char === '=') {
+                var _cwR = readValue(i + 2, stop, TERMS_TOP);
+                var _cwVal = _cwR ? _cwR.binding : null;
+                if (taintEnabled && _cwVal && _cwVal.kind === 'chain') {
+                  var _cwTaint = collectChainTaint(_cwVal.toks);
+                  if (_cwTaint && _cwTaint.size) {
+                    recordTaintFinding('navigation', 'high', t.text, _cwTag, _cwTaint, taintCondStack,
+                      { expr: t.text, line: countLines(t._src, t.start) });
+                  }
+                }
+                i = skipExpr(i + 2, stop) - 1;
+                continue;
+              }
+            }
+          }
+        }
+      }
+
       // Path assignment on a tracked DOM element: `el.prop = value`,
       // `el.style.color = value`, etc. Records the mutation on the
       // element binding so subsequent DOM serialization sees it.
@@ -6473,6 +6625,105 @@
     return scripts;
   }
 
+  // Scan JS source for navigation sinks and wrap them with protocol filtering.
+  // Returns the modified source, or null if no changes.
+  function filterNavigationSinks(jsContent) {
+    var tokens = tokenize(jsContent);
+    if (!tokens.length) return null;
+    // Build scope to resolve variable types.
+    var scope = buildScopeState(tokens, tokens.length);
+    var replacements = []; // { start, end, replacement }
+    for (var i = 0; i < tokens.length; i++) {
+      var t = tokens[i];
+      if (t.type !== 'other') continue;
+      // Check: navigation property assignment (location.href = expr, location = expr)
+      if (PATH_RE.test(t.text) || IDENT_RE.test(t.text)) {
+        var navType = isNavGlobal(t.text, scope.resolve);
+        if (navType) {
+          var eq = tokens[i + 1];
+          // location.href = expr / location = expr
+          if (eq && eq.type === 'sep' && eq.char === '=') {
+            var stmtEnd = i + 2;
+            while (stmtEnd < tokens.length && !(tokens[stmtEnd].type === 'sep' && tokens[stmtEnd].char === ';')) stmtEnd++;
+            var rhsStart = tokens[i + 2].start;
+            var rhsEnd = tokens[stmtEnd - 1].end;
+            var rhsSrc = t._src.slice(rhsStart, rhsEnd);
+            var fullStart = t.start;
+            var fullEnd = tokens[stmtEnd] ? tokens[stmtEnd].end : rhsEnd;
+            // Only wrap if the RHS isn't a plain string literal (string literals are safe).
+            if (tokens[i + 2].type !== 'str' || stmtEnd > i + 3) {
+              var safeExpr = '(function(){var __u=__safeNav(' + rhsSrc + ');if(__u!==undefined)' + t.text + '=__u}())';
+              replacements.push({ start: fullStart, end: fullEnd, replacement: safeExpr });
+            }
+            i = stmtEnd;
+            continue;
+          }
+          // location.assign(expr) / location.replace(expr) / navigation.navigate(expr)
+          if (eq && eq.type === 'open' && eq.char === '(') {
+            var callEnd = i + 2;
+            var depth = 1;
+            while (callEnd < tokens.length && depth > 0) {
+              if (tokens[callEnd].type === 'open' && tokens[callEnd].char === '(') depth++;
+              if (tokens[callEnd].type === 'close' && tokens[callEnd].char === ')') depth--;
+              callEnd++;
+            }
+            // Extract the first argument.
+            var argStart = tokens[i + 2] ? tokens[i + 2].start : null;
+            var argEnd = tokens[callEnd - 2] ? tokens[callEnd - 2].end : null;
+            if (argStart !== null && argEnd !== null) {
+              var argSrc = t._src.slice(argStart, argEnd);
+              if (tokens[i + 2].type !== 'str') {
+                var safeCall = '(function(){var __u=__safeNav(' + argSrc + ');if(__u!==undefined)' + t.text + '(__u)}())';
+                var cFullEnd = tokens[callEnd - 1] ? tokens[callEnd - 1].end : argEnd;
+                replacements.push({ start: t.start, end: cFullEnd, replacement: safeCall });
+              }
+            }
+            i = callEnd;
+            continue;
+          }
+        }
+        // frame.src = expr where frame is an iframe/frame element
+        if (PATH_RE.test(t.text)) {
+          var parts = t.text.split('.');
+          var lastProp = parts[parts.length - 1];
+          if (lastProp === 'src') {
+            var baseBind = scope.resolve(parts[0]);
+            var tag = getElementTag(baseBind);
+            if (tag === 'iframe' || tag === 'frame') {
+              var eq2 = tokens[i + 1];
+              if (eq2 && eq2.type === 'sep' && eq2.char === '=') {
+                var stmtEnd2 = i + 2;
+                while (stmtEnd2 < tokens.length && !(tokens[stmtEnd2].type === 'sep' && tokens[stmtEnd2].char === ';')) stmtEnd2++;
+                var rhsStart2 = tokens[i + 2].start;
+                var rhsEnd2 = tokens[stmtEnd2 - 1].end;
+                var rhsSrc2 = t._src.slice(rhsStart2, rhsEnd2);
+                if (tokens[i + 2].type !== 'str' || stmtEnd2 > i + 3) {
+                  var safeSrc = '(function(){var __u=__safeNav(' + rhsSrc2 + ');if(__u!==undefined)' + t.text + '=__u}())';
+                  var fFullEnd = tokens[stmtEnd2] ? tokens[stmtEnd2].end : rhsEnd2;
+                  replacements.push({ start: t.start, end: fFullEnd, replacement: safeSrc });
+                }
+                i = stmtEnd2;
+                continue;
+              }
+            }
+          }
+        }
+      }
+    }
+    if (!replacements.length) return null;
+    // Apply replacements in reverse order to preserve positions.
+    var result = jsContent;
+    for (var ri = replacements.length - 1; ri >= 0; ri--) {
+      var rep = replacements[ri];
+      result = result.slice(0, rep.start) + rep.replacement + result.slice(rep.end);
+    }
+    // Prepend the safe navigation helper if not already present.
+    if (result.indexOf('__safeNav') >= 0 && result.indexOf('function __safeNav') < 0) {
+      result = NAV_SAFE_FILTER + '\n' + result;
+    }
+    return result;
+  }
+
   function convertJsFile(jsContent, precedingCode, knownDomFunctions) {
     // Use extractAllHTML to detect actual innerHTML/outerHTML assignments.
     // This uses the tokenizer (skipping comments/strings) AND verifies
@@ -6481,18 +6732,25 @@
       ? precedingCode + '\n/*__FILE_BOUNDARY__*/\n' + jsContent
       : jsContent;
     const extractions = extractAllHTML(combined);
-    if (extractions.length === 0) return null;
-    const converted = convertRaw(combined, undefined, knownDomFunctions);
-    if (!converted || converted === '// (no nodes parsed)') return null;
+    // Also filter navigation sinks in the current file.
+    var navFiltered = filterNavigationSinks(jsContent);
+    if (extractions.length === 0 && !navFiltered) return navFiltered;
+    var sourceToConvert = navFiltered || jsContent;
+    var combinedSrc = precedingCode
+      ? precedingCode + '\n/*__FILE_BOUNDARY__*/\n' + sourceToConvert
+      : sourceToConvert;
+    if (extractions.length === 0) return navFiltered;
+    const converted = convertRaw(combinedSrc, undefined, knownDomFunctions);
+    if (!converted || converted === '// (no nodes parsed)') return navFiltered;
     if (precedingCode) {
       const idx = converted.indexOf('/*__FILE_BOUNDARY__*/');
       if (idx >= 0) {
         const result = converted.slice(idx + '/*__FILE_BOUNDARY__*/'.length).trim();
         if (result && result !== jsContent.trim()) return result;
-        return null;
+        return navFiltered;
       }
     }
-    if (converted.trim() === jsContent.trim()) return null;
+    if (converted.trim() === jsContent.trim()) return navFiltered;
     return converted;
   }
 
