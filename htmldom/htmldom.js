@@ -3561,10 +3561,6 @@
       const rt = chainAsExprText(right);
       if (lt === null || rt === null) return null;
       const text = '(' + lt + ' ' + op + ' ' + rt + ')';
-      // Comparison and logical operators produce booleans — taint doesn't
-      // propagate because the result is true/false, not attacker content.
-      const _boolOps = { '<':1, '>':1, '<=':1, '>=':1, '==':1, '!=':1, '===':1, '!==':1, 'in':1, 'instanceof':1 };
-      if (_boolOps[op]) return chainBinding([exprRef(text)]);
       return chainBinding([deriveExprRef(text, left.toks, right.toks)]);
     };
 
