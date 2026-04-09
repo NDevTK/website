@@ -3375,6 +3375,19 @@ function render() {
 
   // --- Disjunctive merge ---
   checkTaint('merge: y big or small', { 'a.js': 'var x = location.search; var y; if (x > 5) { y = "big"; } else { y = "small"; } if (y === "big" && y === "small") { document.getElementById("o").innerHTML = x; }' }, 0);
+
+  // --- IIFE ---
+  checkTaint('IIFE function', { 'a.js': '(function() { document.getElementById("o").innerHTML = location.search; })();' }, 1);
+  checkTaint('IIFE with args', { 'a.js': '(function(x) { document.getElementById("o").innerHTML = x; })(location.search);' }, 1);
+
+  // --- Computed property write ---
+  checkTaint('computed prop write+read', { 'a.js': 'var o = {}; var key = "x"; o[key] = location.search; document.getElementById("o").innerHTML = o[key];' }, 1);
+
+  // --- JSON.parse taint ---
+  checkTaint('JSON.parse tainted', { 'a.js': 'var x = JSON.parse(location.search); document.getElementById("o").innerHTML = x;' }, 1);
+
+  // --- Logical assignment ---
+  checkTaint('logical OR assign', { 'a.js': 'var x = ""; x ||= location.search; document.getElementById("o").innerHTML = x;' }, 1);
   checkTaint('satisfiable: obj.prop++ count', { 'a.js': 'var state = {count:0}; window.addEventListener("message", function(e) { state.count++; if (state.count > 3) { document.getElementById("o").innerHTML = e.data; } });' }, 1);
   checkTaint('satisfiable: ident++ in handler', { 'a.js': 'var n = 0; window.addEventListener("message", function(e) { n++; if (n > 5) { document.getElementById("o").innerHTML = e.data; } });' }, 1);
 

@@ -4270,8 +4270,8 @@
             bindings.push(chainBinding([deriveExprRef(_spreadName, _spreadBind && _spreadBind.kind === 'chain' ? _spreadBind.toks : null)]));
           }
           i++;
-          if (tks[i] && tks[i].type === 'sep' && tks[i].char === ',') i++;
-          continue;
+          if (tks[i] && tks[i].type === 'sep' && tks[i].char === ',') { i++; continue; }
+          break; // likely at ')' — exit the while loop
         }
         const v = readValue(i, stop, TERMS_ARG);
         if (!v) return null;
