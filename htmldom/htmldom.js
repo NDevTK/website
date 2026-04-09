@@ -2453,6 +2453,17 @@
               if (sep && sep.type === 'other' && sep.text === ':') {
                 i++;
                 const alias = tks[i];
+                // Nested destructuring: { key: { ... } } or { key: [ ... ] }
+                if (alias && alias.type === 'open' && (alias.char === '{' || alias.char === '[')) {
+                  var nested = readDestructurePattern(i, stop);
+                  if (nested) {
+                    entries.push({ key, nested: nested.pattern });
+                    i = nested.next;
+                    if (tks[i] && tks[i].type === 'sep' && tks[i].char === ',') i++;
+                    continue;
+                  }
+                  return null;
+                }
                 if (!alias || alias.type !== 'other' || !IDENT_RE.test(alias.text)) return null;
                 name = alias.text;
                 i++;
@@ -2545,11 +2556,16 @@
       if (pattern.kind === 'obj-pattern') {
         const props = source && source.kind === 'object' ? source.props : null;
         const seen = Object.create(null);
-        for (const { key, name, dflt } of pattern.entries) {
-          seen[key] = true;
-          let val = props ? (props[key] || null) : null;
-          if (val === null && dflt) val = resolveDefault(dflt);
-          bind(name, val);
+        for (const entry of pattern.entries) {
+          seen[entry.key] = true;
+          let val = props ? (props[entry.key] || null) : null;
+          if (val === null && entry.dflt) val = resolveDefault(entry.dflt);
+          if (entry.nested) {
+            // Nested destructuring: recursively apply pattern.
+            applyPatternBindings(entry.nested, val, bind);
+          } else {
+            bind(entry.name, val);
+          }
         }
         if (pattern.rest) {
           if (props) {
