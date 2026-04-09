@@ -2653,7 +2653,18 @@
             const s = n === null ? chainAsKnownString(resChain) : null;
             const truthy = (n !== null && n !== 0) || (s !== null && s !== '' && s !== 'false' && s !== 'null' && s !== 'undefined' && s !== '0' && s !== 'NaN');
             const falsy = n === 0 || s === '' || s === 'false' || s === 'null' || s === 'undefined' || s === '0' || s === 'NaN';
-            if (truthy || !falsy) results.push(el);
+            if (truthy) results.push(el);
+            else if (falsy) { /* skip */ }
+            else {
+              // Can't determine at compile time: result could contain any
+              // element. Return opaque binding with taint from all elements.
+              var _allElToks = [];
+              for (var _fe = 0; _fe < bind.elems.length; _fe++) {
+                if (bind.elems[_fe] && bind.elems[_fe].kind === 'chain') _allElToks.push(bind.elems[_fe].toks);
+              }
+              var _filterRef = deriveExprRef.apply(null, [chainAsExprText(chainBinding([exprRef('filtered')]))||'filtered'].concat(_allElToks));
+              return { bind: chainBinding([_filterRef]), next: fnNext + 1 };
+            }
           }
           return { bind: arrayBinding(results), next: fnNext + 1 };
         }
@@ -5060,14 +5071,21 @@
               if (_evArgs && _evArgs.bindings.length >= 2) {
                 var _evTypeStr = _evArgs.bindings[0] && _evArgs.bindings[0].kind === 'chain' ? chainAsKnownString(_evArgs.bindings[0]) : null;
                 var _evHandler = _evArgs.bindings[1];
-                if (_evTypeStr && _evHandler && _evHandler.kind === 'function' && EVENT_TAINT_SOURCES[_evTypeStr]) {
-                  var _evSources = EVENT_TAINT_SOURCES[_evTypeStr];
-                  if (_evHandler.params && _evHandler.params.length > 0) {
+                if (_evHandler && _evHandler.kind === 'function') {
+                  // Build tainted param binding if this event type has known sources.
+                  var _evParamBindings = [];
+                  if (_evTypeStr && EVENT_TAINT_SOURCES[_evTypeStr] && _evHandler.params && _evHandler.params.length > 0) {
+                    var _evSources = EVENT_TAINT_SOURCES[_evTypeStr];
                     var _pn = _evHandler.params[0].name;
                     var _evRef = exprRef(_pn);
                     _evRef.taint = new Set(Object.values(_evSources));
-                    instantiateFunction(_evHandler, [chainBinding([_evRef])]);
+                    _evParamBindings.push(chainBinding([_evRef]));
+                  } else if (_evHandler.params && _evHandler.params.length > 0) {
+                    // Unknown event type: param is opaque, no taint.
+                    _evParamBindings.push(chainBinding([exprRef(_evHandler.params[0].name)]));
                   }
+                  // Always walk the handler body for side effects on shared state.
+                  instantiateFunction(_evHandler, _evParamBindings);
                 }
                 i = _evArgs.next - 1;
                 continue;
