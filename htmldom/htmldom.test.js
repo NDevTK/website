@@ -3393,6 +3393,15 @@ function render() {
 
   // --- Logical assignment ---
   checkTaint('logical OR assign', { 'a.js': 'var x = ""; x ||= location.search; document.getElementById("o").innerHTML = x;' }, 1);
+
+  // --- Remaining features ---
+  checkTaint('??= taint', { 'a.js': 'var x = null; x ??= location.search; document.getElementById("o").innerHTML = x;' }, 1);
+  checkTaint('??= safe', { 'a.js': 'var x = "safe"; x ??= location.search; document.getElementById("o").innerHTML = x;' }, 0);
+  checkTaint('nested destruct', { 'a.js': 'var obj = { inner: { html: location.search } }; var { inner: { html } } = obj; document.getElementById("o").innerHTML = html;' }, 1);
+  checkTaint('destruct fn return', { 'a.js': 'function getData() { return { html: location.search }; } var { html } = getData(); document.getElementById("o").innerHTML = html;' }, 1);
+  checkTaint('class method', { 'a.js': 'class Renderer { render(html) { document.getElementById("o").innerHTML = html; } } var r = new Renderer(); r.render(location.search);' }, 1);
+  checkTaint('getter', { 'a.js': 'var obj = { get val() { return location.search; } }; document.getElementById("o").innerHTML = obj.val;' }, 1);
+  checkTaint('tagged template', { 'a.js': 'function tag(strings, ...vals) { return vals[0]; } var x = location.search; document.getElementById("o").innerHTML = tag`prefix${x}suffix`;' }, 1);
   checkTaint('satisfiable: obj.prop++ count', { 'a.js': 'var state = {count:0}; window.addEventListener("message", function(e) { state.count++; if (state.count > 3) { document.getElementById("o").innerHTML = e.data; } });' }, 1);
   checkTaint('satisfiable: ident++ in handler', { 'a.js': 'var n = 0; window.addEventListener("message", function(e) { n++; if (n > 5) { document.getElementById("o").innerHTML = e.data; } });' }, 1);
 

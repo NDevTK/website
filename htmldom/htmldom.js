@@ -2212,6 +2212,15 @@
       for (let i = 1; i < parts.length && b; i++) {
         const p = parts[i];
         if (b.kind === 'object') {
+          // Check for getter: __getter_prop is a function that returns the value.
+          var _getter = b.props['__getter_' + p];
+          if (_getter && _getter.kind === 'function') {
+            var _getResult = instantiateFunction(_getter, []);
+            if (_getResult && _getResult.kind) b = _getResult;
+            else if (_getResult) b = chainBinding(_getResult);
+            else b = null;
+            continue;
+          }
           b = b.props[p] || null;
         } else if (b.kind === 'chain' && b.toks.length === 1 && b.toks[0].type === 'other') {
           // Opaque chain (e.g. parameter bound to exprRef) — extend the
@@ -2653,9 +2662,32 @@
             if ((tk.text === 'get' || tk.text === 'set' || tk.text === 'async') &&
                 tks[i + 1] && tks[i + 1].type === 'other' && IDENT_RE.test(tks[i + 1].text) &&
                 tks[i + 2] && tks[i + 2].type === 'open' && tks[i + 2].char === '(') {
+              var _gsPrefix = tk.text;
               i++; // skip prefix
               keyName = tks[i].text;
               i++;
+              // Parse params and body directly (no 'function' keyword).
+              var _gsParams = [], _gsJ = i; // i points to '('
+              if (tks[_gsJ] && tks[_gsJ].type === 'open' && tks[_gsJ].char === '(') {
+                _gsJ++;
+                while (_gsJ < stop) {
+                  if (tks[_gsJ].type === 'close' && tks[_gsJ].char === ')') { _gsJ++; break; }
+                  var _gsp = parseParamWithDefault(tks, _gsJ, stop);
+                  if (_gsp) { _gsParams.push(_gsp.param); _gsJ = _gsp.next; }
+                  else _gsJ++;
+                  if (tks[_gsJ] && tks[_gsJ].type === 'sep' && tks[_gsJ].char === ',') _gsJ++;
+                }
+              }
+              if (tks[_gsJ] && tks[_gsJ].type === 'open' && tks[_gsJ].char === '{') {
+                var _gsBD = 1, _gsBE = _gsJ + 1;
+                while (_gsBE < stop && _gsBD > 0) { if (tks[_gsBE].type === 'open' && tks[_gsBE].char === '{') _gsBD++; if (tks[_gsBE].type === 'close' && tks[_gsBE].char === '}') _gsBD--; _gsBE++; }
+                var _gsFnBind = functionBinding(_gsParams, _gsJ, _gsBE, true);
+                if (_gsPrefix === 'get') props['__getter_' + keyName] = _gsFnBind;
+                else props[keyName] = _gsFnBind;
+                i = _gsBE;
+                if (tks[i] && tks[i].type === 'sep' && tks[i].char === ',') i++;
+                continue;
+              }
             } else {
               keyName = tk.text;
               i++;
@@ -3108,6 +3140,25 @@
             next = r.next;
             continue;
           }
+          // Object method call: cur is a function binding accessed via .prop,
+          // followed by (args). Inline the function.
+          if (isCall && cur && cur.kind === 'function') {
+            var _omArgs = readCallArgBindings(next + 1, stop);
+            if (_omArgs) {
+              var _omResult = instantiateFunction(cur, _omArgs.bindings);
+              if (_omResult && _omResult.kind) { bind = _omResult; next = _omArgs.next; continue; }
+              if (_omResult) { bind = chainBinding(_omResult); next = _omArgs.next; continue; }
+            }
+          }
+          // Getter on object: auto-invoke.
+          if (!isCall && cur && cur.kind === 'object' && cur.props['__getter_' + lastSeg]) {
+            var _gtrFn = cur.props['__getter_' + lastSeg];
+            if (_gtrFn.kind === 'function') {
+              var _gtrResult = instantiateFunction(_gtrFn, []);
+              if (_gtrResult && _gtrResult.kind) { cur = _gtrResult; }
+              else if (_gtrResult) { cur = chainBinding(_gtrResult); }
+            }
+          }
           bind = cur;
           next = next + 1;
           continue;
@@ -3482,6 +3533,24 @@
       // `new X(args)` / `new X.Y` / `new X` — absorb the constructor call
       // and its arguments as a single opaque expression reference.
       if (t.type === 'other' && t.text === 'new') {
+        // Check if the constructor is a known class.
+        var _newName = tks[k + 1];
+        if (_newName && _newName.type === 'other' && IDENT_RE.test(_newName.text)) {
+          var _newBind = resolve(_newName.text);
+          if (_newBind && _newBind.kind === 'object' && _newBind._isClass) {
+            // Class instantiation: create instance with class methods.
+            var _newJ = k + 2;
+            if (tks[_newJ] && tks[_newJ].type === 'open' && tks[_newJ].char === '(') {
+              var _nd = 1; _newJ++;
+              while (_newJ < stop && _nd > 0) { if (tks[_newJ].type === 'open' && tks[_newJ].char === '(') _nd++; if (tks[_newJ].type === 'close' && tks[_newJ].char === ')') _nd--; _newJ++; }
+            }
+            // Create instance object with copies of all class methods.
+            var _instProps = Object.create(null);
+            for (var _ck in _newBind.props) _instProps[_ck] = _newBind.props[_ck];
+            var _inst = objectBinding(_instProps);
+            return { bind: _inst, next: _newJ };
+          }
+        }
         let j = k + 1;
         if (tks[j] && tks[j].type === 'other' && IDENT_OR_PATH_RE.test(tks[j].text)) j++;
         if (tks[j] && tks[j].type === 'open' && tks[j].char === '(') {
@@ -3566,6 +3635,40 @@
       if (IDENT_OR_PATH_RE.test(t.text)) {
         const paren = tks[k + 1];
         const isCall = paren && paren.type === 'open' && paren.char === '(';
+        // Tagged template: tag`...` — call the tag function with template parts.
+        if (paren && paren.type === 'tmpl') {
+          var tagBind = resolvePath(t.text);
+          if (tagBind && tagBind.kind === 'function') {
+            // Build arguments: first arg is strings array, rest are expression values.
+            var _tagArgs = [chainBinding([makeSynthStr('')])]; // strings placeholder
+            if (paren.parts) {
+              for (var _tp = 0; _tp < paren.parts.length; _tp++) {
+                if (paren.parts[_tp].kind === 'expr') {
+                  var _tagExpr = evalExprSrc(paren.parts[_tp].expr);
+                  if (_tagExpr) _tagArgs.push(chainBinding(_tagExpr));
+                  else _tagArgs.push(chainBinding([exprRef(paren.parts[_tp].expr)]));
+                }
+              }
+            }
+            var _tagResult = instantiateFunction(tagBind, _tagArgs);
+            if (_tagResult && _tagResult.kind) return { bind: _tagResult, next: k + 2 };
+            if (_tagResult) return { bind: chainBinding(_tagResult), next: k + 2 };
+          }
+          // Unknown tag: result is opaque (tag function transforms the template).
+          // Propagate taint from any expression parts.
+          var _tagSrc = t._src ? t._src.slice(t.start, paren.end) : t.text + '`...`';
+          var _tagRef = exprRef(_tagSrc);
+          if (paren.parts) {
+            for (var _tp2 = 0; _tp2 < paren.parts.length; _tp2++) {
+              if (paren.parts[_tp2].kind === 'expr') {
+                var _te = evalExprSrc(paren.parts[_tp2].expr);
+                var _tt = _te ? collectChainTaint(_te) : null;
+                if (_tt) { if (!_tagRef.taint) _tagRef.taint = new Set(); for (var _tl of _tt) _tagRef.taint.add(_tl); }
+              }
+            }
+          }
+          return { bind: chainBinding([_tagRef]), next: k + 2 };
+        }
         // Known math/numeric constants like `Math.PI`.
         if (!isCall && MATH_CONSTANTS[t.text] !== undefined) {
           return { bind: chainBinding([makeSynthStr(String(MATH_CONSTANTS[t.text]))]), next: k + 1 };
@@ -5442,6 +5545,99 @@
         }
         pendingFunctionBrace = true;
         continue;
+      }
+      // Class declaration: class Name { method(params) { body } ... }
+      if (t.text === 'class') {
+        var _clsName = tokens[i + 1];
+        var _clsOpen = null;
+        var _clsIdx = i + 1;
+        // Optional name.
+        if (_clsName && _clsName.type === 'other' && IDENT_RE.test(_clsName.text)) _clsIdx++;
+        else _clsName = null;
+        // Optional extends.
+        if (tokens[_clsIdx] && tokens[_clsIdx].type === 'other' && tokens[_clsIdx].text === 'extends') {
+          _clsIdx++; // skip extends
+          if (tokens[_clsIdx] && tokens[_clsIdx].type === 'other') _clsIdx++; // skip parent class name
+        }
+        _clsOpen = tokens[_clsIdx];
+        if (_clsOpen && _clsOpen.type === 'open' && _clsOpen.char === '{') {
+          // Find the matching }.
+          var _clsEnd = _clsIdx + 1, _clsD = 1;
+          while (_clsEnd < stop && _clsD > 0) {
+            if (tokens[_clsEnd].type === 'open' && tokens[_clsEnd].char === '{') _clsD++;
+            if (tokens[_clsEnd].type === 'close' && tokens[_clsEnd].char === '}') _clsD--;
+            _clsEnd++;
+          }
+          // Parse methods inside the class body.
+          var _clsProps = Object.create(null);
+          var _clsJ = _clsIdx + 1;
+          while (_clsJ < _clsEnd - 1) {
+            var _mTok = tokens[_clsJ];
+            if (!_mTok) break;
+            // Skip static, async, get, set keywords for now — just find method name + parens.
+            var _isGetter = false, _isSetter = false;
+            if (_mTok.type === 'other' && _mTok.text === 'static') { _clsJ++; _mTok = tokens[_clsJ]; }
+            if (_mTok && _mTok.type === 'other' && _mTok.text === 'async') { _clsJ++; _mTok = tokens[_clsJ]; }
+            if (_mTok && _mTok.type === 'other' && _mTok.text === 'get') {
+              var _gnext = tokens[_clsJ + 1];
+              if (_gnext && _gnext.type === 'open' && _gnext.char === '(') { /* method named 'get' */ }
+              else { _isGetter = true; _clsJ++; _mTok = tokens[_clsJ]; }
+            }
+            if (_mTok && _mTok.type === 'other' && _mTok.text === 'set') {
+              var _snext = tokens[_clsJ + 1];
+              if (_snext && _snext.type === 'open' && _snext.char === '(') { /* method named 'set' */ }
+              else { _isSetter = true; _clsJ++; _mTok = tokens[_clsJ]; }
+            }
+            if (_mTok && _mTok.type === 'other' && IDENT_RE.test(_mTok.text)) {
+              var _mName = _mTok.text;
+              var _mParen = tokens[_clsJ + 1];
+              if (_mParen && _mParen.type === 'open' && _mParen.char === '(') {
+                // Parse params.
+                var _mParams = [], _mJ = _clsJ + 2;
+                while (_mJ < _clsEnd) {
+                  var _mp = parseParamWithDefault(tokens, _mJ, _clsEnd);
+                  if (!_mp) break;
+                  _mParams.push(_mp.param);
+                  _mJ = _mp.next;
+                  if (tokens[_mJ] && tokens[_mJ].type === 'close' && tokens[_mJ].char === ')') { _mJ++; break; }
+                  if (tokens[_mJ] && tokens[_mJ].type === 'sep' && tokens[_mJ].char === ',') { _mJ++; continue; }
+                  break;
+                }
+                if (tokens[_mJ - 1] && tokens[_mJ - 1].type === 'close' && tokens[_mJ - 1].char === ')') { /* ok */ }
+                else if (tokens[_mJ] && tokens[_mJ].type === 'close' && tokens[_mJ].char === ')') _mJ++;
+                // Parse body.
+                if (tokens[_mJ] && tokens[_mJ].type === 'open' && tokens[_mJ].char === '{') {
+                  var _mBD = 1, _mBE = _mJ + 1;
+                  while (_mBE < _clsEnd && _mBD > 0) {
+                    if (tokens[_mBE].type === 'open' && tokens[_mBE].char === '{') _mBD++;
+                    if (tokens[_mBE].type === 'close' && tokens[_mBE].char === '}') _mBD--;
+                    _mBE++;
+                  }
+                  if (_isGetter) {
+                    // Getter: store as a function, resolve when property is accessed.
+                    _clsProps['__getter_' + _mName] = functionBinding(_mParams, _mJ, _mBE, true);
+                  } else {
+                    _clsProps[_mName] = functionBinding(_mParams, _mJ, _mBE, true);
+                  }
+                  _clsJ = _mBE;
+                  continue;
+                }
+              }
+            }
+            _clsJ++;
+          }
+          // Store class as an object binding with method properties.
+          if (_clsName) {
+            var _clsBinding = objectBinding(_clsProps);
+            _clsBinding._isClass = true;
+            declFunction(_clsName.text, _clsBinding);
+          }
+          // Don't skip body — let the walker continue through it
+          // so extraction and inner declarations are processed.
+          i = _clsIdx; // point to '{', the walker will push a scope frame
+          pendingFunctionBrace = true;
+          continue;
+        }
       }
       if (t.text === '=>') {
         // Only arrow bodies of the form `=> { ... }` open a function scope;
