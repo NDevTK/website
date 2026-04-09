@@ -3368,6 +3368,13 @@ function render() {
 
   // --- Event handler state machine ---
   checkTaint('state machine two invocations', { 'a.js': 'var state = "idle"; window.addEventListener("message", function(e) { if (state === "idle") { state = "ready"; } else if (state === "ready") { document.getElementById("o").innerHTML = e.data; } });' }, 1);
+
+  // --- Array theory ---
+  checkTaint('array: len 0 access dead', { 'a.js': 'var arr = []; if (arr.length === 0) { if (arr[0]) { document.getElementById("o").innerHTML = arr[0]; } }' }, 0);
+  checkTaint('array: len > 0 access sat', { 'a.js': 'var arr = [location.search]; if (arr.length > 0) { document.getElementById("o").innerHTML = arr[0]; }' }, 1);
+
+  // --- Disjunctive merge ---
+  checkTaint('merge: y big or small', { 'a.js': 'var x = location.search; var y; if (x > 5) { y = "big"; } else { y = "small"; } if (y === "big" && y === "small") { document.getElementById("o").innerHTML = x; }' }, 0);
   checkTaint('satisfiable: obj.prop++ count', { 'a.js': 'var state = {count:0}; window.addEventListener("message", function(e) { state.count++; if (state.count > 3) { document.getElementById("o").innerHTML = e.data; } });' }, 1);
   checkTaint('satisfiable: ident++ in handler', { 'a.js': 'var n = 0; window.addEventListener("message", function(e) { n++; if (n > 5) { document.getElementById("o").innerHTML = e.data; } });' }, 1);
 
