@@ -1340,6 +1340,10 @@
     const taintFindings = taintEnabled ? [] : null;
     // Path conditions accumulated through if/else branches.
     const taintCondStack = taintEnabled ? [] : null;
+    // Track whether we're inside an event handler walk. Mutations to
+    // outer-scope variables inside handlers produce values that depend
+    // on the number of handler invocations (attacker-controlled).
+    var inEventHandler = false;
     // Loop detection stack: each entry is `{ id, kind, headerSrc, bodyEnd,
     // frame, modifiedVars }` recording an enclosing `for`/`while`. Operands
     // added to a binding's chain while a loop is active carry a `loopId` tag
@@ -3823,7 +3827,57 @@
           if (j < stop) {
             // Evaluate the condition.
             const condVal = readValue(i + 2, j, null);
-            const concrete = condVal ? evalTruthiness(condVal.binding) : null;
+            var concrete = condVal ? evalTruthiness(condVal.binding) : null;
+            // SMT satisfiability: determine if the condition can be true
+            // for some assignment of attacker-controlled symbolic values.
+            //
+            // A variable is symbolic when its value is derived from
+            // attacker input (taint labels) or from state modified by
+            // event handlers (which fire unbounded times with
+            // attacker-chosen data). Any predicate over symbolic values
+            // is satisfiable — the attacker can choose inputs to make it
+            // true.
+            //
+            // For each identifier/path in the condition source tokens,
+            // resolve the ROOT identifier and check if it or any of its
+            // contents (array elements, object properties) carry taint.
+            // This catches cases like `parts.length >= 2` where
+            // `parts` is an array with tainted elements — the length
+            // is derived from attacker-controlled push() calls.
+            if (taintEnabled && concrete !== null) {
+              var _sat = false;
+              var _isSymbolic = function(b) {
+                if (!b) return false;
+                if (b.kind === 'chain') return !!collectChainTaint(b.toks);
+                if (b.kind === 'array') {
+                  for (var _i = 0; _i < b.elems.length; _i++) {
+                    if (_isSymbolic(b.elems[_i])) return true;
+                  }
+                }
+                if (b.kind === 'object') {
+                  for (var _k in b.props) {
+                    if (_isSymbolic(b.props[_k])) return true;
+                  }
+                }
+                return false;
+              };
+              for (var _si = i + 2; _si < j && !_sat; _si++) {
+                var _st = tokens[_si];
+                if (_st.type !== 'other') continue;
+                if (!IDENT_OR_PATH_RE.test(_st.text) && !IDENT_RE.test(_st.text)) continue;
+                // Resolve the root identifier, not the full dotted path.
+                // parts.length → root is parts (array with tainted elements).
+                var _root = _st.text.split('.')[0];
+                var _rb = resolve(_root);
+                if (_isSymbolic(_rb)) { _sat = true; break; }
+                // Also check the full path resolution.
+                if (!_sat) {
+                  var _fb = resolvePath(_st.text);
+                  if (_isSymbolic(_fb)) { _sat = true; break; }
+                }
+              }
+              if (_sat) concrete = null;
+            }
             // Determine if-body range.
             const bodyTok = tokens[j + 1];
             let ifEnd;
@@ -4812,7 +4866,19 @@
         }
         if (eqTok && eqTok.type === 'sep' && eqTok.char === '=') {
           const stmtEndIdx = skipExpr(i + 2, stop);
-          const r = readValue(i + 2, stop, TERMS_TOP);
+          // Handle chained assignment: a = b = c = expr.
+          // Collect all targets, then assign the final value to all.
+          var _chainTargets = [t.text];
+          var _rhsStart = i + 2;
+          while (_rhsStart + 1 < stmtEndIdx) {
+            var _ct = tokens[_rhsStart];
+            var _ce = tokens[_rhsStart + 1];
+            if (_ct && _ct.type === 'other' && IDENT_RE.test(_ct.text) && _ce && _ce.type === 'sep' && _ce.char === '=') {
+              _chainTargets.push(_ct.text);
+              _rhsStart += 2;
+            } else break;
+          }
+          const r = readValue(_rhsStart, stop, TERMS_TOP);
           // Detect prepend pattern: x = expr + x (builds string in reverse).
           // Treat as equivalent to x += expr but with the new content prepended.
           // For build variables assigned via = inside a loop (prepend
@@ -4823,7 +4889,8 @@
             const tagged = tagWithLoop(r.binding.toks, loopId);
             assignName(t.text, chainBinding(tagged));
           } else {
-            assignName(t.text, r ? r.binding : null);
+            var _assignVal = r ? r.binding : null;
+            for (var _ci = 0; _ci < _chainTargets.length; _ci++) assignName(_chainTargets[_ci], _assignVal);
           }
           // Preserve non-build-var assignments in the build var's chain
           // so the emitter outputs them at the correct position.
@@ -4885,7 +4952,12 @@
         if (eqTok && eqTok.type === 'op' && (eqTok.text === '++' || eqTok.text === '--')) {
           const cur = resolve(t.text);
           const n = cur && cur.kind === 'chain' ? chainAsNumber(cur) : null;
-          if (n !== null && loopStack.length === 0) {
+          if (inEventHandler) {
+            // Value depends on handler invocation count (symbolic).
+            var _ehRef2 = exprRef(t.text);
+            _ehRef2.taint = new Set(['event']);
+            assignName(t.text, chainBinding([_ehRef2]));
+          } else if (n !== null && loopStack.length === 0) {
             const delta = eqTok.text === '++' ? 1 : -1;
             assignName(t.text, chainBinding([makeSynthStr(String(n + delta))]));
           } else {
@@ -5048,13 +5120,48 @@
       // element binding so subsequent DOM serialization sees it.
       if (t.type === 'other' && PATH_RE.test(t.text)) {
         const eqTok = tokens[i + 1];
+        // Path post-increment/decrement: obj.prop++ / obj.prop--
+        if (eqTok && eqTok.type === 'op' && (eqTok.text === '++' || eqTok.text === '--')) {
+          const parts = t.text.split('.');
+          const baseBind = resolve(parts[0]);
+          if (baseBind && baseBind.kind === 'object' && parts.length === 2) {
+            var cur = baseBind.props[parts[1]];
+            var n = cur && cur.kind === 'chain' ? chainAsNumber(cur) : null;
+            var delta = eqTok.text === '++' ? 1 : -1;
+            if (inEventHandler) {
+              // Inside event handler: result depends on invocation count
+              // (attacker-controlled). Tag as event-derived taint.
+              var _ehRef = exprRef(t.text);
+              _ehRef.taint = new Set(['event']);
+              baseBind.props[parts[1]] = chainBinding([_ehRef]);
+            } else {
+              baseBind.props[parts[1]] = n !== null
+                ? chainBinding([makeSynthStr(String(n + delta))])
+                : chainBinding([deriveExprRef(t.text, cur ? cur.toks : null)]);
+            }
+          }
+          i = i + 1;
+          continue;
+        }
+        // Path compound assignment: obj.prop += value
         if (eqTok && eqTok.type === 'sep' && (eqTok.char === '=' || eqTok.char === '+=')) {
           const parts = t.text.split('.');
           const baseBind = resolve(parts[0]);
           // Object property assignment: obj.prop = value
           if (baseBind && baseBind.kind === 'object' && parts.length === 2) {
             const r = readValue(i + 2, stop, TERMS_TOP);
-            if (r && r.binding) baseBind.props[parts[1]] = r.binding;
+            if (r && r.binding) {
+              if (eqTok.char === '+=') {
+                var prev = baseBind.props[parts[1]];
+                if (prev && prev.kind === 'chain' && r.binding.kind === 'chain') {
+                  baseBind.props[parts[1]] = chainBinding([...prev.toks, SYNTH_PLUS, ...r.binding.toks]);
+                } else {
+                  baseBind.props[parts[1]] = r.binding;
+                }
+              } else {
+                baseBind.props[parts[1]] = r.binding;
+              }
+            }
             i = skipExpr(i + 2, stop) - 1;
             continue;
           }
@@ -5147,8 +5254,11 @@
                     // Unknown event type: param is opaque, no taint.
                     _evParamBindings.push(chainBinding([exprRef(_evHandler.params[0].name)]));
                   }
-                  // Always walk the handler body for side effects on shared state.
+                  // Walk the handler body for side effects on shared state.
+                  var _prevInEH = inEventHandler;
+                  inEventHandler = true;
                   instantiateFunction(_evHandler, _evParamBindings);
+                  inEventHandler = _prevInEH;
                 }
                 i = _evArgs.next - 1;
                 continue;

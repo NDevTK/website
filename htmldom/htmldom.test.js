@@ -3300,6 +3300,23 @@ function render() {
   checkTaint('try-finally no catch', { 'a.js': 'var x; try{x=location.search;}finally{} document.getElementById("o").innerHTML=x;' }, 1);
   checkTaint('comparison preserves taint', { 'a.js': 'var x=location.search.length>0; document.getElementById("o").innerHTML=x;' }, 1);
   checkTaint('equality preserves taint', { 'a.js': 'var x=location.search==="admin"; document.getElementById("o").innerHTML=x;' }, 1);
+  checkTaint('bitwise preserves taint', { 'a.js': 'var x=location.search|0; document.getElementById("o").innerHTML=x;' }, 1);
+
+  // --- SMT satisfiability ---
+  checkTaint('satisfiable: tainted bool gates sink', { 'a.js': 'var flag = location.search === "go"; if (flag) { document.getElementById("o").innerHTML = location.hash; }' }, 1);
+  checkTaint('satisfiable: handler flag', { 'a.js': 'var ready = false; window.addEventListener("message", function(e) { ready = e.data === "init"; }); if (ready) { document.getElementById("o").innerHTML = location.search; }' }, 1);
+  checkTaint('satisfiable: multi message accum', { 'a.js': 'var parts = []; window.addEventListener("message", function(e) { parts.push(e.data); if (parts.length >= 2) { document.getElementById("o").innerHTML = parts.join(""); } });' }, 1);
+  checkTaint('unsatisfiable: if(false) dead', { 'a.js': 'if (false) { document.getElementById("o").innerHTML = location.search; }' }, 0);
+  checkTaint('unsatisfiable: concrete false', { 'a.js': 'var x = 1 > 2; if (x) { document.getElementById("o").innerHTML = location.search; }' }, 0);
+  checkTaint('satisfiable: 3 handlers shared', { 'a.js': 'var a,b,c; window.addEventListener("message", function(e) { a = e.data; }); window.addEventListener("message", function(e) { b = e.origin; }); window.addEventListener("hashchange", function() { c = location.hash; if (a && b) { document.getElementById("o").innerHTML = a + b + c; } });' }, 1);
+  checkTaint('satisfiable: obj.prop++ count', { 'a.js': 'var state = {count:0}; window.addEventListener("message", function(e) { state.count++; if (state.count > 3) { document.getElementById("o").innerHTML = e.data; } });' }, 1);
+  checkTaint('satisfiable: ident++ in handler', { 'a.js': 'var n = 0; window.addEventListener("message", function(e) { n++; if (n > 5) { document.getElementById("o").innerHTML = e.data; } });' }, 1);
+
+  // --- Chained assignment ---
+  checkTaint('chained assign', { 'a.js': 'var a,b; a=b=location.search; document.getElementById("o").innerHTML=a;' }, 1);
+
+  // --- Object property mutations ---
+  checkTaint('obj.prop += in handler', { 'a.js': 'var state = {html:""}; window.addEventListener("message", function(e) { state.html += e.data; }); document.getElementById("o").innerHTML = state.html;' }, 1);
 
   // --- Object property mutation ---
   checkTaint('obj.prop = tainted', { 'a.js': 'var state = { msg: "" }; state.msg = location.search; document.getElementById("o").innerHTML = state.msg;' }, 1);
