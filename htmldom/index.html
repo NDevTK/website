@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>HTML to DOM API Converter</title>
+<title>HTML DOM Security Analyzer</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="script-src 'self' https://cdnjs.cloudflare.com 'inline-speculation-rules'; style-src 'self' https://cdnjs.cloudflare.com 'unsafe-inline'; object-src 'none'; base-uri 'none'; worker-src blob: data:;" />
 <style>
@@ -59,8 +59,8 @@ code { background: #2a2e33; padding: 0.05rem 0.25rem; border-radius: 3px; font-s
 <body>
 
 <header>
-  <h1>HTML &rarr; DOM API Converter</h1>
-  <span class="hint">Converts <code>innerHTML</code> assignments to safe <code>createElement</code>/<code>appendChild</code> calls with full JS support.</span>
+  <h1>HTML DOM Security Analyzer</h1>
+  <span class="hint">Converts unsafe sinks to safe DOM API calls and traces taint from sources to sinks across files, functions, and control flow.</span>
 </header>
 
 <div class="toolbar">
