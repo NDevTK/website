@@ -2332,12 +2332,20 @@
             // Opaque index: produce a symbolic chain so downstream
             // property access (.v) and operators (===, ?) can form
             // valid expressions instead of returning null.
+            // For taint: collect taint from ALL array elements since
+            // any element could be accessed at runtime.
+            var _elemTaintSources = [];
+            if (taintEnabled && bind && bind.kind === 'array') {
+              for (var _ei = 0; _ei < bind.elems.length; _ei++) {
+                if (bind.elems[_ei] && bind.elems[_ei].kind === 'chain') _elemTaintSources.push(bind.elems[_ei].toks);
+              }
+            }
             const baseText = bind.kind === 'chain' && bind.toks.length === 1 && bind.toks[0].type === 'other'
               ? bind.toks[0].text
               : (tks[next - 1] && tks[next - 1]._src ? tks[next - 1]._src.slice(tks[next - 1].start, tks[next - 1].end) : null);
             if (baseText) {
               const idxText = tks[next + 1] && tks[next + 1]._src ? tks[next + 1]._src.slice(tks[next + 1].start, tks[j - 1].end) : 'i';
-              bind = chainBinding([deriveExprRef(baseText + '[' + idxText + ']', bind ? bind.toks : null)]);
+              bind = chainBinding([deriveExprRef.apply(null, [baseText + '[' + idxText + ']', bind ? bind.toks : null].concat(_elemTaintSources))]);
             } else {
               bind = null;
             }
@@ -2512,15 +2520,30 @@
         if (method === 'map' || method === 'filter' || method === 'forEach') {
           const lp = tks[parenIdx];
           if (!lp || lp.type !== 'open' || lp.char !== '(') return null;
+          // Try arrow function, then function expression, then identifier.
+          var fn = null, fnNext = 0;
           const arrow = peekArrow(parenIdx + 1, stop);
-          if (!arrow) return null;
-          const body = readArrowBody(arrow.arrowNext, stop);
-          if (!body) return null;
-          const rp = tks[body.next];
+          if (arrow) {
+            const body = readArrowBody(arrow.arrowNext, stop);
+            if (body) { fn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock); fnNext = body.next; }
+          }
+          if (!fn) {
+            var fexpr = readFunctionExpr(parenIdx + 1, stop);
+            if (fexpr) { fn = fexpr.binding; fnNext = fexpr.next; }
+          }
+          if (!fn) {
+            // Try identifier reference to a function.
+            var cbTok = tks[parenIdx + 1];
+            if (cbTok && cbTok.type === 'other' && IDENT_RE.test(cbTok.text)) {
+              var refB = resolve(cbTok.text);
+              if (refB && refB.kind === 'function') { fn = refB; fnNext = parenIdx + 2; }
+            }
+          }
+          if (!fn) return null;
+          const rp = tks[fnNext];
           if (!rp || rp.type !== 'close' || rp.char !== ')') return null;
-          const fn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock);
           if (method === 'forEach') {
-            return { bind: chainBinding([makeSynthStr('undefined')]), next: body.next + 1 };
+            return { bind: chainBinding([makeSynthStr('undefined')]), next: fnNext + 1 };
           }
           const results = [];
           for (const el of bind.elems) {
@@ -2541,7 +2564,7 @@
             if (truthy) results.push(el);
             else if (!falsy) return null;
           }
-          return { bind: arrayBinding(results), next: body.next + 1 };
+          return { bind: arrayBinding(results), next: fnNext + 1 };
         }
         // `.reduce(fn, init)` — two-arg reducer: invoke the callback
         // per element with (accumulator, element) and thread the
@@ -2627,32 +2650,10 @@
         }
         // Try function expression: `.map(function(x) { ... })`
         if (!fn) {
-          let k = parenIdx + 1;
-          if (tks[k] && tks[k].type === 'other' && tks[k].text === 'function') {
-            k++;
-            // optional name
-            if (tks[k] && tks[k].type === 'other' && IDENT_RE.test(tks[k].text) && tks[k].text !== 'function') k++;
-            if (tks[k] && tks[k].type === 'open' && tks[k].char === '(') {
-              const params = [];
-              let j = k + 1;
-              while (j < stop) {
-                const pt = tks[j];
-                if (pt && pt.type === 'close' && pt.char === ')') { j++; break; }
-                if (pt && pt.type === 'other' && IDENT_RE.test(pt.text)) params.push({ name: pt.text });
-                j++;
-              }
-              // Expect `{`
-              if (tks[j] && tks[j].type === 'open' && tks[j].char === '{') {
-                let depth = 1, bodyEnd = j + 1;
-                while (bodyEnd < stop && depth > 0) {
-                  if (tks[bodyEnd].type === 'open' && tks[bodyEnd].char === '{') depth++;
-                  else if (tks[bodyEnd].type === 'close' && tks[bodyEnd].char === '}') depth--;
-                  if (depth > 0) bodyEnd++;
-                }
-                fn = functionBinding(params, j, bodyEnd + 1, true);
-                fnEnd = bodyEnd + 1;
-              }
-            }
+          var _fexpr = readFunctionExpr(parenIdx + 1, stop);
+          if (_fexpr) {
+            fn = _fexpr.binding;
+            fnEnd = _fexpr.next;
           }
         }
         if (!fn) return null;
@@ -3587,14 +3588,18 @@
         const entry = loopStack.pop();
         // Collect names that were pre-scanned as opaque in the loop frame.
         const preScanNames = entry.frame ? Object.keys(entry.frame.bindings) : [];
-        const topIdx = stack.indexOf(entry.frame);
-        if (topIdx >= 0) stack.splice(topIdx, 1);
-        // Merge pre-scanned and modified variables: all need to be
-        // opaque in the outer scope after the loop exits.
+        // Capture modified variable bindings BEFORE removing the loop frame,
+        // since resolve() would return the pre-loop outer value after removal.
         const allModified = new Set(entry.modifiedVars);
         for (const n of preScanNames) allModified.add(n);
+        var _loopBindings = {};
         for (const name of allModified) {
-          const b = resolve(name);
+          _loopBindings[name] = resolve(name);
+        }
+        const topIdx = stack.indexOf(entry.frame);
+        if (topIdx >= 0) stack.splice(topIdx, 1);
+        for (const name of allModified) {
+          const b = _loopBindings[name];
           if (b && b.kind === 'chain') {
             // Store the chain UNSTRIPPED; strip the outer loop's tags only
             // at display time via loopVarHtml. The unstripped chain is
@@ -3604,7 +3609,7 @@
               loop: { id: entry.id, kind: entry.kind, headerSrc: entry.headerSrc },
               chain: b.toks,
             });
-            assignName(name, chainBinding([exprRef(name)]));
+            assignName(name, chainBinding([deriveExprRef(name, b.toks)]));
           }
         }
       }
@@ -3923,7 +3928,8 @@
                 const elB = elseBindings[name] || snapshot[name];
                 if (ifB === elB) continue;
                 if (JSON.stringify(ifB) === JSON.stringify(elB)) continue;
-                assignName(name, chainBinding([exprRef(name)]));
+                // Preserve taint from both branches.
+                assignName(name, chainBinding([deriveExprRef(name, ifB && ifB.kind === 'chain' ? ifB.toks : null, elB && elB.kind === 'chain' ? elB.toks : null)]));
               }
               i = (elseEnd > 0 ? elseEnd : ifEnd) - 1;
               continue;
@@ -4064,23 +4070,24 @@
             const catchFull = expandWithLVs(catchB, catchLoopVars);
             if (JSON.stringify(tryFull) === JSON.stringify(catchFull)) continue;
             const snapB = snapshot[name];
-            if (snapB && snapB.kind === 'chain') {
-              if (trackBuildVar && trackBuildVar.has(name)) {
-                const snapFull = snapB.toks;
-                const tryAppended = chainStartsWith(tryFull, snapFull);
-                const catchAppended = chainStartsWith(catchFull, snapFull);
-                const tryExtra = tryAppended ? stripLeadingPlus(tryFull.slice(snapFull.length)) : tryFull;
-                const catchExtra = catchAppended ? stripLeadingPlus(catchFull.slice(snapFull.length)) : catchFull;
-                const tryCatchTok = { type: 'trycatch', tryBody: tryExtra, catchBody: catchExtra, catchParam };
-                if (tryAppended && catchAppended) {
-                  assignName(name, chainBinding([...snapB.toks, SYNTH_PLUS, tryCatchTok]));
-                } else {
-                  // Full replacement in at least one branch.
-                  assignName(name, chainBinding([tryCatchTok]));
-                }
+            if (!snapB || snapB.kind !== 'chain') {
+              // Variable was uninitialized before try/catch — merge with taint.
+              assignName(name, chainBinding([deriveExprRef(name, tryB.toks, catchB.toks)]));
+            } else if (trackBuildVar && trackBuildVar.has(name)) {
+              const snapFull = snapB.toks;
+              const tryAppended = chainStartsWith(tryFull, snapFull);
+              const catchAppended = chainStartsWith(catchFull, snapFull);
+              const tryExtra = tryAppended ? stripLeadingPlus(tryFull.slice(snapFull.length)) : tryFull;
+              const catchExtra = catchAppended ? stripLeadingPlus(catchFull.slice(snapFull.length)) : catchFull;
+              const tryCatchTok = { type: 'trycatch', tryBody: tryExtra, catchBody: catchExtra, catchParam };
+              if (tryAppended && catchAppended) {
+                assignName(name, chainBinding([...snapB.toks, SYNTH_PLUS, tryCatchTok]));
               } else {
-                assignName(name, chainBinding([exprRef(name)]));
+                assignName(name, chainBinding([tryCatchTok]));
               }
+            } else {
+              // Preserve taint from both branches on the merged reference.
+              assignName(name, chainBinding([deriveExprRef(name, tryB.toks, catchB.toks)]));
             }
           }
           // Walk finally body unconditionally (it always runs).
@@ -4197,7 +4204,12 @@
               }
             }
             for (const name of switchChanged) {
-              assignName(name, chainBinding([exprRef(name)]));
+              // Preserve taint from all case branches.
+              var _swToks = [];
+              for (var _cr of caseResults) {
+                if (_cr.bindings[name] && _cr.bindings[name].kind === 'chain') _swToks.push(_cr.bindings[name].toks);
+              }
+              assignName(name, chainBinding([deriveExprRef.apply(null, [name].concat(_swToks))]));
             }
             i = switchEnd - 1;
             continue;
