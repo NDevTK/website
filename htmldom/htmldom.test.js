@@ -3293,6 +3293,18 @@ function render() {
   checkTaint('filter tainted', { 'a.js': 'var items = ["safe", location.search]; var filtered = items.filter(function(x){ return x.length > 0; }); document.getElementById("o").innerHTML = filtered[0];' }, 1);
   checkTaint('filter safe', { 'a.js': 'var items = ["a", "b"]; var filtered = items.filter(function(x){ return x.length > 0; }); document.getElementById("o").innerHTML = filtered[0];' }, 0);
 
+  // --- Object property mutation ---
+  checkTaint('obj.prop = tainted', { 'a.js': 'var state = { msg: "" }; state.msg = location.search; document.getElementById("o").innerHTML = state.msg;' }, 1);
+  checkTaint('obj prop via handler', { 'a.js': 'var state = { msg: "" }; window.addEventListener("message", function(e) { state.msg = e.data; }); function render() { document.getElementById("o").innerHTML = state.msg; } render();' }, 2);
+
+  // --- Multi-step accumulation ---
+  checkTaint('handler push + url join', { 'a.js': 'var parts = [];\nwindow.addEventListener("message", function(e) { parts.push(e.data); });\nvar url = location.search;\nvar html = parts.join("") + url;\ndocument.getElementById("o").innerHTML = html;' }, 1);
+  checkTaint('two handlers shared vars', { 'a.js': 'var a = "", b = "";\nwindow.addEventListener("message", function(e) { a = e.data; });\nwindow.addEventListener("message", function(e) { b = e.origin; });\ndocument.getElementById("o").innerHTML = a + b;' }, 1);
+  checkTaint('multi-step cache + hash', { 'a.js': 'var cache = {};\nwindow.addEventListener("message", function(e) { cache.content = e.data; });\nvar suffix = location.hash;\nfunction build() { return cache.content + suffix; }\ndocument.getElementById("o").innerHTML = build();' }, 1);
+  checkTaint('handler calls sink fn', { 'a.js': 'function setContent(html) { document.getElementById("o").innerHTML = html; }\nwindow.addEventListener("message", function(e) { setContent(e.data); });' }, 1);
+  checkTaint('message-store-hashchange-sink', { 'a.js': 'var pending;\nwindow.addEventListener("message", function(e) { pending = e.data; });\nwindow.addEventListener("hashchange", function() {\n  document.getElementById("o").innerHTML = pending + location.hash;\n});' }, 1);
+  checkTaint('conditional multi-source', { 'a.js': 'var result;\nwindow.addEventListener("message", function(e) {\n  if (location.search.indexOf("admin") >= 0) {\n    result = e.data;\n  }\n});\ndocument.getElementById("o").innerHTML = result;' }, 1);
+
   console.log(`  (${pass + fail - before} cases)`);
 })();
 

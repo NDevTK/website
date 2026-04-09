@@ -4995,6 +4995,13 @@
         if (eqTok && eqTok.type === 'sep' && (eqTok.char === '=' || eqTok.char === '+=')) {
           const parts = t.text.split('.');
           const baseBind = resolve(parts[0]);
+          // Object property assignment: obj.prop = value
+          if (baseBind && baseBind.kind === 'object' && parts.length === 2) {
+            const r = readValue(i + 2, stop, TERMS_TOP);
+            if (r && r.binding) baseBind.props[parts[1]] = r.binding;
+            i = skipExpr(i + 2, stop) - 1;
+            continue;
+          }
           if (baseBind && baseBind.kind === 'element') {
             const r = readValue(i + 2, stop, TERMS_TOP);
             const val = r ? r.binding : null;
