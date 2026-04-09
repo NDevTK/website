@@ -3059,7 +3059,7 @@
         const b = resolvePath(t.text);
         // Taint: check call-based sinks even in expression position
         // (e.g. var x = eval(tainted)).
-        if (taintEnabled && isCall && TAINT_CALL_SINKS[t.text]) {
+        if (taintEnabled && isCall && TAINT_CALL_SINKS[t.text] && !declaredNames.has(t.text.split('.')[0])) {
           var _sinkCallArgs = readCallArgBindings(k + 1, stop);
           if (_sinkCallArgs) checkSinkCall(t.text, _sinkCallArgs.bindings, t);
         }
@@ -4826,14 +4826,14 @@
               // Also check for trailing .prop = value (e.g. returned element).
               i = callArgs.next - 1;
               // Check for call-based sinks.
-              if (taintEnabled && TAINT_CALL_SINKS[t.text]) {
+              if (taintEnabled && TAINT_CALL_SINKS[t.text] && !declaredNames.has(t.text.split('.')[0])) {
                 checkSinkCall(t.text, callArgs.args.map(function(a) { return chainBinding(a); }), t);
               }
               continue;
             }
           }
           // Taint: even if callee isn't inlinable, check if it's a call-based sink.
-          if (taintEnabled && TAINT_CALL_SINKS[t.text]) {
+          if (taintEnabled && TAINT_CALL_SINKS[t.text] && !declaredNames.has(t.text.split('.')[0])) {
             var sinkArgs = readCallArgBindings(i + 1, stop);
             if (sinkArgs) {
               checkSinkCall(t.text, sinkArgs.bindings, t);
@@ -5024,7 +5024,7 @@
               }
             }
             // Taint: detect call-based sinks (eval, document.write, etc.).
-            if (taintEnabled && TAINT_CALL_SINKS[t.text]) {
+            if (taintEnabled && TAINT_CALL_SINKS[t.text] && !declaredNames.has(t.text.split('.')[0])) {
               const argResult = readCallArgBindings(i + 1, stop);
               if (argResult) {
                 checkSinkCall(t.text, argResult.bindings, t);
