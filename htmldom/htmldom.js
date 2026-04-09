@@ -6642,38 +6642,92 @@
       if (t.type !== 'other') continue;
 
       // --- Code execution sinks: eval, Function, setTimeout/setInterval ---
+      // Helper: resolve an argument's source text to a known string if possible.
+      // Checks literal strings, template literals, concat of literals, and
+      // variables that resolve to literal strings through scope.
+      var _resolveArgText = function(argStart, argEnd) {
+        if (argStart >= argEnd) return null;
+        // Single string token.
+        if (argEnd === argStart + 1 && tokens[argStart].type === 'str') return tokens[argStart].text;
+        // Single template literal with no expressions.
+        if (argEnd === argStart + 1 && tokens[argStart].type === 'tmpl') {
+          var parts = tokens[argStart].parts;
+          if (parts && parts.every(function(p) { return p.kind === 'text'; })) {
+            return parts.map(function(p) { return p.raw; }).join('');
+          }
+          return null;
+        }
+        // Single identifier: resolve through scope.
+        if (argEnd === argStart + 1 && tokens[argStart].type === 'other' && IDENT_RE.test(tokens[argStart].text)) {
+          var b = scope.resolve(tokens[argStart].text);
+          if (b && b.kind === 'chain' && b.toks.length === 1 && b.toks[0].type === 'str') return b.toks[0].text;
+          return null;
+        }
+        // Multi-token: try concat of string literals (e.g. "a" + "b").
+        var result = '';
+        for (var ai = argStart; ai < argEnd; ai++) {
+          var at = tokens[ai];
+          if (at.type === 'str') { result += at.text; continue; }
+          if (at.type === 'plus') continue;
+          if (at.type === 'other' && IDENT_RE.test(at.text)) {
+            var ab = scope.resolve(at.text);
+            if (ab && ab.kind === 'chain' && ab.toks.length === 1 && ab.toks[0].type === 'str') { result += ab.toks[0].text; continue; }
+          }
+          return null; // non-literal part
+        }
+        return result;
+      };
+      // Helper: split call args by commas at depth 0. Returns array of {start, end}.
+      var _splitCallArgs = function(openIdx) {
+        var args = [], argStart = openIdx + 1, d = 0;
+        for (var ai = openIdx + 1; ai < tokens.length; ai++) {
+          if (tokens[ai].type === 'open') d++;
+          if (tokens[ai].type === 'close') { if (d === 0) { if (ai > argStart) args.push({ start: argStart, end: ai }); return { args: args, callEnd: ai + 1 }; } d--; }
+          if (d === 0 && tokens[ai].type === 'sep' && tokens[ai].char === ',') { args.push({ start: argStart, end: ai }); argStart = ai + 1; }
+        }
+        return { args: args, callEnd: tokens.length };
+      };
+
+      // eval(expr) / Function(expr)
       if (t.text === 'eval' || t.text === 'Function') {
         var paren = tokens[i + 1];
         if (paren && paren.type === 'open' && paren.char === '(') {
-          var callEnd = i + 2, depth = 1;
-          while (callEnd < tokens.length && depth > 0) {
-            if (tokens[callEnd].type === 'open' && tokens[callEnd].char === '(') depth++;
-            if (tokens[callEnd].type === 'close' && tokens[callEnd].char === ')') depth--;
-            callEnd++;
+          var parsed = _splitCallArgs(i + 1);
+          var fullEnd = tokens[parsed.callEnd - 1] ? tokens[parsed.callEnd - 1].end : t.end;
+          if (parsed.args.length === 0) {
+            // eval() with no args — leave as is (returns undefined).
+            i = parsed.callEnd;
+            continue;
           }
-          var argTok = tokens[i + 2];
-          var argEndTok = tokens[callEnd - 2];
-          if (argTok && argEndTok) {
-            // Check if the argument is a known string literal.
-            var resolved = scope.resolve && argTok.type === 'other' && IDENT_RE.test(argTok.text) ? scope.resolve(argTok.text) : null;
-            var isLiteral = argTok.type === 'str' && callEnd === i + 4; // single string arg
-            var isResolvedLiteral = resolved && resolved.kind === 'chain' && resolved.toks.length === 1 && resolved.toks[0].type === 'str';
-            var literalCode = isLiteral ? argTok.text : (isResolvedLiteral ? resolved.toks[0].text : null);
-            var fullEnd = tokens[callEnd - 1] ? tokens[callEnd - 1].end : argEndTok.end;
-            if (literalCode !== null) {
-              // eval("code") → code (inline it)
-              // Function("code") → (function() { code })
-              if (t.text === 'eval') {
-                replacements.push({ start: t.start, end: fullEnd, replacement: literalCode });
+          if (t.text === 'eval') {
+            // eval only uses first argument.
+            var code = _resolveArgText(parsed.args[0].start, parsed.args[0].end);
+            if (code !== null) {
+              replacements.push({ start: t.start, end: fullEnd, replacement: code });
+            } else {
+              replacements.push({ start: t.start, end: fullEnd, replacement: '/* [blocked: eval with dynamic argument] */ void 0' });
+            }
+          } else {
+            // Function(body) or Function(param1, param2, ..., body)
+            var lastArg = parsed.args[parsed.args.length - 1];
+            var bodyCode = _resolveArgText(lastArg.start, lastArg.end);
+            if (bodyCode !== null) {
+              var paramParts = [];
+              for (var pi = 0; pi < parsed.args.length - 1; pi++) {
+                var pText = _resolveArgText(parsed.args[pi].start, parsed.args[pi].end);
+                if (pText !== null) paramParts.push(pText);
+                else { bodyCode = null; break; }
+              }
+              if (bodyCode !== null) {
+                replacements.push({ start: t.start, end: fullEnd, replacement: '(function(' + paramParts.join(', ') + ') { ' + bodyCode + ' })' });
               } else {
-                replacements.push({ start: t.start, end: fullEnd, replacement: '(function() { ' + literalCode + ' })' });
+                replacements.push({ start: t.start, end: fullEnd, replacement: '/* [blocked: Function with dynamic argument] */ void 0' });
               }
             } else {
-              // Dynamic/tainted: remove the dangerous call.
-              replacements.push({ start: t.start, end: fullEnd, replacement: '/* [blocked: ' + t.text + ' with dynamic argument] */ void 0' });
+              replacements.push({ start: t.start, end: fullEnd, replacement: '/* [blocked: Function with dynamic argument] */ void 0' });
             }
           }
-          i = callEnd;
+          i = parsed.callEnd;
           continue;
         }
       }
@@ -6681,21 +6735,30 @@
       if (t.text === 'new' && tokens[i + 1] && tokens[i + 1].type === 'other' && tokens[i + 1].text === 'Function') {
         var paren2 = tokens[i + 2];
         if (paren2 && paren2.type === 'open' && paren2.char === '(') {
-          var callEnd2 = i + 3, depth2 = 1;
-          while (callEnd2 < tokens.length && depth2 > 0) {
-            if (tokens[callEnd2].type === 'open' && tokens[callEnd2].char === '(') depth2++;
-            if (tokens[callEnd2].type === 'close' && tokens[callEnd2].char === ')') depth2--;
-            callEnd2++;
-          }
-          var argTok2 = tokens[i + 3];
-          var isLit2 = argTok2 && argTok2.type === 'str' && callEnd2 === i + 5;
-          var fullEnd2 = tokens[callEnd2 - 1] ? tokens[callEnd2 - 1].end : 0;
-          if (isLit2) {
-            replacements.push({ start: t.start, end: fullEnd2, replacement: '(function() { ' + argTok2.text + ' })' });
+          var parsed2 = _splitCallArgs(i + 2);
+          var fullEnd2 = tokens[parsed2.callEnd - 1] ? tokens[parsed2.callEnd - 1].end : 0;
+          if (parsed2.args.length === 0) {
+            replacements.push({ start: t.start, end: fullEnd2, replacement: '(function() {})' });
           } else {
-            replacements.push({ start: t.start, end: fullEnd2, replacement: '/* [blocked: new Function with dynamic argument] */ void 0' });
+            var lastArg2 = parsed2.args[parsed2.args.length - 1];
+            var bodyCode2 = _resolveArgText(lastArg2.start, lastArg2.end);
+            if (bodyCode2 !== null) {
+              var paramParts2 = [];
+              for (var pi2 = 0; pi2 < parsed2.args.length - 1; pi2++) {
+                var pText2 = _resolveArgText(parsed2.args[pi2].start, parsed2.args[pi2].end);
+                if (pText2 !== null) paramParts2.push(pText2);
+                else { bodyCode2 = null; break; }
+              }
+              if (bodyCode2 !== null) {
+                replacements.push({ start: t.start, end: fullEnd2, replacement: '(function(' + paramParts2.join(', ') + ') { ' + bodyCode2 + ' })' });
+              } else {
+                replacements.push({ start: t.start, end: fullEnd2, replacement: '/* [blocked: new Function with dynamic argument] */ void 0' });
+              }
+            } else {
+              replacements.push({ start: t.start, end: fullEnd2, replacement: '/* [blocked: new Function with dynamic argument] */ void 0' });
+            }
           }
-          i = callEnd2;
+          i = parsed2.callEnd;
           continue;
         }
       }
