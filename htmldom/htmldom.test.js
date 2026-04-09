@@ -12,8 +12,9 @@
 const fs = require('fs');
 const path = require('path');
 
-// Minimal DOM stubs — just enough for htmldom.js's IIFE init to run without
-// exploding. extractHTML itself doesn't touch any of these.
+// Minimal DOM globals — htmldom.js's IIFE calls document.getElementById
+// at init time for its UI wiring. These provide just enough for the
+// file to load in Node; the analysis functions never use them.
 global.document = {
   getElementById: () => ({ addEventListener: () => {}, value: '' }),
 };
