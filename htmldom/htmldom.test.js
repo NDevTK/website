@@ -1936,8 +1936,7 @@ function render() {
 (function () {
   const cp = globalThis.__convertProject;
   if (!cp) return;
-  let JSDOM;
-  try { JSDOM = require('jsdom').JSDOM; } catch (e) { return; }
+  const JSDOM = require('jsdom').JSDOM;
   const before = pass + fail;
   console.log('\nbehavioral equivalence');
   console.log('----------------------');
