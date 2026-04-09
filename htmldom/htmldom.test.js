@@ -3337,6 +3337,13 @@ function render() {
   // --- SMT expression-level constraints ---
   checkTaint('expr: x+y>10 && x+y<5', { 'a.js': 'var x = location.search; var y = location.hash; if (x + y > 10 && x + y < 5) { document.getElementById("o").innerHTML = x; }' }, 0);
   checkTaint('expr: x+y>3 && x+y<5 sat', { 'a.js': 'var x = location.search; var y = location.hash; if (x + y > 3 && x + y < 5) { document.getElementById("o").innerHTML = x; }' }, 1);
+
+  // --- SMT integration: all branch types ---
+  checkTaint('while unsat path', { 'a.js': 'var x = location.search; if (x > 5) { while (x < 3) { document.getElementById("o").innerHTML = x; } }' }, 0);
+  checkTaint('for unsat path', { 'a.js': 'var x = location.search; if (x > 5) { for (var i = 0; x < 3; i++) { document.getElementById("o").innerHTML = x; } }' }, 0);
+  checkTaint('switch dead case', { 'a.js': 'var x = location.search; switch(true) { case x > 5 && x < 3: document.getElementById("o").innerHTML = x; break; }' }, 0);
+  checkTaint('handler path unsat', { 'a.js': 'window.addEventListener("message", function(e) { var x = e.data; if (x > 5) { if (x < 3) { document.getElementById("o").innerHTML = x; } } });' }, 0);
+  checkTaint('fn path unsat', { 'a.js': 'function render(x) { if (x > 5) { if (x < 3) { document.getElementById("o").innerHTML = x; } } } render(location.search);' }, 0);
   checkTaint('satisfiable: obj.prop++ count', { 'a.js': 'var state = {count:0}; window.addEventListener("message", function(e) { state.count++; if (state.count > 3) { document.getElementById("o").innerHTML = e.data; } });' }, 1);
   checkTaint('satisfiable: ident++ in handler', { 'a.js': 'var n = 0; window.addEventListener("message", function(e) { n++; if (n > 5) { document.getElementById("o").innerHTML = e.data; } });' }, 1);
 

@@ -4009,8 +4009,6 @@
     // Evaluate truthiness of a chain binding. Returns true, false, or null (unknown).
     const evalTruthiness = (bind) => {
       if (!bind || bind.kind !== 'chain') return null;
-      // Check boolean/null/undefined keywords first — these are synthetic
-      // tokens from combineArith, not user string literals.
       if (bind.toks.length === 1 && bind.toks[0].type === 'str') {
         const text = bind.toks[0].text;
         if (text === 'true') return true;
@@ -4021,6 +4019,30 @@
       const s = chainAsKnownString(bind);
       if (s !== null) return s !== '';
       return null;
+    };
+
+    // Unified reachability check for ALL branch decisions.
+    // Takes a token range (start, end) in the main tokens array.
+    // Returns: true (always true), false (always false), null (both possible).
+    // Uses concrete evaluation first, then SMT with path constraints.
+    const checkReachability = (start, end) => {
+      if (start >= end) return null;
+      // Concrete evaluation via readValue.
+      var condVal = readValue(start, end, null);
+      var concrete = condVal ? evalTruthiness(condVal.binding) : null;
+      // SMT: build formula from raw tokens in range and check satisfiability.
+      if (taintEnabled) {
+        var condToks = [];
+        for (var ci = start; ci < end; ci++) condToks.push(tokens[ci]);
+        var smtResult = smtCheckCondition(condToks, resolve, resolvePath, pathConstraints);
+        if (smtResult) {
+          if (smtResult.sat && smtResult.unsat) return null;
+          if (smtResult.sat && !smtResult.unsat) return true;
+          if (!smtResult.sat && smtResult.unsat) return false;
+          if (!smtResult.sat && !smtResult.unsat) return false; // neither = dead
+        }
+      }
+      return concrete;
     };
 
     const chainAsExprText = (chain) => {
@@ -4230,25 +4252,9 @@
             j++;
           }
           if (j < stop) {
-            // Evaluate the condition.
+            // Evaluate the condition via unified reachability check.
             const condVal = readValue(i + 2, j, null);
-            var concrete = condVal ? evalTruthiness(condVal.binding) : null;
-            // SMT: check satisfiability of the condition formula.
-            // If the condition contains symbolic variables (tainted/event-modified),
-            // the concrete evaluation may be wrong — the attacker can choose values
-            // to satisfy or falsify the predicate. The SMT solver determines which
-            // branches are actually reachable.
-            if (taintEnabled) {
-              var _condTokens = [];
-              for (var _si = i + 2; _si < j; _si++) _condTokens.push(tokens[_si]);
-              var _smtResult = smtCheckCondition(_condTokens, resolve, resolvePath, pathConstraints);
-              if (_smtResult) {
-                // SMT overrides concrete evaluation when symbolic vars present.
-                if (_smtResult.sat && _smtResult.unsat) concrete = null; // both branches reachable
-                else if (_smtResult.sat && !_smtResult.unsat) concrete = true; // only true branch
-                else if (!_smtResult.sat && _smtResult.unsat) concrete = false; // only false branch
-              }
-            }
+            var concrete = taintEnabled ? checkReachability(i + 2, j) : (condVal ? evalTruthiness(condVal.binding) : null);
             // Determine if-body range.
             const bodyTok = tokens[j + 1];
             let ifEnd;
@@ -4734,6 +4740,50 @@
             for (const cs of cases) {
               // Restore snapshot.
               for (const name in snapshot) assignName(name, snapshot[name]);
+              // Check if this case is reachable via SMT.
+              // For switch(true), the case expression is the condition itself.
+              // For switch(disc), the condition is disc === caseExpr.
+              // Build an SMT formula and check satisfiability.
+              if (taintEnabled && cs.label !== 'default' && cs.caseExpr) {
+                var _discB = discVal ? discVal.binding : null;
+                var _discIsTrueConst = _discB && _discB.kind === 'chain' && _discB.toks.length === 1 && _discB.toks[0].type === 'str' && _discB.toks[0].text === 'true';
+                // Build the case expression as an SMT formula.
+                var _caseFormula = null;
+                // Find the case expression token range.
+                for (var _csi = 0; _csi < tokens.length; _csi++) {
+                  if (tokens[_csi].start === cs.srcStart && tokens[_csi].text === 'case') {
+                    var _ceStart = _csi + 1, _ceEnd = _ceStart;
+                    for (var _csj = _ceStart; _csj < tokens.length; _csj++) {
+                      if (tokens[_csj].type === 'other' && tokens[_csj].text === ':') { _ceEnd = _csj; break; }
+                    }
+                    if (_ceEnd > _ceStart) {
+                      var _ceToks = [];
+                      for (var _ck = _ceStart; _ck < _ceEnd; _ck++) _ceToks.push(tokens[_ck]);
+                      if (_discIsTrueConst) {
+                        // switch(true): case expr is the condition itself.
+                        _caseFormula = smtParseExpr(_ceToks, 0, _ceToks.length, resolve, resolvePath);
+                      } else {
+                        // switch(disc): condition is disc === caseExpr.
+                        var _ceSmtExpr = smtParseAtom(_ceToks, 0, _ceToks.length, resolve, resolvePath);
+                        var _discSmtExpr = _discB ? smtParseAtom([{ type: 'other', text: discExpr || 'disc' }], 0, 1, resolve, resolvePath) : null;
+                        if (_ceSmtExpr && _discSmtExpr) _caseFormula = smtCmp('===', _discSmtExpr, _ceSmtExpr);
+                      }
+                    }
+                    break;
+                  }
+                }
+                if (_caseFormula) {
+                  // Check with path constraints.
+                  var _fullCaseFormula = _caseFormula;
+                  if (pathConstraints && pathConstraints.length > 0) {
+                    for (var _pi = 0; _pi < pathConstraints.length; _pi++) _fullCaseFormula = smtAnd(pathConstraints[_pi], _fullCaseFormula);
+                  }
+                  if (!smtSat(_fullCaseFormula)) {
+                    caseResults.push({ label: cs.label, caseExpr: cs.caseExpr, bindings: snapshot });
+                    continue;
+                  }
+                }
+              }
               walkRange(cs.bodyStart, cs.bodyEnd);
               const bindings = Object.create(null);
               for (let si = stack.length - 1; si >= 0; si--) {
@@ -5026,6 +5076,25 @@
                 if (hn && hn.type === 'op' && (hn.text === '++' || hn.text === '--')) {
                   if (!loopFrame.bindings[hk.text]) loopFrame.bindings[hk.text] = chainBinding([exprRef(hk.text)]);
                 }
+              }
+            }
+            // Check loop condition reachability.
+            {
+              var _loopCondStart = -1, _loopCondEnd = -1;
+              if (t.text === 'while') {
+                _loopCondStart = i + 2; _loopCondEnd = j;
+              } else {
+                // for: condition is between 1st and 2nd semicolons.
+                for (var _lsi = i + 2; _lsi < j; _lsi++) {
+                  if (tokens[_lsi].type === 'sep' && tokens[_lsi].char === ';') {
+                    if (_loopCondStart < 0) _loopCondStart = _lsi + 1;
+                    else { _loopCondEnd = _lsi; break; }
+                  }
+                }
+              }
+              if (_loopCondStart >= 0 && _loopCondEnd > _loopCondStart) {
+                var _loopReach = checkReachability(_loopCondStart, _loopCondEnd);
+                if (_loopReach === false) { i = bodyEnd - 1; continue; }
               }
             }
             stack.push(loopFrame);
