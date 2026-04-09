@@ -6599,9 +6599,6 @@
     $('in').addEventListener('input', convert);
   }
 
-  const toggles = ['skipWS', 'useFragment', 'emitComments'];
-  for (const id of toggles) $(id).addEventListener('change', convert);
-
   convert();
 
   // --- Project-level API ---
