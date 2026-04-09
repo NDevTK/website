@@ -441,10 +441,13 @@
   function smtOr(a, b) { return !a ? b : !b ? a : a.type === 'const' ? (a.value ? a : b) : b.type === 'const' ? (b.value ? b : a) : { type: 'or', left: a, right: b }; }
   function smtCmp(op, l, r) { return { type: 'cmp', op: op, left: l, right: r }; }
   function smtArith(op, l, r) { return { type: 'arith', op: op, left: l, right: r }; }
+  // String theory constraints:
+  //   strProp: { symId, prop, value } — e.g. x.startsWith("http"), x.length === 0
+  function smtStrProp(symId, prop, value) { return { type: 'strProp', symId: symId, prop: prop, value: value }; }
 
   function smtHasSym(e) {
     if (!e) return false;
-    if (e.type === 'sym') return true;
+    if (e.type === 'sym' || e.type === 'strProp') return true;
     if (e.type === 'const') return false;
     return (e.left && smtHasSym(e.left)) || (e.right && smtHasSym(e.right)) || (e.arg && smtHasSym(e.arg));
   }
@@ -481,7 +484,7 @@
       if (!l || !r) return null;
       return l.concat(r);
     }
-    if (f.type === 'cmp' || f.type === 'not') return [f];
+    if (f.type === 'cmp' || f.type === 'not' || f.type === 'strProp') return [f];
     if (f.type === 'or') return null; // can't flatten disjunction
     if (f.type === 'sym') return []; // symbolic = satisfiable, no constraint
     return [];
@@ -589,6 +592,78 @@
     // Check relational constraints via transitive closure.
     // Build a directed graph: edge from A to B with weight means A + weight <= B (or <).
     // Use Floyd-Warshall to detect negative cycles (contradiction).
+    // --- String theory: check string property constraints ---
+    // Collect strProp atoms per symbolic variable.
+    var strConstraints = Object.create(null); // symId → [{prop, value}]
+    // Also collect length constraints for string-length correlation.
+    var lengthBounds = Object.create(null); // symId → bounds
+    for (var si = 0; si < atoms.length; si++) {
+      var sa = atoms[si];
+      if (sa.type === 'strProp') {
+        if (!strConstraints[sa.symId]) strConstraints[sa.symId] = [];
+        strConstraints[sa.symId].push({ prop: sa.prop, value: sa.value });
+      }
+      // cmp where left is arith('length', sym, _) and right is const
+      // e.g. x.length === 0
+      if (sa.type === 'cmp' && sa.left && sa.left.type === 'arith' && sa.left.op === 'length' && sa.left.left.type === 'sym' && sa.right.type === 'const') {
+        var _lsId = sa.left.left.id;
+        if (!lengthBounds[_lsId]) lengthBounds[_lsId] = { eqs: [], lo: -Infinity, hi: Infinity };
+        var _lv = sa.right.value;
+        if (typeof _lv === 'number') {
+          switch (sa.op) {
+            case '===': case '==': lengthBounds[_lsId].eqs.push(_lv); break;
+            case '>': lengthBounds[_lsId].lo = Math.max(lengthBounds[_lsId].lo, _lv + 1); break;
+            case '>=': lengthBounds[_lsId].lo = Math.max(lengthBounds[_lsId].lo, _lv); break;
+            case '<': lengthBounds[_lsId].hi = Math.min(lengthBounds[_lsId].hi, _lv - 1); break;
+            case '<=': lengthBounds[_lsId].hi = Math.min(lengthBounds[_lsId].hi, _lv); break;
+          }
+        }
+      }
+      // cmp where left is arith('indexOf', sym, const) and right is const
+      // e.g. x.indexOf("a") >= 0
+      if (sa.type === 'cmp' && sa.left && sa.left.type === 'arith' && sa.left.op === 'indexOf' && sa.left.left.type === 'sym' && sa.left.right.type === 'const' && sa.right.type === 'const') {
+        var _isId = sa.left.left.id;
+        var _idxStr = sa.left.right.value;
+        // indexOf >= 0 means string contains the substring → like includes.
+        if ((sa.op === '>=' && sa.right.value === 0) || (sa.op === '>' && sa.right.value === -1)) {
+          if (!strConstraints[_isId]) strConstraints[_isId] = [];
+          strConstraints[_isId].push({ prop: 'includes', value: _idxStr });
+        }
+      }
+    }
+    // Check string contradictions.
+    for (var scId in strConstraints) {
+      var sc = strConstraints[scId];
+      // startsWith contradictions: two different prefixes where neither is a prefix of the other.
+      var starts = sc.filter(function(c) { return c.prop === 'startsWith'; });
+      for (var s1 = 0; s1 < starts.length; s1++) {
+        for (var s2 = s1 + 1; s2 < starts.length; s2++) {
+          var p1 = starts[s1].value, p2 = starts[s2].value;
+          if (!p1.startsWith(p2) && !p2.startsWith(p1)) return false;
+        }
+      }
+      // endsWith contradictions.
+      var ends = sc.filter(function(c) { return c.prop === 'endsWith'; });
+      for (var e1 = 0; e1 < ends.length; e1++) {
+        for (var e2 = e1 + 1; e2 < ends.length; e2++) {
+          var s1e = ends[e1].value, s2e = ends[e2].value;
+          if (!s1e.endsWith(s2e) && !s2e.endsWith(s1e)) return false;
+        }
+      }
+      // length === 0 contradicts includes/startsWith/endsWith with non-empty string.
+      var lb = lengthBounds[scId];
+      if (lb && lb.eqs.indexOf(0) >= 0) {
+        for (var sci = 0; sci < sc.length; sci++) {
+          if (sc[sci].value && sc[sci].value.length > 0) return false;
+        }
+      }
+      if (lb && lb.hi === 0) {
+        for (var sci2 = 0; sci2 < sc.length; sci2++) {
+          if (sc[sci2].value && sc[sci2].value.length > 0) return false;
+        }
+      }
+    }
+
     var allIds = Object.keys(bounds).map(Number);
     for (var ri = 0; ri < relations.length; ri++) {
       var rel = relations[ri];
@@ -766,7 +841,11 @@
               if (b.kind === 'object') { for (var k in b.props) if (_hasTaint(b.props[k])) return true; }
               return false;
             };
-            if (_hasTaint(rb)) return smtSym(t.text);
+            if (_hasTaint(rb)) {
+              // x.length → arith('length', sym(x)) for string theory.
+              if (t.text.endsWith('.length')) return smtArith('length', smtSym(t.text.slice(0, -7)), smtConst(0));
+              return smtSym(t.text);
+            }
           }
           // Resolve full path to concrete value.
           var fb = resolvePathFunc(t.text);
@@ -780,6 +859,50 @@
           }
         }
         return smtSym(t.text);
+      }
+    }
+    // Multi-token: detect method calls like x.startsWith("str"), x.indexOf("str").
+    // Pattern: IDENT_PATH ( ARG )
+    if (end >= start + 3 && toks[start].type === 'other' && toks[start + 1].type === 'open' && toks[start + 1].char === '(') {
+      var _mPath = toks[start].text;
+      var _mDot = _mPath.lastIndexOf('.');
+      if (_mDot > 0) {
+        var _mBase = _mPath.slice(0, _mDot);
+        var _mMethod = _mPath.slice(_mDot + 1);
+        // Resolve the base to check if it's symbolic.
+        var _mRoot = _mBase.split('.')[0];
+        var _mRb = resolveFunc(_mRoot);
+        var _mIsSym = false;
+        if (_mRb) {
+          var _ht = function(b) { if (!b) return false; if (b.kind==='chain') return !!collectChainTaint(b.toks); if (b.kind==='array') { for (var e=0;e<b.elems.length;e++) if (_ht(b.elems[e])) return true; } if (b.kind==='object') { for (var k in b.props) if (_ht(b.props[k])) return true; } return false; };
+          _mIsSym = _ht(_mRb);
+        }
+        if (_mIsSym) {
+          // Find the argument (single string literal).
+          var _mArgTok = toks[start + 2];
+          var _mArgVal = null;
+          if (_mArgTok && _mArgTok.type === 'str' && toks[start + 3] && toks[start + 3].type === 'close') {
+            _mArgVal = _mArgTok.text;
+          }
+          var _mSymId = smtSym(_mBase).id;
+          // String methods that produce boolean-like results.
+          if (_mMethod === 'startsWith' && _mArgVal !== null) return smtStrProp(_mSymId, 'startsWith', _mArgVal);
+          if (_mMethod === 'endsWith' && _mArgVal !== null) return smtStrProp(_mSymId, 'endsWith', _mArgVal);
+          if (_mMethod === 'includes' && _mArgVal !== null) return smtStrProp(_mSymId, 'includes', _mArgVal);
+          // indexOf returns a number — wrap as comparison >= 0 or === -1.
+          if (_mMethod === 'indexOf' && _mArgVal !== null) return smtArith('indexOf', smtSym(_mBase), smtConst(_mArgVal));
+          // .length is a property, not a method call.
+        }
+      }
+    }
+    // Pattern: IDENT.length — property access without call.
+    if (end === start + 1 && toks[start].type === 'other' && toks[start].text.endsWith('.length')) {
+      var _lBase = toks[start].text.slice(0, -7);
+      var _lRoot = _lBase.split('.')[0];
+      var _lRb = resolveFunc(_lRoot);
+      if (_lRb) {
+        var _lt = function(b) { if (!b) return false; if (b.kind==='chain') return !!collectChainTaint(b.toks); if (b.kind==='array') { for (var e=0;e<b.elems.length;e++) if (_lt(b.elems[e])) return true; } if (b.kind==='object') { for (var k in b.props) if (_lt(b.props[k])) return true; } return false; };
+        if (_lt(_lRb)) return smtArith('length', smtSym(_lBase), smtConst(0));
       }
     }
     return smtSym('_expr');
@@ -1639,7 +1762,12 @@
   // `next` is the index after the param (points at `,` or `)`).
   function parseParamWithDefault(tokens, k, stop) {
     const nm = tokens[k];
-    if (!nm || nm.type !== 'other' || !IDENT_RE.test(nm.text)) return null;
+    if (!nm || nm.type !== 'other') return null;
+    // Rest parameter: ...args
+    if (nm.text.startsWith('...') && IDENT_RE.test(nm.text.slice(3))) {
+      return { param: { name: nm.text.slice(3), rest: true }, next: k + 1 };
+    }
+    if (!IDENT_RE.test(nm.text)) return null;
     let j = k + 1;
     const sep = tokens[j];
     if (sep && sep.type === 'sep' && sep.char === '=') {
@@ -2695,6 +2823,16 @@
       while (fj < stop) {
         var pt = tks[fj];
         if (pt && pt.type === 'close' && pt.char === ')') { fj++; break; }
+        // Rest parameter: ...args (single token "...args" or two tokens "..." + "args")
+        if (pt && pt.type === 'other' && pt.text.startsWith('...')) {
+          var _restName = pt.text.slice(3);
+          if (IDENT_RE.test(_restName)) {
+            params.push({ name: _restName, rest: true });
+            fj++;
+            if (tks[fj] && tks[fj].type === 'sep' && tks[fj].char === ',') fj++;
+            continue;
+          }
+        }
         if (pt && pt.type === 'other' && IDENT_RE.test(pt.text)) {
           var paramObj = { name: pt.text };
           // Check for default value: param = defaultExpr.
@@ -3628,6 +3766,11 @@
       tks = tokens;
       for (let p = 0; p < fn.params.length; p++) {
         const pi = fn.params[p];
+        if (pi.rest) {
+          // Rest parameter: collect remaining args into an array.
+          frame.bindings[pi.name] = arrayBinding(argBindings.slice(p));
+          break;
+        }
         const a = argBindings[p];
         if (a) {
           frame.bindings[pi.name] = a;
@@ -5463,6 +5606,21 @@
         }
       }
 
+      // setTimeout/setInterval with function callback: walk the callback.
+      if (t.type === 'other' && (t.text === 'setTimeout' || t.text === 'setInterval') && !declaredNames.has(t.text)) {
+        var _timerParen = tokens[i + 1];
+        if (_timerParen && _timerParen.type === 'open' && _timerParen.char === '(') {
+          var _timerArgs = readCallArgBindings(i + 1, stop);
+          if (_timerArgs && _timerArgs.bindings.length >= 1) {
+            var _timerCb = _timerArgs.bindings[0];
+            if (_timerCb && _timerCb.kind === 'function') {
+              instantiateFunction(_timerCb, []);
+            }
+            i = _timerArgs.next - 1;
+            continue;
+          }
+        }
+      }
       // Bare function call as a statement: `render(input);` or `obj.method(args);`.
       // Resolve the callee; if it's a function binding, inline it for side effects.
       if (t.type === 'other' && IDENT_OR_PATH_RE.test(t.text)) {
@@ -5735,9 +5893,16 @@
                     // Unknown event type: param is opaque, no taint.
                     _evParamBindings.push(chainBinding([exprRef(_evHandler.params[0].name)]));
                   }
-                  // Walk the handler body for side effects on shared state.
+                  // Walk the handler body twice: event handlers fire
+                  // multiple times. The first walk establishes mutations
+                  // (state transitions). The second walk sees accumulated
+                  // state and can reach branches guarded by it.
+                  // Suppress findings during the first walk.
                   var _prevInEH = inEventHandler;
                   inEventHandler = true;
+                  var _savedFindings = taintFindings ? taintFindings.length : 0;
+                  instantiateFunction(_evHandler, _evParamBindings);
+                  if (taintFindings) taintFindings.length = _savedFindings; // discard first-walk findings
                   instantiateFunction(_evHandler, _evParamBindings);
                   inEventHandler = _prevInEH;
                 }

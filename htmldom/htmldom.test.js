@@ -3354,6 +3354,20 @@ function render() {
   checkTaint('two messages state machine', { 'a.js': 'var step1 = null; window.addEventListener("message", function(e) { if (e.data.type === "init") { step1 = e.data.payload; } if (e.data.type === "exec" && step1) { document.getElementById("o").innerHTML = step1; } });' }, 1);
   checkTaint('url gate + postMessage', { 'a.js': 'var isAdmin = location.search === "admin"; var payload; window.addEventListener("message", function(e) { payload = e.data; if (isAdmin && payload) { document.getElementById("o").innerHTML = payload; } });' }, 1);
   checkTaint('impossible concrete state', { 'a.js': 'var allowed = false; window.addEventListener("message", function(e) { if (allowed === true && allowed === false) { document.getElementById("o").innerHTML = e.data; } });' }, 0);
+
+  // --- String theory ---
+  checkTaint('string: startsWith contradiction', { 'a.js': 'var x = location.search; if (x.startsWith("http")) { if (x.startsWith("javascript")) { document.getElementById("o").innerHTML = x; } }' }, 0);
+  checkTaint('string: startsWith compatible', { 'a.js': 'var x = location.search; if (x.startsWith("http")) { if (x.startsWith("https")) { document.getElementById("o").innerHTML = x; } }' }, 1);
+  checkTaint('string: length 0 + indexOf', { 'a.js': 'var x = location.search; if (x.length === 0) { if (x.indexOf("a") >= 0) { document.getElementById("o").innerHTML = x; } }' }, 0);
+
+  // --- Rest params ---
+  checkTaint('rest params', { 'a.js': 'function f(...args){document.getElementById("o").innerHTML=args[0];} f(location.search);' }, 1);
+
+  // --- setTimeout/setInterval callback ---
+  checkTaint('setTimeout reads global', { 'a.js': 'var data = location.search; setTimeout(function() { document.getElementById("o").innerHTML = data; }, 0);' }, 1);
+
+  // --- Event handler state machine ---
+  checkTaint('state machine two invocations', { 'a.js': 'var state = "idle"; window.addEventListener("message", function(e) { if (state === "idle") { state = "ready"; } else if (state === "ready") { document.getElementById("o").innerHTML = e.data; } });' }, 1);
   checkTaint('satisfiable: obj.prop++ count', { 'a.js': 'var state = {count:0}; window.addEventListener("message", function(e) { state.count++; if (state.count > 3) { document.getElementById("o").innerHTML = e.data; } });' }, 1);
   checkTaint('satisfiable: ident++ in handler', { 'a.js': 'var n = 0; window.addEventListener("message", function(e) { n++; if (n > 5) { document.getElementById("o").innerHTML = e.data; } });' }, 1);
 
