@@ -3348,6 +3348,12 @@ function render() {
   // --- SMT cross-function path constraints ---
   checkTaint('fn1 constrains fn2', { 'a.js': 'var x = location.search; function validate() { if (x > 5) { render(); } } function render() { if (x < 3) { document.getElementById("o").innerHTML = x; } } validate();' }, 0);
   checkTaint('fn sets then checks', { 'a.js': 'var x; function init() { x = location.search; } init(); if (x > 5 && x < 3) { document.getElementById("o").innerHTML = x; }' }, 0);
+
+  // --- SMT global scope with handlers ---
+  checkTaint('global cond set + handler read', { 'a.js': 'var config; if (location.search.indexOf("debug") >= 0) { config = location.search; } window.addEventListener("message", function(e) { if (config) { document.getElementById("o").innerHTML = config + e.data; } });' }, 1);
+  checkTaint('two messages state machine', { 'a.js': 'var step1 = null; window.addEventListener("message", function(e) { if (e.data.type === "init") { step1 = e.data.payload; } if (e.data.type === "exec" && step1) { document.getElementById("o").innerHTML = step1; } });' }, 1);
+  checkTaint('url gate + postMessage', { 'a.js': 'var isAdmin = location.search === "admin"; var payload; window.addEventListener("message", function(e) { payload = e.data; if (isAdmin && payload) { document.getElementById("o").innerHTML = payload; } });' }, 1);
+  checkTaint('impossible concrete state', { 'a.js': 'var allowed = false; window.addEventListener("message", function(e) { if (allowed === true && allowed === false) { document.getElementById("o").innerHTML = e.data; } });' }, 0);
   checkTaint('satisfiable: obj.prop++ count', { 'a.js': 'var state = {count:0}; window.addEventListener("message", function(e) { state.count++; if (state.count > 3) { document.getElementById("o").innerHTML = e.data; } });' }, 1);
   checkTaint('satisfiable: ident++ in handler', { 'a.js': 'var n = 0; window.addEventListener("message", function(e) { n++; if (n > 5) { document.getElementById("o").innerHTML = e.data; } });' }, 1);
 

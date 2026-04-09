@@ -492,6 +492,22 @@
   // Handles: sym OP const, sym OP sym, arith(sym,const) OP const/sym.
   function smtTheorySat(atoms) {
     if (!atoms) return false; // null = had a const(false)
+    // Evaluate any fully-concrete atoms first.
+    for (var ci = 0; ci < atoms.length; ci++) {
+      var ca = atoms[ci];
+      if (ca.type === 'cmp' && ca.left.type === 'const' && ca.right.type === 'const') {
+        var lv = ca.left.value, rv = ca.right.value;
+        var ok;
+        switch (ca.op) {
+          case '<': ok = lv < rv; break; case '>': ok = lv > rv; break;
+          case '<=': ok = lv <= rv; break; case '>=': ok = lv >= rv; break;
+          case '==': case '===': ok = lv === rv; break;
+          case '!=': case '!==': ok = lv !== rv; break;
+          default: ok = true;
+        }
+        if (!ok) return false; // concrete comparison fails → unsat
+      }
+    }
     // Per-symbol bounds: { symId → { lo, hi, loStrict, hiStrict, eqs:[], neqs:[] } }
     var bounds = Object.create(null);
     // Relational pairs: [{leftId, rightId, op}] for sym OP sym constraints
