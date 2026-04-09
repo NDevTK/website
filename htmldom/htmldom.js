@@ -1251,9 +1251,10 @@
     // Variables whose final value was built inside a loop, captured on
     // loop exit. Each entry: { name, loop: {id,kind,headerSrc}, chain }.
     const loopVars = [];
-    // Guard against infinite recursion in instantiateFunction.
-    // Tracks function bindings currently being inlined.
-    const inliningFns = new Set();
+    // Call stack for interprocedural analysis. Tracks functions currently
+    // being walked so recursive calls can be detected and handled at the
+    // fixed point (the first walk already captures all taint effects).
+    const fnCallStack = new Set();
     // When set, non-build statements inject 'preserve' tokens into this
     // variable's chain so the emitter outputs them at the right position.
     // trackBuildVar can be a string (single build var) or a Set (multiple).
@@ -3004,10 +3005,17 @@
     // Pushes a temporary scope with param→arg bindings, parses the body
     // expression in the original token array, then pops the scope.
     const instantiateFunction = (fn, argBindings) => {
-      // Prevent infinite recursion: if this function is already being inlined
-      // up the call stack, skip re-entry (recursive/mutual recursion).
-      if (inliningFns.has(fn)) return null;
-      inliningFns.add(fn);
+      // Recursion: if we're already walking this function's body, we've
+      // reached a fixed point — the first walk already captured all side
+      // effects (taint propagation, shared variable mutations). Re-walking
+      // with the same parameter taint won't discover new flows.
+      if (fnCallStack.has(fn)) {
+        // Still propagate taint from arguments to shared state: if an arg
+        // is tainted and the function writes params to outer variables,
+        // those writes were already processed in the first walk.
+        return null;
+      }
+      fnCallStack.add(fn);
       stack.push({ bindings: Object.create(null), isFunction: true });
       const frame = stack[stack.length - 1];
       // Body indices are into the original `tokens` array; swap `tks` if we
@@ -3044,7 +3052,7 @@
           if (/var __f\s*=\s*document\.createDocumentFragment/.test(peekSrc)) {
             tks = savedTks;
             stack.pop();
-            inliningFns.delete(fn);
+            fnCallStack.delete(fn);
             return null;
           }
         }
@@ -3116,7 +3124,7 @@
       }
       tks = savedTks;
       stack.pop();
-      inliningFns.delete(fn);
+      fnCallStack.delete(fn);
       // Expand any loopVars created during the function body walk.
       if (result && fnLoopVars && fnLoopVars.length > 0) {
         const lvByName = Object.create(null);
