@@ -1402,6 +1402,8 @@
     };
     const checkTaintSourceCall = (callExpr) => {
       if (!taintEnabled) return null;
+      var root = callExpr.split('.')[0];
+      if (root !== 'window' && root !== 'self' && root !== 'globalThis' && declaredNames.has(root)) return null;
       var label = getTaintSourceCall(callExpr);
       if (label) return new Set([label]);
       return null;
@@ -6688,8 +6690,8 @@
         return { args: args, callEnd: tokens.length };
       };
 
-      // eval(expr) / Function(expr)
-      if (t.text === 'eval' || t.text === 'Function') {
+      // eval(expr) / Function(expr) — only real globals, not shadowed locals.
+      if ((t.text === 'eval' || t.text === 'Function') && !scope.declaredNames.has(t.text)) {
         var paren = tokens[i + 1];
         if (paren && paren.type === 'open' && paren.char === '(') {
           var parsed = _splitCallArgs(i + 1);
@@ -6732,7 +6734,7 @@
         }
       }
       // new Function(...)
-      if (t.text === 'new' && tokens[i + 1] && tokens[i + 1].type === 'other' && tokens[i + 1].text === 'Function') {
+      if (t.text === 'new' && tokens[i + 1] && tokens[i + 1].type === 'other' && tokens[i + 1].text === 'Function' && !scope.declaredNames.has('Function')) {
         var paren2 = tokens[i + 2];
         if (paren2 && paren2.type === 'open' && paren2.char === '(') {
           var parsed2 = _splitCallArgs(i + 2);
@@ -6763,7 +6765,7 @@
         }
       }
       // setTimeout("code", delay) / setInterval("code", delay) — convert string to function
-      if (t.text === 'setTimeout' || t.text === 'setInterval') {
+      if ((t.text === 'setTimeout' || t.text === 'setInterval') && !scope.declaredNames.has(t.text)) {
         var paren3 = tokens[i + 1];
         if (paren3 && paren3.type === 'open' && paren3.char === '(') {
           var firstArg = tokens[i + 2];
