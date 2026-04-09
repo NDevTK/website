@@ -3757,7 +3757,13 @@
           if (b.kind === 'function' && isCall) {
             const args = readConcatArgs(k + 1, stop);
             if (!args) return null;
-            const toks = instantiateFunction(b, args.args.map((a) => chainBinding(a)));
+            var _fnResult = instantiateFunction(b, args.args.map((a) => chainBinding(a)));
+            // Non-chain return (object/array/function binding).
+            if (_fnResult && _fnResult.kind && _fnResult.kind !== 'chain') {
+              return { bind: _fnResult, next: args.next };
+            }
+            var toks = (typeof _fnResult === 'object' && _fnResult && !_fnResult.kind) ? _fnResult : _fnResult;
+            if (!toks || (Array.isArray(toks) && toks.length === 0)) toks = null;
             if (!toks) {
               // Function couldn't be inlined (e.g. pre-pass converted).
               // Produce an opaque call expression.
@@ -3819,6 +3825,7 @@
         }
       }
       let result = null;
+      var fnReturnBinding = null; // non-chain return (object/array/function)
       var fnLoopVars = null;
       if (fn.isBlock) {
         // Skip functions already converted by the pre-pass to return
@@ -3878,8 +3885,15 @@
         while (ri < bodyEnd) {
           const t = tks[ri];
           if (t && t.type === 'other' && t.text === 'return') {
-            const r = readConcatExpr(ri + 1, bodyEnd, TERMS_TOP);
-            if (r) result = r.toks;
+            // Use readValue to preserve object/array/function bindings.
+            const rv = readValue(ri + 1, bodyEnd, TERMS_TOP);
+            if (rv && rv.binding) {
+              if (rv.binding.kind === 'chain') { result = rv.binding.toks; }
+              else { fnReturnBinding = rv.binding; }
+            } else {
+              const r = readConcatExpr(ri + 1, bodyEnd, TERMS_TOP);
+              if (r) result = r.toks;
+            }
             break;
           }
           if (t && t.type === 'open' && t.char === '{') {
@@ -3909,6 +3923,8 @@
         }
         result = expandLoopVars(result, lvByName);
       }
+      // Return non-chain binding directly (object/array from return statement).
+      if (!result && fnReturnBinding) return fnReturnBinding;
       return result;
     };
 
@@ -6325,9 +6341,8 @@
       if (c === ',' || c === ';') { push({ type: 'sep', char: c, start: i, end: i + 1 }); i++; continue; }
       if (c === ':') { push({ type: 'other', text: ':', start: i, end: i + 1 }); i++; continue; }
       if (c === '?') {
-        // Multi-char tokens starting with '?': `??` (nullish coalescing)
-        // and `?.` (optional chaining; ignore `?.<digit>` which is a
-        // ternary followed by a decimal number).
+        // ??= must be checked before ?? to avoid consuming ?? and leaving = separate.
+        if (src[i + 1] === '?' && src[i + 2] === '=') { push({ type: 'sep', char: '??=', start: i, end: i + 3 }); i += 3; continue; }
         if (src[i + 1] === '?') { push({ type: 'op', text: '??', start: i, end: i + 2 }); i += 2; continue; }
         if (src[i + 1] === '.' && !/[0-9]/.test(src[i + 2] || '')) {
           push({ type: 'op', text: '?.', start: i, end: i + 2 }); i += 2; continue;
