@@ -3305,6 +3305,21 @@ function render() {
   checkTaint('message-store-hashchange-sink', { 'a.js': 'var pending;\nwindow.addEventListener("message", function(e) { pending = e.data; });\nwindow.addEventListener("hashchange", function() {\n  document.getElementById("o").innerHTML = pending + location.hash;\n});' }, 1);
   checkTaint('conditional multi-source', { 'a.js': 'var result;\nwindow.addEventListener("message", function(e) {\n  if (location.search.indexOf("admin") >= 0) {\n    result = e.data;\n  }\n});\ndocument.getElementById("o").innerHTML = result;' }, 1);
 
+  // --- Method chains preserve taint ---
+  checkTaint('toString preserves', { 'a.js': 'var x = location.search.toString(); document.getElementById("o").innerHTML = x;' }, 1);
+  checkTaint('trim preserves', { 'a.js': 'var x = location.search.trim(); document.getElementById("o").innerHTML = x;' }, 1);
+  checkTaint('toLowerCase preserves', { 'a.js': 'var x = location.search.toLowerCase(); document.getElementById("o").innerHTML = x;' }, 1);
+  checkTaint('concat preserves', { 'a.js': 'var x = "prefix".concat(location.search); document.getElementById("o").innerHTML = x;' }, 1);
+
+  // --- Object methods ---
+  checkTaint('obj method returns taint', { 'a.js': 'var o = { get: function() { return location.search; } }; document.getElementById("o").innerHTML = o.get();' }, 1);
+
+  // --- Cross-file ---
+  checkTaint('cross-file taint', { 'index.html': '<html><body><div id="o"></div><script src="a.js"></script><script src="b.js"></script></body></html>', 'a.js': 'var shared = location.search;', 'b.js': 'document.getElementById("o").innerHTML = shared;' }, 1);
+
+  // --- False positive: reassigned to safe ---
+  checkTaint('reassigned to safe', { 'a.js': 'var x = location.search; x = "safe"; document.getElementById("o").innerHTML = x;' }, 0);
+
   console.log(`  (${pass + fail - before} cases)`);
 })();
 
@@ -3366,6 +3381,10 @@ function render() {
   checkConv('location shadow safe', 'var location = {}; location.href = "x";', null);
   checkConv('iframe.src filter', 'var f = document.createElement("iframe"); f.src = location.search;', '__safeNav');
   checkConv('opener.location filter', 'opener.location = location.search;', '__safeNav');
+
+  // --- Converter in complex contexts ---
+  checkConv('setTimeout in loop', 'for (var i = 0; i < 3; i++) { setTimeout("alert(" + i + ")", i * 100); }', 'function()');
+  checkConv('iframe.src dynamic', 'var f = document.createElement("iframe"); f.src = location.hash;', '__safeNav');
 
   console.log(`  (${pass + fail - before} cases)`);
 })();
