@@ -263,11 +263,17 @@
   }
 
   // Check if an expression text matches a known taint source. Returns label or null.
+  // Matches exact, suffix (window.location.search), and prefix with method calls
+  // (location.hash.slice(1) starts with taint source location.hash).
   function getTaintSource(expr) {
     if (TAINT_SOURCES[expr]) return TAINT_SOURCES[expr];
-    // Check partial matches: e.g. "window.location.search" matches "location.search"
     for (var src in TAINT_SOURCES) {
+      // Suffix match: "window.location.search" contains "location.search"
       if (expr.endsWith(src) && (expr.length === src.length || expr[expr.length - src.length - 1] === '.')) {
+        return TAINT_SOURCES[src];
+      }
+      // Prefix match: "location.hash.slice(1)" starts with "location.hash"
+      if (expr.startsWith(src) && expr.length > src.length && (expr[src.length] === '.' || expr[src.length] === '(')) {
         return TAINT_SOURCES[src];
       }
     }
@@ -324,29 +330,6 @@
   // Navigation Sink Infrastructure
   // -----------------------------------------------------------------------
 
-  // Global navigation objects — expressions that are always navigation-related
-  // when they appear unbound (not shadowed by a local variable).
-  const NAV_GLOBALS = {
-    'location':                   'location',
-    'window.location':            'location',
-    'document.location':          'location',
-    'self.location':              'location',
-    'globalThis.location':        'location',
-    'opener':                     'opener',
-    'window.opener':              'opener',
-    'opener.location':            'opener.location',
-    'window.opener.location':     'opener.location',
-    'parent':                     'parent',
-    'window.parent':              'parent',
-    'parent.location':            'parent.location',
-    'window.parent.location':     'parent.location',
-    'top':                        'top',
-    'window.top':                 'top',
-    'top.location':               'top.location',
-    'window.top.location':        'top.location',
-    'navigation':                 'navigation',
-    'window.navigation':          'navigation',
-  };
 
   // Navigation sink patterns: property assignments or method calls that
   // cause navigation and are vulnerable to javascript: protocol XSS.
@@ -378,24 +361,32 @@
   // locally (var/let/const/function). Bare assignments to globals
   // (location = x) don't count as declarations.
   // declaredSet: a Set of names declared with var/let/const.
-  function isNavGlobal(expr, declaredSet) {
-    var parts = expr.split('.');
-    var root = parts[0];
-    // window/self/globalThis prefixed — always global.
-    if (root !== 'window' && root !== 'self' && root !== 'globalThis') {
-      // If the root was explicitly declared, it's a local variable.
-      if (declaredSet && declaredSet.has(root)) return null;
-    }
-    // Direct match.
-    if (NAV_GLOBALS[expr]) return NAV_GLOBALS[expr];
-    // Property on a nav global (e.g. 'location.href' → 'location' + '.href').
-    for (var pi = parts.length - 1; pi >= 1; pi--) {
-      var prefix = parts.slice(0, pi).join('.');
-      if (NAV_GLOBALS[prefix]) {
-        return NAV_GLOBALS[prefix] + '.' + parts.slice(pi).join('.');
-      }
-    }
-    return null;
+  // Navigation sink expressions: these are the ONLY patterns that cause
+  // navigation and are vulnerable to javascript: protocol. Any other
+  // property on location (location.hash, location.search) is a SOURCE
+  // not a sink.
+  const NAV_SINK_EXPRS = new Set([
+    'location', 'location.href', 'location.assign', 'location.replace',
+    'window.location', 'window.location.href', 'window.location.assign', 'window.location.replace',
+    'document.location', 'document.location.href', 'document.location.assign', 'document.location.replace',
+    'self.location', 'self.location.href',
+    'opener', 'opener.location', 'opener.location.href',
+    'window.opener', 'window.opener.location', 'window.opener.location.href',
+    'parent', 'parent.location', 'parent.location.href',
+    'window.parent', 'window.parent.location', 'window.parent.location.href',
+    'top', 'top.location', 'top.location.href',
+    'window.top', 'window.top.location', 'window.top.location.href',
+    'navigation.navigate', 'window.navigation.navigate',
+  ]);
+
+  // Check if an expression is a navigation sink. Only matches actual
+  // sink patterns, not reads like location.hash or location.search.
+  function isNavSink(expr, declaredSet) {
+    if (!NAV_SINK_EXPRS.has(expr)) return false;
+    var root = expr.split('.')[0];
+    if (root === 'window' || root === 'self' || root === 'globalThis' || root === 'document') return true;
+    if (declaredSet && declaredSet.has(root)) return false;
+    return true;
   }
 
   // Protocol filter code for safe navigation: validates URL is http(s).
@@ -4711,7 +4702,7 @@
       if (IDENT_RE.test(t.text)) {
         const eqTok = tokens[i + 1];
         // Navigation sink: bare assignment to a navigation global (location = expr).
-        if (taintEnabled && eqTok && eqTok.type === 'sep' && eqTok.char === '=' && isNavGlobal(t.text, declaredNames)) {
+        if (taintEnabled && eqTok && eqTok.type === 'sep' && eqTok.char === '=' && isNavSink(t.text, declaredNames)) {
           var _bNavR = readValue(i + 2, stop, TERMS_TOP);
           if (_bNavR && _bNavR.binding && _bNavR.binding.kind === 'chain') {
             var _bNavTaint = collectChainTaint(_bNavR.binding.toks);
@@ -4899,7 +4890,7 @@
       // Navigation sink detection: location.href = expr, location = expr,
       // location.assign(expr), opener.location = expr, etc.
       if (t.type === 'other' && (PATH_RE.test(t.text) || IDENT_RE.test(t.text))) {
-        var _navType = isNavGlobal(t.text, declaredNames);
+        var _navType = isNavSink(t.text, declaredNames);
         // Check for navigation property assignment: location.href = expr, location = expr
         if (_navType) {
           var _navEq = tokens[i + 1];
@@ -6650,7 +6641,7 @@
       if (t.type !== 'other') continue;
       // Check: navigation property assignment (location.href = expr, location = expr)
       if (PATH_RE.test(t.text) || IDENT_RE.test(t.text)) {
-        var navType = isNavGlobal(t.text, scope.declaredNames);
+        var navType = isNavSink(t.text, scope.declaredNames);
         if (navType) {
           var eq = tokens[i + 1];
           // location.href = expr / location = expr
