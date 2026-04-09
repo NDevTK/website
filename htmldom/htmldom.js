@@ -94,6 +94,211 @@
 
   function $(id) { return document.getElementById(id); }
 
+  // -----------------------------------------------------------------------
+  // Taint Analysis Infrastructure
+  // -----------------------------------------------------------------------
+
+  // Known taint sources — expressions or patterns that introduce untrusted data.
+  const TAINT_SOURCES = {
+    // URL-derived
+    'location.search':    'url',
+    'location.hash':      'url',
+    'location.href':      'url',
+    'location.pathname':  'url',
+    'document.URL':       'url',
+    'document.documentURI': 'url',
+    'document.baseURI':   'url',
+    'window.location':    'url',
+    'window.location.search': 'url',
+    'window.location.hash':   'url',
+    'window.location.href':   'url',
+    // Document properties
+    'document.cookie':    'cookie',
+    'document.referrer':  'referrer',
+    'document.domain':    'referrer',
+    // Window properties
+    'window.name':        'window.name',
+    // Storage
+    'localStorage':       'storage',
+    'sessionStorage':     'storage',
+  };
+  // Patterns matched against full expressions (method calls, etc.).
+  const TAINT_SOURCE_CALLS = {
+    'localStorage.getItem':    'storage',
+    'sessionStorage.getItem':  'storage',
+    'location.toString':       'url',
+    'decodeURIComponent':      'url', // preserves taint, not a sanitizer
+    'decodeURI':               'url',
+    'atob':                    'url', // often used to decode tainted base64
+  };
+  // Event handler parameter sources: addEventListener type → param.property → label.
+  const EVENT_TAINT_SOURCES = {
+    'message':    { 'data': 'postMessage', 'origin': 'postMessage' },
+    'hashchange': { 'newURL': 'url', 'oldURL': 'url' },
+    'popstate':   { 'state': 'url' },
+  };
+
+  // Sink classification: property → {type, severity, elementDependent}.
+  // When elementDependent is true, the sink only applies to certain element types.
+  const TAINT_SINKS = {
+    'innerHTML':          { type: 'html',   severity: 'high',   elementDependent: false },
+    'outerHTML':          { type: 'html',   severity: 'high',   elementDependent: false },
+    'insertAdjacentHTML': { type: 'html',   severity: 'high',   elementDependent: false },
+    'srcdoc':             { type: 'html',   severity: 'high',   elementDependent: true, elements: new Set(['iframe']) },
+    'src':                { type: 'url',    severity: 'high',   elementDependent: true, elements: new Set(['iframe', 'script', 'embed', 'object', 'frame']) },
+    'href':               { type: 'url',    severity: 'high',   elementDependent: true, elements: new Set(['a', 'base', 'area']) },
+    'action':             { type: 'url',    severity: 'high',   elementDependent: true, elements: new Set(['form']) },
+    'formAction':         { type: 'url',    severity: 'medium', elementDependent: true, elements: new Set(['input', 'button']) },
+    'data':               { type: 'url',    severity: 'high',   elementDependent: true, elements: new Set(['object']) },
+    'textContent':        { type: 'text',   severity: 'safe',   elementDependent: true, elements: new Set(['script', 'style']) },
+    // Safe by default on non-script/style elements — only a sink on script/style
+  };
+  // Global call sinks (not property-based).
+  const TAINT_CALL_SINKS = {
+    'eval':                   { type: 'code', severity: 'critical' },
+    'Function':               { type: 'code', severity: 'critical' },
+    'setTimeout':             { type: 'code', severity: 'high' },    // when first arg is string
+    'setInterval':            { type: 'code', severity: 'high' },
+    'document.write':         { type: 'html', severity: 'high' },
+    'document.writeln':       { type: 'html', severity: 'high' },
+    'window.open':            { type: 'url',  severity: 'medium' },
+  };
+  // setAttribute sinks: attr name → classification.
+  const ATTR_SINKS = {
+    'onclick': 'code', 'onload': 'code', 'onerror': 'code',
+    'onmouseover': 'code', 'onfocus': 'code', 'onblur': 'code',
+    'onsubmit': 'code', 'onchange': 'code', 'oninput': 'code',
+    'onkeydown': 'code', 'onkeyup': 'code', 'onkeypress': 'code',
+    'onmousedown': 'code', 'onmouseup': 'code', 'onmousemove': 'code',
+    'ondblclick': 'code', 'oncontextmenu': 'code', 'ondrag': 'code',
+    'ondrop': 'code', 'onscroll': 'code', 'onwheel': 'code',
+    'ontouchstart': 'code', 'ontouchend': 'code', 'ontouchmove': 'code',
+    'onanimationend': 'code', 'ontransitionend': 'code',
+    'style': 'css',
+  };
+
+  // Element type classification for property sinks.
+  // Maps element tag → property → whether it's a sink.
+  const ELEMENT_SINK_TYPES = {
+    'iframe':  { src: 'url', srcdoc: 'html', sandbox: 'safe', allow: 'safe', name: 'safe' },
+    'script':  { src: 'url', textContent: 'code', text: 'code', innerText: 'code' },
+    'embed':   { src: 'url' },
+    'object':  { data: 'url', type: 'safe' },
+    'frame':   { src: 'url' },
+    'a':       { href: 'url' },
+    'area':    { href: 'url' },
+    'base':    { href: 'url' },
+    'form':    { action: 'url' },
+    'input':   { formAction: 'url', value: 'safe' },
+    'button':  { formAction: 'url' },
+    'link':    { href: 'url' }, // rel=stylesheet, rel=import, etc.
+    'style':   { textContent: 'css', innerText: 'css' },
+    'img':     { src: 'safe', srcset: 'safe' },
+    'video':   { src: 'safe' },
+    'audio':   { src: 'safe' },
+    'source':  { src: 'safe', srcset: 'safe' },
+    'track':   { src: 'safe' },
+  };
+
+  // Known sanitizer functions that neutralize taint.
+  const TAINT_SANITIZERS = new Set([
+    'encodeURIComponent', 'encodeURI',
+    'parseInt', 'parseFloat', 'Number', 'Boolean',
+    'DOMPurify.sanitize',
+    'escape',
+    'btoa',
+  ]);
+
+  // Collect taint from a chain token array. Returns a Set of source labels
+  // or null if no taint.
+  function collectChainTaint(toks) {
+    if (!toks) return null;
+    var result = null;
+    for (var i = 0; i < toks.length; i++) {
+      if (toks[i].taint) {
+        if (!result) result = new Set();
+        for (var label of toks[i].taint) result.add(label);
+      }
+    }
+    return result;
+  }
+
+  // Propagate taint to a chain token array: apply labels to all non-plus tokens.
+  function applyTaint(toks, labels) {
+    if (!labels || !labels.size) return toks;
+    return toks.map(function (t) {
+      if (t.type === 'plus') return t;
+      if (t.taint) {
+        var merged = new Set(t.taint);
+        for (var l of labels) merged.add(l);
+        return Object.assign({}, t, { taint: merged });
+      }
+      return Object.assign({}, t, { taint: new Set(labels) });
+    });
+  }
+
+  // Check if an expression text matches a known taint source. Returns label or null.
+  function getTaintSource(expr) {
+    if (TAINT_SOURCES[expr]) return TAINT_SOURCES[expr];
+    // Check partial matches: e.g. "window.location.search" matches "location.search"
+    for (var src in TAINT_SOURCES) {
+      if (expr.endsWith(src) && (expr.length === src.length || expr[expr.length - src.length - 1] === '.')) {
+        return TAINT_SOURCES[src];
+      }
+    }
+    return null;
+  }
+
+  // Check if an expression is a known call-based taint source.
+  function getTaintSourceCall(callExpr) {
+    return TAINT_SOURCE_CALLS[callExpr] || null;
+  }
+
+  // Classify a property sink given the element type. Returns sink info or null.
+  function classifySink(propName, elementTag) {
+    // Direct sink lookup (non-element-dependent)
+    var sink = TAINT_SINKS[propName];
+    if (sink && !sink.elementDependent) {
+      return { type: sink.type, severity: sink.severity, prop: propName };
+    }
+    // Element-dependent: check if this property is a sink on this element type
+    if (elementTag) {
+      var elSinks = ELEMENT_SINK_TYPES[elementTag.toLowerCase()];
+      if (elSinks && elSinks[propName]) {
+        var sinkType = elSinks[propName];
+        if (sinkType === 'safe') return null;
+        return { type: sinkType, severity: sinkType === 'code' ? 'critical' : 'high', prop: propName, elementTag: elementTag };
+      }
+      // If element type is known and property isn't listed, it's safe.
+      if (sink && sink.elementDependent && !sink.elements.has(elementTag.toLowerCase())) {
+        return null; // e.g. img.src is safe
+      }
+    }
+    // Element-dependent sink but element type unknown — report as potential
+    if (sink && sink.elementDependent) {
+      return { type: sink.type, severity: sink.severity, prop: propName, elementTag: elementTag || 'unknown' };
+    }
+    return null;
+  }
+
+  // Check if a function name is a known sanitizer.
+  function isSanitizer(name) {
+    return TAINT_SANITIZERS.has(name);
+  }
+
+  // Extract the element tag from a binding's origin (for element type tracking).
+  function getElementTag(binding) {
+    if (!binding) return null;
+    if (binding.kind === 'element' && binding.origin) {
+      if (binding.origin.kind === 'create') return binding.origin.tag;
+    }
+    return null;
+  }
+
+  // -----------------------------------------------------------------------
+  // End Taint Analysis Infrastructure
+  // -----------------------------------------------------------------------
+
   // Extract the virtual DOM constructed by the script: every
   // `document.createElement`/`getElementById`/`createTextNode` call
   // produces a tracked element, and subsequent `el.prop = ...`,
@@ -1028,10 +1233,15 @@
     return externallyMutable;
   }
 
-  function buildScopeState(tokens, stopAt, externallyMutable, trackBuildVarInit) {
+  function buildScopeState(tokens, stopAt, externallyMutable, trackBuildVarInit, taintConfig) {
     const stack = [{ bindings: Object.create(null), isFunction: true }];
     let pendingFunctionBrace = false;
     let pendingFunctionParams = null;
+    // Taint tracking state (active when taintConfig is provided).
+    const taintEnabled = !!taintConfig;
+    const taintFindings = taintEnabled ? [] : null;
+    // Path conditions accumulated through if/else branches.
+    const taintCondStack = taintEnabled ? [] : null;
     // Loop detection stack: each entry is `{ id, kind, headerSrc, bodyEnd,
     // frame, modifiedVars }` recording an enclosing `for`/`while`. Operands
     // added to a binding's chain while a loop is active carry a `loopId` tag
@@ -1082,6 +1292,76 @@
     // template-literal expression that was re-tokenized) while sharing the
     // current scope stack.
     let tks = tokens;
+    // Taint checking helpers (no-ops when taintEnabled is false).
+    const checkTaintSource = (exprText) => {
+      if (!taintEnabled) return null;
+      var label = getTaintSource(exprText);
+      if (label) return new Set([label]);
+      return null;
+    };
+    const checkTaintSourceCall = (callExpr) => {
+      if (!taintEnabled) return null;
+      var label = getTaintSourceCall(callExpr);
+      if (label) return new Set([label]);
+      return null;
+    };
+    const recordTaintFinding = (sinkType, severity, prop, elementTag, taintLabels, pathConditions, location) => {
+      if (!taintFindings) return;
+      taintFindings.push({
+        type: sinkType,
+        severity: severity,
+        sink: { prop: prop, elementTag: elementTag || null },
+        sources: Array.from(taintLabels),
+        conditions: pathConditions ? pathConditions.slice() : [],
+        location: location || null,
+      });
+    };
+    const checkSinkAssignment = (el, propName, valBinding) => {
+      if (!taintEnabled || !valBinding) return;
+      var toks = valBinding.kind === 'chain' ? valBinding.toks : null;
+      var taint = toks ? collectChainTaint(toks) : null;
+      if (!taint || !taint.size) return;
+      var tag = getElementTag(el);
+      var sinkInfo = classifySink(propName, tag);
+      if (sinkInfo && sinkInfo.severity !== 'safe') {
+        recordTaintFinding(sinkInfo.type, sinkInfo.severity, propName, tag, taint, taintCondStack);
+      }
+    };
+    const checkSinkSetAttribute = (el, attrName, valBinding) => {
+      if (!taintEnabled || !valBinding || !attrName) return;
+      var toks = valBinding.kind === 'chain' ? valBinding.toks : null;
+      var taint = toks ? collectChainTaint(toks) : null;
+      if (!taint || !taint.size) return;
+      var sinkType = ATTR_SINKS[attrName.toLowerCase()];
+      if (sinkType) {
+        var sev = sinkType === 'code' ? 'critical' : sinkType === 'css' ? 'medium' : 'high';
+        recordTaintFinding(sinkType, sev, attrName, getElementTag(el), taint, taintCondStack);
+      }
+      // Also check if it's a URL attribute on a sensitive element
+      var tag = getElementTag(el);
+      if (tag && (attrName === 'src' || attrName === 'href' || attrName === 'action')) {
+        var sinkInfo = classifySink(attrName, tag);
+        if (sinkInfo) {
+          recordTaintFinding(sinkInfo.type, sinkInfo.severity, attrName, tag, taint, taintCondStack);
+        }
+      }
+    };
+    const checkSinkCall = (callExpr, argBindings) => {
+      if (!taintEnabled || !argBindings) return;
+      var sinkInfo = TAINT_CALL_SINKS[callExpr];
+      if (!sinkInfo) return;
+      for (var ai = 0; ai < argBindings.length; ai++) {
+        var ab = argBindings[ai];
+        if (!ab) continue;
+        var toks = ab.kind === 'chain' ? ab.toks : null;
+        var taint = toks ? collectChainTaint(toks) : null;
+        if (taint && taint.size) {
+          recordTaintFinding(sinkInfo.type, sinkInfo.severity, callExpr, null, taint, taintCondStack);
+          break;
+        }
+      }
+    };
+
     // Tracked virtual DOM elements, recorded in creation order. Each entry
     // is an elementBinding/textNodeBinding (mutable) so subsequent
     // `el.prop = ...` / `el.appendChild(...)` statements update the same
@@ -1094,6 +1374,8 @@
     // Apply a mutation to an element binding's property path.
     const applyElementSet = (el, path, val) => {
       if (!el || el.kind !== 'element') return;
+      // Taint: check if assigning a tainted value to a sink property.
+      if (path.length === 1) checkSinkAssignment(el, path[0], val);
       const seg = path[0];
       if (path.length === 1) {
         if (seg === 'innerHTML' || seg === 'outerHTML') { el.html = val; }
@@ -1132,7 +1414,10 @@
       }
       if (method === 'setAttribute' && argBinds.length === 2) {
         const name = argBinds[0] && argBinds[0].kind === 'chain' ? chainAsKnownString(argBinds[0]) : null;
-        if (name !== null) el.attrs[name] = argBinds[1];
+        if (name !== null) {
+          el.attrs[name] = argBinds[1];
+          checkSinkSetAttribute(el, name, argBinds[1]);
+        }
         domOps.push({ op: 'setAttribute', element: el, name, value: argBinds[1] });
         return;
       }
@@ -2391,7 +2676,11 @@
         if (j === k + 1) return null;
         const first = tks[k];
         const last = tks[j - 1];
-        return { bind: chainBinding([exprRef(first._src.slice(first.start, last.end))]), next: j };
+        var _newText = first._src.slice(first.start, last.end);
+        var _newRef = exprRef(_newText);
+        var _newTaint = checkTaintSource(_newText);
+        if (_newTaint) _newRef.taint = _newTaint;
+        return { bind: chainBinding([_newRef]), next: j };
       }
       // `await expr` / `yield expr` / `void expr` / `typeof expr` / `delete expr`:
       // evaluate the expression and surface a canonical symbolic form.
@@ -2626,7 +2915,11 @@
           }
           const first = tks[k];
           const last = tks[end - 1];
-          return { bind: chainBinding([exprRef(first._src.slice(first.start, last.end))]), next: end };
+          var _opaqueText = first._src.slice(first.start, last.end);
+          var _opaqueRef = exprRef(_opaqueText);
+          var _opaqueTaint = checkTaintSource(_opaqueText);
+          if (_opaqueTaint) _opaqueRef.taint = _opaqueTaint;
+          return { bind: chainBinding([_opaqueRef]), next: end };
         }
         if (b) {
           // Call syntax: `name(args)` where name resolves to a function binding.
@@ -2639,7 +2932,21 @@
               // Produce an opaque call expression.
               const first = tks[k];
               const last = tks[args.next - 1];
-              return { bind: chainBinding([exprRef(first._src.slice(first.start, last.end))]), next: args.next };
+              var _callRef = exprRef(first._src.slice(first.start, last.end));
+              // Taint: check if this is a sanitizer (clears taint) or propagates it.
+              if (taintEnabled && !isSanitizer(t.text)) {
+                var _argTaint = null;
+                for (var _ai = 0; _ai < args.args.length; _ai++) {
+                  var _at = collectChainTaint(args.args[_ai]);
+                  if (_at) { if (!_argTaint) _argTaint = new Set(); for (var _l of _at) _argTaint.add(_l); }
+                }
+                if (_argTaint) _callRef.taint = _argTaint;
+              }
+              return { bind: chainBinding([_callRef]), next: args.next };
+            }
+            // Taint: for inlined functions, check if it's a sanitizer.
+            if (taintEnabled && isSanitizer(t.text)) {
+              return { bind: chainBinding(toks.map(function(tk) { var c = Object.assign({}, tk); delete c.taint; return c; })), next: args.next };
             }
             return { bind: chainBinding(toks), next: args.next };
           }
@@ -2903,13 +3210,25 @@
     // sub-results.
     const combineArith = (left, op, right) => {
       if (!left || left.kind !== 'chain' || !right || right.kind !== 'chain') return null;
+      // Merge taint from both operands onto the result token.
+      const _mergeTaint = (ref, a, b) => {
+        if (!taintEnabled) return ref;
+        var t1 = collectChainTaint(a.toks);
+        var t2 = collectChainTaint(b.toks);
+        if (!t1 && !t2) return ref;
+        var merged = new Set();
+        if (t1) for (var l of t1) merged.add(l);
+        if (t2) for (var l of t2) merged.add(l);
+        if (merged.size) ref.taint = merged;
+        return ref;
+      };
       // `in` / `instanceof` are always symbolic — they depend on runtime
       // prototype/object state we don't model. Skip straight to symbolic.
       if (op === 'in' || op === 'instanceof') {
         const lt = chainAsExprText(left);
         const rt = chainAsExprText(right);
         if (lt === null || rt === null) return null;
-        return chainBinding([exprRef('(' + lt + ' ' + op + ' ' + rt + ')')]);
+        return chainBinding([_mergeTaint(exprRef('(' + lt + ' ' + op + ' ' + rt + ')'), left, right)]);
       }
       const lNum = chainAsNumber(left);
       const rNum = chainAsNumber(right);
@@ -2986,7 +3305,7 @@
           const lt = chainAsExprText(left);
           const rt = chainAsExprText(right);
           if (lt !== null && rt !== null) {
-            return chainBinding([exprRef('(' + lt + ' + ' + rt + ')')]);
+            return chainBinding([_mergeTaint(exprRef('(' + lt + ' + ' + rt + ')'), left, right)]);
           }
         }
         return null;
@@ -3005,7 +3324,7 @@
       const rt = chainAsExprText(right);
       if (lt === null || rt === null) return null;
       const text = '(' + lt + ' ' + op + ' ' + rt + ')';
-      return chainBinding([exprRef(text)]);
+      return chainBinding([_mergeTaint(exprRef(text), left, right)]);
     };
 
     // Apply a unary prefix operator to a chain binding. Folds to a literal
@@ -3406,9 +3725,11 @@
                 }
               }
               // Walk if-body using the full walker; capture loopVars created.
+              if (taintCondStack) taintCondStack.push(condExpr);
               const lvBefore = loopVars.length;
               walkRange(j + 1, ifEnd);
               const ifLoopVars = loopVars.splice(lvBefore);
+              if (taintCondStack) taintCondStack.pop();
               // Capture if-branch bindings.
               const ifBindings = Object.create(null);
               for (let si = stack.length - 1; si >= 0; si--) {
@@ -3420,10 +3741,12 @@
               for (const name in snapshot) {
                 assignName(name, snapshot[name]);
               }
+              if (taintCondStack) taintCondStack.push('!(' + condExpr + ')');
               const lvBefore2 = loopVars.length;
               if (elseStart > 0 && elseEnd > elseStart) {
                 walkRange(elseStart, elseEnd);
               }
+              if (taintCondStack) taintCondStack.pop();
               const elseLoopVars = loopVars.splice(lvBefore2);
               // Merge: for any binding that differs between branches,
               // produce a cond token.
@@ -4283,12 +4606,87 @@
         }
       }
 
+      // Bare function call as a statement: `render(input);` or `obj.method(args);`.
+      // Resolve the callee; if it's a function binding, inline it for side effects.
+      if (t.type === 'other' && IDENT_OR_PATH_RE.test(t.text)) {
+        const callParen = tokens[i + 1];
+        if (callParen && callParen.type === 'open' && callParen.char === '(') {
+          var calleeBind = resolvePath(t.text);
+          if (calleeBind && calleeBind.kind === 'function') {
+            var callArgs = readConcatArgs(i + 1, stop);
+            if (callArgs) {
+              instantiateFunction(calleeBind, callArgs.args.map(function(a) { return chainBinding(a); }));
+              // Also check for trailing .prop = value (e.g. returned element).
+              i = callArgs.next - 1;
+              // Check for call-based sinks.
+              if (taintEnabled && TAINT_CALL_SINKS[t.text]) {
+                checkSinkCall(t.text, callArgs.args.map(function(a) { return chainBinding(a); }));
+              }
+              continue;
+            }
+          }
+          // Taint: even if callee isn't inlinable, check if it's a call-based sink.
+          if (taintEnabled && TAINT_CALL_SINKS[t.text]) {
+            var sinkArgs = readCallArgBindings(i + 1, stop);
+            if (sinkArgs) {
+              checkSinkCall(t.text, sinkArgs.bindings);
+              i = sinkArgs.next - 1;
+              continue;
+            }
+          }
+        }
+      }
+
+      // DOM factory call as a statement: `document.getElementById("x").prop = value`
+      // or `document.createElement("div").method(...)`. Resolve the call,
+      // then handle trailing property assignment or method call on the result.
+      if (t.type === 'other' && DOM_FACTORIES[t.text]) {
+        const factoryParen = tokens[i + 1];
+        if (factoryParen && factoryParen.type === 'open' && factoryParen.char === '(') {
+          const factoryArgs = readConcatArgs(i + 1, stop);
+          if (factoryArgs) {
+            const factoryResult = DOM_FACTORIES[t.text](factoryArgs.args, i, factoryArgs.next, t);
+            if (factoryResult && factoryResult.bind) {
+              var afterCall = factoryResult.next;
+              // Check for trailing .prop = value or .method(args).
+              var trailTok = tokens[afterCall];
+              if (trailTok && trailTok.type === 'other' && trailTok.text[0] === '.') {
+                var trailProp = trailTok.text.slice(1);
+                var trailEq = tokens[afterCall + 1];
+                if (trailEq && trailEq.type === 'sep' && (trailEq.char === '=' || trailEq.char === '+=')) {
+                  // Property assignment on DOM factory result.
+                  var trailR = readValue(afterCall + 2, stop, TERMS_TOP);
+                  var trailVal = trailR ? trailR.binding : null;
+                  if (factoryResult.bind.kind === 'element') {
+                    applyElementSet(factoryResult.bind, [trailProp], trailVal);
+                  }
+                  i = skipExpr(afterCall + 2, stop) - 1;
+                  continue;
+                } else if (trailEq && trailEq.type === 'open' && trailEq.char === '(') {
+                  // Method call on DOM factory result.
+                  if (factoryResult.bind.kind === 'element' && DOM_METHODS.has(trailProp)) {
+                    var methodArgs = readCallArgBindings(afterCall + 1, stop);
+                    if (methodArgs) {
+                      applyElementMethod(factoryResult.bind, trailProp, methodArgs.bindings);
+                      i = methodArgs.next - 1;
+                      continue;
+                    }
+                  }
+                }
+              }
+              i = afterCall - 1;
+              continue;
+            }
+          }
+        }
+      }
+
       // Path assignment on a tracked DOM element: `el.prop = value`,
       // `el.style.color = value`, etc. Records the mutation on the
       // element binding so subsequent DOM serialization sees it.
       if (t.type === 'other' && PATH_RE.test(t.text)) {
         const eqTok = tokens[i + 1];
-        if (eqTok && eqTok.type === 'sep' && eqTok.char === '=') {
+        if (eqTok && eqTok.type === 'sep' && (eqTok.char === '=' || eqTok.char === '+=')) {
           const parts = t.text.split('.');
           const baseBind = resolve(parts[0]);
           if (baseBind && baseBind.kind === 'element') {
@@ -4297,6 +4695,28 @@
             applyElementSet(baseBind, parts.slice(1), val);
             i = skipExpr(i + 2, stop) - 1;
             continue;
+          }
+          // Taint: check for sink property assignments on non-tracked elements.
+          if (taintEnabled && parts.length >= 2) {
+            const sinkProp = parts[parts.length - 1];
+            if (TAINT_SINKS[sinkProp] || sinkProp === 'src' || sinkProp === 'href' || sinkProp === 'action' || sinkProp === 'srcdoc') {
+              const r = readValue(i + 2, stop, TERMS_TOP);
+              const val = r ? r.binding : null;
+              if (val && val.kind === 'chain') {
+                var _taint = collectChainTaint(val.toks);
+                if (_taint && _taint.size) {
+                  // Try to resolve element type from the base binding.
+                  var _elTag = baseBind ? getElementTag(baseBind) : null;
+                  var _sinkInfo = classifySink(sinkProp, _elTag);
+                  if (_sinkInfo && _sinkInfo.severity !== 'safe') {
+                    recordTaintFinding(_sinkInfo.type, _sinkInfo.severity, sinkProp, _elTag, _taint, taintCondStack,
+                      { expr: t.text, line: countLines(t._src, t.start) });
+                  }
+                }
+              }
+              i = skipExpr(i + 2, stop) - 1;
+              continue;
+            }
           }
         }
         // Path method call: `el.appendChild(child)`, `el.setAttribute(...)`.
@@ -4311,6 +4731,47 @@
               const argResult = readCallArgBindings(i + 1, stop);
               if (argResult) {
                 applyElementMethod(baseBind, method, argResult.bindings);
+                i = argResult.next - 1;
+                continue;
+              }
+            }
+            // Taint: detect call-based sinks (eval, document.write, etc.).
+            if (taintEnabled && TAINT_CALL_SINKS[t.text]) {
+              const argResult = readCallArgBindings(i + 1, stop);
+              if (argResult) {
+                checkSinkCall(t.text, argResult.bindings);
+                i = argResult.next - 1;
+                continue;
+              }
+            }
+            // Taint: detect addEventListener('type', handler) and mark
+            // the handler's event parameter as a taint source.
+            if (taintEnabled && method === 'addEventListener') {
+              const argResult = readCallArgBindings(i + 1, stop);
+              if (argResult && argResult.bindings.length >= 2) {
+                const evType = argResult.bindings[0] && argResult.bindings[0].kind === 'chain' ? chainAsKnownString(argResult.bindings[0]) : null;
+                const handler = argResult.bindings[1];
+                if (evType && handler && handler.kind === 'function' && EVENT_TAINT_SOURCES[evType]) {
+                  // Tag the function's first parameter with taint for each known property.
+                  const evSources = EVENT_TAINT_SOURCES[evType];
+                  if (handler.params && handler.params.length > 0) {
+                    const paramName = handler.params[0];
+                    // Create tainted bindings for event properties
+                    for (var _evProp in evSources) {
+                      var _evLabel = evSources[_evProp];
+                      var _evRef = exprRef(paramName + '.' + _evProp);
+                      _evRef.taint = new Set([_evLabel]);
+                      // Inject into the function's scope: when the function body
+                      // is walked, paramName.property will resolve to this tainted ref.
+                    }
+                    // Mark the parameter itself as tainted (conservatively).
+                    var _paramRef = exprRef(paramName);
+                    _paramRef.taint = new Set(Object.values(evSources));
+                    // Store on the handler so instantiateFunction picks it up.
+                    handler._taintedParams = handler._taintedParams || {};
+                    handler._taintedParams[paramName] = new Set(Object.values(evSources));
+                  }
+                }
                 i = argResult.next - 1;
                 continue;
               }
@@ -4431,7 +4892,7 @@
     };
     const setTrackBuildVar = (name) => { trackBuildVar = name ? new Set(Array.isArray(name) ? name : [name]) : null; };
     const getBuildVarDeclStart = () => buildVarDeclStart;
-    return { resolve, resolvePath, parseRange, rewriteTemplate, advanceTo, setTrackBuildVar, getBuildVarDeclStart, loopInfo, loopVars, inScope, domElements, domOps };
+    return { resolve, resolvePath, parseRange, rewriteTemplate, advanceTo, setTrackBuildVar, getBuildVarDeclStart, loopInfo, loopVars, inScope, domElements, domOps, taintFindings, resolveForTaint: resolve };
   }
 
   function hasBinding(stack, name) {
@@ -6362,6 +6823,133 @@
     };
   }
 
+  // -----------------------------------------------------------------------
+  // Taint Analysis API
+  // -----------------------------------------------------------------------
+
+  // Analyze a single JS source for taint flows. Returns an array of findings.
+  // All detection happens inside the scope walker — no post-hoc regex scanning.
+  function traceTaintInJs(jsContent, precedingCode) {
+    var src = (precedingCode ? precedingCode + '\n' : '') + jsContent;
+    var tokens = tokenize(src.trim());
+    if (!tokens.length) return [];
+    // Run scope walker with taint enabled — it detects all sinks internally.
+    var scope = buildScopeState(tokens, tokens.length, null, null, { enabled: true });
+    return scope.taintFindings || [];
+  }
+
+  // Count newlines before a position for line number calculation.
+  function countLines(src, pos) {
+    if (!src) return 0;
+    var n = 1;
+    for (var i = 0; i < pos && i < src.length; i++) {
+      if (src[i] === '\n') n++;
+    }
+    return n;
+  }
+
+  // Analyze a multi-file project for taint flows.
+  // Returns { findings: [...], summary: { ... } }.
+  function traceTaint(files) {
+    var allFindings = [];
+    // Find HTML pages and their referenced scripts.
+    var htmlPages = Object.keys(files).filter(function(p) { return /\.html?$/i.test(p); });
+    // Analyze JS files inline in HTML and standalone.
+    for (var page of htmlPages) {
+      var content = files[page];
+      // Extract inline scripts from HTML.
+      var htmlTokens = tokenizeHtml(content);
+      for (var ti = 0; ti < htmlTokens.length; ti++) {
+        if (htmlTokens[ti].type === 'openTag' && htmlTokens[ti].tag === 'script') {
+          // Check if it has a src attribute (external) — skip inline scan.
+          var hasSrc = false;
+          for (var ai = 0; ai < (htmlTokens[ti].attrs || []).length; ai++) {
+            if (htmlTokens[ti].attrs[ai].name === 'src') { hasSrc = true; break; }
+          }
+          if (hasSrc) continue;
+          // Find matching </script> and extract content.
+          var scriptStart = ti + 1;
+          var scriptEnd = scriptStart;
+          while (scriptEnd < htmlTokens.length && !(htmlTokens[scriptEnd].type === 'closeTag' && htmlTokens[scriptEnd].tag === 'script')) scriptEnd++;
+          var scriptContent = '';
+          for (var si = scriptStart; si < scriptEnd; si++) {
+            if (htmlTokens[si].type === 'text') scriptContent += htmlTokens[si].text;
+          }
+          if (scriptContent.trim()) {
+            var inlineFindings = traceTaintInJs(scriptContent);
+            for (var f of inlineFindings) {
+              f.file = page;
+              f.inline = true;
+              allFindings.push(f);
+            }
+          }
+        }
+      }
+      // Find external script references.
+      var scriptRefs = [];
+      for (var ti2 = 0; ti2 < htmlTokens.length; ti2++) {
+        if (htmlTokens[ti2].type === 'openTag' && htmlTokens[ti2].tag === 'script') {
+          for (var ai2 = 0; ai2 < (htmlTokens[ti2].attrs || []).length; ai2++) {
+            if (htmlTokens[ti2].attrs[ai2].name === 'src') {
+              scriptRefs.push(htmlTokens[ti2].attrs[ai2].value);
+            }
+          }
+        }
+      }
+      // Analyze external scripts in order (preceding code accumulates).
+      var precedingCode = '';
+      for (var sr of scriptRefs) {
+        if (files[sr]) {
+          var extFindings = traceTaintInJs(files[sr], precedingCode);
+          for (var f2 of extFindings) {
+            f2.file = sr;
+            allFindings.push(f2);
+          }
+          precedingCode += (precedingCode ? '\n' : '') + files[sr];
+        }
+      }
+    }
+    // Also analyze standalone JS files not referenced by any HTML.
+    var referencedJs = new Set();
+    for (var page2 of htmlPages) {
+      var ht2 = tokenizeHtml(files[page2]);
+      for (var ti3 = 0; ti3 < ht2.length; ti3++) {
+        if (ht2[ti3].type === 'openTag' && ht2[ti3].tag === 'script') {
+          for (var ai3 = 0; ai3 < (ht2[ti3].attrs || []).length; ai3++) {
+            if (ht2[ti3].attrs[ai3].name === 'src') referencedJs.add(ht2[ti3].attrs[ai3].value);
+          }
+        }
+      }
+    }
+    var standaloneJs = Object.keys(files).filter(function(p) { return /\.js$/i.test(p) && !referencedJs.has(p); });
+    for (var sj of standaloneJs) {
+      var sjFindings = traceTaintInJs(files[sj]);
+      for (var f3 of sjFindings) {
+        f3.file = sj;
+        allFindings.push(f3);
+      }
+    }
+    // Deduplicate findings.
+    var seen = new Set();
+    var deduped = [];
+    for (var finding of allFindings) {
+      var key = finding.file + ':' + finding.type + ':' + (finding.sink.prop || '') + ':' + finding.sources.join(',');
+      if (!seen.has(key)) {
+        seen.add(key);
+        deduped.push(finding);
+      }
+    }
+    return {
+      findings: deduped,
+      summary: {
+        total: deduped.length,
+        critical: deduped.filter(function(f) { return f.severity === 'critical'; }).length,
+        high: deduped.filter(function(f) { return f.severity === 'high'; }).length,
+        medium: deduped.filter(function(f) { return f.severity === 'medium'; }).length,
+      }
+    };
+  }
+
   function convertProject(files) {
     const output = {};
     const htmlPages = Object.keys(files).filter(function(p) { return /\.html?$/i.test(p); }).sort();
@@ -6462,9 +7050,42 @@
     return output;
   }
 
+  // -----------------------------------------------------------------------
+  // Public API
+  // -----------------------------------------------------------------------
+  var api = {
+    // Core analysis
+    tokenize: tokenize,
+    tokenizeHtml: tokenizeHtml,
+    // Conversion
+    convertProject: convertProject,
+    convertJsFile: convertJsFile,
+    convertHtmlMarkup: convertHtmlMarkup,
+    // Taint analysis
+    traceTaint: traceTaint,
+    traceTaintInJs: traceTaintInJs,
+    // Utilities
+    decodeHtmlEntities: decodeHtmlEntities,
+    parseStyleDecls: parseStyleDecls,
+    serializeHtmlTokens: serializeHtmlTokens,
+    makeVar: makeVar,
+    // Classification data (for custom analysis)
+    TAINT_SOURCES: TAINT_SOURCES,
+    TAINT_SINKS: TAINT_SINKS,
+    TAINT_CALL_SINKS: TAINT_CALL_SINKS,
+    ELEMENT_SINK_TYPES: ELEMENT_SINK_TYPES,
+    TAINT_SANITIZERS: TAINT_SANITIZERS,
+    EVENT_TAINT_SOURCES: EVENT_TAINT_SOURCES,
+  };
+
   if (typeof globalThis !== 'undefined') {
     globalThis.__convertProject = convertProject;
     globalThis.__convertHtmlMarkup = convertHtmlMarkup;
     globalThis.__convertJsFile = convertJsFile;
+    globalThis.__traceTaint = traceTaint;
+    globalThis.__htmldomApi = api;
+  }
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = api;
   }
 })();
