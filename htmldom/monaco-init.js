@@ -149,19 +149,106 @@
       document.getElementById('editorFilename').textContent = (source === 'output' ? '[output] ' : '') + path;
       document.getElementById('downloadCurrent').disabled = source !== 'output';
       renderSidebar();
+      updateEditorDecorations();
     }
 
     // --- Conversion ---
     // Use the project-level API from htmldom.js.
     var convertAllRunning = false;
+    var taintResults = null;
+    var editorDecorations = [];
     function convertAll() {
       if (convertAllRunning || !folderFiles) return;
       convertAllRunning = true;
       // __convertProject processes each HTML page independently.
       outputFiles = globalThis.__convertProject ? globalThis.__convertProject(folderFiles) : {};
+      // Run taint analysis.
+      if (globalThis.__traceTaint) {
+        try {
+          taintResults = globalThis.__traceTaint(folderFiles);
+        } catch (e) {
+          taintResults = { findings: [], summary: { total: 0 } };
+        }
+      }
       renderSidebar();
+      renderTaintFindings();
+      updateEditorDecorations();
       document.getElementById('downloadAll').disabled = !Object.keys(outputFiles).length;
       convertAllRunning = false;
+    }
+
+    function renderTaintFindings() {
+      var container = document.getElementById('taintFindings');
+      var summary = document.getElementById('taintSummary');
+      if (!taintResults || !taintResults.findings.length) {
+        container.innerHTML = '<div class="empty-hint">No security issues found</div>';
+        summary.style.display = 'none';
+        return;
+      }
+      var f = taintResults.findings;
+      summary.style.display = '';
+      var parts = [];
+      if (taintResults.summary.critical) parts.push(taintResults.summary.critical + ' critical');
+      if (taintResults.summary.high) parts.push(taintResults.summary.high + ' high');
+      if (taintResults.summary.medium) parts.push(taintResults.summary.medium + ' medium');
+      summary.textContent = f.length + ' finding' + (f.length === 1 ? '' : 's') + (parts.length ? ': ' + parts.join(', ') : '');
+      container.innerHTML = '';
+      for (var i = 0; i < f.length; i++) {
+        var finding = f[i];
+        var el = document.createElement('div');
+        el.className = 'finding-item';
+        var sev = document.createElement('span');
+        sev.className = 'finding-severity ' + finding.severity;
+        sev.textContent = finding.severity.toUpperCase();
+        el.appendChild(sev);
+        var desc = document.createTextNode(finding.sources.join(', ') + ' \u2192 ' + finding.sink.prop + (finding.sink.elementTag ? ' on <' + finding.sink.elementTag + '>' : ''));
+        el.appendChild(desc);
+        if (finding.file) {
+          var flow = document.createElement('div');
+          flow.className = 'finding-flow';
+          flow.textContent = finding.file + (finding.location && finding.location.line ? ':' + finding.location.line : '');
+          el.appendChild(flow);
+        }
+        if (finding.conditions && finding.conditions.length) {
+          var cond = document.createElement('div');
+          cond.className = 'finding-cond';
+          cond.textContent = 'when: ' + finding.conditions.join(' && ');
+          el.appendChild(cond);
+        }
+        (function(fi) {
+          el.addEventListener('click', function() {
+            if (fi.file && folderFiles[fi.file]) {
+              selectFile(fi.file, 'original');
+              if (fi.location && fi.location.line) {
+                editor.revealLineInCenter(fi.location.line);
+              }
+            }
+          });
+        })(finding);
+        container.appendChild(el);
+      }
+    }
+
+    function updateEditorDecorations() {
+      if (!taintResults || !activeFile) { editorDecorations = editor.deltaDecorations(editorDecorations, []); return; }
+      var file = activeFile.path;
+      var decorations = [];
+      for (var i = 0; i < taintResults.findings.length; i++) {
+        var f = taintResults.findings[i];
+        if (f.file !== file || !f.location || !f.location.line) continue;
+        var line = f.location.line;
+        var cls = f.severity === 'critical' ? 'taint-decoration-critical' : f.severity === 'high' ? 'taint-decoration-high' : 'taint-decoration-medium';
+        decorations.push({
+          range: new monaco.Range(line, 1, line, 1),
+          options: {
+            isWholeLine: true,
+            className: cls,
+            glyphMarginClassName: 'taint-glyph-' + f.severity,
+            hoverMessage: { value: '**' + f.severity.toUpperCase() + '**: ' + f.sources.join(', ') + ' \u2192 ' + f.sink.prop + (f.conditions.length ? '\n\nConditions: ' + f.conditions.join(' && ') : '') },
+          }
+        });
+      }
+      editorDecorations = editor.deltaDecorations(editorDecorations, decorations);
     }
 
     // --- Event handlers ---
