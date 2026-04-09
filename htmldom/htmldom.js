@@ -210,31 +210,46 @@
   ]);
 
   // Collect taint from a chain token array. Returns a Set of source labels
-  // or null if no taint.
+  // or null if no taint. Recurses into structured tokens (cond, trycatch,
+  // switch, tmpl) so taint inside branches is never missed.
   function collectChainTaint(toks) {
     if (!toks) return null;
     var result = null;
+    var merge = function(set) {
+      if (!set) return;
+      if (!result) result = new Set();
+      for (var label of set) result.add(label);
+    };
     for (var i = 0; i < toks.length; i++) {
-      if (toks[i].taint) {
-        if (!result) result = new Set();
-        for (var label of toks[i].taint) result.add(label);
+      var t = toks[i];
+      if (t.taint) merge(t.taint);
+      if (t.type === 'cond') {
+        merge(collectChainTaint(t.ifTrue));
+        merge(collectChainTaint(t.ifFalse));
+      } else if (t.type === 'trycatch') {
+        merge(collectChainTaint(t.tryBody));
+        merge(collectChainTaint(t.catchBody));
+      } else if (t.type === 'switch' && t.branches) {
+        for (var bi = 0; bi < t.branches.length; bi++) {
+          merge(collectChainTaint(t.branches[bi].chain));
+        }
+      } else if (t.type === 'tmpl' && t.parts) {
+        for (var pi = 0; pi < t.parts.length; pi++) {
+          if (t.parts[pi].kind === 'expr' && t.parts[pi].toks) {
+            merge(collectChainTaint(t.parts[pi].toks));
+          }
+        }
       }
     }
     return result;
   }
 
-  // Propagate taint to a chain token array: apply labels to all non-plus tokens.
-  function applyTaint(toks, labels) {
-    if (!labels || !labels.size) return toks;
-    return toks.map(function (t) {
-      if (t.type === 'plus') return t;
-      if (t.taint) {
-        var merged = new Set(t.taint);
-        for (var l of labels) merged.add(l);
-        return Object.assign({}, t, { taint: merged });
-      }
-      return Object.assign({}, t, { taint: new Set(labels) });
-    });
+  // Copy taint from a source token to a new exprRef. Used when creating
+  // derived opaque expressions from tainted operands.
+  function copyTaint(newRef, sourceToks) {
+    var t = collectChainTaint(sourceToks);
+    if (t) newRef.taint = t;
+    return newRef;
   }
 
   // Check if an expression text matches a known taint source. Returns label or null.
@@ -1524,7 +1539,7 @@
         } else if (b.kind === 'chain' && b.toks.length === 1 && b.toks[0].type === 'other') {
           // Opaque chain (e.g. parameter bound to exprRef) — extend the
           // path so `column.title` becomes `store.columns[i].title`.
-          b = chainBinding([exprRef(b.toks[0].text + '.' + parts.slice(i).join('.'))]);
+          b = chainBinding([copyTaint(exprRef(b.toks[0].text + '.' + parts.slice(i).join('.')), b.toks)]);
           break;
         } else if (p === 'length' && b.kind === 'array') {
           b = chainBinding([makeSynthStr(String(b.elems.length))]);
@@ -1623,12 +1638,14 @@
       for (const p of tok.parts) {
         if (p.kind === 'text') { parts.push({ kind: 'text', raw: p.raw }); continue; }
         let resolvedText = null;
+        var _tmplChain = null;
         if (TEMPLATE_EXPR_PATH_RE.test(p.expr)) {
           const path = p.expr.replace(/\s+/g, '');
           const b = resolvePath(path);
-          if (b) resolvedText = bindingToText(b);
+          if (b) { resolvedText = bindingToText(b); if (b.kind === 'chain') _tmplChain = b.toks; }
         } else {
           const chain = evalExprSrc(p.expr);
+          _tmplChain = chain;
           if (chain) {
             // Check if the chain contains structured tokens (cond, trycatch, switch).
             const hasStructured = chain.some(t => t.type === 'cond' || t.type === 'trycatch' || t.type === 'switch' || t.type === 'iter');
@@ -1658,12 +1675,25 @@
           }
         }
         if (resolvedText !== null) {
+          // Taint: if the resolved chain carries taint, don't inline as
+          // text — keep as expr so collectChainTaint can find it.
+          if (taintEnabled && _tmplChain && collectChainTaint(_tmplChain)) {
+            parts.push({ kind: 'expr', expr: p.expr, toks: _tmplChain });
+            changed = true;
+            continue;
+          }
           const raw = resolvedText.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$\{/g, '\\${');
           parts.push({ kind: 'text', raw });
           changed = true;
           continue;
         }
-        parts.push({ kind: 'expr', expr: p.expr });
+        // Attach resolved chain toks to expr parts so collectChainTaint can find them.
+        var _exprPart = { kind: 'expr', expr: p.expr };
+        if (taintEnabled && _tmplChain && collectChainTaint(_tmplChain)) {
+          _exprPart.toks = _tmplChain;
+          changed = true;
+        }
+        parts.push(_exprPart);
       }
       if (!changed) return tok;
       // Coalesce adjacent text parts.
@@ -2250,7 +2280,7 @@
               : (tks[next - 1] && tks[next - 1]._src ? tks[next - 1]._src.slice(tks[next - 1].start, tks[next - 1].end) : null);
             if (baseText) {
               const idxText = tks[next + 1] && tks[next + 1]._src ? tks[next + 1]._src.slice(tks[next + 1].start, tks[j - 1].end) : 'i';
-              bind = chainBinding([exprRef(baseText + '[' + idxText + ']')]);
+              bind = chainBinding([copyTaint(exprRef(baseText + '[' + idxText + ']'), bind ? bind.toks : null)]);
             } else {
               bind = null;
             }
@@ -2298,7 +2328,7 @@
               cur = ok ? chainBinding([makeSynthStr(String(n))]) : null;
             } else if (cur.kind === 'chain' && cur.toks.length === 1 && cur.toks[0].type === 'other') {
               // Opaque chain: extend the expression text with the property.
-              cur = chainBinding([exprRef(cur.toks[0].text + '.' + p)]);
+              cur = chainBinding([copyTaint(exprRef(cur.toks[0].text + '.' + p), cur.toks)]);
             } else {
               cur = null;
               break;
@@ -3109,8 +3139,22 @@
       if (end === k) return null;
       const first = tks[k];
       const last = tks[end - 1];
+      // Collect taint from any tokens in the captured range.
+      var _rangeRef = exprRef(first._src.slice(first.start, last.end));
+      if (taintEnabled) {
+        for (var _ri = k; _ri < end; _ri++) {
+          var _rt = tks[_ri];
+          if (_rt.type === 'other' && IDENT_RE.test(_rt.text)) {
+            var _rb = resolve(_rt.text);
+            if (_rb && _rb.kind === 'chain') {
+              var _rTaint = collectChainTaint(_rb.toks);
+              if (_rTaint) { if (!_rangeRef.taint) _rangeRef.taint = new Set(); for (var _rl of _rTaint) _rangeRef.taint.add(_rl); }
+            }
+          }
+        }
+      }
       return {
-        toks: [exprRef(first._src.slice(first.start, last.end))],
+        toks: [_rangeRef],
         next: end,
       };
     };
@@ -3347,7 +3391,7 @@
       const et = chainAsExprText(operand);
       if (et === null) return null;
       const text = op + et;
-      return chainBinding([exprRef(text)]);
+      return chainBinding([copyTaint(exprRef(text), operand.toks)]);
     };
 
     const chainAsNumber = (chain) => {
@@ -4735,6 +4779,83 @@
                 continue;
               }
             }
+            // Taint: detect addEventListener on ANY object (window, document, element).
+            // Parse the call args directly since readCallArgBindings can't
+            // handle function expressions.
+            if (taintEnabled && method === 'addEventListener') {
+              var _lp = tokens[i + 1];
+              if (_lp && _lp.type === 'open' && _lp.char === '(') {
+                // Read first arg (event type string).
+                var _evTypeV = readValue(i + 2, stop, TERMS_ARG);
+                var _evTypeStr = _evTypeV && _evTypeV.binding ? chainAsKnownString(_evTypeV.binding) : null;
+                var _comma = _evTypeV ? tokens[_evTypeV.next] : null;
+                if (_evTypeStr && _comma && _comma.type === 'sep' && _comma.char === ',' && EVENT_TAINT_SOURCES[_evTypeStr]) {
+                  // Parse the callback function expression.
+                  var _cbStart = _evTypeV.next + 1;
+                  var _cbTok = tokens[_cbStart];
+                  var _fnBind = null;
+                  var _fnEnd = _cbStart;
+                  // Check for: function(params) { body }
+                  if (_cbTok && _cbTok.type === 'other' && _cbTok.text === 'function') {
+                    var _fk = _cbStart + 1;
+                    if (tokens[_fk] && tokens[_fk].type === 'other' && IDENT_RE.test(tokens[_fk].text)) _fk++; // optional name
+                    if (tokens[_fk] && tokens[_fk].type === 'open' && tokens[_fk].char === '(') {
+                      var _fParams = [];
+                      var _fj = _fk + 1;
+                      while (_fj < stop) {
+                        var _pt = tokens[_fj];
+                        if (_pt && _pt.type === 'close' && _pt.char === ')') { _fj++; break; }
+                        if (_pt && _pt.type === 'other' && IDENT_RE.test(_pt.text)) _fParams.push({ name: _pt.text });
+                        _fj++;
+                      }
+                      if (tokens[_fj] && tokens[_fj].type === 'open' && tokens[_fj].char === '{') {
+                        var _fd = 1, _fbe = _fj + 1;
+                        while (_fbe < stop && _fd > 0) {
+                          if (tokens[_fbe].type === 'open' && tokens[_fbe].char === '{') _fd++;
+                          else if (tokens[_fbe].type === 'close' && tokens[_fbe].char === '}') _fd--;
+                          if (_fd > 0) _fbe++;
+                        }
+                        _fnBind = functionBinding(_fParams, _fj, _fbe + 1, true);
+                        _fnEnd = _fbe + 1;
+                      }
+                    }
+                  }
+                  // Also check for arrow: (params) => { body } or param => { body }
+                  if (!_fnBind && _cbTok) {
+                    var _arrow = peekArrow(_cbStart, stop);
+                    if (_arrow) {
+                      var _abody = readArrowBody(_arrow.bodyIdx, stop);
+                      if (_abody) {
+                        _fnBind = functionBinding(_arrow.params, _abody.bodyStart, _abody.bodyEnd, _abody.isBlock);
+                        _fnEnd = _abody.bodyEnd;
+                      }
+                    }
+                  }
+                  // Also check for identifier referencing a function.
+                  if (!_fnBind && _cbTok && _cbTok.type === 'other' && IDENT_RE.test(_cbTok.text)) {
+                    var _refB = resolve(_cbTok.text);
+                    if (_refB && _refB.kind === 'function') { _fnBind = _refB; _fnEnd = _cbStart + 1; }
+                  }
+                  if (_fnBind && _fnBind.params && _fnBind.params.length > 0) {
+                    var _evSources = EVENT_TAINT_SOURCES[_evTypeStr];
+                    var _pn = _fnBind.params[0].name;
+                    var _evLabels = new Set(Object.values(_evSources));
+                    var _evRef = exprRef(_pn);
+                    _evRef.taint = _evLabels;
+                    instantiateFunction(_fnBind, [chainBinding([_evRef])]);
+                  }
+                  // Skip past the closing paren of addEventListener(...).
+                  var _endD = 1, _endI = i + 2;
+                  while (_endI < stop && _endD > 0) {
+                    if (tokens[_endI].type === 'open' && tokens[_endI].char === '(') _endD++;
+                    if (tokens[_endI].type === 'close' && tokens[_endI].char === ')') _endD--;
+                    _endI++;
+                  }
+                  i = _endI - 1;
+                  continue;
+                }
+              }
+            }
             // Taint: detect call-based sinks (eval, document.write, etc.).
             if (taintEnabled && TAINT_CALL_SINKS[t.text]) {
               const argResult = readCallArgBindings(i + 1, stop);
@@ -4744,38 +4865,7 @@
                 continue;
               }
             }
-            // Taint: detect addEventListener('type', handler) and mark
-            // the handler's event parameter as a taint source.
-            if (taintEnabled && method === 'addEventListener') {
-              const argResult = readCallArgBindings(i + 1, stop);
-              if (argResult && argResult.bindings.length >= 2) {
-                const evType = argResult.bindings[0] && argResult.bindings[0].kind === 'chain' ? chainAsKnownString(argResult.bindings[0]) : null;
-                const handler = argResult.bindings[1];
-                if (evType && handler && handler.kind === 'function' && EVENT_TAINT_SOURCES[evType]) {
-                  // Tag the function's first parameter with taint for each known property.
-                  const evSources = EVENT_TAINT_SOURCES[evType];
-                  if (handler.params && handler.params.length > 0) {
-                    const paramName = handler.params[0];
-                    // Create tainted bindings for event properties
-                    for (var _evProp in evSources) {
-                      var _evLabel = evSources[_evProp];
-                      var _evRef = exprRef(paramName + '.' + _evProp);
-                      _evRef.taint = new Set([_evLabel]);
-                      // Inject into the function's scope: when the function body
-                      // is walked, paramName.property will resolve to this tainted ref.
-                    }
-                    // Mark the parameter itself as tainted (conservatively).
-                    var _paramRef = exprRef(paramName);
-                    _paramRef.taint = new Set(Object.values(evSources));
-                    // Store on the handler so instantiateFunction picks it up.
-                    handler._taintedParams = handler._taintedParams || {};
-                    handler._taintedParams[paramName] = new Set(Object.values(evSources));
-                  }
-                }
-                i = argResult.next - 1;
-                continue;
-              }
-            }
+            // (addEventListener handling moved above to work on any base object)
           }
         }
       }
