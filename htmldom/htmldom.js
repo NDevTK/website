@@ -6631,16 +6631,122 @@
 
   // Scan JS source for navigation sinks and wrap them with protocol filtering.
   // Returns the modified source, or null if no changes.
-  function filterNavigationSinks(jsContent) {
+  function filterUnsafeSinks(jsContent) {
     var tokens = tokenize(jsContent);
     if (!tokens.length) return null;
-    // Build scope to resolve variable types.
-    var scope = buildScopeState(tokens, tokens.length);
+    // Build scope to resolve variable types and taint.
+    var scope = buildScopeState(tokens, tokens.length, null, null, { enabled: true });
     var replacements = []; // { start, end, replacement }
     for (var i = 0; i < tokens.length; i++) {
       var t = tokens[i];
       if (t.type !== 'other') continue;
-      // Check: navigation property assignment (location.href = expr, location = expr)
+
+      // --- Code execution sinks: eval, Function, setTimeout/setInterval ---
+      if (t.text === 'eval' || t.text === 'Function') {
+        var paren = tokens[i + 1];
+        if (paren && paren.type === 'open' && paren.char === '(') {
+          var callEnd = i + 2, depth = 1;
+          while (callEnd < tokens.length && depth > 0) {
+            if (tokens[callEnd].type === 'open' && tokens[callEnd].char === '(') depth++;
+            if (tokens[callEnd].type === 'close' && tokens[callEnd].char === ')') depth--;
+            callEnd++;
+          }
+          var argTok = tokens[i + 2];
+          var argEndTok = tokens[callEnd - 2];
+          if (argTok && argEndTok) {
+            // Check if the argument is a known string literal.
+            var resolved = scope.resolve && argTok.type === 'other' && IDENT_RE.test(argTok.text) ? scope.resolve(argTok.text) : null;
+            var isLiteral = argTok.type === 'str' && callEnd === i + 4; // single string arg
+            var isResolvedLiteral = resolved && resolved.kind === 'chain' && resolved.toks.length === 1 && resolved.toks[0].type === 'str';
+            var literalCode = isLiteral ? argTok.text : (isResolvedLiteral ? resolved.toks[0].text : null);
+            var fullEnd = tokens[callEnd - 1] ? tokens[callEnd - 1].end : argEndTok.end;
+            if (literalCode !== null) {
+              // eval("code") → code (inline it)
+              // Function("code") → (function() { code })
+              if (t.text === 'eval') {
+                replacements.push({ start: t.start, end: fullEnd, replacement: literalCode });
+              } else {
+                replacements.push({ start: t.start, end: fullEnd, replacement: '(function() { ' + literalCode + ' })' });
+              }
+            } else {
+              // Dynamic/tainted: remove the dangerous call.
+              replacements.push({ start: t.start, end: fullEnd, replacement: '/* [blocked: ' + t.text + ' with dynamic argument] */ void 0' });
+            }
+          }
+          i = callEnd;
+          continue;
+        }
+      }
+      // new Function(...)
+      if (t.text === 'new' && tokens[i + 1] && tokens[i + 1].type === 'other' && tokens[i + 1].text === 'Function') {
+        var paren2 = tokens[i + 2];
+        if (paren2 && paren2.type === 'open' && paren2.char === '(') {
+          var callEnd2 = i + 3, depth2 = 1;
+          while (callEnd2 < tokens.length && depth2 > 0) {
+            if (tokens[callEnd2].type === 'open' && tokens[callEnd2].char === '(') depth2++;
+            if (tokens[callEnd2].type === 'close' && tokens[callEnd2].char === ')') depth2--;
+            callEnd2++;
+          }
+          var argTok2 = tokens[i + 3];
+          var isLit2 = argTok2 && argTok2.type === 'str' && callEnd2 === i + 5;
+          var fullEnd2 = tokens[callEnd2 - 1] ? tokens[callEnd2 - 1].end : 0;
+          if (isLit2) {
+            replacements.push({ start: t.start, end: fullEnd2, replacement: '(function() { ' + argTok2.text + ' })' });
+          } else {
+            replacements.push({ start: t.start, end: fullEnd2, replacement: '/* [blocked: new Function with dynamic argument] */ void 0' });
+          }
+          i = callEnd2;
+          continue;
+        }
+      }
+      // setTimeout("code", delay) / setInterval("code", delay) — convert string to function
+      if (t.text === 'setTimeout' || t.text === 'setInterval') {
+        var paren3 = tokens[i + 1];
+        if (paren3 && paren3.type === 'open' && paren3.char === '(') {
+          var firstArg = tokens[i + 2];
+          if (firstArg) {
+            var comma = null, commaIdx = -1;
+            // Find the comma separating first arg from the rest.
+            var d3 = 0;
+            for (var ci = i + 2; ci < tokens.length; ci++) {
+              if (tokens[ci].type === 'open') d3++;
+              if (tokens[ci].type === 'close') d3--;
+              if (d3 < 0) break;
+              if (d3 === 0 && tokens[ci].type === 'sep' && tokens[ci].char === ',') { commaIdx = ci; break; }
+            }
+            if (firstArg.type === 'str' && commaIdx > 0) {
+              // setTimeout("alert(1)", 100) → setTimeout(function() { alert(1) }, 100)
+              replacements.push({ start: firstArg.start, end: tokens[commaIdx - 1].end, replacement: 'function() { ' + firstArg.text + ' }' });
+              i = commaIdx;
+              continue;
+            }
+            // Check if first arg is tainted/dynamic (not a function keyword or arrow).
+            var resolved3 = firstArg.type === 'other' && IDENT_RE.test(firstArg.text) ? scope.resolve(firstArg.text) : null;
+            var isFn = firstArg.text === 'function' || (resolved3 && resolved3.kind === 'function');
+            var isArrow = false;
+            // Check for arrow: look for => before comma
+            if (!isFn && commaIdx > 0) {
+              for (var ai = i + 2; ai < commaIdx; ai++) {
+                if (tokens[ai].type === 'other' && tokens[ai].text === '=>') { isArrow = true; break; }
+              }
+            }
+            if (!isFn && !isArrow && commaIdx > 0 && firstArg.type !== 'str') {
+              // Dynamic string passed to setTimeout — check for taint.
+              var hasTaint = false;
+              if (resolved3 && resolved3.kind === 'chain') hasTaint = !!collectChainTaint(resolved3.toks);
+              if (hasTaint || firstArg.type === 'other') {
+                // Block it.
+                var timerEnd = commaIdx;
+                replacements.push({ start: firstArg.start, end: tokens[commaIdx - 1].end, replacement: '/* [blocked: ' + t.text + ' with dynamic string] */ function() {}' });
+                i = commaIdx;
+                continue;
+              }
+            }
+          }
+        }
+      }
+
+      // --- Navigation sinks ---
       if (PATH_RE.test(t.text) || IDENT_RE.test(t.text)) {
         var navType = isNavSink(t.text, scope.declaredNames);
         if (navType) {
@@ -6737,7 +6843,7 @@
       : jsContent;
     const extractions = extractAllHTML(combined);
     // Also filter navigation sinks in the current file.
-    var navFiltered = filterNavigationSinks(jsContent);
+    var navFiltered = filterUnsafeSinks(jsContent);
     if (extractions.length === 0 && !navFiltered) return navFiltered;
     var sourceToConvert = navFiltered || jsContent;
     var combinedSrc = precedingCode
