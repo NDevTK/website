@@ -3153,7 +3153,8 @@
           if (isCall && cur && cur.kind === 'function') {
             var _omArgs = readCallArgBindings(next + 1, stop);
             if (_omArgs) {
-              var _omResult = instantiateFunction(cur, _omArgs.bindings);
+              // Pass the receiver object as 'this' for method calls.
+              var _omResult = instantiateFunction(cur, _omArgs.bindings, bind);
               if (_omResult && _omResult.kind) { bind = _omResult; next = _omArgs.next; continue; }
               if (_omResult) { bind = chainBinding(_omResult); next = _omArgs.next; continue; }
             }
@@ -3910,7 +3911,13 @@
           if (b.kind === 'function' && isCall) {
             const args = readConcatArgs(k + 1, stop);
             if (!args) return null;
-            var _fnResult = instantiateFunction(b, args.args.map((a) => chainBinding(a)));
+            // For method calls (dotted path), bind 'this' to the receiver object.
+            var _thisBind = null;
+            var _dot = t.text.lastIndexOf('.');
+            if (_dot > 0) {
+              _thisBind = resolvePath(t.text.slice(0, _dot));
+            }
+            var _fnResult = instantiateFunction(b, args.args.map((a) => chainBinding(a)), _thisBind);
             // Non-chain return (object/array/function binding).
             if (_fnResult && _fnResult.kind && _fnResult.kind !== 'chain') {
               return { bind: _fnResult, next: args.next };
@@ -3949,9 +3956,11 @@
     // Invoke a function binding with a list of argument chains (token lists).
     // Pushes a temporary scope with param→arg bindings, parses the body
     // expression in the original token array, then pops the scope.
-    const instantiateFunction = (fn, argBindings) => {
+    const instantiateFunction = (fn, argBindings, thisBinding) => {
       stack.push({ bindings: Object.create(null), isFunction: true });
       const frame = stack[stack.length - 1];
+      // Bind 'this' if provided (for method calls on objects).
+      if (thisBinding) frame.bindings['this'] = thisBinding;
       // instantiateFunction walks the body with calling context —
       // taint findings are valid here (unlike definition-time walks).
       var savedTaintFnDepth = taintFnDepth;

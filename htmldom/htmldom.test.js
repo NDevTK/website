@@ -3409,6 +3409,16 @@ function render() {
   checkTaint('promise-like then', { 'a.js': 'var p = { then: function(cb) { cb(location.search); } }; p.then(function(x) { document.getElementById("o").innerHTML = x; });' }, 1);
   checkTaint('no dup closure', { 'a.js': 'var x = location.search; function outer() { function inner() { document.getElementById("o").innerHTML = x; } inner(); } outer();' }, 1);
   checkTaint('no dup IIFE', { 'a.js': '(function() { document.getElementById("o").innerHTML = location.search; })();' }, 1);
+
+  // --- Complex cross-function side effects ---
+  checkTaint('fn modifies shared obj', { 'a.js': 'var state = { safe: true };\nfunction corrupt() { state.safe = false; state.data = location.search; }\nfunction render() { if (state.safe) { document.getElementById("o").innerHTML = state.data; } }\ncorrupt(); render();' }, 1);
+  checkTaint('validator transformer renderer', { 'a.js': 'var input = location.search;\nvar validated = false;\nvar transformed = "";\nfunction validate() { if (input.length > 0) { validated = true; } }\nfunction transform() { if (validated) { transformed = "<b>" + input + "</b>"; } }\nfunction render() { if (transformed) { document.getElementById("o").innerHTML = transformed; } }\nvalidate(); transform(); render();' }, 1);
+  checkTaint('closure side effect', { 'a.js': 'var result = "";\nfunction process(data) { function inner() { result = data; } inner(); }\nprocess(location.search);\ndocument.getElementById("o").innerHTML = result;' }, 1);
+  checkTaint('callback with taint', { 'a.js': 'function fetchData(callback) { callback(location.search); }\nfunction handleData(data) { document.getElementById("o").innerHTML = data; }\nfetchData(handleData);' }, 1);
+  checkTaint('handler modifies fn reads', { 'a.js': 'var cache = { html: "" };\nwindow.addEventListener("message", function(e) { cache.html = e.data; });\nfunction refresh() { document.getElementById("o").innerHTML = cache.html; }\nrefresh();' }, 1);
+  checkTaint('method returns this.data', { 'a.js': 'var api = { data: location.search, getData: function() { return this.data; } };\ndocument.getElementById("o").innerHTML = api.getData();' }, 1);
+  checkTaint('forEach side effect', { 'a.js': 'var output = "";\nvar items = [location.search, document.cookie];\nitems.forEach(function(item) { output += item; });\ndocument.getElementById("o").innerHTML = output;' }, 1);
+  checkTaint('fn sanitizes safe', { 'a.js': 'function safe(data) { var clean = parseInt(data, 10); document.getElementById("o").innerHTML = clean; }\nsafe(location.search);' }, 0);
   checkTaint('satisfiable: obj.prop++ count', { 'a.js': 'var state = {count:0}; window.addEventListener("message", function(e) { state.count++; if (state.count > 3) { document.getElementById("o").innerHTML = e.data; } });' }, 1);
   checkTaint('satisfiable: ident++ in handler', { 'a.js': 'var n = 0; window.addEventListener("message", function(e) { n++; if (n > 5) { document.getElementById("o").innerHTML = e.data; } });' }, 1);
 
