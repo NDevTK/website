@@ -244,12 +244,19 @@
     return result;
   }
 
-  // Copy taint from a source token to a new exprRef. Used when creating
-  // derived opaque expressions from tainted operands.
-  function copyTaint(newRef, sourceToks) {
-    var t = collectChainTaint(sourceToks);
-    if (t) newRef.taint = t;
-    return newRef;
+  // Create an exprRef that inherits taint from any number of source token
+  // arrays. Every place that creates a derived opaque expression from
+  // existing bindings should use this instead of bare exprRef().
+  function deriveExprRef(text) {
+    var ref = exprRef(text);
+    for (var i = 1; i < arguments.length; i++) {
+      var t = collectChainTaint(arguments[i]);
+      if (t) {
+        if (!ref.taint) ref.taint = new Set();
+        for (var l of t) ref.taint.add(l);
+      }
+    }
+    return ref;
   }
 
   // Check if an expression text matches a known taint source. Returns label or null.
@@ -1539,7 +1546,7 @@
         } else if (b.kind === 'chain' && b.toks.length === 1 && b.toks[0].type === 'other') {
           // Opaque chain (e.g. parameter bound to exprRef) — extend the
           // path so `column.title` becomes `store.columns[i].title`.
-          b = chainBinding([copyTaint(exprRef(b.toks[0].text + '.' + parts.slice(i).join('.')), b.toks)]);
+          b = chainBinding([deriveExprRef(b.toks[0].text + '.' + parts.slice(i).join('.'), b.toks)]);
           break;
         } else if (p === 'length' && b.kind === 'array') {
           b = chainBinding([makeSynthStr(String(b.elems.length))]);
@@ -2154,9 +2161,59 @@
     // Read any value at index `k`: arrow function, chain, object literal, or
     // array literal. `terms` defines the expression terminators for chain
     // parsing. Returns { binding, next } or null.
+    // Parse a function expression: function [name](params) { body }.
+    // Returns { binding: functionBinding, next } or null.
+    const readFunctionExpr = (k, stop) => {
+      var ft = tks[k];
+      if (!ft || ft.type !== 'other' || ft.text !== 'function') return null;
+      var fk = k + 1;
+      // Optional function name.
+      if (tks[fk] && tks[fk].type === 'other' && IDENT_RE.test(tks[fk].text) && tks[fk].text !== 'function') fk++;
+      // Parameter list.
+      if (!tks[fk] || tks[fk].type !== 'open' || tks[fk].char !== '(') return null;
+      var params = [];
+      var fj = fk + 1;
+      while (fj < stop) {
+        var pt = tks[fj];
+        if (pt && pt.type === 'close' && pt.char === ')') { fj++; break; }
+        if (pt && pt.type === 'other' && IDENT_RE.test(pt.text)) {
+          var paramObj = { name: pt.text };
+          // Check for default value: param = defaultExpr.
+          if (tks[fj + 1] && tks[fj + 1].type === 'sep' && tks[fj + 1].char === '=') {
+            paramObj.defaultStart = fj + 2;
+            var dd = fj + 2;
+            while (dd < stop && !(tks[dd].type === 'sep' && tks[dd].char === ',') && !(tks[dd].type === 'close' && tks[dd].char === ')')) {
+              if (tks[dd].type === 'open') { var dep = 1; dd++; while (dd < stop && dep > 0) { if (tks[dd].type === 'open') dep++; if (tks[dd].type === 'close') dep--; dd++; } continue; }
+              dd++;
+            }
+            paramObj.defaultEnd = dd;
+            fj = dd;
+          } else {
+            fj++;
+          }
+          params.push(paramObj);
+        } else {
+          fj++;
+        }
+        if (tks[fj] && tks[fj].type === 'sep' && tks[fj].char === ',') fj++;
+      }
+      // Body: { ... }
+      if (!tks[fj] || tks[fj].type !== 'open' || tks[fj].char !== '{') return null;
+      var depth = 1, bodyEnd = fj + 1;
+      while (bodyEnd < stop && depth > 0) {
+        if (tks[bodyEnd].type === 'open' && tks[bodyEnd].char === '{') depth++;
+        else if (tks[bodyEnd].type === 'close' && tks[bodyEnd].char === '}') depth--;
+        bodyEnd++;
+      }
+      return { binding: functionBinding(params, fj, bodyEnd, true), next: bodyEnd };
+    };
+
     const readValue = (k, stop, terms) => {
       const t = tks[k];
       if (!t) return null;
+      // Function expression: function(params) { body }
+      var fnExpr = readFunctionExpr(k, stop);
+      if (fnExpr) return fnExpr;
       // Arrow function (it can start with `(` or with an ident).
       const arrow = peekArrow(k, stop);
       if (arrow) {
@@ -2280,7 +2337,7 @@
               : (tks[next - 1] && tks[next - 1]._src ? tks[next - 1]._src.slice(tks[next - 1].start, tks[next - 1].end) : null);
             if (baseText) {
               const idxText = tks[next + 1] && tks[next + 1]._src ? tks[next + 1]._src.slice(tks[next + 1].start, tks[j - 1].end) : 'i';
-              bind = chainBinding([copyTaint(exprRef(baseText + '[' + idxText + ']'), bind ? bind.toks : null)]);
+              bind = chainBinding([deriveExprRef(baseText + '[' + idxText + ']', bind ? bind.toks : null)]);
             } else {
               bind = null;
             }
@@ -2328,7 +2385,7 @@
               cur = ok ? chainBinding([makeSynthStr(String(n))]) : null;
             } else if (cur.kind === 'chain' && cur.toks.length === 1 && cur.toks[0].type === 'other') {
               // Opaque chain: extend the expression text with the property.
-              cur = chainBinding([copyTaint(exprRef(cur.toks[0].text + '.' + p), cur.toks)]);
+              cur = chainBinding([deriveExprRef(cur.toks[0].text + '.' + p, cur.toks)]);
             } else {
               cur = null;
               break;
@@ -3260,25 +3317,13 @@
     // sub-results.
     const combineArith = (left, op, right) => {
       if (!left || left.kind !== 'chain' || !right || right.kind !== 'chain') return null;
-      // Merge taint from both operands onto the result token.
-      const _mergeTaint = (ref, a, b) => {
-        if (!taintEnabled) return ref;
-        var t1 = collectChainTaint(a.toks);
-        var t2 = collectChainTaint(b.toks);
-        if (!t1 && !t2) return ref;
-        var merged = new Set();
-        if (t1) for (var l of t1) merged.add(l);
-        if (t2) for (var l of t2) merged.add(l);
-        if (merged.size) ref.taint = merged;
-        return ref;
-      };
       // `in` / `instanceof` are always symbolic — they depend on runtime
       // prototype/object state we don't model. Skip straight to symbolic.
       if (op === 'in' || op === 'instanceof') {
         const lt = chainAsExprText(left);
         const rt = chainAsExprText(right);
         if (lt === null || rt === null) return null;
-        return chainBinding([_mergeTaint(exprRef('(' + lt + ' ' + op + ' ' + rt + ')'), left, right)]);
+        return chainBinding([deriveExprRef('(' + lt + ' ' + op + ' ' + rt + ')', left.toks, right.toks)]);
       }
       const lNum = chainAsNumber(left);
       const rNum = chainAsNumber(right);
@@ -3355,7 +3400,7 @@
           const lt = chainAsExprText(left);
           const rt = chainAsExprText(right);
           if (lt !== null && rt !== null) {
-            return chainBinding([_mergeTaint(exprRef('(' + lt + ' + ' + rt + ')'), left, right)]);
+            return chainBinding([deriveExprRef('(' + lt + ' + ' + rt + ')', left.toks, right.toks)]);
           }
         }
         return null;
@@ -3374,7 +3419,7 @@
       const rt = chainAsExprText(right);
       if (lt === null || rt === null) return null;
       const text = '(' + lt + ' ' + op + ' ' + rt + ')';
-      return chainBinding([_mergeTaint(exprRef(text), left, right)]);
+      return chainBinding([deriveExprRef(text, left.toks, right.toks)]);
     };
 
     // Apply a unary prefix operator to a chain binding. Folds to a literal
@@ -3397,7 +3442,7 @@
       const et = chainAsExprText(operand);
       if (et === null) return null;
       const text = op + et;
-      return chainBinding([copyTaint(exprRef(text), operand.toks)]);
+      return chainBinding([deriveExprRef(text, operand.toks)]);
     };
 
     const chainAsNumber = (chain) => {
@@ -4498,37 +4543,13 @@
           let k = j + 1;
           if (eqTok && eqTok.type === 'sep' && eqTok.char === '=') {
             hasInit = true;
-            // Check for function expression: var x = function(params) { body }
-            var _rhsTok = tokens[j + 2];
-            if (_rhsTok && _rhsTok.type === 'other' && _rhsTok.text === 'function') {
-              var _fk = j + 3;
-              if (tokens[_fk] && tokens[_fk].type === 'other' && IDENT_RE.test(tokens[_fk].text) && tokens[_fk].text !== 'function') _fk++;
-              if (tokens[_fk] && tokens[_fk].type === 'open' && tokens[_fk].char === '(') {
-                var _fParams = [];
-                var _fj = _fk + 1;
-                while (_fj < stop) {
-                  var _pt = tokens[_fj];
-                  if (_pt && _pt.type === 'close' && _pt.char === ')') { _fj++; break; }
-                  if (_pt && _pt.type === 'other' && IDENT_RE.test(_pt.text)) _fParams.push({ name: _pt.text });
-                  _fj++;
-                }
-                if (tokens[_fj] && tokens[_fj].type === 'open' && tokens[_fj].char === '{') {
-                  var _fd = 1, _fbe = _fj + 1;
-                  while (_fbe < stop && _fd > 0) {
-                    if (tokens[_fbe].type === 'open' && tokens[_fbe].char === '{') _fd++;
-                    else if (tokens[_fbe].type === 'close' && tokens[_fbe].char === '}') _fd--;
-                    _fbe++;
-                  }
-                  value = functionBinding(_fParams, _fj, _fbe, true);
-                  k = _fbe;
-                }
-              }
-            }
-            if (!value) {
-              const r = readValue(j + 2, stop, TERMS_TOP);
-              value = r ? r.binding : null;
-              k = skipExpr(j + 2, stop);
-            }
+            // readValue handles function expressions, arrows, and all
+            // other value types through a single code path.
+            const r = readValue(j + 2, stop, TERMS_TOP);
+            value = r ? r.binding : null;
+            // For function bindings use the precise end; for chains use
+            // skipExpr to ensure we consume the full statement.
+            k = (r && r.binding && r.binding.kind === 'function') ? r.next : skipExpr(j + 2, stop);
           }
           if (hasInit) {
             declBind(nameTok.text, value);
@@ -4814,80 +4835,24 @@
               }
             }
             // Taint: detect addEventListener on ANY object (window, document, element).
-            // Parse the call args directly since readCallArgBindings can't
-            // handle function expressions.
+            // readCallArgBindings now handles function expressions and arrows
+            // via readValue → readFunctionExpr, so no special parser needed.
             if (taintEnabled && method === 'addEventListener') {
-              var _lp = tokens[i + 1];
-              if (_lp && _lp.type === 'open' && _lp.char === '(') {
-                // Read first arg (event type string).
-                var _evTypeV = readValue(i + 2, stop, TERMS_ARG);
-                var _evTypeStr = _evTypeV && _evTypeV.binding ? chainAsKnownString(_evTypeV.binding) : null;
-                var _comma = _evTypeV ? tokens[_evTypeV.next] : null;
-                if (_evTypeStr && _comma && _comma.type === 'sep' && _comma.char === ',' && EVENT_TAINT_SOURCES[_evTypeStr]) {
-                  // Parse the callback function expression.
-                  var _cbStart = _evTypeV.next + 1;
-                  var _cbTok = tokens[_cbStart];
-                  var _fnBind = null;
-                  var _fnEnd = _cbStart;
-                  // Check for: function(params) { body }
-                  if (_cbTok && _cbTok.type === 'other' && _cbTok.text === 'function') {
-                    var _fk = _cbStart + 1;
-                    if (tokens[_fk] && tokens[_fk].type === 'other' && IDENT_RE.test(tokens[_fk].text)) _fk++; // optional name
-                    if (tokens[_fk] && tokens[_fk].type === 'open' && tokens[_fk].char === '(') {
-                      var _fParams = [];
-                      var _fj = _fk + 1;
-                      while (_fj < stop) {
-                        var _pt = tokens[_fj];
-                        if (_pt && _pt.type === 'close' && _pt.char === ')') { _fj++; break; }
-                        if (_pt && _pt.type === 'other' && IDENT_RE.test(_pt.text)) _fParams.push({ name: _pt.text });
-                        _fj++;
-                      }
-                      if (tokens[_fj] && tokens[_fj].type === 'open' && tokens[_fj].char === '{') {
-                        var _fd = 1, _fbe = _fj + 1;
-                        while (_fbe < stop && _fd > 0) {
-                          if (tokens[_fbe].type === 'open' && tokens[_fbe].char === '{') _fd++;
-                          else if (tokens[_fbe].type === 'close' && tokens[_fbe].char === '}') _fd--;
-                          if (_fd > 0) _fbe++;
-                        }
-                        _fnBind = functionBinding(_fParams, _fj, _fbe + 1, true);
-                        _fnEnd = _fbe + 1;
-                      }
-                    }
-                  }
-                  // Also check for arrow: (params) => { body } or param => { body }
-                  if (!_fnBind && _cbTok) {
-                    var _arrow = peekArrow(_cbStart, stop);
-                    if (_arrow) {
-                      var _abody = readArrowBody(_arrow.bodyIdx, stop);
-                      if (_abody) {
-                        _fnBind = functionBinding(_arrow.params, _abody.bodyStart, _abody.bodyEnd, _abody.isBlock);
-                        _fnEnd = _abody.bodyEnd;
-                      }
-                    }
-                  }
-                  // Also check for identifier referencing a function.
-                  if (!_fnBind && _cbTok && _cbTok.type === 'other' && IDENT_RE.test(_cbTok.text)) {
-                    var _refB = resolve(_cbTok.text);
-                    if (_refB && _refB.kind === 'function') { _fnBind = _refB; _fnEnd = _cbStart + 1; }
-                  }
-                  if (_fnBind && _fnBind.params && _fnBind.params.length > 0) {
-                    var _evSources = EVENT_TAINT_SOURCES[_evTypeStr];
-                    var _pn = _fnBind.params[0].name;
-                    var _evLabels = new Set(Object.values(_evSources));
+              var _evArgs = readCallArgBindings(i + 1, stop);
+              if (_evArgs && _evArgs.bindings.length >= 2) {
+                var _evTypeStr = _evArgs.bindings[0] && _evArgs.bindings[0].kind === 'chain' ? chainAsKnownString(_evArgs.bindings[0]) : null;
+                var _evHandler = _evArgs.bindings[1];
+                if (_evTypeStr && _evHandler && _evHandler.kind === 'function' && EVENT_TAINT_SOURCES[_evTypeStr]) {
+                  var _evSources = EVENT_TAINT_SOURCES[_evTypeStr];
+                  if (_evHandler.params && _evHandler.params.length > 0) {
+                    var _pn = _evHandler.params[0].name;
                     var _evRef = exprRef(_pn);
-                    _evRef.taint = _evLabels;
-                    instantiateFunction(_fnBind, [chainBinding([_evRef])]);
+                    _evRef.taint = new Set(Object.values(_evSources));
+                    instantiateFunction(_evHandler, [chainBinding([_evRef])]);
                   }
-                  // Skip past the closing paren of addEventListener(...).
-                  var _endD = 1, _endI = i + 2;
-                  while (_endI < stop && _endD > 0) {
-                    if (tokens[_endI].type === 'open' && tokens[_endI].char === '(') _endD++;
-                    if (tokens[_endI].type === 'close' && tokens[_endI].char === ')') _endD--;
-                    _endI++;
-                  }
-                  i = _endI - 1;
-                  continue;
                 }
+                i = _evArgs.next - 1;
+                continue;
               }
             }
             // Taint: detect call-based sinks (eval, document.write, etc.).
@@ -4899,7 +4864,6 @@
                 continue;
               }
             }
-            // (addEventListener handling moved above to work on any base object)
           }
         }
       }
