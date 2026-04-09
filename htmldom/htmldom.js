@@ -1417,7 +1417,7 @@
         location: location || null,
       });
     };
-    const checkSinkAssignment = (el, propName, valBinding) => {
+    const checkSinkAssignment = (el, propName, valBinding, tok) => {
       if (!taintEnabled || !valBinding) return;
       var toks = valBinding.kind === 'chain' ? valBinding.toks : null;
       var taint = toks ? collectChainTaint(toks) : null;
@@ -1425,7 +1425,8 @@
       var tag = getElementTag(el);
       var sinkInfo = classifySink(propName, tag);
       if (sinkInfo && sinkInfo.severity !== 'safe') {
-        recordTaintFinding(sinkInfo.type, sinkInfo.severity, propName, tag, taint, taintCondStack);
+        var loc = tok && tok._src ? { expr: tok.text || propName, line: countLines(tok._src, tok.start) } : null;
+        recordTaintFinding(sinkInfo.type, sinkInfo.severity, propName, tag, taint, taintCondStack, loc);
       }
     };
     const checkSinkSetAttribute = (el, attrName, valBinding) => {
@@ -1474,10 +1475,10 @@
     const elementBinding = domFactory.element;
     const textNodeBinding = domFactory.textNode;
     // Apply a mutation to an element binding's property path.
-    const applyElementSet = (el, path, val) => {
+    const applyElementSet = (el, path, val, tok) => {
       if (!el || el.kind !== 'element') return;
       // Taint: check if assigning a tainted value to a sink property.
-      if (path.length === 1) checkSinkAssignment(el, path[0], val);
+      if (path.length === 1) checkSinkAssignment(el, path[0], val, tok);
       const seg = path[0];
       if (path.length === 1) {
         if (seg === 'innerHTML' || seg === 'outerHTML') { el.html = val; }
@@ -4864,7 +4865,7 @@
                   var trailR = readValue(afterCall + 2, stop, TERMS_TOP);
                   var trailVal = trailR ? trailR.binding : null;
                   if (factoryResult.bind.kind === 'element') {
-                    applyElementSet(factoryResult.bind, [trailProp], trailVal);
+                    applyElementSet(factoryResult.bind, [trailProp], trailVal, trailTok);
                   }
                   i = skipExpr(afterCall + 2, stop) - 1;
                   continue;
@@ -4958,7 +4959,7 @@
           if (baseBind && baseBind.kind === 'element') {
             const r = readValue(i + 2, stop, TERMS_TOP);
             const val = r ? r.binding : null;
-            applyElementSet(baseBind, parts.slice(1), val);
+            applyElementSet(baseBind, parts.slice(1), val, t);
             i = skipExpr(i + 2, stop) - 1;
             continue;
           }
@@ -7237,10 +7238,20 @@
             if (htmlTokens[si].type === 'text') scriptContent += htmlTokens[si].text;
           }
           if (scriptContent.trim()) {
+            // Compute the line offset: the script content's line 1 maps
+            // to this line in the HTML file.
+            var scriptLineOffset = 0;
+            var scriptToken = htmlTokens[scriptStart];
+            if (scriptToken && scriptToken.start !== undefined) {
+              scriptLineOffset = countLines(content, scriptToken.start);
+            }
             var inlineFindings = traceTaintInJs(scriptContent);
             for (var f of inlineFindings) {
               f.file = page;
               f.inline = true;
+              if (f.location && f.location.line) {
+                f.location.line += scriptLineOffset;
+              }
               allFindings.push(f);
             }
           }
