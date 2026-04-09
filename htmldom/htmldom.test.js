@@ -3147,6 +3147,48 @@ function render() {
 })();
 
 // -----------------------------------------------------------------------
+// Taint analysis
+// -----------------------------------------------------------------------
+(function () {
+  const traceTaint = globalThis.__traceTaint;
+  if (!traceTaint) return;
+  const before = pass + fail;
+  console.log('\ntaint analysis');
+  console.log('--------------');
+
+  function checkTaint(name, files, expectedCount) {
+    try {
+      const result = traceTaint(files);
+      const count = result.findings.length;
+      if (count === expectedCount) { pass++; } else {
+        fail++;
+        failures.push({ name, input: JSON.stringify(files).slice(0, 120), want: expectedCount + ' findings', got: count + ' findings' });
+      }
+    } catch (e) {
+      fail++;
+      failures.push({ name, input: JSON.stringify(files).slice(0, 120), want: expectedCount + ' findings', got: 'ERROR: ' + e.message });
+    }
+  }
+
+  // Basic taint flows
+  checkTaint('direct innerHTML', { 'a.js': 'document.getElementById("o").innerHTML = location.search;' }, 1);
+  checkTaint('variable taint', { 'a.js': 'var x = location.search; document.getElementById("o").innerHTML = x;' }, 1);
+  checkTaint('safe literal', { 'a.js': 'document.getElementById("o").innerHTML = "safe";' }, 0);
+  checkTaint('postMessage handler', { 'a.js': 'window.addEventListener("message", function(e) { document.getElementById("o").innerHTML = e.data; });' }, 1);
+
+  // Recursive functions (must not stack overflow)
+  checkTaint('recursive with taint', { 'a.js': 'var result = "";\nfunction build(data, depth) {\n  if (depth > 3) return;\n  result += data;\n  build(data, depth + 1);\n}\nbuild(location.search, 0);\ndocument.getElementById("o").innerHTML = result;' }, 1);
+  checkTaint('mutual recursion taint', { 'a.js': 'var out = "";\nfunction a(x) { out += x; b(x); }\nfunction b(x) { a(x); }\na(location.search);\ndocument.getElementById("o").innerHTML = out;' }, 1);
+  checkTaint('recursive safe', { 'a.js': 'var result = 0;\nfunction count(n) { if (n <= 0) return; result++; count(n - 1); }\ncount(5);\ndocument.getElementById("o").innerHTML = result;' }, 0);
+
+  // Cross-function side effects
+  checkTaint('closure side effect', { 'a.js': 'var result = "";\nfunction process(data) { function inner() { result = data; } inner(); }\nprocess(location.search);\ndocument.getElementById("o").innerHTML = result;' }, 1);
+  checkTaint('callback with taint', { 'a.js': 'function fetchData(callback) { callback(location.search); }\nfunction handleData(data) { document.getElementById("o").innerHTML = data; }\nfetchData(handleData);' }, 1);
+
+  console.log(`  (${pass + fail - before} cases)`);
+})();
+
+// -----------------------------------------------------------------------
 // Report
 // -----------------------------------------------------------------------
 console.log('');

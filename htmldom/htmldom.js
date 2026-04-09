@@ -1251,6 +1251,9 @@
     // Variables whose final value was built inside a loop, captured on
     // loop exit. Each entry: { name, loop: {id,kind,headerSrc}, chain }.
     const loopVars = [];
+    // Guard against infinite recursion in instantiateFunction.
+    // Tracks function bindings currently being inlined.
+    const inliningFns = new Set();
     // When set, non-build statements inject 'preserve' tokens into this
     // variable's chain so the emitter outputs them at the right position.
     // trackBuildVar can be a string (single build var) or a Set (multiple).
@@ -1524,7 +1527,10 @@
         } else if (b.kind === 'chain' && b.toks.length === 1 && b.toks[0].type === 'other') {
           // Opaque chain (e.g. parameter bound to exprRef) — extend the
           // path so `column.title` becomes `store.columns[i].title`.
-          b = chainBinding([exprRef(b.toks[0].text + '.' + parts.slice(i).join('.'))]);
+          var _extRef = exprRef(b.toks[0].text + '.' + parts.slice(i).join('.'));
+          // Propagate taint from the base token (e.g. tainted event param).
+          if (b.toks[0].taint) _extRef.taint = new Set(b.toks[0].taint);
+          b = chainBinding([_extRef]);
           break;
         } else if (p === 'length' && b.kind === 'array') {
           b = chainBinding([makeSynthStr(String(b.elems.length))]);
@@ -2724,6 +2730,44 @@
         if (!o) return null;
         return { bind: o.binding, next: o.next };
       }
+      // Function expression: `function(params) { body }` or `function name(params) { body }`.
+      if (t.type === 'other' && t.text === 'function') {
+        let j = k + 1;
+        // Optional function name.
+        if (tks[j] && tks[j].type === 'other' && IDENT_RE.test(tks[j].text)) j++;
+        if (tks[j] && tks[j].type === 'open' && tks[j].char === '(') {
+          const params = [];
+          j++;
+          if (tks[j] && tks[j].type === 'close' && tks[j].char === ')') { j++; }
+          else {
+            let ok = true;
+            while (j < stop) {
+              const pt = parseParamWithDefault(tks, j, stop);
+              if (!pt) { ok = false; break; }
+              params.push(pt.param);
+              j = pt.next;
+              const sep = tks[j];
+              if (sep && sep.type === 'close' && sep.char === ')') { j++; break; }
+              if (sep && sep.type === 'sep' && sep.char === ',') { j++; continue; }
+              ok = false; break;
+            }
+            if (!ok) return null;
+          }
+          if (tks[j] && tks[j].type === 'open' && tks[j].char === '{') {
+            let depth = 1;
+            let bk = j + 1;
+            while (bk < stop && depth > 0) {
+              if (tks[bk].type === 'open' && tks[bk].char === '{') depth++;
+              else if (tks[bk].type === 'close' && tks[bk].char === '}') depth--;
+              bk++;
+            }
+            if (depth === 0) {
+              return { bind: functionBinding(params, j + 1, bk - 1, true), next: bk };
+            }
+          }
+        }
+        return null;
+      }
       if (t.type !== 'other') return null;
       // Primitive literal.
       const lit = primitiveAsString(t.text);
@@ -2960,6 +3004,10 @@
     // Pushes a temporary scope with param→arg bindings, parses the body
     // expression in the original token array, then pops the scope.
     const instantiateFunction = (fn, argBindings) => {
+      // Prevent infinite recursion: if this function is already being inlined
+      // up the call stack, skip re-entry (recursive/mutual recursion).
+      if (inliningFns.has(fn)) return null;
+      inliningFns.add(fn);
       stack.push({ bindings: Object.create(null), isFunction: true });
       const frame = stack[stack.length - 1];
       // Body indices are into the original `tokens` array; swap `tks` if we
@@ -2968,8 +3016,14 @@
       tks = tokens;
       for (let p = 0; p < fn.params.length; p++) {
         const pi = fn.params[p];
-        const a = argBindings[p];
+        var a = argBindings[p];
         if (a) {
+          // If the argument is a chain with a single identifier, resolve it
+          // to the underlying binding so function-as-argument works properly.
+          if (a.kind === 'chain' && a.toks && a.toks.length === 1 && a.toks[0].type === 'other' && IDENT_RE.test(a.toks[0].text)) {
+            var _resolved = resolve(a.toks[0].text);
+            if (_resolved && _resolved.kind === 'function') a = _resolved;
+          }
           frame.bindings[pi.name] = a;
         } else if (pi.defaultStart != null) {
           // Evaluate the parameter's default expression in the current
@@ -2990,6 +3044,7 @@
           if (/var __f\s*=\s*document\.createDocumentFragment/.test(peekSrc)) {
             tks = savedTks;
             stack.pop();
+            inliningFns.delete(fn);
             return null;
           }
         }
@@ -3061,6 +3116,7 @@
       }
       tks = savedTks;
       stack.pop();
+      inliningFns.delete(fn);
       // Expand any loopVars created during the function body walk.
       if (result && fnLoopVars && fnLoopVars.length > 0) {
         const lvByName = Object.create(null);
@@ -4752,25 +4808,23 @@
                 const evType = argResult.bindings[0] && argResult.bindings[0].kind === 'chain' ? chainAsKnownString(argResult.bindings[0]) : null;
                 const handler = argResult.bindings[1];
                 if (evType && handler && handler.kind === 'function' && EVENT_TAINT_SOURCES[evType]) {
-                  // Tag the function's first parameter with taint for each known property.
+                  // Build tainted parameter bindings for the event handler.
                   const evSources = EVENT_TAINT_SOURCES[evType];
+                  var _evParamBindings = [];
                   if (handler.params && handler.params.length > 0) {
-                    const paramName = handler.params[0];
-                    // Create tainted bindings for event properties
+                    const paramName = handler.params[0].name;
+                    // Create a tainted binding for the event parameter.
+                    var _evRef = exprRef(paramName);
+                    _evRef.taint = new Set(Object.values(evSources));
+                    _evParamBindings.push(chainBinding([_evRef]));
+                    // Create tainted bindings for known event properties.
                     for (var _evProp in evSources) {
-                      var _evLabel = evSources[_evProp];
-                      var _evRef = exprRef(paramName + '.' + _evProp);
-                      _evRef.taint = new Set([_evLabel]);
-                      // Inject into the function's scope: when the function body
-                      // is walked, paramName.property will resolve to this tainted ref.
+                      var _evPropRef = exprRef(paramName + '.' + _evProp);
+                      _evPropRef.taint = new Set([evSources[_evProp]]);
                     }
-                    // Mark the parameter itself as tainted (conservatively).
-                    var _paramRef = exprRef(paramName);
-                    _paramRef.taint = new Set(Object.values(evSources));
-                    // Store on the handler so instantiateFunction picks it up.
-                    handler._taintedParams = handler._taintedParams || {};
-                    handler._taintedParams[paramName] = new Set(Object.values(evSources));
                   }
+                  // Walk the handler body with tainted parameter bindings.
+                  instantiateFunction(handler, _evParamBindings);
                 }
                 i = argResult.next - 1;
                 continue;
