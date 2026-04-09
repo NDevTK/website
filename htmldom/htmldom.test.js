@@ -3284,6 +3284,15 @@ function render() {
   checkTaint('postMessage getElementById', { 'a.js': 'window.addEventListener("message", function(event) { var target = document.getElementById("output"); target.innerHTML = event.data; });' }, 1);
   checkTaint('split then join', { 'a.js': 'var x = location.search; var parts = x.split("&"); document.getElementById("o").innerHTML = parts.join("");' }, 1);
 
+  // --- Cross-handler state ---
+  checkTaint('cross-handler state', { 'a.js': 'var saved; window.addEventListener("message", function(e) { saved = e.data; }); window.addEventListener("hashchange", function() { document.getElementById("o").innerHTML = saved; });' }, 1, { sources: ['postMessage'] });
+  checkTaint('handler sets, fn reads', { 'a.js': 'var data; window.addEventListener("message", function(e) { data = e.data; }); function render() { document.getElementById("o").innerHTML = data; } render();' }, 2);
+  checkTaint('postMessage + url combine', { 'a.js': 'var config = {}; window.addEventListener("message", function(e) { config.template = e.data; }); document.getElementById("o").innerHTML = config.template + location.search;' }, 1);
+
+  // --- Filter tracks taint from source elements ---
+  checkTaint('filter tainted', { 'a.js': 'var items = ["safe", location.search]; var filtered = items.filter(function(x){ return x.length > 0; }); document.getElementById("o").innerHTML = filtered[0];' }, 1);
+  checkTaint('filter safe', { 'a.js': 'var items = ["a", "b"]; var filtered = items.filter(function(x){ return x.length > 0; }); document.getElementById("o").innerHTML = filtered[0];' }, 0);
+
   console.log(`  (${pass + fail - before} cases)`);
 })();
 
