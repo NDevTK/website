@@ -3317,6 +3317,14 @@ function render() {
   checkTaint('unsatisfiable: x===a && x!==a', { 'a.js': 'var x = location.search; if (x === "a" && x !== "a") { document.getElementById("o").innerHTML = x; }' }, 0);
   checkTaint('satisfiable: x>3 && x<5', { 'a.js': 'var x = location.search; if (x > 3 && x < 5) { document.getElementById("o").innerHTML = x; }' }, 1);
   checkTaint('satisfiable: x===a || x===b', { 'a.js': 'var x = location.search; if (x === "a" || x === "b") { document.getElementById("o").innerHTML = x; }' }, 1);
+
+  // --- SMT path constraint propagation ---
+  checkTaint('path: nested unsat (x>5 then x<3)', { 'a.js': 'var x = location.search; if (x > 5) { if (x < 3) { document.getElementById("o").innerHTML = x; } }' }, 0);
+  checkTaint('path: nested sat (x>3 then x<5)', { 'a.js': 'var x = location.search; if (x > 3) { if (x < 5) { document.getElementById("o").innerHTML = x; } }' }, 1);
+  checkTaint('path: triple nested unsat', { 'a.js': 'var x = location.search; if (x > 10) { if (x < 20) { if (x > 25) { document.getElementById("o").innerHTML = x; } } }' }, 0);
+  checkTaint('path: triple nested sat', { 'a.js': 'var x = location.search; if (x > 10) { if (x < 20) { if (x > 12) { document.getElementById("o").innerHTML = x; } } }' }, 1);
+  checkTaint('path: eq then neq', { 'a.js': 'var x = location.search; if (x === "admin") { if (x !== "admin") { document.getElementById("o").innerHTML = x; } }' }, 0);
+  checkTaint('path: else branch constraint', { 'a.js': 'var x = location.search; if (x > 5) { } else { if (x > 10) { document.getElementById("o").innerHTML = x; } }' }, 0);
   checkTaint('satisfiable: obj.prop++ count', { 'a.js': 'var state = {count:0}; window.addEventListener("message", function(e) { state.count++; if (state.count > 3) { document.getElementById("o").innerHTML = e.data; } });' }, 1);
   checkTaint('satisfiable: ident++ in handler', { 'a.js': 'var n = 0; window.addEventListener("message", function(e) { n++; if (n > 5) { document.getElementById("o").innerHTML = e.data; } });' }, 1);
 

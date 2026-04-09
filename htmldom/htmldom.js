@@ -456,6 +456,12 @@
     var _add = function(f) {
       if (!f) return;
       if (f.type === 'and') { _add(f.left); _add(f.right); return; }
+      // NOT(cmp) → flip the comparison operator.
+      if (f.type === 'not' && f.arg && f.arg.type === 'cmp') {
+        var flipNeg = { '<':'>=', '>':'<=', '<=':'>', '>=':'<', '==':'!=', '===':'!==', '!=':'==', '!==':'===' };
+        _add(smtCmp(flipNeg[f.arg.op] || f.arg.op, f.arg.left, f.arg.right));
+        return;
+      }
       if (f.type !== 'cmp') return;
       var sym = null, val = null, op = f.op;
       if (f.left.type === 'sym' && f.right.type === 'const') { sym = f.left.id; val = f.right.value; }
@@ -645,16 +651,28 @@
   }
 
   // --- Integration: check condition satisfiability ---
-  // Returns { sat, unsat } or null if condition is purely concrete.
-  function smtCheckCondition(condTokens, resolveFunc, resolvePathFunc) {
+  // condTokens: raw JS tokens of the condition expression
+  // pathConstraintStack: array of SMT formulas from enclosing branches
+  // Returns { sat, unsat } or null if purely concrete.
+  function smtCheckCondition(condTokens, resolveFunc, resolvePathFunc, pathConstraintStack) {
     var formula = smtParseExpr(condTokens, 0, condTokens.length, resolveFunc, resolvePathFunc);
     if (!formula) return null;
-    if (!smtHasSym(formula)) {
-      // Purely concrete formula: evaluate directly.
-      return { sat: smtSat(formula), unsat: smtSat(smtNot(formula)) };
+    // Combine with path constraints: the full context is
+    // pathConstraint[0] ∧ pathConstraint[1] ∧ ... ∧ formula
+    var context = formula;
+    var negContext = smtNot(formula);
+    if (pathConstraintStack && pathConstraintStack.length > 0) {
+      // Build conjunction of all path constraints.
+      var pathConj = pathConstraintStack[0];
+      for (var i = 1; i < pathConstraintStack.length; i++) {
+        pathConj = smtAnd(pathConj, pathConstraintStack[i]);
+      }
+      // The true branch is reachable iff pathConj ∧ formula is satisfiable.
+      // The false branch is reachable iff pathConj ∧ ¬formula is satisfiable.
+      context = smtAnd(pathConj, formula);
+      negContext = smtAnd(pathConj, smtNot(formula));
     }
-    // Symbolic formula: use the solver.
-    return { sat: smtSat(formula), unsat: smtSat(smtNot(formula)) };
+    return { sat: smtSat(context), unsat: smtSat(negContext) };
   }
 
   // -----------------------------------------------------------------------
@@ -1602,7 +1620,11 @@
     // Taint tracking state (active when taintConfig is provided).
     const taintEnabled = !!taintConfig;
     const taintFindings = taintEnabled ? [] : null;
-    // Path conditions accumulated through if/else branches.
+    // SMT path constraint: conjunction of conditions along the current
+    // execution path. Pushed when entering a branch, popped when leaving.
+    // Each entry is an SMT formula. The full path constraint is AND of all.
+    const pathConstraints = taintEnabled ? [] : null;
+    // String conditions for display in findings.
     const taintCondStack = taintEnabled ? [] : null;
     // Track whether we're inside an event handler walk. Mutations to
     // outer-scope variables inside handlers produce values that depend
@@ -4100,7 +4122,7 @@
             if (taintEnabled) {
               var _condTokens = [];
               for (var _si = i + 2; _si < j; _si++) _condTokens.push(tokens[_si]);
-              var _smtResult = smtCheckCondition(_condTokens, resolve, resolvePath);
+              var _smtResult = smtCheckCondition(_condTokens, resolve, resolvePath, pathConstraints);
               if (_smtResult) {
                 // SMT overrides concrete evaluation when symbolic vars present.
                 if (_smtResult.sat && _smtResult.unsat) concrete = null; // both branches reachable
@@ -4249,12 +4271,21 @@
                   if (!(name in snapshot)) snapshot[name] = stack[si].bindings[name];
                 }
               }
-              // Walk if-body using the full walker; capture loopVars created.
+              // Build SMT formula for path constraint propagation.
+              var _pathFormula = null;
+              if (pathConstraints) {
+                var _condToks = [];
+                for (var _pi = i + 2; _pi < j; _pi++) _condToks.push(tokens[_pi]);
+                _pathFormula = smtParseExpr(_condToks, 0, _condToks.length, resolve, resolvePath);
+              }
+              // Walk if-body: push path constraint (condition is true in this branch).
               if (taintCondStack) taintCondStack.push(condExpr);
+              if (pathConstraints && _pathFormula) pathConstraints.push(_pathFormula);
               const lvBefore = loopVars.length;
               walkRange(j + 1, ifEnd);
               const ifLoopVars = loopVars.splice(lvBefore);
               if (taintCondStack) taintCondStack.pop();
+              if (pathConstraints && _pathFormula) pathConstraints.pop();
               // Capture if-branch bindings.
               const ifBindings = Object.create(null);
               for (let si = stack.length - 1; si >= 0; si--) {
@@ -4262,16 +4293,18 @@
                   if (!(name in ifBindings)) ifBindings[name] = stack[si].bindings[name];
                 }
               }
-              // Restore snapshot and walk else-body.
+              // Walk else-body: push negated path constraint.
               for (const name in snapshot) {
                 assignName(name, snapshot[name]);
               }
               if (taintCondStack) taintCondStack.push('!(' + condExpr + ')');
+              if (pathConstraints && _pathFormula) pathConstraints.push(smtNot(_pathFormula));
               const lvBefore2 = loopVars.length;
               if (elseStart > 0 && elseEnd > elseStart) {
                 walkRange(elseStart, elseEnd);
               }
               if (taintCondStack) taintCondStack.pop();
+              if (pathConstraints && _pathFormula) pathConstraints.pop();
               const elseLoopVars = loopVars.splice(lvBefore2);
               // Merge: for any binding that differs between branches,
               // produce a cond token.
