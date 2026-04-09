@@ -373,32 +373,25 @@
   // Check if an expression is a known global navigation object.
   // Returns the nav type or null. Only matches when the name isn't
   // shadowed by a local binding in the provided resolve function.
-  function isNavGlobal(expr, resolveLocal) {
-    // Direct match (e.g. 'location', 'opener', 'opener.location').
-    if (NAV_GLOBALS[expr]) {
-      var root = expr.split('.')[0];
-      if (root === 'window' || root === 'self' || root === 'globalThis') return NAV_GLOBALS[expr];
-      if (resolveLocal) {
-        var b = resolveLocal(root);
-        if (b && !(b.kind === 'chain' && b.toks.length === 1 && b.toks[0].type === 'other' && b.toks[0].text === root)) {
-          return null; // shadowed by local
-        }
-      }
-      return NAV_GLOBALS[expr];
-    }
-    // Check if the expression is a property on a nav global.
-    // e.g. 'location.href' → root 'location' is nav, property 'href'.
+  // Check if an expression refers to a global navigation object.
+  // Only returns a match when the root identifier is NOT declared
+  // locally (var/let/const/function). Bare assignments to globals
+  // (location = x) don't count as declarations.
+  // declaredSet: a Set of names declared with var/let/const.
+  function isNavGlobal(expr, declaredSet) {
     var parts = expr.split('.');
+    var root = parts[0];
+    // window/self/globalThis prefixed — always global.
+    if (root !== 'window' && root !== 'self' && root !== 'globalThis') {
+      // If the root was explicitly declared, it's a local variable.
+      if (declaredSet && declaredSet.has(root)) return null;
+    }
+    // Direct match.
+    if (NAV_GLOBALS[expr]) return NAV_GLOBALS[expr];
+    // Property on a nav global (e.g. 'location.href' → 'location' + '.href').
     for (var pi = parts.length - 1; pi >= 1; pi--) {
       var prefix = parts.slice(0, pi).join('.');
       if (NAV_GLOBALS[prefix]) {
-        var root2 = parts[0];
-        if (root2 !== 'window' && root2 !== 'self' && root2 !== 'globalThis' && resolveLocal) {
-          var b2 = resolveLocal(root2);
-          if (b2 && !(b2.kind === 'chain' && b2.toks.length === 1 && b2.toks[0].type === 'other' && b2.toks[0].text === root2)) {
-            return null;
-          }
-        }
         return NAV_GLOBALS[prefix] + '.' + parts.slice(pi).join('.');
       }
     }
@@ -1409,6 +1402,9 @@
     // Taint checking helpers (no-ops when taintEnabled is false).
     const checkTaintSource = (exprText) => {
       if (!taintEnabled) return null;
+      // Don't flag as taint source if the root is a declared local variable.
+      var root = exprText.split('.')[0];
+      if (root !== 'window' && root !== 'self' && root !== 'globalThis' && declaredNames.has(root)) return null;
       var label = getTaintSource(exprText);
       if (label) return new Set([label]);
       return null;
@@ -1460,7 +1456,7 @@
         }
       }
     };
-    const checkSinkCall = (callExpr, argBindings) => {
+    const checkSinkCall = (callExpr, argBindings, tok) => {
       if (!taintEnabled || !argBindings) return;
       var sinkInfo = TAINT_CALL_SINKS[callExpr];
       if (!sinkInfo) return;
@@ -1470,7 +1466,8 @@
         var toks = ab.kind === 'chain' ? ab.toks : null;
         var taint = toks ? collectChainTaint(toks) : null;
         if (taint && taint.size) {
-          recordTaintFinding(sinkInfo.type, sinkInfo.severity, callExpr, null, taint, taintCondStack);
+          var loc = tok && tok._src ? { expr: callExpr, line: countLines(tok._src, tok.start) } : null;
+          recordTaintFinding(sinkInfo.type, sinkInfo.severity, callExpr, null, taint, taintCondStack, loc);
           break;
         }
       }
@@ -1607,8 +1604,12 @@
       }
       return value;
     };
-    const declBlock = (name, value) => { topBlock().bindings[name] = asRef(name, value); };
+    // Track names explicitly declared with var/let/const/function.
+    // Used to distinguish `var location = x` (local) from `location = x` (global write).
+    const declaredNames = new Set();
+    const declBlock = (name, value) => { declaredNames.add(name); topBlock().bindings[name] = asRef(name, value); };
     const declFunction = (name, value) => {
+      declaredNames.add(name);
       for (let i = stack.length - 1; i >= 0; i--) {
         if (stack[i].isFunction) { stack[i].bindings[name] = asRef(name, value); return; }
       }
@@ -3068,7 +3069,7 @@
         // (e.g. var x = eval(tainted)).
         if (taintEnabled && isCall && TAINT_CALL_SINKS[t.text]) {
           var _sinkCallArgs = readCallArgBindings(k + 1, stop);
-          if (_sinkCallArgs) checkSinkCall(t.text, _sinkCallArgs.bindings);
+          if (_sinkCallArgs) checkSinkCall(t.text, _sinkCallArgs.bindings, t);
         }
         if (!b) {
           // Unresolved identifier: return it as an opaque chain carrying
@@ -4709,6 +4710,17 @@
       // (which translates to `IDENT = IDENT + <value>`).
       if (IDENT_RE.test(t.text)) {
         const eqTok = tokens[i + 1];
+        // Navigation sink: bare assignment to a navigation global (location = expr).
+        if (taintEnabled && eqTok && eqTok.type === 'sep' && eqTok.char === '=' && isNavGlobal(t.text, declaredNames)) {
+          var _bNavR = readValue(i + 2, stop, TERMS_TOP);
+          if (_bNavR && _bNavR.binding && _bNavR.binding.kind === 'chain') {
+            var _bNavTaint = collectChainTaint(_bNavR.binding.toks);
+            if (_bNavTaint && _bNavTaint.size) {
+              recordTaintFinding('navigation', 'high', t.text, null, _bNavTaint, taintCondStack,
+                { expr: t.text, line: countLines(t._src, t.start) });
+            }
+          }
+        }
         if (eqTok && eqTok.type === 'sep' && eqTok.char === '=') {
           const stmtEndIdx = skipExpr(i + 2, stop);
           const r = readValue(i + 2, stop, TERMS_TOP);
@@ -4823,7 +4835,7 @@
               i = callArgs.next - 1;
               // Check for call-based sinks.
               if (taintEnabled && TAINT_CALL_SINKS[t.text]) {
-                checkSinkCall(t.text, callArgs.args.map(function(a) { return chainBinding(a); }));
+                checkSinkCall(t.text, callArgs.args.map(function(a) { return chainBinding(a); }), t);
               }
               continue;
             }
@@ -4832,7 +4844,7 @@
           if (taintEnabled && TAINT_CALL_SINKS[t.text]) {
             var sinkArgs = readCallArgBindings(i + 1, stop);
             if (sinkArgs) {
-              checkSinkCall(t.text, sinkArgs.bindings);
+              checkSinkCall(t.text, sinkArgs.bindings, t);
               i = sinkArgs.next - 1;
               continue;
             }
@@ -4884,10 +4896,10 @@
         }
       }
 
-      // Navigation sink detection: location.href = expr, location.assign(expr),
-      // opener.location = expr, frame.contentWindow.location.href = expr, etc.
-      if (t.type === 'other' && PATH_RE.test(t.text)) {
-        var _navType = isNavGlobal(t.text, resolve);
+      // Navigation sink detection: location.href = expr, location = expr,
+      // location.assign(expr), opener.location = expr, etc.
+      if (t.type === 'other' && (PATH_RE.test(t.text) || IDENT_RE.test(t.text))) {
+        var _navType = isNavGlobal(t.text, declaredNames);
         // Check for navigation property assignment: location.href = expr, location = expr
         if (_navType) {
           var _navEq = tokens[i + 1];
@@ -4910,7 +4922,7 @@
           if (_navParen && _navParen.type === 'open' && _navParen.char === '(') {
             var _navCallArgs = readCallArgBindings(i + 1, stop);
             if (_navCallArgs && taintEnabled) {
-              checkSinkCall(t.text, _navCallArgs.bindings);
+              checkSinkCall(t.text, _navCallArgs.bindings, t);
             }
             if (_navCallArgs) { i = _navCallArgs.next - 1; continue; }
           }
@@ -5023,7 +5035,7 @@
             if (taintEnabled && TAINT_CALL_SINKS[t.text]) {
               const argResult = readCallArgBindings(i + 1, stop);
               if (argResult) {
-                checkSinkCall(t.text, argResult.bindings);
+                checkSinkCall(t.text, argResult.bindings, t);
                 i = argResult.next - 1;
                 continue;
               }
@@ -5144,7 +5156,7 @@
     };
     const setTrackBuildVar = (name) => { trackBuildVar = name ? new Set(Array.isArray(name) ? name : [name]) : null; };
     const getBuildVarDeclStart = () => buildVarDeclStart;
-    return { resolve, resolvePath, parseRange, rewriteTemplate, advanceTo, setTrackBuildVar, getBuildVarDeclStart, loopInfo, loopVars, inScope, domElements, domOps, taintFindings, resolveForTaint: resolve };
+    return { resolve, resolvePath, parseRange, rewriteTemplate, advanceTo, setTrackBuildVar, getBuildVarDeclStart, loopInfo, loopVars, inScope, declaredNames, domElements, domOps, taintFindings, resolveForTaint: resolve };
   }
 
   function hasBinding(stack, name) {
@@ -6638,7 +6650,7 @@
       if (t.type !== 'other') continue;
       // Check: navigation property assignment (location.href = expr, location = expr)
       if (PATH_RE.test(t.text) || IDENT_RE.test(t.text)) {
-        var navType = isNavGlobal(t.text, scope.resolve);
+        var navType = isNavGlobal(t.text, scope.declaredNames);
         if (navType) {
           var eq = tokens[i + 1];
           // location.href = expr / location = expr
