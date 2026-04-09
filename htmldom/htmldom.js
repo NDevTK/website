@@ -551,9 +551,10 @@
             else if (L.op === '-') adjusted = R.value + L.right.value;
             if (adjusted !== null) addBound(L.left.id, op, adjusted);
           }
-          // arith(sym, sym) OP const: treat the expression as a synthetic symbol.
-          if (L.left.type === 'sym' && L.right.type === 'sym') {
-            var exprKey = 'expr:' + L.left.id + L.op + L.right.id;
+          // Any arith expression with a sym operand: create synthetic variable.
+          // Handles arith(sym, sym), arith('length', sym, _), arith('indexOf', sym, _), etc.
+          if (L.left.type === 'sym') {
+            var exprKey = 'expr:' + L.left.id + ':' + L.op + ':' + (L.right.type === 'sym' ? L.right.id : L.right.type === 'const' ? L.right.value : '_');
             var exprId = smtSym(exprKey).id;
             addBound(exprId, op, R.value);
           }
@@ -565,8 +566,8 @@
             else if (R.op === '-') adjusted2 = L.value + R.right.value;
             if (adjusted2 !== null) addBound(R.left.id, _swapCmp[op] || op, adjusted2);
           }
-          if (R.left.type === 'sym' && R.right.type === 'sym') {
-            var exprKey2 = 'expr:' + R.left.id + R.op + R.right.id;
+          if (R.left.type === 'sym') {
+            var exprKey2 = 'expr:' + R.left.id + ':' + R.op + ':' + (R.right.type === 'sym' ? R.right.id : R.right.type === 'const' ? R.right.value : '_');
             var exprId2 = smtSym(exprKey2).id;
             addBound(exprId2, _swapCmp[op] || op, L.value);
           }
