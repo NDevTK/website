@@ -5681,13 +5681,37 @@
           var _laR = readValue(i + 2, stop, TERMS_TOP);
           var _laRhs = _laR ? _laR.binding : null;
           var _laCur = resolve(t.text);
-          // x ||= expr → x = x || expr. Result is either cur or rhs.
-          // Since either could be the final value, merge taint from both.
-          if (_laRhs && _laRhs.kind === 'chain') {
-            if (_laCur && _laCur.kind === 'chain') {
-              assignName(t.text, chainBinding([deriveExprRef(t.text, _laCur.toks, _laRhs.toks)]));
-            } else {
-              assignName(t.text, _laRhs);
+          var _laOp = eqTok.char;
+          // Evaluate the LHS concretely to determine which branch executes.
+          var _laTruth = _laCur ? evalTruthiness(_laCur) : null;
+          var _laIsNull = _laCur && _laCur.kind === 'chain' && _laCur.toks.length === 1 && (_laCur.toks[0].text === 'null' || _laCur.toks[0].text === 'undefined');
+          if (_laOp === '||=') {
+            // x ||= y: if x is truthy, keep x; else x = y.
+            if (_laTruth === true) { /* keep current, no change */ }
+            else if (_laTruth === false) { if (_laRhs) assignName(t.text, _laRhs); }
+            else {
+              // Unknown: could be either. Merge taint from both.
+              if (_laRhs && _laRhs.kind === 'chain' && _laCur && _laCur.kind === 'chain') {
+                assignName(t.text, chainBinding([deriveExprRef(t.text, _laCur.toks, _laRhs.toks)]));
+              } else if (_laRhs) { assignName(t.text, _laRhs); }
+            }
+          } else if (_laOp === '&&=') {
+            // x &&= y: if x is falsy, keep x; else x = y.
+            if (_laTruth === false) { /* keep current, no change */ }
+            else if (_laTruth === true) { if (_laRhs) assignName(t.text, _laRhs); }
+            else {
+              if (_laRhs && _laRhs.kind === 'chain' && _laCur && _laCur.kind === 'chain') {
+                assignName(t.text, chainBinding([deriveExprRef(t.text, _laCur.toks, _laRhs.toks)]));
+              } else if (_laRhs) { assignName(t.text, _laRhs); }
+            }
+          } else { // ??=
+            // x ??= y: if x is non-null/undefined, keep x; else x = y.
+            if (_laCur && !_laIsNull && _laTruth !== null) { /* keep current */ }
+            else if (_laIsNull || !_laCur) { if (_laRhs) assignName(t.text, _laRhs); }
+            else {
+              if (_laRhs && _laRhs.kind === 'chain' && _laCur && _laCur.kind === 'chain') {
+                assignName(t.text, chainBinding([deriveExprRef(t.text, _laCur.toks, _laRhs.toks)]));
+              } else if (_laRhs) { assignName(t.text, _laRhs); }
             }
           }
           i = skipExpr(i + 2, stop) - 1;
