@@ -3325,6 +3325,18 @@ function render() {
   checkTaint('path: triple nested sat', { 'a.js': 'var x = location.search; if (x > 10) { if (x < 20) { if (x > 12) { document.getElementById("o").innerHTML = x; } } }' }, 1);
   checkTaint('path: eq then neq', { 'a.js': 'var x = location.search; if (x === "admin") { if (x !== "admin") { document.getElementById("o").innerHTML = x; } }' }, 0);
   checkTaint('path: else branch constraint', { 'a.js': 'var x = location.search; if (x > 5) { } else { if (x > 10) { document.getElementById("o").innerHTML = x; } }' }, 0);
+
+  // --- SMT relational constraints ---
+  checkTaint('relational: x>y then y>x', { 'a.js': 'var x = location.search; var y = location.hash; if (x > y) { if (y > x) { document.getElementById("o").innerHTML = x; } }' }, 0);
+  checkTaint('relational: x>y valid', { 'a.js': 'var x = location.search; var y = location.hash; if (x > y) { document.getElementById("o").innerHTML = x; }' }, 1);
+
+  // --- SMT transitive closure ---
+  checkTaint('transitive: x>y>z>x cycle', { 'a.js': 'var x = location.search; var y = location.hash; var z = document.cookie; if (x > y) { if (y > z) { if (z > x) { document.getElementById("o").innerHTML = x; } } }' }, 0);
+  checkTaint('transitive: x>y>z valid', { 'a.js': 'var x = location.search; var y = location.hash; var z = document.cookie; if (x > y) { if (y > z) { document.getElementById("o").innerHTML = x; } }' }, 1);
+
+  // --- SMT expression-level constraints ---
+  checkTaint('expr: x+y>10 && x+y<5', { 'a.js': 'var x = location.search; var y = location.hash; if (x + y > 10 && x + y < 5) { document.getElementById("o").innerHTML = x; }' }, 0);
+  checkTaint('expr: x+y>3 && x+y<5 sat', { 'a.js': 'var x = location.search; var y = location.hash; if (x + y > 3 && x + y < 5) { document.getElementById("o").innerHTML = x; }' }, 1);
   checkTaint('satisfiable: obj.prop++ count', { 'a.js': 'var state = {count:0}; window.addEventListener("message", function(e) { state.count++; if (state.count > 3) { document.getElementById("o").innerHTML = e.data; } });' }, 1);
   checkTaint('satisfiable: ident++ in handler', { 'a.js': 'var n = 0; window.addEventListener("message", function(e) { n++; if (n > 5) { document.getElementById("o").innerHTML = e.data; } });' }, 1);
 

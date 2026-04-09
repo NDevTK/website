@@ -440,8 +440,8 @@
   function smtAnd(a, b) { return !a ? b : !b ? a : a.type === 'const' ? (a.value ? b : a) : b.type === 'const' ? (b.value ? a : b) : { type: 'and', left: a, right: b }; }
   function smtOr(a, b) { return !a ? b : !b ? a : a.type === 'const' ? (a.value ? a : b) : b.type === 'const' ? (b.value ? b : a) : { type: 'or', left: a, right: b }; }
   function smtCmp(op, l, r) { return { type: 'cmp', op: op, left: l, right: r }; }
+  function smtArith(op, l, r) { return { type: 'arith', op: op, left: l, right: r }; }
 
-  // --- Theory solver: check if a formula tree contains symbolic variables ---
   function smtHasSym(e) {
     if (!e) return false;
     if (e.type === 'sym') return true;
@@ -449,123 +449,214 @@
     return (e.left && smtHasSym(e.left)) || (e.right && smtHasSym(e.right)) || (e.arg && smtHasSym(e.arg));
   }
 
-  // --- Theory solver: collect all constraints on each symbolic variable ---
-  // Extracts { symId → [{ op, value }] } from a conjunction of comparisons.
-  function smtCollectBounds(formula) {
-    var bounds = Object.create(null); // symId → array of {op, value}
-    var _add = function(f) {
-      if (!f) return;
-      if (f.type === 'and') { _add(f.left); _add(f.right); return; }
-      // NOT(cmp) → flip the comparison operator.
-      if (f.type === 'not' && f.arg && f.arg.type === 'cmp') {
-        var flipNeg = { '<':'>=', '>':'<=', '<=':'>', '>=':'<', '==':'!=', '===':'!==', '!=':'==', '!==':'===' };
-        _add(smtCmp(flipNeg[f.arg.op] || f.arg.op, f.arg.left, f.arg.right));
-        return;
-      }
-      if (f.type !== 'cmp') return;
-      var sym = null, val = null, op = f.op;
-      if (f.left.type === 'sym' && f.right.type === 'const') { sym = f.left.id; val = f.right.value; }
-      else if (f.right.type === 'sym' && f.left.type === 'const') {
-        sym = f.right.id; val = f.left.value;
-        var flip = { '>':'<', '<':'>', '>=':'<=', '<=':'>=', '==':'==', '===':'===', '!=':'!=', '!==':'!==' };
-        op = flip[op] || op;
-      }
-      if (sym === null) return;
-      if (!bounds[sym]) bounds[sym] = [];
-      bounds[sym].push({ op: op, value: val });
+  // --- Normalize: push NOT inward (NNF), flatten AND/OR ---
+  var _flipCmp = { '<':'>=', '>':'<=', '<=':'>', '>=':'<', '==':'!=', '===':'!==', '!=':'==', '!==':'===' };
+  var _swapCmp = { '>':'<', '<':'>', '>=':'<=', '<=':'>=', '==':'==', '===':'===', '!=':'!=', '!==':'!==' };
+  function smtNNF(f) {
+    if (!f) return f;
+    if (f.type === 'const' || f.type === 'sym') return f;
+    if (f.type === 'and') return smtAnd(smtNNF(f.left), smtNNF(f.right));
+    if (f.type === 'or') return smtOr(smtNNF(f.left), smtNNF(f.right));
+    if (f.type === 'cmp' || f.type === 'arith') return f;
+    if (f.type === 'not') {
+      var a = f.arg;
+      if (a.type === 'const') return smtConst(!a.value);
+      if (a.type === 'sym') return f; // NOT(sym) stays
+      if (a.type === 'not') return smtNNF(a.arg);
+      if (a.type === 'and') return smtOr(smtNNF(smtNot(a.left)), smtNNF(smtNot(a.right)));
+      if (a.type === 'or') return smtAnd(smtNNF(smtNot(a.left)), smtNNF(smtNot(a.right)));
+      if (a.type === 'cmp') return smtCmp(_flipCmp[a.op] || a.op, a.left, a.right);
+      return f;
+    }
+    return f;
+  }
+
+  // --- Collect all atomic constraints from a conjunction (NNF form) ---
+  // Returns array of cmp/not nodes. Returns null if formula contains OR (non-conjunctive).
+  function smtCollectAtoms(f) {
+    if (!f) return [];
+    if (f.type === 'const') return f.value ? [] : null; // false = unsat
+    if (f.type === 'and') {
+      var l = smtCollectAtoms(f.left), r = smtCollectAtoms(f.right);
+      if (!l || !r) return null;
+      return l.concat(r);
+    }
+    if (f.type === 'cmp' || f.type === 'not') return [f];
+    if (f.type === 'or') return null; // can't flatten disjunction
+    if (f.type === 'sym') return []; // symbolic = satisfiable, no constraint
+    return [];
+  }
+
+  // --- Theory solver: arithmetic bounds + relational + equality ---
+  // Checks if a set of atomic constraints is jointly satisfiable.
+  // Handles: sym OP const, sym OP sym, arith(sym,const) OP const/sym.
+  function smtTheorySat(atoms) {
+    if (!atoms) return false; // null = had a const(false)
+    // Per-symbol bounds: { symId → { lo, hi, loStrict, hiStrict, eqs:[], neqs:[] } }
+    var bounds = Object.create(null);
+    // Relational pairs: [{leftId, rightId, op}] for sym OP sym constraints
+    var relations = [];
+    var getBounds = function(id) {
+      if (!bounds[id]) bounds[id] = { lo: -Infinity, hi: Infinity, loStrict: false, hiStrict: false, eqs: [], neqs: [] };
+      return bounds[id];
     };
-    _add(formula);
-    return bounds;
-  }
-
-  // --- Theory solver: check if bounds on a single variable are contradictory ---
-  function smtBoundsContradict(constraints) {
-    var lo = -Infinity, hi = Infinity, loStrict = false, hiStrict = false;
-    var eqVals = [], neqVals = [];
-    for (var i = 0; i < constraints.length; i++) {
-      var c = constraints[i], v = c.value;
-      if (typeof v !== 'number') {
-        // String equality/inequality.
-        if (c.op === '===' || c.op === '==') eqVals.push(v);
-        else if (c.op === '!==' || c.op === '!=') neqVals.push(v);
-        continue;
+    var addBound = function(id, op, val) {
+      var b = getBounds(id);
+      if (typeof val === 'number') {
+        switch (op) {
+          case '>': if (val >= b.lo) { b.lo = val; b.loStrict = true; } break;
+          case '>=': if (val > b.lo || (val === b.lo && !b.loStrict)) { b.lo = val; b.loStrict = false; } break;
+          case '<': if (val <= b.hi) { b.hi = val; b.hiStrict = true; } break;
+          case '<=': if (val < b.hi || (val === b.hi && !b.hiStrict)) { b.hi = val; b.hiStrict = false; } break;
+          case '===': case '==': b.eqs.push(val); break;
+          case '!==': case '!=': b.neqs.push(val); break;
+        }
+      } else {
+        if (op === '===' || op === '==') b.eqs.push(val);
+        else if (op === '!==' || op === '!=') b.neqs.push(val);
       }
-      switch (c.op) {
-        case '>': if (v >= lo) { lo = v; loStrict = true; } break;
-        case '>=': if (v > lo || (v === lo && !loStrict)) { lo = v; loStrict = false; } break;
-        case '<': if (v <= hi) { hi = v; hiStrict = true; } break;
-        case '<=': if (v < hi || (v === hi && !hiStrict)) { hi = v; hiStrict = false; } break;
-        case '===': case '==': eqVals.push(v); break;
-        case '!==': case '!=': neqVals.push(v); break;
-      }
-    }
-    // Check range contradiction: lower bound >= upper bound with strict.
-    if (loStrict || hiStrict) { if (lo >= hi) return true; }
-    else { if (lo > hi) return true; }
-    // Check equality contradictions.
-    if (eqVals.length >= 2) {
-      for (var j = 1; j < eqVals.length; j++) { if (eqVals[j] !== eqVals[0]) return true; }
-    }
-    // Check eq + neq contradiction.
-    if (eqVals.length >= 1) {
-      for (var k = 0; k < neqVals.length; k++) { if (neqVals[k] === eqVals[0]) return true; }
-      // Check eq value vs range.
-      var ev = eqVals[0];
-      if (typeof ev === 'number') {
-        if (loStrict ? ev <= lo : ev < lo) return true;
-        if (hiStrict ? ev >= hi : ev > hi) return true;
-      }
-    }
-    return false;
-  }
-
-  // --- Satisfiability checker ---
-  function smtSat(formula) {
-    if (!formula) return true;
-    if (formula.type === 'const') return !!formula.value;
-    if (formula.type === 'sym') return true; // attacker chooses
-    if (formula.type === 'not') {
-      var inner = formula.arg;
-      if (inner.type === 'const') return !inner.value;
-      if (inner.type === 'sym') return true;
-      // De Morgan: !(a && b) = !a || !b, !(a || b) = !a && !b
-      if (inner.type === 'and') return smtSat(smtOr(smtNot(inner.left), smtNot(inner.right)));
-      if (inner.type === 'or') return smtSat(smtAnd(smtNot(inner.left), smtNot(inner.right)));
-      // !(a op b) → flip the comparison
-      if (inner.type === 'cmp') {
-        var flipCmp = { '<':'>=', '>':'<=', '<=':'>', '>=':'<', '==':'!=', '===':'!==', '!=':'==', '!==':'===' };
-        return smtSat(smtCmp(flipCmp[inner.op] || inner.op, inner.left, inner.right));
-      }
-      return true; // unknown negation: assume satisfiable
-    }
-    if (formula.type === 'or') return smtSat(formula.left) || smtSat(formula.right);
-    if (formula.type === 'and') {
-      if (!smtSat(formula.left) || !smtSat(formula.right)) return false;
-      // Check for contradictions using bound collection.
-      var bounds = smtCollectBounds(formula);
-      for (var sid in bounds) {
-        if (smtBoundsContradict(bounds[sid])) return false;
-      }
-      return true;
-    }
-    if (formula.type === 'cmp') {
-      if (formula.left.type === 'const' && formula.right.type === 'const') {
-        var l = formula.left.value, r = formula.right.value;
-        switch (formula.op) {
-          case '<': return l < r; case '>': return l > r;
-          case '<=': return l <= r; case '>=': return l >= r;
-          case '==': case '===': return l === r;
-          case '!=': case '!==': return l !== r;
+    };
+    // Extract constraints from atoms.
+    for (var i = 0; i < atoms.length; i++) {
+      var a = atoms[i];
+      if (a.type === 'cmp') {
+        var L = a.left, R = a.right, op = a.op;
+        if (L.type === 'sym' && R.type === 'const') { addBound(L.id, op, R.value); }
+        else if (R.type === 'sym' && L.type === 'const') { addBound(R.id, _swapCmp[op] || op, L.value); }
+        else if (L.type === 'sym' && R.type === 'sym') { relations.push({ leftId: L.id, rightId: R.id, op: op }); }
+        // arith(sym, const) OP const: e.g. (x + 1) > 5 → x > 4
+        else if (L.type === 'arith' && R.type === 'const') {
+          if (L.left.type === 'sym' && L.right.type === 'const') {
+            var adjusted = null;
+            if (L.op === '+') adjusted = R.value - L.right.value;
+            else if (L.op === '-') adjusted = R.value + L.right.value;
+            if (adjusted !== null) addBound(L.left.id, op, adjusted);
+          }
+          // arith(sym, sym) OP const: treat the expression as a synthetic symbol.
+          if (L.left.type === 'sym' && L.right.type === 'sym') {
+            var exprKey = 'expr:' + L.left.id + L.op + L.right.id;
+            var exprId = smtSym(exprKey).id;
+            addBound(exprId, op, R.value);
+          }
+        }
+        else if (R.type === 'arith' && L.type === 'const') {
+          if (R.left.type === 'sym' && R.right.type === 'const') {
+            var adjusted2 = null;
+            if (R.op === '+') adjusted2 = L.value - R.right.value;
+            else if (R.op === '-') adjusted2 = L.value + R.right.value;
+            if (adjusted2 !== null) addBound(R.left.id, _swapCmp[op] || op, adjusted2);
+          }
+          if (R.left.type === 'sym' && R.right.type === 'sym') {
+            var exprKey2 = 'expr:' + R.left.id + R.op + R.right.id;
+            var exprId2 = smtSym(exprKey2).id;
+            addBound(exprId2, _swapCmp[op] || op, L.value);
+          }
         }
       }
-      return true; // symbolic comparison: attacker can satisfy
+      // NOT(sym) is like sym == false — no arithmetic bound.
+    }
+    // Check per-variable bound contradictions.
+    for (var sid in bounds) {
+      var b = bounds[sid];
+      if (b.loStrict || b.hiStrict) { if (b.lo >= b.hi) return false; }
+      else { if (b.lo > b.hi) return false; }
+      if (b.eqs.length >= 2) { for (var j = 1; j < b.eqs.length; j++) if (b.eqs[j] !== b.eqs[0]) return false; }
+      if (b.eqs.length >= 1) {
+        for (var k = 0; k < b.neqs.length; k++) if (b.neqs[k] === b.eqs[0]) return false;
+        var ev = b.eqs[0];
+        if (typeof ev === 'number') {
+          if (b.loStrict ? ev <= b.lo : ev < b.lo) return false;
+          if (b.hiStrict ? ev >= b.hi : ev > b.hi) return false;
+        }
+      }
+    }
+    // Check relational constraints via transitive closure.
+    // Build a directed graph: edge from A to B with weight means A + weight <= B (or <).
+    // Use Floyd-Warshall to detect negative cycles (contradiction).
+    var allIds = Object.keys(bounds).map(Number);
+    for (var ri = 0; ri < relations.length; ri++) {
+      var rel = relations[ri];
+      if (allIds.indexOf(rel.leftId) < 0) allIds.push(rel.leftId);
+      if (allIds.indexOf(rel.rightId) < 0) allIds.push(rel.rightId);
+    }
+    if (relations.length > 0 && allIds.length <= 20) {
+      // Build difference constraints: x OP y → difference bounds.
+      // x > y means x - y > 0, i.e. y - x < 0.
+      // We track: dist[i][j] = max proven lower bound on (var_i - var_j).
+      var n = allIds.length;
+      var idxOf = Object.create(null);
+      for (var ii = 0; ii < n; ii++) idxOf[allIds[ii]] = ii;
+      // dist[i][j] = upper bound on (j - i), i.e. j <= i + dist[i][j].
+      var dist = [];
+      for (var di = 0; di < n; di++) {
+        dist[di] = [];
+        for (var dj = 0; dj < n; dj++) dist[di][dj] = di === dj ? 0 : Infinity;
+      }
+      // Add relational edges.
+      for (var re = 0; re < relations.length; re++) {
+        var r = relations[re];
+        var li = idxOf[r.leftId], ri2 = idxOf[r.rightId];
+        if (li === undefined || ri2 === undefined) continue;
+        // x > y → y - x < 0 → dist[x][y] = min(dist[x][y], -1) (strict)
+        // x >= y → y - x <= 0 → dist[x][y] = min(dist[x][y], 0)
+        // x < y → x - y < 0 → dist[y][x] = min(dist[y][x], -1)
+        // x <= y → x - y <= 0 → dist[y][x] = min(dist[y][x], 0)
+        // x == y → both directions = 0
+        switch (r.op) {
+          case '>': dist[li][ri2] = Math.min(dist[li][ri2], -1); break;
+          case '>=': dist[li][ri2] = Math.min(dist[li][ri2], 0); break;
+          case '<': dist[ri2][li] = Math.min(dist[ri2][li], -1); break;
+          case '<=': dist[ri2][li] = Math.min(dist[ri2][li], 0); break;
+          case '===': case '==':
+            dist[li][ri2] = Math.min(dist[li][ri2], 0);
+            dist[ri2][li] = Math.min(dist[ri2][li], 0);
+            break;
+        }
+      }
+      // Also add const bounds as edges to a virtual "zero" node — not needed for
+      // pure relational contradictions but helps with mixed constraints.
+      // Floyd-Warshall: find shortest paths (min weights).
+      for (var fk = 0; fk < n; fk++) {
+        for (var fi = 0; fi < n; fi++) {
+          for (var fj = 0; fj < n; fj++) {
+            if (dist[fi][fk] + dist[fk][fj] < dist[fi][fj]) {
+              dist[fi][fj] = dist[fi][fk] + dist[fk][fj];
+            }
+          }
+        }
+      }
+      // Negative cycle on diagonal = contradiction.
+      for (var ci = 0; ci < n; ci++) {
+        if (dist[ci][ci] < 0) return false;
+      }
     }
     return true;
   }
 
-  // Check if a formula is valid (true for ALL assignments).
-  function smtIsValid(formula) {
-    return !smtSat(smtNot(formula));
+  // --- Main satisfiability checker ---
+  function smtSat(formula) {
+    if (!formula) return true;
+    // Normalize to NNF (push NOT inward).
+    var nnf = smtNNF(formula);
+    if (!nnf) return true;
+    if (nnf.type === 'const') return !!nnf.value;
+    if (nnf.type === 'sym') return true;
+    // Try to collect atoms from conjunction.
+    var atoms = smtCollectAtoms(nnf);
+    if (atoms !== null) return smtTheorySat(atoms);
+    // Contains OR: check each disjunct.
+    if (nnf.type === 'or') return smtSat(nnf.left) || smtSat(nnf.right);
+    // Comparison with concrete operands.
+    if (nnf.type === 'cmp' && nnf.left.type === 'const' && nnf.right.type === 'const') {
+      var l = nnf.left.value, r = nnf.right.value;
+      switch (nnf.op) {
+        case '<': return l < r; case '>': return l > r;
+        case '<=': return l <= r; case '>=': return l >= r;
+        case '==': case '===': return l === r;
+        case '!=': case '!==': return l !== r;
+      }
+    }
+    return true; // unknown = assume satisfiable (sound for security)
   }
 
   // --- Condition parser: raw JS tokens → SMT formula ---
@@ -575,21 +666,49 @@
   function smtParseExpr(toks, start, end, resolveFunc, resolvePathFunc) {
     if (start >= end) return null;
     // Find lowest-precedence binary operator at depth 0.
+    // Precedence (low→high): || < && < comparisons < +/- < */% < atoms
     var d = 0, lastOr = -1, lastAnd = -1, lastCmp = -1, lastCmpOp = null;
+    var lastAdd = -1, lastAddOp = null, lastMul = -1, lastMulOp = null;
     for (var i = start; i < end; i++) {
       if (toks[i].type === 'open') d++;
       if (toks[i].type === 'close') d--;
       if (d !== 0) continue;
-      if (toks[i].type === 'op' && toks[i].text === '||') lastOr = i;
-      else if (toks[i].type === 'op' && toks[i].text === '&&') lastAnd = i;
-      else if (toks[i].type === 'op' && _cmpOps[toks[i].text]) { lastCmp = i; lastCmpOp = toks[i].text; }
+      var tt = toks[i].text;
+      if (toks[i].type === 'op' && tt === '||') lastOr = i;
+      else if (toks[i].type === 'op' && tt === '&&') lastAnd = i;
+      else if (toks[i].type === 'op' && _cmpOps[tt]) { lastCmp = i; lastCmpOp = tt; }
+      else if ((toks[i].type === 'op' && (tt === '-')) || (toks[i].type === 'plus')) { lastAdd = i; lastAddOp = tt === '-' ? '-' : '+'; }
+      else if (toks[i].type === 'op' && (tt === '*' || tt === '/' || tt === '%')) { lastMul = i; lastMulOp = tt; }
     }
     if (lastOr >= 0) return smtOr(smtParseExpr(toks, start, lastOr, resolveFunc, resolvePathFunc), smtParseExpr(toks, lastOr + 1, end, resolveFunc, resolvePathFunc));
     if (lastAnd >= 0) return smtAnd(smtParseExpr(toks, start, lastAnd, resolveFunc, resolvePathFunc), smtParseExpr(toks, lastAnd + 1, end, resolveFunc, resolvePathFunc));
     if (lastCmp >= 0) {
-      var cl = smtParseAtom(toks, start, lastCmp, resolveFunc, resolvePathFunc);
-      var cr = smtParseAtom(toks, lastCmp + 1, end, resolveFunc, resolvePathFunc);
+      var cl = smtParseExpr(toks, start, lastCmp, resolveFunc, resolvePathFunc);
+      var cr = smtParseExpr(toks, lastCmp + 1, end, resolveFunc, resolvePathFunc);
       return (cl && cr) ? smtCmp(lastCmpOp, cl, cr) : null;
+    }
+    if (lastAdd >= 0) {
+      var al = smtParseExpr(toks, start, lastAdd, resolveFunc, resolvePathFunc);
+      var ar = smtParseExpr(toks, lastAdd + 1, end, resolveFunc, resolvePathFunc);
+      if (al && ar) {
+        // Fold const + const.
+        if (al.type === 'const' && ar.type === 'const' && typeof al.value === 'number' && typeof ar.value === 'number') {
+          return smtConst(lastAddOp === '+' ? al.value + ar.value : al.value - ar.value);
+        }
+        return smtArith(lastAddOp, al, ar);
+      }
+    }
+    if (lastMul >= 0) {
+      var ml = smtParseExpr(toks, start, lastMul, resolveFunc, resolvePathFunc);
+      var mr = smtParseExpr(toks, lastMul + 1, end, resolveFunc, resolvePathFunc);
+      if (ml && mr) {
+        if (ml.type === 'const' && mr.type === 'const' && typeof ml.value === 'number' && typeof mr.value === 'number') {
+          if (lastMulOp === '*') return smtConst(ml.value * mr.value);
+          if (lastMulOp === '/' && mr.value !== 0) return smtConst(ml.value / mr.value);
+          if (lastMulOp === '%' && mr.value !== 0) return smtConst(ml.value % mr.value);
+        }
+        return smtArith(lastMulOp, ml, mr);
+      }
     }
     return smtParseAtom(toks, start, end, resolveFunc, resolvePathFunc);
   }
