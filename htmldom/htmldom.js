@@ -3514,6 +3514,11 @@
         if (!o) return null;
         return { bind: o.binding, next: o.next };
       }
+      // Function expression in expression position.
+      if (t.type === 'other' && t.text === 'function') {
+        var _fnExpr = readFunctionExpr(k, stop);
+        if (_fnExpr) return { bind: _fnExpr.binding, next: _fnExpr.next };
+      }
       if (t.type !== 'other') return null;
       // Primitive literal.
       const lit = primitiveAsString(t.text);
@@ -3631,12 +3636,19 @@
               if (t.text === 'JSON.stringify') {
                 return { bind: chainBinding([makeSynthStr(JSON.stringify(val))]), next: argRes.next };
               }
-              // parse: value is a string, parse it and reconstruct a binding.
               if (typeof val === 'string') {
                 try {
                   const parsed = JSON.parse(val);
                   return { bind: jsonToBinding(parsed), next: argRes.next };
                 } catch (_) { /* fall through */ }
+              }
+            }
+            // Tainted/opaque argument: result carries the same taint.
+            var _argBind = argRes.bindings[0];
+            if (_argBind && _argBind.kind === 'chain') {
+              var _jTaint = collectChainTaint(_argBind.toks);
+              if (_jTaint) {
+                return { bind: chainBinding([deriveExprRef(t.text + '(...)', _argBind.toks)]), next: argRes.next };
               }
             }
           }
@@ -4245,6 +4257,22 @@
       const maybeRp = tks[i];
       if (maybeRp && maybeRp.type === 'close' && maybeRp.char === ')') return { bindings, next: i + 1 };
       while (i < stop) {
+        // Spread: ...expr — unpack array elements into individual args.
+        if (tks[i] && tks[i].type === 'other' && tks[i].text.startsWith('...')) {
+          var _spreadName = tks[i].text.slice(3);
+          var _spreadBind = IDENT_RE.test(_spreadName) ? resolvePath(_spreadName) : null;
+          if (_spreadBind && _spreadBind.kind === 'array') {
+            for (var _si = 0; _si < _spreadBind.elems.length; _si++) {
+              if (_spreadBind.elems[_si]) bindings.push(_spreadBind.elems[_si]);
+            }
+          } else {
+            // Opaque spread: propagate taint from the expression.
+            bindings.push(chainBinding([deriveExprRef(_spreadName, _spreadBind && _spreadBind.kind === 'chain' ? _spreadBind.toks : null)]));
+          }
+          i++;
+          if (tks[i] && tks[i].type === 'sep' && tks[i].char === ',') i++;
+          continue;
+        }
         const v = readValue(i, stop, TERMS_ARG);
         if (!v) return null;
         bindings.push(v.binding);
@@ -4379,6 +4407,27 @@
           if (taintEnabled && _popped.isFunction) taintFnDepth--;
         }
         continue;
+      }
+
+      // IIFE: ')(' pattern — (function(){...})() or (()=>{...})()
+      if (t.type === 'close' && t.char === ')' && tokens[i + 1] && tokens[i + 1].type === 'open' && tokens[i + 1].char === '(') {
+        var _iifeOpenIdx = -1, _iifeDep = 1;
+        for (var _ii = i - 1; _ii >= 0; _ii--) {
+          if (tokens[_ii].type === 'close' && tokens[_ii].char === ')') _iifeDep++;
+          if (tokens[_ii].type === 'open' && tokens[_ii].char === '(') { _iifeDep--; if (_iifeDep === 0) { _iifeOpenIdx = _ii; break; } }
+        }
+        if (_iifeOpenIdx >= 0) {
+          var _iifeFnE = readFunctionExpr(_iifeOpenIdx + 1, i);
+          var _iifeFn = _iifeFnE ? _iifeFnE.binding : null;
+          if (!_iifeFn) {
+            var _iifeArr = peekArrow(_iifeOpenIdx + 1, i);
+            if (_iifeArr) { var _iifeB = readArrowBody(_iifeArr.arrowNext, i); if (_iifeB) _iifeFn = functionBinding(_iifeArr.params, _iifeB.bodyStart, _iifeB.bodyEnd, _iifeB.isBlock); }
+          }
+          if (_iifeFn) {
+            var _iifeA = readCallArgBindings(i + 1, stop);
+            if (_iifeA) { instantiateFunction(_iifeFn, _iifeA.bindings); i = _iifeA.next - 1; continue; }
+          }
+        }
       }
 
       if (t.type !== 'other') continue;
@@ -5604,6 +5653,23 @@
           i = i + 1;
           continue;
         }
+        // Logical assignment: IDENT ||= expr, IDENT &&= expr, IDENT ??= expr
+        if (eqTok && eqTok.type === 'sep' && (eqTok.char === '||=' || eqTok.char === '&&=' || eqTok.char === '??=')) {
+          var _laR = readValue(i + 2, stop, TERMS_TOP);
+          var _laRhs = _laR ? _laR.binding : null;
+          var _laCur = resolve(t.text);
+          // x ||= expr → x = x || expr. Result is either cur or rhs.
+          // Since either could be the final value, merge taint from both.
+          if (_laRhs && _laRhs.kind === 'chain') {
+            if (_laCur && _laCur.kind === 'chain') {
+              assignName(t.text, chainBinding([deriveExprRef(t.text, _laCur.toks, _laRhs.toks)]));
+            } else {
+              assignName(t.text, _laRhs);
+            }
+          }
+          i = skipExpr(i + 2, stop) - 1;
+          continue;
+        }
       }
 
       // setTimeout/setInterval with function callback: walk the callback.
@@ -5955,6 +6021,28 @@
               (afterTok.char === '=' || afterTok.char === '+=' || afterTok.char === '-=' ||
                afterTok.char === '*=' || afterTok.char === '/=')) {
             // Bracket-access assignment: items[i].seen = true
+            // Update object/array bindings when the key is known.
+            var _baseBind = resolve(t.text);
+            if (_baseBind && afterTok.char === '=') {
+              // Find the key: tokens between [ and ] in the first bracket.
+              var _keyStart = i + 2, _keyEnd = i + 2;
+              var _kd = 1;
+              for (var _ki = i + 2; _ki < j && _kd > 0; _ki++) {
+                if (tokens[_ki].type === 'open' && tokens[_ki].char === '[') _kd++;
+                if (tokens[_ki].type === 'close' && tokens[_ki].char === ']') { _kd--; if (_kd === 0) { _keyEnd = _ki; break; } }
+              }
+              if (_keyEnd > _keyStart) {
+                var _keyVal = readValue(_keyStart, _keyEnd, null);
+                var _keyStr = _keyVal ? chainAsKnownString(_keyVal.binding) : null;
+                if (_keyStr !== null) {
+                  var _rhsVal = readValue(j + 1, stop, TERMS_TOP);
+                  if (_rhsVal && _rhsVal.binding) {
+                    if (_baseBind.kind === 'object') _baseBind.props[_keyStr] = _rhsVal.binding;
+                    if (_baseBind.kind === 'array' && /^\d+$/.test(_keyStr)) _baseBind.elems[parseInt(_keyStr, 10)] = _rhsVal.binding;
+                  }
+                }
+              }
+            }
             const stmtEndIdx = skipExpr(j + 1, endI);
             // Preserve the statement in build var chains.
             if (trackBuildVar && (trackBuildVarDepth < 0 || funcDepth() === trackBuildVarDepth)) {
