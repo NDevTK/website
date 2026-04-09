@@ -727,16 +727,39 @@
   // --- Main satisfiability checker ---
   function smtSat(formula) {
     if (!formula) return true;
-    // Normalize to NNF (push NOT inward).
     var nnf = smtNNF(formula);
     if (!nnf) return true;
     if (nnf.type === 'const') return !!nnf.value;
     if (nnf.type === 'sym') return true;
-    // Try to collect atoms from conjunction.
+    // Try to collect atoms from pure conjunction.
     var atoms = smtCollectAtoms(nnf);
     if (atoms !== null) return smtTheorySat(atoms);
-    // Contains OR: check each disjunct.
+    // Disjunction: at least one branch must be satisfiable.
     if (nnf.type === 'or') return smtSat(nnf.left) || smtSat(nnf.right);
+    // Conjunction with nested OR: distribute AND over OR (DNF conversion).
+    // A ∧ (B ∨ C) = (A ∧ B) ∨ (A ∧ C). Check each conjunct.
+    if (nnf.type === 'and') {
+      var orChild = null, otherChild = null;
+      if (nnf.left.type === 'or') { orChild = nnf.left; otherChild = nnf.right; }
+      else if (nnf.right.type === 'or') { orChild = nnf.right; otherChild = nnf.left; }
+      if (orChild) {
+        return smtSat(smtAnd(otherChild, orChild.left)) || smtSat(smtAnd(otherChild, orChild.right));
+      }
+      // Nested AND with deeper OR: flatten and retry.
+      // Collect all conjuncts, find the first OR, distribute.
+      var conjuncts = [];
+      var _flatAnd = function(f) { if (f.type === 'and') { _flatAnd(f.left); _flatAnd(f.right); } else conjuncts.push(f); };
+      _flatAnd(nnf);
+      for (var ci = 0; ci < conjuncts.length; ci++) {
+        if (conjuncts[ci].type === 'or') {
+          var rest = null;
+          for (var cj = 0; cj < conjuncts.length; cj++) {
+            if (cj !== ci) rest = rest ? smtAnd(rest, conjuncts[cj]) : conjuncts[cj];
+          }
+          return smtSat(smtAnd(rest, conjuncts[ci].left)) || smtSat(smtAnd(rest, conjuncts[ci].right));
+        }
+      }
+    }
     // Comparison with concrete operands.
     if (nnf.type === 'cmp' && nnf.left.type === 'const' && nnf.right.type === 'const') {
       var l = nnf.left.value, r = nnf.right.value;
@@ -747,7 +770,7 @@
         case '!=': case '!==': return l !== r;
       }
     }
-    return true; // unknown = assume satisfiable (sound for security)
+    return true;
   }
 
   // --- Condition parser: raw JS tokens → SMT formula ---

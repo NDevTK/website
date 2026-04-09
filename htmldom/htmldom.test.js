@@ -3345,6 +3345,11 @@ function render() {
   checkTaint('handler path unsat', { 'a.js': 'window.addEventListener("message", function(e) { var x = e.data; if (x > 5) { if (x < 3) { document.getElementById("o").innerHTML = x; } } });' }, 0);
   checkTaint('fn path unsat', { 'a.js': 'function render(x) { if (x > 5) { if (x < 3) { document.getElementById("o").innerHTML = x; } } } render(location.search);' }, 0);
 
+  // --- SMT OR handling ---
+  checkTaint('or both unsat with path', { 'a.js': 'var x = location.search; if (x > 5) { if (x < 3 || x < 2) { document.getElementById("o").innerHTML = x; } }' }, 0);
+  checkTaint('or one sat with path', { 'a.js': 'var x = location.search; if (x > 5) { if (x > 10 || x < 3) { document.getElementById("o").innerHTML = x; } }' }, 1);
+  checkTaint('or rescues dead branch', { 'a.js': 'var x = location.search; if (x > 5) { if (x < 3 || x > 7) { document.getElementById("o").innerHTML = x; } }' }, 1);
+
   // --- SMT cross-function path constraints ---
   checkTaint('fn1 constrains fn2', { 'a.js': 'var x = location.search; function validate() { if (x > 5) { render(); } } function render() { if (x < 3) { document.getElementById("o").innerHTML = x; } } validate();' }, 0);
   checkTaint('fn sets then checks', { 'a.js': 'var x; function init() { x = location.search; } init(); if (x > 5 && x < 3) { document.getElementById("o").innerHTML = x; }' }, 0);
