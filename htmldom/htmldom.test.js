@@ -3309,6 +3309,14 @@ function render() {
   checkTaint('unsatisfiable: if(false) dead', { 'a.js': 'if (false) { document.getElementById("o").innerHTML = location.search; }' }, 0);
   checkTaint('unsatisfiable: concrete false', { 'a.js': 'var x = 1 > 2; if (x) { document.getElementById("o").innerHTML = location.search; }' }, 0);
   checkTaint('satisfiable: 3 handlers shared', { 'a.js': 'var a,b,c; window.addEventListener("message", function(e) { a = e.data; }); window.addEventListener("message", function(e) { b = e.origin; }); window.addEventListener("hashchange", function() { c = location.hash; if (a && b) { document.getElementById("o").innerHTML = a + b + c; } });' }, 1);
+
+  // --- SMT contradiction detection ---
+  checkTaint('unsatisfiable: x>5 && x<3', { 'a.js': 'var x = location.search; if (x > 5 && x < 3) { document.getElementById("o").innerHTML = x; }' }, 0);
+  checkTaint('unsatisfiable: x>=5 && x<5', { 'a.js': 'var x = location.search; if (x >= 5 && x < 5) { document.getElementById("o").innerHTML = x; }' }, 0);
+  checkTaint('unsatisfiable: x===a && x===b', { 'a.js': 'var x = location.search; if (x === "a" && x === "b") { document.getElementById("o").innerHTML = x; }' }, 0);
+  checkTaint('unsatisfiable: x===a && x!==a', { 'a.js': 'var x = location.search; if (x === "a" && x !== "a") { document.getElementById("o").innerHTML = x; }' }, 0);
+  checkTaint('satisfiable: x>3 && x<5', { 'a.js': 'var x = location.search; if (x > 3 && x < 5) { document.getElementById("o").innerHTML = x; }' }, 1);
+  checkTaint('satisfiable: x===a || x===b', { 'a.js': 'var x = location.search; if (x === "a" || x === "b") { document.getElementById("o").innerHTML = x; }' }, 1);
   checkTaint('satisfiable: obj.prop++ count', { 'a.js': 'var state = {count:0}; window.addEventListener("message", function(e) { state.count++; if (state.count > 3) { document.getElementById("o").innerHTML = e.data; } });' }, 1);
   checkTaint('satisfiable: ident++ in handler', { 'a.js': 'var n = 0; window.addEventListener("message", function(e) { n++; if (n > 5) { document.getElementById("o").innerHTML = e.data; } });' }, 1);
 

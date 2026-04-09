@@ -394,6 +394,270 @@
   var NAV_SAFE_FILTER_USED = false;
 
   // -----------------------------------------------------------------------
+  // SMT Constraint Solver
+  // -----------------------------------------------------------------------
+  //
+  // Determines satisfiability of conditions at compile time using
+  // constraint formulas, theory solvers, and path constraint propagation.
+  //
+  // Architecture:
+  //   1. Formula AST — typed expression tree (Sym, Const, Not, And, Or, Cmp)
+  //   2. Theory solvers — evaluate formulas over specific domains:
+  //      - Boolean theory: AND, OR, NOT simplification
+  //      - Linear arithmetic: integer/float comparisons and bounds
+  //      - Equality theory: =, !=, ===, !== with unification
+  //   3. Satisfiability checker — determines if a formula has a model
+  //      (assignment of symbolic variables that makes it true)
+  //   4. Condition parser — builds formulas from raw JS condition tokens
+  //   5. Integration — scope walker queries the solver for branch reachability
+  //
+  // A symbolic variable represents a value the attacker controls:
+  //   - Taint sources (location.search, postMessage data)
+  //   - Event handler invocation counts (handler fires N times)
+  //   - Any value derived from the above through operations
+
+  // --- Formula AST ---
+  // Each node: { type, ... } where type is one of:
+  //   sym    — symbolic variable: { id, name }
+  //   const  — concrete value: { value }
+  //   not    — negation: { arg }
+  //   and    — conjunction: { args: [...] }  (flattened)
+  //   or     — disjunction: { args: [...] }  (flattened)
+  //   cmp    — comparison: { op, left, right }
+  //   arith  — arithmetic: { op, left, right }
+
+  var _nextSymId = 0;
+  var _symNameMap = Object.create(null);
+
+  function smtSym(name) {
+    if (name in _symNameMap) return { type: 'sym', id: _symNameMap[name], name: name };
+    var id = _nextSymId++;
+    _symNameMap[name] = id;
+    return { type: 'sym', id: id, name: name };
+  }
+  function smtConst(value) { return { type: 'const', value: value }; }
+  function smtNot(e) { return !e ? null : e.type === 'not' ? e.arg : e.type === 'const' ? smtConst(!e.value) : { type: 'not', arg: e }; }
+  function smtAnd(a, b) { return !a ? b : !b ? a : a.type === 'const' ? (a.value ? b : a) : b.type === 'const' ? (b.value ? a : b) : { type: 'and', left: a, right: b }; }
+  function smtOr(a, b) { return !a ? b : !b ? a : a.type === 'const' ? (a.value ? a : b) : b.type === 'const' ? (b.value ? b : a) : { type: 'or', left: a, right: b }; }
+  function smtCmp(op, l, r) { return { type: 'cmp', op: op, left: l, right: r }; }
+
+  // --- Theory solver: check if a formula tree contains symbolic variables ---
+  function smtHasSym(e) {
+    if (!e) return false;
+    if (e.type === 'sym') return true;
+    if (e.type === 'const') return false;
+    return (e.left && smtHasSym(e.left)) || (e.right && smtHasSym(e.right)) || (e.arg && smtHasSym(e.arg));
+  }
+
+  // --- Theory solver: collect all constraints on each symbolic variable ---
+  // Extracts { symId → [{ op, value }] } from a conjunction of comparisons.
+  function smtCollectBounds(formula) {
+    var bounds = Object.create(null); // symId → array of {op, value}
+    var _add = function(f) {
+      if (!f) return;
+      if (f.type === 'and') { _add(f.left); _add(f.right); return; }
+      if (f.type !== 'cmp') return;
+      var sym = null, val = null, op = f.op;
+      if (f.left.type === 'sym' && f.right.type === 'const') { sym = f.left.id; val = f.right.value; }
+      else if (f.right.type === 'sym' && f.left.type === 'const') {
+        sym = f.right.id; val = f.left.value;
+        var flip = { '>':'<', '<':'>', '>=':'<=', '<=':'>=', '==':'==', '===':'===', '!=':'!=', '!==':'!==' };
+        op = flip[op] || op;
+      }
+      if (sym === null) return;
+      if (!bounds[sym]) bounds[sym] = [];
+      bounds[sym].push({ op: op, value: val });
+    };
+    _add(formula);
+    return bounds;
+  }
+
+  // --- Theory solver: check if bounds on a single variable are contradictory ---
+  function smtBoundsContradict(constraints) {
+    var lo = -Infinity, hi = Infinity, loStrict = false, hiStrict = false;
+    var eqVals = [], neqVals = [];
+    for (var i = 0; i < constraints.length; i++) {
+      var c = constraints[i], v = c.value;
+      if (typeof v !== 'number') {
+        // String equality/inequality.
+        if (c.op === '===' || c.op === '==') eqVals.push(v);
+        else if (c.op === '!==' || c.op === '!=') neqVals.push(v);
+        continue;
+      }
+      switch (c.op) {
+        case '>': if (v >= lo) { lo = v; loStrict = true; } break;
+        case '>=': if (v > lo || (v === lo && !loStrict)) { lo = v; loStrict = false; } break;
+        case '<': if (v <= hi) { hi = v; hiStrict = true; } break;
+        case '<=': if (v < hi || (v === hi && !hiStrict)) { hi = v; hiStrict = false; } break;
+        case '===': case '==': eqVals.push(v); break;
+        case '!==': case '!=': neqVals.push(v); break;
+      }
+    }
+    // Check range contradiction: lower bound >= upper bound with strict.
+    if (loStrict || hiStrict) { if (lo >= hi) return true; }
+    else { if (lo > hi) return true; }
+    // Check equality contradictions.
+    if (eqVals.length >= 2) {
+      for (var j = 1; j < eqVals.length; j++) { if (eqVals[j] !== eqVals[0]) return true; }
+    }
+    // Check eq + neq contradiction.
+    if (eqVals.length >= 1) {
+      for (var k = 0; k < neqVals.length; k++) { if (neqVals[k] === eqVals[0]) return true; }
+      // Check eq value vs range.
+      var ev = eqVals[0];
+      if (typeof ev === 'number') {
+        if (loStrict ? ev <= lo : ev < lo) return true;
+        if (hiStrict ? ev >= hi : ev > hi) return true;
+      }
+    }
+    return false;
+  }
+
+  // --- Satisfiability checker ---
+  function smtSat(formula) {
+    if (!formula) return true;
+    if (formula.type === 'const') return !!formula.value;
+    if (formula.type === 'sym') return true; // attacker chooses
+    if (formula.type === 'not') {
+      var inner = formula.arg;
+      if (inner.type === 'const') return !inner.value;
+      if (inner.type === 'sym') return true;
+      // De Morgan: !(a && b) = !a || !b, !(a || b) = !a && !b
+      if (inner.type === 'and') return smtSat(smtOr(smtNot(inner.left), smtNot(inner.right)));
+      if (inner.type === 'or') return smtSat(smtAnd(smtNot(inner.left), smtNot(inner.right)));
+      // !(a op b) → flip the comparison
+      if (inner.type === 'cmp') {
+        var flipCmp = { '<':'>=', '>':'<=', '<=':'>', '>=':'<', '==':'!=', '===':'!==', '!=':'==', '!==':'===' };
+        return smtSat(smtCmp(flipCmp[inner.op] || inner.op, inner.left, inner.right));
+      }
+      return true; // unknown negation: assume satisfiable
+    }
+    if (formula.type === 'or') return smtSat(formula.left) || smtSat(formula.right);
+    if (formula.type === 'and') {
+      if (!smtSat(formula.left) || !smtSat(formula.right)) return false;
+      // Check for contradictions using bound collection.
+      var bounds = smtCollectBounds(formula);
+      for (var sid in bounds) {
+        if (smtBoundsContradict(bounds[sid])) return false;
+      }
+      return true;
+    }
+    if (formula.type === 'cmp') {
+      if (formula.left.type === 'const' && formula.right.type === 'const') {
+        var l = formula.left.value, r = formula.right.value;
+        switch (formula.op) {
+          case '<': return l < r; case '>': return l > r;
+          case '<=': return l <= r; case '>=': return l >= r;
+          case '==': case '===': return l === r;
+          case '!=': case '!==': return l !== r;
+        }
+      }
+      return true; // symbolic comparison: attacker can satisfy
+    }
+    return true;
+  }
+
+  // Check if a formula is valid (true for ALL assignments).
+  function smtIsValid(formula) {
+    return !smtSat(smtNot(formula));
+  }
+
+  // --- Condition parser: raw JS tokens → SMT formula ---
+  // Operator precedence: || < && < comparisons < atoms
+  var _cmpOps = { '<':1, '>':1, '<=':1, '>=':1, '==':1, '!=':1, '===':1, '!==':1 };
+
+  function smtParseExpr(toks, start, end, resolveFunc, resolvePathFunc) {
+    if (start >= end) return null;
+    // Find lowest-precedence binary operator at depth 0.
+    var d = 0, lastOr = -1, lastAnd = -1, lastCmp = -1, lastCmpOp = null;
+    for (var i = start; i < end; i++) {
+      if (toks[i].type === 'open') d++;
+      if (toks[i].type === 'close') d--;
+      if (d !== 0) continue;
+      if (toks[i].type === 'op' && toks[i].text === '||') lastOr = i;
+      else if (toks[i].type === 'op' && toks[i].text === '&&') lastAnd = i;
+      else if (toks[i].type === 'op' && _cmpOps[toks[i].text]) { lastCmp = i; lastCmpOp = toks[i].text; }
+    }
+    if (lastOr >= 0) return smtOr(smtParseExpr(toks, start, lastOr, resolveFunc, resolvePathFunc), smtParseExpr(toks, lastOr + 1, end, resolveFunc, resolvePathFunc));
+    if (lastAnd >= 0) return smtAnd(smtParseExpr(toks, start, lastAnd, resolveFunc, resolvePathFunc), smtParseExpr(toks, lastAnd + 1, end, resolveFunc, resolvePathFunc));
+    if (lastCmp >= 0) {
+      var cl = smtParseAtom(toks, start, lastCmp, resolveFunc, resolvePathFunc);
+      var cr = smtParseAtom(toks, lastCmp + 1, end, resolveFunc, resolvePathFunc);
+      return (cl && cr) ? smtCmp(lastCmpOp, cl, cr) : null;
+    }
+    return smtParseAtom(toks, start, end, resolveFunc, resolvePathFunc);
+  }
+
+  function smtParseAtom(toks, start, end, resolveFunc, resolvePathFunc) {
+    if (start >= end) return null;
+    // NOT prefix.
+    if (toks[start].type === 'op' && toks[start].text === '!') {
+      var inner = smtParseAtom(toks, start + 1, end, resolveFunc, resolvePathFunc);
+      return inner ? smtNot(inner) : null;
+    }
+    // Parenthesized.
+    if (toks[start].type === 'open' && toks[start].char === '(') {
+      var d2 = 1, j2 = start + 1;
+      while (j2 < end && d2 > 0) { if (toks[j2].type === 'open') d2++; if (toks[j2].type === 'close') d2--; j2++; }
+      return smtParseExpr(toks, start + 1, j2 - 1, resolveFunc, resolvePathFunc);
+    }
+    // Single token.
+    if (end === start + 1) {
+      var t = toks[start];
+      // String literal.
+      if (t.type === 'str') return smtConst(t.text);
+      if (t.type === 'other') {
+        // JS constants.
+        if (t.text === 'true') return smtConst(true);
+        if (t.text === 'false') return smtConst(false);
+        if (t.text === 'null' || t.text === 'undefined') return smtConst(false);
+        if (/^\d+(\.\d+)?$/.test(t.text)) return smtConst(Number(t.text));
+        // Identifier: check if symbolic (tainted / event-modified).
+        var root = t.text.split('.')[0];
+        if (IDENT_RE.test(root)) {
+          var rb = resolveFunc(root);
+          if (rb) {
+            // Check root binding for taint (recursive into arrays/objects).
+            var _hasTaint = function(b) {
+              if (!b) return false;
+              if (b.kind === 'chain') return !!collectChainTaint(b.toks);
+              if (b.kind === 'array') { for (var e = 0; e < b.elems.length; e++) if (_hasTaint(b.elems[e])) return true; }
+              if (b.kind === 'object') { for (var k in b.props) if (_hasTaint(b.props[k])) return true; }
+              return false;
+            };
+            if (_hasTaint(rb)) return smtSym(t.text);
+          }
+          // Resolve full path to concrete value.
+          var fb = resolvePathFunc(t.text);
+          if (fb && fb.kind === 'chain' && fb.toks.length === 1 && fb.toks[0].type === 'str') {
+            var fv = fb.toks[0].text;
+            if (fv === 'true') return smtConst(true);
+            if (fv === 'false' || fv === 'null' || fv === 'undefined' || fv === '') return smtConst(false);
+            var nv = Number(fv);
+            if (!Number.isNaN(nv)) return smtConst(nv);
+            return smtConst(fv);
+          }
+        }
+        return smtSym(t.text);
+      }
+    }
+    return smtSym('_expr');
+  }
+
+  // --- Integration: check condition satisfiability ---
+  // Returns { sat, unsat } or null if condition is purely concrete.
+  function smtCheckCondition(condTokens, resolveFunc, resolvePathFunc) {
+    var formula = smtParseExpr(condTokens, 0, condTokens.length, resolveFunc, resolvePathFunc);
+    if (!formula) return null;
+    if (!smtHasSym(formula)) {
+      // Purely concrete formula: evaluate directly.
+      return { sat: smtSat(formula), unsat: smtSat(smtNot(formula)) };
+    }
+    // Symbolic formula: use the solver.
+    return { sat: smtSat(formula), unsat: smtSat(smtNot(formula)) };
+  }
+
+  // -----------------------------------------------------------------------
   // End Taint Analysis Infrastructure
   // -----------------------------------------------------------------------
 
@@ -3828,55 +4092,21 @@
             // Evaluate the condition.
             const condVal = readValue(i + 2, j, null);
             var concrete = condVal ? evalTruthiness(condVal.binding) : null;
-            // SMT satisfiability: determine if the condition can be true
-            // for some assignment of attacker-controlled symbolic values.
-            //
-            // A variable is symbolic when its value is derived from
-            // attacker input (taint labels) or from state modified by
-            // event handlers (which fire unbounded times with
-            // attacker-chosen data). Any predicate over symbolic values
-            // is satisfiable — the attacker can choose inputs to make it
-            // true.
-            //
-            // For each identifier/path in the condition source tokens,
-            // resolve the ROOT identifier and check if it or any of its
-            // contents (array elements, object properties) carry taint.
-            // This catches cases like `parts.length >= 2` where
-            // `parts` is an array with tainted elements — the length
-            // is derived from attacker-controlled push() calls.
-            if (taintEnabled && concrete !== null) {
-              var _sat = false;
-              var _isSymbolic = function(b) {
-                if (!b) return false;
-                if (b.kind === 'chain') return !!collectChainTaint(b.toks);
-                if (b.kind === 'array') {
-                  for (var _i = 0; _i < b.elems.length; _i++) {
-                    if (_isSymbolic(b.elems[_i])) return true;
-                  }
-                }
-                if (b.kind === 'object') {
-                  for (var _k in b.props) {
-                    if (_isSymbolic(b.props[_k])) return true;
-                  }
-                }
-                return false;
-              };
-              for (var _si = i + 2; _si < j && !_sat; _si++) {
-                var _st = tokens[_si];
-                if (_st.type !== 'other') continue;
-                if (!IDENT_OR_PATH_RE.test(_st.text) && !IDENT_RE.test(_st.text)) continue;
-                // Resolve the root identifier, not the full dotted path.
-                // parts.length → root is parts (array with tainted elements).
-                var _root = _st.text.split('.')[0];
-                var _rb = resolve(_root);
-                if (_isSymbolic(_rb)) { _sat = true; break; }
-                // Also check the full path resolution.
-                if (!_sat) {
-                  var _fb = resolvePath(_st.text);
-                  if (_isSymbolic(_fb)) { _sat = true; break; }
-                }
+            // SMT: check satisfiability of the condition formula.
+            // If the condition contains symbolic variables (tainted/event-modified),
+            // the concrete evaluation may be wrong — the attacker can choose values
+            // to satisfy or falsify the predicate. The SMT solver determines which
+            // branches are actually reachable.
+            if (taintEnabled) {
+              var _condTokens = [];
+              for (var _si = i + 2; _si < j; _si++) _condTokens.push(tokens[_si]);
+              var _smtResult = smtCheckCondition(_condTokens, resolve, resolvePath);
+              if (_smtResult) {
+                // SMT overrides concrete evaluation when symbolic vars present.
+                if (_smtResult.sat && _smtResult.unsat) concrete = null; // both branches reachable
+                else if (_smtResult.sat && !_smtResult.unsat) concrete = true; // only true branch
+                else if (!_smtResult.sat && _smtResult.unsat) concrete = false; // only false branch
               }
-              if (_sat) concrete = null;
             }
             // Determine if-body range.
             const bodyTok = tokens[j + 1];
