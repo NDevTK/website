@@ -188,7 +188,6 @@
       var f = taintResults.findings;
       summary.style.display = '';
       var parts = [];
-      if (taintResults.summary.critical) parts.push(taintResults.summary.critical + ' critical');
       if (taintResults.summary.high) parts.push(taintResults.summary.high + ' high');
       if (taintResults.summary.medium) parts.push(taintResults.summary.medium + ' medium');
       summary.textContent = f.length + ' finding' + (f.length === 1 ? '' : 's') + (parts.length ? ': ' + parts.join(', ') : '');
@@ -238,7 +237,7 @@
         var f = taintResults.findings[i];
         if (f.file !== file || !f.location || !f.location.line) continue;
         var line = f.location.line;
-        var cls = f.severity === 'critical' ? 'taint-decoration-critical' : f.severity === 'high' ? 'taint-decoration-high' : 'taint-decoration-medium';
+        var cls = f.severity === 'high' ? 'taint-decoration-high' : 'taint-decoration-medium';
         decorations.push({
           range: new monaco.Range(line, 1, line, 1),
           options: {

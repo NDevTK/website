@@ -155,9 +155,9 @@
   };
   // Global call sinks (not property-based).
   const TAINT_CALL_SINKS = {
-    'eval':                   { type: 'code', severity: 'critical' },
-    'Function':               { type: 'code', severity: 'critical' },
-    'setTimeout':             { type: 'code', severity: 'high' },    // when first arg is string
+    'eval':                   { type: 'code', severity: 'high' },
+    'Function':               { type: 'code', severity: 'high' },
+    'setTimeout':             { type: 'code', severity: 'high' },
     'setInterval':            { type: 'code', severity: 'high' },
     'document.write':         { type: 'html', severity: 'high' },
     'document.writeln':       { type: 'html', severity: 'high' },
