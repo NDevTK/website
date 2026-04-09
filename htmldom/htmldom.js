@@ -866,9 +866,15 @@
               return false;
             };
             if (_hasTaint(rb)) {
-              // x.length → arith('length', sym(x)) for string theory.
-              if (t.text.endsWith('.length')) return smtArith('length', smtSym(t.text.slice(0, -7)), smtConst(0));
-              return smtSym(t.text);
+              // Resolve aliases: if the binding is a single opaque ref to
+              // another expression, use that expression as the symbolic name.
+              // This unifies x and y when y = x.
+              var _symName = t.text;
+              if (rb.kind === 'chain' && rb.toks.length === 1 && rb.toks[0].type === 'other') {
+                _symName = rb.toks[0].text;
+              }
+              if (_symName.endsWith('.length') || t.text.endsWith('.length')) return smtArith('length', smtSym(_symName.replace(/\.length$/, '')), smtConst(0));
+              return smtSym(_symName);
             }
           }
           // Resolve full path to concrete value.
@@ -908,13 +914,14 @@
           if (_mArgTok && _mArgTok.type === 'str' && toks[start + 3] && toks[start + 3].type === 'close') {
             _mArgVal = _mArgTok.text;
           }
-          var _mSymId = smtSym(_mBase).id;
-          // String methods that produce boolean-like results.
+          // Resolve aliases for consistent symbolic ID.
+          var _mResolvedBase = _mBase;
+          if (_mRb && _mRb.kind === 'chain' && _mRb.toks.length === 1 && _mRb.toks[0].type === 'other') _mResolvedBase = _mRb.toks[0].text;
+          var _mSymId = smtSym(_mResolvedBase).id;
           if (_mMethod === 'startsWith' && _mArgVal !== null) return smtStrProp(_mSymId, 'startsWith', _mArgVal);
           if (_mMethod === 'endsWith' && _mArgVal !== null) return smtStrProp(_mSymId, 'endsWith', _mArgVal);
           if (_mMethod === 'includes' && _mArgVal !== null) return smtStrProp(_mSymId, 'includes', _mArgVal);
-          // indexOf returns a number — wrap as comparison >= 0 or === -1.
-          if (_mMethod === 'indexOf' && _mArgVal !== null) return smtArith('indexOf', smtSym(_mBase), smtConst(_mArgVal));
+          if (_mMethod === 'indexOf' && _mArgVal !== null) return smtArith('indexOf', smtSym(_mResolvedBase), smtConst(_mArgVal));
           // .length is a property, not a method call.
         }
       }
@@ -3172,6 +3179,20 @@
     // Apply a method call: .concat on chain, or .join on array.
     const applyMethod = (bind, method, parenIdx, stop) => {
       if (method === 'concat') {
+        // Array concat: [].concat(arr) → merge elements.
+        if (bind && bind.kind === 'array') {
+          var _cArgs = readCallArgBindings(parenIdx, stop);
+          if (_cArgs) {
+            var _cElems = bind.elems.slice();
+            for (var _ci = 0; _ci < _cArgs.bindings.length; _ci++) {
+              var _ca = _cArgs.bindings[_ci];
+              if (_ca && _ca.kind === 'array') { for (var _cj = 0; _cj < _ca.elems.length; _cj++) _cElems.push(_ca.elems[_cj]); }
+              else if (_ca) _cElems.push(_ca);
+            }
+            return { bind: arrayBinding(_cElems), next: _cArgs.next };
+          }
+        }
+        // String concat.
         if (!bind || bind.kind !== 'chain') return null;
         const args = readConcatArgs(parenIdx, stop);
         if (!args) return null;
@@ -3774,7 +3795,19 @@
         if (isCall && (t.text === 'JSON.stringify' || t.text === 'JSON.parse')) {
           const argRes = readCallArgBindings(k + 1, stop);
           if (argRes && argRes.bindings.length >= 1) {
-            const val = bindingToJson(argRes.bindings[0]);
+            // Check taint BEFORE concrete evaluation — if the argument
+            // carries taint, the result should too regardless of concrete value.
+            var _argBind = argRes.bindings[0];
+            var _jTaint = null;
+            if (_argBind) {
+              if (_argBind.kind === 'chain') _jTaint = collectChainTaint(_argBind.toks);
+              else if (_argBind.kind === 'object') { for (var _jk in _argBind.props) { var _jpt = _argBind.props[_jk]; if (_jpt && _jpt.kind === 'chain' && collectChainTaint(_jpt.toks)) { _jTaint = collectChainTaint(_jpt.toks); break; } } }
+              else if (_argBind.kind === 'array') { for (var _ji = 0; _ji < _argBind.elems.length; _ji++) { var _jet = _argBind.elems[_ji]; if (_jet && _jet.kind === 'chain' && collectChainTaint(_jet.toks)) { _jTaint = collectChainTaint(_jet.toks); break; } } }
+            }
+            if (_jTaint) {
+              return { bind: chainBinding([deriveExprRef(t.text + '(...)', _argBind.kind === 'chain' ? _argBind.toks : [exprRef(t.text)])]), next: argRes.next };
+            }
+            const val = bindingToJson(_argBind);
             if (val !== undefined) {
               if (t.text === 'JSON.stringify') {
                 return { bind: chainBinding([makeSynthStr(JSON.stringify(val))]), next: argRes.next };

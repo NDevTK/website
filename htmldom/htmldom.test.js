@@ -3402,6 +3402,13 @@ function render() {
   checkTaint('class method', { 'a.js': 'class Renderer { render(html) { document.getElementById("o").innerHTML = html; } } var r = new Renderer(); r.render(location.search);' }, 1);
   checkTaint('getter', { 'a.js': 'var obj = { get val() { return location.search; } }; document.getElementById("o").innerHTML = obj.val;' }, 1);
   checkTaint('tagged template', { 'a.js': 'function tag(strings, ...vals) { return vals[0]; } var x = location.search; document.getElementById("o").innerHTML = tag`prefix${x}suffix`;' }, 1);
+
+  // --- Engine weakness fixes ---
+  checkTaint('alias contradiction', { 'a.js': 'var x = location.search; var y = x; if (y === "a") { if (x === "b") { document.getElementById("o").innerHTML = x; } }' }, 0);
+  checkTaint('array concat taint', { 'a.js': 'var a = [location.search]; var b = [].concat(a); document.getElementById("o").innerHTML = b[0];' }, 1);
+  checkTaint('promise-like then', { 'a.js': 'var p = { then: function(cb) { cb(location.search); } }; p.then(function(x) { document.getElementById("o").innerHTML = x; });' }, 1);
+  checkTaint('no dup closure', { 'a.js': 'var x = location.search; function outer() { function inner() { document.getElementById("o").innerHTML = x; } inner(); } outer();' }, 1);
+  checkTaint('no dup IIFE', { 'a.js': '(function() { document.getElementById("o").innerHTML = location.search; })();' }, 1);
   checkTaint('satisfiable: obj.prop++ count', { 'a.js': 'var state = {count:0}; window.addEventListener("message", function(e) { state.count++; if (state.count > 3) { document.getElementById("o").innerHTML = e.data; } });' }, 1);
   checkTaint('satisfiable: ident++ in handler', { 'a.js': 'var n = 0; window.addEventListener("message", function(e) { n++; if (n > 5) { document.getElementById("o").innerHTML = e.data; } });' }, 1);
 
