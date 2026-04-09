@@ -3922,7 +3922,10 @@
       // instantiateFunction walks the body with calling context —
       // taint findings are valid here (unlike definition-time walks).
       var savedTaintFnDepth = taintFnDepth;
-      taintFnDepth = 0;
+      // Only enable findings (taintFnDepth=0) when called from the main
+      // walk. Inside definition-time body walks (taintFnDepth > 0),
+      // nested instantiateFunction calls stay suppressed.
+      if (savedTaintFnDepth === 0) taintFnDepth = 0;
       const savedTks = tks;
       tks = tokens;
       for (let p = 0; p < fn.params.length; p++) {
