@@ -3293,6 +3293,14 @@ function render() {
   checkTaint('filter tainted', { 'a.js': 'var items = ["safe", location.search]; var filtered = items.filter(function(x){ return x.length > 0; }); document.getElementById("o").innerHTML = filtered[0];' }, 1);
   checkTaint('filter safe', { 'a.js': 'var items = ["a", "b"]; var filtered = items.filter(function(x){ return x.length > 0; }); document.getElementById("o").innerHTML = filtered[0];' }, 0);
 
+  // --- for-in / for-of / comma / try-finally ---
+  checkTaint('for-in obj values', { 'a.js': 'var obj={a:location.search}; var s=""; for(var k in obj){s+=obj[k];} document.getElementById("o").innerHTML=s;' }, 1);
+  checkTaint('for-of array', { 'a.js': 'var arr=[location.search]; for(var x of arr){document.getElementById("o").innerHTML=x;}' }, 1);
+  checkTaint('comma operator', { 'a.js': 'var x=(0,location.search); document.getElementById("o").innerHTML=x;' }, 1);
+  checkTaint('try-finally no catch', { 'a.js': 'var x; try{x=location.search;}finally{} document.getElementById("o").innerHTML=x;' }, 1);
+  checkTaint('comparison no false positive', { 'a.js': 'var x=location.search.length>0; document.getElementById("o").innerHTML=x;' }, 0);
+  checkTaint('equality no false positive', { 'a.js': 'var x=location.search==="admin"; document.getElementById("o").innerHTML=x;' }, 0);
+
   // --- Object property mutation ---
   checkTaint('obj.prop = tainted', { 'a.js': 'var state = { msg: "" }; state.msg = location.search; document.getElementById("o").innerHTML = state.msg;' }, 1);
   checkTaint('obj prop via handler', { 'a.js': 'var state = { msg: "" }; window.addEventListener("message", function(e) { state.msg = e.data; }); function render() { document.getElementById("o").innerHTML = state.msg; } render();' }, 2);

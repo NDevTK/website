@@ -2422,9 +2422,15 @@
             // For taint: collect taint from ALL array elements since
             // any element could be accessed at runtime.
             var _elemTaintSources = [];
-            if (taintEnabled && bind && bind.kind === 'array') {
-              for (var _ei = 0; _ei < bind.elems.length; _ei++) {
-                if (bind.elems[_ei] && bind.elems[_ei].kind === 'chain') _elemTaintSources.push(bind.elems[_ei].toks);
+            if (taintEnabled && bind) {
+              if (bind.kind === 'array') {
+                for (var _ei = 0; _ei < bind.elems.length; _ei++) {
+                  if (bind.elems[_ei] && bind.elems[_ei].kind === 'chain') _elemTaintSources.push(bind.elems[_ei].toks);
+                }
+              } else if (bind.kind === 'object') {
+                for (var _ok in bind.props) {
+                  if (bind.props[_ok] && bind.props[_ok].kind === 'chain') _elemTaintSources.push(bind.props[_ok].toks);
+                }
               }
             }
             const baseText = bind.kind === 'chain' && bind.toks.length === 1 && bind.toks[0].type === 'other'
@@ -2913,11 +2919,20 @@
       }
       if (t.type === 'regex') return { bind: chainBinding([exprRef(t.text)]), next: k + 1 };
       if (t.type === 'open' && t.char === '(') {
-        const r = readConcatExpr(k + 1, stop, { sep: [], close: [')'] });
-        if (!r) return null;
-        const rp = tks[r.next];
+        // Handle comma operator: (expr1, expr2, ..., exprN) → value is exprN.
+        var _lastToks = null, _parenNext = k + 1;
+        while (_parenNext < stop) {
+          var _pr = readConcatExpr(_parenNext, stop, { sep: [','], close: [')'] });
+          if (!_pr) break;
+          _lastToks = _pr.toks;
+          _parenNext = _pr.next;
+          if (tks[_parenNext] && tks[_parenNext].type === 'sep' && tks[_parenNext].char === ',') { _parenNext++; continue; }
+          break;
+        }
+        if (!_lastToks) return null;
+        const rp = tks[_parenNext];
         if (!rp || rp.type !== 'close' || rp.char !== ')') return null;
-        return { bind: chainBinding(r.toks), next: r.next + 1 };
+        return { bind: chainBinding(_lastToks), next: _parenNext + 1 };
       }
       if (t.type === 'open' && t.char === '[') {
         const a = readArrayLit(k, stop);
@@ -3546,6 +3561,10 @@
       const rt = chainAsExprText(right);
       if (lt === null || rt === null) return null;
       const text = '(' + lt + ' ' + op + ' ' + rt + ')';
+      // Comparison and logical operators produce booleans — taint doesn't
+      // propagate because the result is true/false, not attacker content.
+      const _boolOps = { '<':1, '>':1, '<=':1, '>=':1, '==':1, '!=':1, '===':1, '!==':1, 'in':1, 'instanceof':1 };
+      if (_boolOps[op]) return chainBinding([exprRef(text)]);
       return chainBinding([deriveExprRef(text, left.toks, right.toks)]);
     };
 
@@ -4155,10 +4174,16 @@
               if (!(name in tryBindings)) tryBindings[name] = stack[si].bindings[name];
             }
           }
+          // If no catch block, try body state persists — skip restore/merge.
+          if (catchStart < 0) {
+            if (finallyStart >= 0) walkRange(finallyStart, finallyEnd);
+            i = k - 1;
+            continue;
+          }
           // Restore and walk catch body.
           for (const name in snapshot) assignName(name, snapshot[name]);
           const lvBefore2 = loopVars.length;
-          if (catchStart >= 0) walkRange(catchStart, catchEnd);
+          walkRange(catchStart, catchEnd);
           const catchLoopVars = loopVars.splice(lvBefore2);
           const catchBindings = Object.create(null);
           for (let si = stack.length - 1; si >= 0; si--) {
@@ -4435,6 +4460,37 @@
               }
               bodyEnd = k;
             }
+            // for-in / for-of: resolve iterable and store taint info
+            // so the loop frame binding can carry it (set after frame push below).
+            var _forInOfTaint = null;
+            if (taintEnabled) {
+              for (var _fi = i + 2; _fi < j; _fi++) {
+                if (tokens[_fi].type === 'other' && (tokens[_fi].text === 'in' || tokens[_fi].text === 'of')) {
+                  var _forInOf = tokens[_fi].text;
+                  var _fiVarStart = i + 2;
+                  if (tokens[_fiVarStart].type === 'other' && (tokens[_fiVarStart].text === 'var' || tokens[_fiVarStart].text === 'let' || tokens[_fiVarStart].text === 'const')) _fiVarStart++;
+                  var _fiVarName = tokens[_fiVarStart] && IDENT_RE.test(tokens[_fiVarStart].text) ? tokens[_fiVarStart].text : null;
+                  if (_fiVarName) {
+                    var _fiExprVal = readValue(_fi + 1, j, null);
+                    var _fiIterBind = _fiExprVal ? _fiExprVal.binding : null;
+                    var _fiTaintSources = [];
+                    if (_fiIterBind && _fiIterBind.kind === 'array') {
+                      for (var _fie = 0; _fie < _fiIterBind.elems.length; _fie++) {
+                        if (_fiIterBind.elems[_fie] && _fiIterBind.elems[_fie].kind === 'chain') _fiTaintSources.push(_fiIterBind.elems[_fie].toks);
+                      }
+                    } else if (_fiIterBind && _fiIterBind.kind === 'object' && _forInOf === 'of') {
+                      for (var _fip in _fiIterBind.props) {
+                        if (_fiIterBind.props[_fip] && _fiIterBind.props[_fip].kind === 'chain') _fiTaintSources.push(_fiIterBind.props[_fip].toks);
+                      }
+                    } else if (_fiIterBind && _fiIterBind.kind === 'chain') {
+                      _fiTaintSources.push(_fiIterBind.toks);
+                    }
+                    if (_fiTaintSources.length) _forInOfTaint = { varName: _fiVarName, sources: _fiTaintSources };
+                  }
+                  break;
+                }
+              }
+            }
             // Collect variables mutated in the loop body (=, +=, ++, --)
             // so we don't resolve them in the header to their initial value.
             var mutatedInBody = new Set();
@@ -4541,6 +4597,10 @@
               }
             }
             stack.push(loopFrame);
+            // Apply for-in/for-of taint to the loop frame binding.
+            if (_forInOfTaint && loopFrame.bindings[_forInOfTaint.varName]) {
+              loopFrame.bindings[_forInOfTaint.varName] = chainBinding([deriveExprRef.apply(null, [_forInOfTaint.varName].concat(_forInOfTaint.sources))]);
+            }
             loopStack.push({
               id, kind: t.text, headerSrc, bodyEnd, frame: loopFrame,
               modifiedVars: new Set(),
