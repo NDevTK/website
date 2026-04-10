@@ -11024,6 +11024,10 @@
     convertProject: convertProject,
     convertJsFile: convertJsFile,
     convertHtmlMarkup: convertHtmlMarkup,
+    // Diagnostics / extraction (exposed for htmldom-convert facade)
+    extractHTML: extractHTML,
+    extractAllHTML: extractAllHTML,
+    extractAllDOM: extractAllDOM,
     // Taint analysis
     traceTaint: traceTaint,
     traceTaintInJs: traceTaintInJs,

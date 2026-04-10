@@ -37,10 +37,25 @@
     window._monacoIn = editor;
     window._monacoOut = { setValue: function() {}, getValue: function() { return ''; } };
 
-    // Load htmldom.js.
-    var s = document.createElement('script');
-    s.src = 'htmldom.js';
-    document.body.appendChild(s);
+    // Load jsanalyze-schemas first (needed by the bindingToValue
+    // seam inside htmldom.js). Then htmldom.js (which contains the
+    // walker + legacy converter). Then the jsanalyze consumer
+    // wrappers so page scripts can reach them as globals.
+    function appendScript(src, onload) {
+      var s = document.createElement('script');
+      s.src = src;
+      if (onload) s.onload = onload;
+      document.body.appendChild(s);
+    }
+    appendScript('jsanalyze-schemas.js', function () {
+      appendScript('htmldom.js', function () {
+        appendScript('jsanalyze-query.js');
+        appendScript('htmldom-convert.js');
+        appendScript('fetch-trace.js');
+        appendScript('taint-report.js');
+        appendScript('csp-derive.js');
+      });
+    });
 
     // --- State ---
     // Start with the example as a single file.

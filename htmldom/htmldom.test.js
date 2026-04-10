@@ -44,6 +44,7 @@ const JsAnalyzeQuery = require(path.join(__dirname, 'jsanalyze-query.js'));
 const FetchTrace = require(path.join(__dirname, 'fetch-trace.js'));
 const TaintReport = require(path.join(__dirname, 'taint-report.js'));
 const CspDerive = require(path.join(__dirname, 'csp-derive.js'));
+const HtmldomConvert = require(path.join(__dirname, 'htmldom-convert.js'));
 
 // Test harness.
 let pass = 0;
@@ -4687,6 +4688,78 @@ await (async function () {
     if (!cspPolicy['connect-src'].includes("'self'")) return 'connect-src missing self';
     if (!cspPolicy['report-unsafe-inline']) return 'unsafe-inline not flagged';
 
+    return null;
+  });
+
+  console.log(`  (${pass + fail - before} cases)`);
+})();
+
+// -----------------------------------------------------------------------
+// htmldom-convert facade (Stage 4a: consumer interface)
+// -----------------------------------------------------------------------
+await (async function () {
+  const hc = HtmldomConvert;
+  const before = pass + fail;
+  console.log('\nhtmldom-convert facade');
+  console.log('----------------------');
+
+  async function checkFacade(name, fn) {
+    try {
+      const err = await fn();
+      if (err) {
+        fail++;
+        failures.push({ name, want: 'valid', got: err, input: 'facade' });
+      } else {
+        pass++;
+      }
+    } catch (e) {
+      fail++;
+      failures.push({ name, want: 'no throw', got: 'threw: ' + e.message, input: 'facade' });
+    }
+  }
+
+  await checkFacade('convertJsFile: basic innerHTML', async () => {
+    const out = await hc.convertJsFile(`document.getElementById("o").innerHTML = "<b>hi</b>";`);
+    if (!/createElement/.test(out)) return 'no createElement in output';
+    if (/innerHTML\s*=/.test(out)) return 'innerHTML still present';
+    return null;
+  });
+
+  await checkFacade('convertJsFile: null for non-innerHTML source', async () => {
+    // convertJsFile returns null (no-op) when there's no innerHTML
+    // to convert. Documented behaviour; matches the test-harness
+    // expectations.
+    const out = await hc.convertJsFile(`var x = 1 + 2; console.log(x);`);
+    if (out !== null) return 'expected null for non-innerHTML, got ' + JSON.stringify(out);
+    return null;
+  });
+
+  await checkFacade('convertProject: HTML + JS', async () => {
+    const files = {
+      'index.html': '<html><body><div id="out"></div><script src="app.js"></script></body></html>',
+      'app.js': 'document.getElementById("out").innerHTML = "<p>X</p>";',
+    };
+    const out = await hc.convertProject(files);
+    if (!out['app.js']) return 'app.js missing from output';
+    if (!/createElement/.test(out['app.js'])) return 'no createElement in converted JS';
+    return null;
+  });
+
+  await checkFacade('extractAllDOM: simple element', async () => {
+    const dom = await hc.extractAllDOM(`var el = document.createElement("span"); el.textContent = "hi";`);
+    if (dom.elements.length !== 1) return 'expected 1 element, got ' + dom.elements.length;
+    return null;
+  });
+
+  await checkFacade('extractAllHTML: single innerHTML', async () => {
+    const all = await hc.extractAllHTML(`document.getElementById("o").innerHTML = "<b>a</b>";`);
+    if (!Array.isArray(all)) return 'expected array';
+    if (all.length !== 1) return 'expected 1 extraction, got ' + all.length;
+    return null;
+  });
+
+  await checkFacade('facade exposes schemaVersion', async () => {
+    if (!hc.schemaVersion) return 'missing schemaVersion';
     return null;
   });
 
