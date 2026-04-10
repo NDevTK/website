@@ -2103,14 +2103,36 @@
       if (!taintEnabled) return;
       var k0 = _mayBeKey(name);
       if (!k0) return;
-      if (!_varMayBe[k0]) _varMayBe[k0] = { vals: [], keys: Object.create(null), complete: true };
+      if (!_varMayBe[k0]) _varMayBe[k0] = { vals: [], keys: Object.create(null), complete: true, fns: null, fnIds: null };
       var slot = _varMayBe[k0];
-      if (slot.complete === false) return; // already poisoned, don't bother
+      // Function-typed assignments are tracked separately so the
+      // walker's indirect-call dispatch can walk EVERY function the
+      // variable may resolve to. This is the call-target may-be set;
+      // it doesn't contribute to the SMT disjunction (functions can't
+      // be encoded as Z3 literals) but it lets us drive the
+      // interprocedural analysis through dispatcher patterns.
+      if (binding && binding.kind === 'function') {
+        if (!slot.fns) { slot.fns = []; slot.fnIds = Object.create(null); }
+        var fkey = binding.bodyStart + ':' + binding.bodyEnd;
+        if (!slot.fnIds[fkey]) {
+          slot.fnIds[fkey] = true;
+          slot.fns.push(binding);
+          if (slot.fns.length > 32) {
+            // Cap to prevent runaway re-walks. Beyond this many call
+            // targets the precision win is marginal anyway.
+            slot.fns = slot.fns.slice(0, 32);
+          }
+        }
+        return;
+      }
+      if (slot.complete === false) return; // already poisoned for SMT
       // Encode the assignment to detect duplicates and check encodability.
       var lit = _bindingToConcreteLit(binding);
       if (!lit) {
         // Opaque / tainted / multi-token / non-chain assignment —
-        // the may-be set can no longer enumerate every reachable value.
+        // the may-be set can no longer enumerate every reachable value
+        // for SMT purposes. (Function entries in slot.fns are still
+        // valid; we only poison the SMT side.)
         slot.complete = false;
         slot.vals = null; // free, no longer needed
         slot.keys = null;
@@ -2128,6 +2150,17 @@
         slot.vals = null;
         slot.keys = null;
       }
+    }
+    // Look up the function may-be set for a call target identifier.
+    // Returns the array of function bindings the variable may resolve
+    // to, or null if no function entries are tracked.
+    function _funcMayBeFor(name) {
+      if (!_varMayBe) return null;
+      var k = _mayBeKey(name);
+      if (!k) return null;
+      var slot = _varMayBe[k];
+      if (!slot || !slot.fns || slot.fns.length === 0) return null;
+      return slot.fns;
     }
     // Track function scope depth for taint. Findings inside function
     // bodies walked at definition time (not via instantiateFunction)
@@ -6664,11 +6697,53 @@
             var callArgs = await readCallArgBindings(i + 1, stop);
             if (callArgs) {
               await instantiateFunction(calleeBind, callArgs.bindings);
+              // Indirect-call may-be: if the callee variable was also
+              // assigned OTHER function values (e.g. `var f = cond ? a : b`
+              // or sequential reassignment from different code paths),
+              // walk every alternative target. Without this, only the
+              // single binding the walker happens to see at this point
+              // gets analysed — anything assigned earlier is missed.
+              if (taintEnabled) {
+                var _altTargets = _funcMayBeFor(t.text);
+                if (_altTargets) {
+                  for (var _ati = 0; _ati < _altTargets.length; _ati++) {
+                    if (_altTargets[_ati] !== calleeBind) {
+                      await instantiateFunction(_altTargets[_ati], callArgs.bindings);
+                      // Register for the phase-2 fixpoint so the
+                      // alternative target's body sees mutations from
+                      // every other callback.
+                      if (_pendingCallbacks) {
+                        _pendingCallbacks.push({ fn: _altTargets[_ati], params: callArgs.bindings, isEventHandler: false });
+                      }
+                    }
+                  }
+                }
+              }
               i = callArgs.next - 1;
               if (taintEnabled && TAINT_CALL_SINKS[t.text] && !declaredNames.has(t.text.split('.')[0])) {
                 checkSinkCall(t.text, callArgs.bindings, t);
               }
               continue;
+            }
+          }
+          // Indirect call: the variable resolves to something that
+          // isn't a known function binding (e.g. a chain produced by a
+          // ternary), but the may-be lattice tracked function targets
+          // assigned to it. Walk all of them.
+          if (taintEnabled && (!calleeBind || calleeBind.kind !== 'function')) {
+            var _icTargets = _funcMayBeFor(t.text);
+            if (_icTargets && _icTargets.length > 0) {
+              var _icArgs = await readCallArgBindings(i + 1, stop);
+              if (_icArgs) {
+                for (var _ici = 0; _ici < _icTargets.length; _ici++) {
+                  await instantiateFunction(_icTargets[_ici], _icArgs.bindings);
+                  if (_pendingCallbacks) {
+                    _pendingCallbacks.push({ fn: _icTargets[_ici], params: _icArgs.bindings, isEventHandler: false });
+                  }
+                }
+                i = _icArgs.next - 1;
+                continue;
+              }
             }
           }
           // Taint: even if callee isn't inlinable, check if it's a call-based sink.

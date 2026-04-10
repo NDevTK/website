@@ -3549,6 +3549,19 @@ await (async function () {
   await checkTaint('mayBe nested alias: write x.v read deep',
     { 'a.js': 'var obj = {inner: {v: "init"}}; var x = obj.inner; window.addEventListener("hashchange", function() { x.v = "X"; }); window.addEventListener("message", function(e) { if (obj.inner.v === "X") document.getElementById("o").innerHTML = e.data; });' }, 1);
 
+  // --- Indirect call dispatch via function may-be ---
+  // The may-be lattice tracks function bindings as call targets
+  // (slot.fns) alongside literal values (slot.vals). When `f()` is
+  // called, the walker walks every function the variable may resolve
+  // to — whether it was reassigned sequentially, written from
+  // different branches, or set in a callback.
+  await checkTaint('indirect call: reassign sees both targets',
+    { 'a.js': 'function safe() {} function unsafe() { document.getElementById("o").innerHTML = location.search; } var f = safe; f = unsafe; f();' }, 1);
+  await checkTaint('indirect call: if-else split',
+    { 'a.js': 'function a() {} function b() { document.getElementById("o").innerHTML = location.search; } var f; if (Math.random()) { f = a; } else { f = b; } f();' }, 1);
+  await checkTaint('indirect call: single safe target stays safe',
+    { 'a.js': 'function safe() {} var f = safe; f();' }, 0);
+
   // --- IIFE ---
   await checkTaint('IIFE function', { 'a.js': '(function() { document.getElementById("o").innerHTML = location.search; })();' }, 1);
   await checkTaint('IIFE with args', { 'a.js': '(function(x) { document.getElementById("o").innerHTML = x; })(location.search);' }, 1);
