@@ -255,7 +255,7 @@
       } else if (t.type === 'trycatch') {
         merge(collectChainTaint(t.tryBody));
         merge(collectChainTaint(t.catchBody));
-      } else if (t.type === 'switch' && t.branches) {
+      } else if ((t.type === 'switch' || t.type === 'switchjoin') && t.branches) {
         for (var bi = 0; bi < t.branches.length; bi++) {
           merge(collectChainTaint(t.branches[bi].chain));
         }
@@ -2061,6 +2061,14 @@
     // monotone (values only ever join in, never leave) so
     // convergence is guaranteed in a bounded number of iterations.
     const _varMayBe = Object.create(null);
+    // Active for-of / for-in loop variable names. When the body's
+    // walker assigns `s = loopVar`, the RHS resolves to an opaque
+    // `other:loopVar` reference — without a guard, that would
+    // poison `s`'s may-be slot. Loop handlers add the loop var name
+    // on entry and remove it on exit; _trackMayBeAssign checks the
+    // set and skips the opaque self-reference so the pre-populated
+    // per-element values aren't clobbered.
+    const _activeForOfVars = new Set();
     function _bindingToConcreteLit(b) {
       // Returns null if the binding cannot be expressed as a single
       // SMT-LIB literal. Returns { lit, sort } otherwise where sort
@@ -2129,6 +2137,15 @@
         }
         return;
       }
+      // If the RHS is an opaque ref to an active for-of loop variable,
+      // skip — we've pre-populated every iteration's concrete value
+      // via the for-of pre-scan and don't want to poison the slot
+      // with the body walker's symbolic view.
+      if (binding && binding.kind === 'chain' && binding.toks.length === 1 &&
+          binding.toks[0].type === 'other' &&
+          _activeForOfVars.has(binding.toks[0].text)) {
+        return;
+      }
       if (slot.complete === false) return; // already poisoned for SMT
       // Expand a conditional chain `(cond) ? a : b` into two separate
       // may-be entries — both branches are reachable values. Without
@@ -2139,6 +2156,26 @@
         var _condTok = binding.toks[0];
         if (_condTok.ifTrue) _trackMayBeAssign(name, chainBinding(_condTok.ifTrue));
         if (_condTok.ifFalse) _trackMayBeAssign(name, chainBinding(_condTok.ifFalse));
+        return;
+      }
+      // Same treatment for `trycatch` tokens (try/catch merge) and
+      // `switchcase` tokens (switch merge): both are two-alternative
+      // join tokens and every alternative is a reachable runtime value.
+      if (binding && binding.kind === 'chain' && binding.toks.length === 1 && binding.toks[0].type === 'trycatch') {
+        var _tcTok = binding.toks[0];
+        if (_tcTok.tryBody) _trackMayBeAssign(name, chainBinding(_tcTok.tryBody));
+        if (_tcTok.catchBody) _trackMayBeAssign(name, chainBinding(_tcTok.catchBody));
+        return;
+      }
+      if (binding && binding.kind === 'chain' && binding.toks.length === 1 &&
+          (binding.toks[0].type === 'switch' || binding.toks[0].type === 'switchjoin')) {
+        var _scTok = binding.toks[0];
+        if (_scTok.branches) {
+          for (var _sci = 0; _sci < _scTok.branches.length; _sci++) {
+            var _sCase = _scTok.branches[_sci];
+            if (_sCase && _sCase.chain) _trackMayBeAssign(name, chainBinding(_sCase.chain));
+          }
+        }
         return;
       }
       // Encode the assignment to detect duplicates and check encodability.
@@ -4517,7 +4554,27 @@
     // Invoke a function binding with a list of argument chains (token lists).
     // Pushes a temporary scope with param→arg bindings, parses the body
     // expression in the original token array, then pops the scope.
+    // Recursion / depth guard for instantiateFunction. Each entry is
+    // the function body range `"<bodyStart>:<bodyEnd>"`. The analyser
+    // walks a function body symbolically once it sees the same body
+    // already live on the call stack and returns a conservative
+    // opaque chain so recursive calls (direct, indirect, or mutual)
+    // don't unbound the walker. An absolute depth cap catches
+    // non-recursive but pathologically deep call graphs.
+    const _callStack = [];
+    const _CALL_STACK_MAX = 64;
     const instantiateFunction = async (fn, argBindings, thisBinding) => {
+      var _fnKey = (fn && fn.bodyStart != null) ? (fn.bodyStart + ':' + fn.bodyEnd) : null;
+      // Detect recursion: the same function body is already being
+      // walked. Return null so the caller falls back to its own
+      // opaque-call handling (which preserves the original source
+      // text and computes taint from the argument bindings). This
+      // prevents runaway recursive walks, mutual recursion, and
+      // pathological graphs from unbounding the analyser without
+      // polluting the output with synthetic tokens.
+      if (_fnKey && _callStack.indexOf(_fnKey) >= 0) return null;
+      if (_callStack.length >= _CALL_STACK_MAX) return null;
+      if (_fnKey) _callStack.push(_fnKey);
       // Closure capture: push any captured-scope frames (by reference)
       // that aren't already on the live stack, so reads of outer
       // variables resolve through the closure. We push only
@@ -4660,6 +4717,8 @@
         var _top = stack[stack.length - 1];
         if (_top === _pushedCaptureFrames[_pc]) stack.pop();
       }
+      // Pop recursion guard entry for this invocation.
+      if (_fnKey && _callStack[_callStack.length - 1] === _fnKey) _callStack.pop();
       // Expand any loopVars created during the function body walk.
       if (result && fnLoopVars && fnLoopVars.length > 0) {
         const lvByName = Object.create(null);
@@ -5069,6 +5128,21 @@
           if (tt !== null && ft !== null) return '(' + t.condExpr + ' ? ' + tt + ' : ' + ft + ')';
           return null;
         }
+        if (t.type === 'trycatch') {
+          const tb = chainAsExprText(chainBinding(t.tryBody));
+          const cb = chainAsExprText(chainBinding(t.catchBody));
+          if (tb !== null && cb !== null) return '(try ' + tb + ' catch ' + cb + ')';
+          return null;
+        }
+        if ((t.type === 'switch' || t.type === 'switchjoin') && t.branches) {
+          var _brParts = [];
+          for (var _bi = 0; _bi < t.branches.length; _bi++) {
+            var _brT = chainAsExprText(chainBinding(t.branches[_bi].chain));
+            if (_brT === null) return null;
+            _brParts.push(_brT);
+          }
+          return '(switch ' + _brParts.join(' | ') + ')';
+        }
         return null;
       };
       if (chain.toks.length === 1) return renderTok(chain.toks[0]);
@@ -5393,13 +5467,17 @@
       const ctx = _task.ctx;
       const elseLoopVars = loopVars.splice(ctx.lvBefore2);
       const elseBindings = _snapshotBindings();
+      // Track which names were merged as cond tokens by the first
+      // loop so the second loop's opaque fallback doesn't overwrite
+      // them (and poison the may-be lattice with an exprRef).
+      const _mergedAsCond = new Set();
       for (const name in ctx.ifBindings) {
         const ifB = ctx.ifBindings[name];
         const elB = elseBindings[name] || _task.snapshot[name];
         if (!ifB || ifB.kind !== 'chain' || !elB || elB.kind !== 'chain') continue;
         const ifFull = _expandBindWithLVs(ifB, ctx.ifLoopVars);
         const elFull = _expandBindWithLVs(elB, elseLoopVars);
-        if (JSON.stringify(ifFull) === JSON.stringify(elFull)) continue;
+        if (JSON.stringify(ifFull) === JSON.stringify(elFull)) { _mergedAsCond.add(name); continue; }
         const snapB = _task.snapshot[name];
         if (snapB && snapB.kind === 'chain') {
           const snapFull = snapB.toks;
@@ -5414,10 +5492,12 @@
           if (currentLoopId !== null) condTok.loopId = currentLoopId;
           assignName(name, (!ifAppended || !elAppended) ? chainBinding([condTok]) : chainBinding([...snapB.toks, SYNTH_PLUS, condTok]));
           if (loopStack.length > 0) loopStack[loopStack.length - 1].modifiedVars.add(name);
+          _mergedAsCond.add(name);
         }
       }
       for (const name in ctx.ifBindings) {
         if (trackBuildVar && trackBuildVar.has(name)) continue;
+        if (_mergedAsCond.has(name)) continue;
         const ifB = ctx.ifBindings[name], elB = elseBindings[name] || _task.snapshot[name];
         if (ifB === elB || JSON.stringify(ifB) === JSON.stringify(elB)) continue;
         assignName(name, chainBinding([deriveExprRef(name, ifB && ifB.kind === 'chain' ? ifB.toks : null, elB && elB.kind === 'chain' ? elB.toks : null)]));
@@ -5466,9 +5546,12 @@
         const catchFull = _expandBindWithLVs(catchB, catchLoopVars);
         if (JSON.stringify(tryFull) === JSON.stringify(catchFull)) continue;
         const snapB = _task.snapshot[name];
-        if (!snapB || snapB.kind !== 'chain') {
-          assignName(name, chainBinding([deriveExprRef(name, tryB.toks, catchB.toks)]));
-        } else if (trackBuildVar && trackBuildVar.has(name)) {
+        // Always emit a `trycatch` join token so the may-be lattice
+        // can split it into both reachable branches. The build-var
+        // path still gets its full snapshot-appended form for
+        // serialization; non-build vars get the bare trycatch token
+        // which _trackMayBeAssign expands into tryBody / catchBody.
+        if (snapB && snapB.kind === 'chain' && trackBuildVar && trackBuildVar.has(name)) {
           const snapFull = snapB.toks;
           const tryAppended = chainStartsWith(tryFull, snapFull);
           const catchAppended = chainStartsWith(catchFull, snapFull);
@@ -5478,7 +5561,8 @@
           if (tryAppended && catchAppended) assignName(name, chainBinding([...snapB.toks, SYNTH_PLUS, tryCatchTok]));
           else assignName(name, chainBinding([tryCatchTok]));
         } else {
-          assignName(name, chainBinding([deriveExprRef(name, tryB.toks, catchB.toks)]));
+          var _tcFullTok = { type: 'trycatch', tryBody: tryFull, catchBody: catchFull, catchParam: _task.catchParam };
+          assignName(name, chainBinding([_tcFullTok]));
         }
       }
       if (_task.finallyStart >= 0) _ws.push({ type: 'range', start: _task.finallyStart, end: _task.finallyEnd });
@@ -5568,9 +5652,20 @@
         if (b && (!snap || JSON.stringify(b) !== JSON.stringify(snap))) switchChanged.add(name);
       }
       for (const name of switchChanged) {
-        var _swToks = [];
-        for (var _cr of caseResults) if (_cr.bindings[name] && _cr.bindings[name].kind === 'chain') _swToks.push(_cr.bindings[name].toks);
-        assignName(name, chainBinding([deriveExprRef.apply(null, [name].concat(_swToks))]));
+        // Emit a `switchjoin` token with one entry per case's chain
+        // so _trackMayBeAssign can split each branch into a separate
+        // may-be lattice entry. This lets post-switch refutations
+        // over values never assigned in any case fire properly.
+        var _swBranches = [];
+        for (var _cr of caseResults) {
+          if (_cr.bindings[name] && _cr.bindings[name].kind === 'chain') {
+            _swBranches.push({ label: _cr.label, caseExpr: _cr.caseExpr, chain: _cr.bindings[name].toks });
+          }
+        }
+        if (_swBranches.length) {
+          var _swTok = { type: 'switchjoin', discExpr: _task.discExpr || '/* switch */', branches: _swBranches };
+          assignName(name, chainBinding([_swTok]));
+        }
       }
       _ws.push({ type: 'range', start: _task.switchEnd, end: _task.resumeEnd });
       continue;
@@ -5585,6 +5680,9 @@
       // as a named variable rather than inlining the one-iteration chain.
       while (loopStack.length > 0 && i >= loopStack[loopStack.length - 1].bodyEnd) {
         const entry = loopStack.pop();
+        // Release the for-of loop var guard so subsequent lattice
+        // updates to unrelated vars aren't accidentally suppressed.
+        if (entry.forOfVarName) _activeForOfVars.delete(entry.forOfVarName);
         // Pop enhanced constraints first (reverse order of push).
         if (entry.extraFormulas && entry.extraFormulas.length) {
           for (var _ef = entry.extraFormulas.length - 1; _ef >= 0; _ef--) {
@@ -6189,7 +6287,13 @@
             }
             // for-in / for-of: resolve iterable and store taint info
             // so the loop frame binding can carry it (set after frame push below).
+            // When the iterable has concrete entries, also stash each
+            // entry so we can pre-populate the may-be lattice for any
+            // variable simply assigned from the loop variable inside
+            // the body (e.g. `var s; for (var v of ["a","b"]) { s = v; }`).
             var _forInOfTaint = null;
+            var _forInOfKnownValues = null;
+            var _forInOfLoopVarName = null;
             if (taintEnabled) {
               for (var _fi = i + 2; _fi < j; _fi++) {
                 if (tokens[_fi].type === 'other' && (tokens[_fi].text === 'in' || tokens[_fi].text === 'of')) {
@@ -6198,21 +6302,37 @@
                   if (tokens[_fiVarStart].type === 'other' && (tokens[_fiVarStart].text === 'var' || tokens[_fiVarStart].text === 'let' || tokens[_fiVarStart].text === 'const')) _fiVarStart++;
                   var _fiVarName = tokens[_fiVarStart] && IDENT_RE.test(tokens[_fiVarStart].text) ? tokens[_fiVarStart].text : null;
                   if (_fiVarName) {
+                    _forInOfLoopVarName = _fiVarName;
                     var _fiExprVal = await readValue(_fi + 1, j, null);
                     var _fiIterBind = _fiExprVal ? _fiExprVal.binding : null;
                     var _fiTaintSources = [];
+                    var _fiKnownVals = [];
                     if (_fiIterBind && _fiIterBind.kind === 'array') {
                       for (var _fie = 0; _fie < _fiIterBind.elems.length; _fie++) {
-                        if (_fiIterBind.elems[_fie] && _fiIterBind.elems[_fie].kind === 'chain') _fiTaintSources.push(_fiIterBind.elems[_fie].toks);
+                        var _fiElem = _fiIterBind.elems[_fie];
+                        if (_fiElem && _fiElem.kind === 'chain') {
+                          _fiTaintSources.push(_fiElem.toks);
+                          _fiKnownVals.push(_fiElem);
+                        }
+                      }
+                    } else if (_fiIterBind && _fiIterBind.kind === 'object' && _forInOf === 'in') {
+                      // for-in over object literal: loop var takes each
+                      // property NAME in turn (not the value).
+                      for (var _fip in _fiIterBind.props) {
+                        _fiKnownVals.push(chainBinding([makeSynthStr(_fip)]));
                       }
                     } else if (_fiIterBind && _fiIterBind.kind === 'object' && _forInOf === 'of') {
-                      for (var _fip in _fiIterBind.props) {
-                        if (_fiIterBind.props[_fip] && _fiIterBind.props[_fip].kind === 'chain') _fiTaintSources.push(_fiIterBind.props[_fip].toks);
+                      for (var _fipv in _fiIterBind.props) {
+                        if (_fiIterBind.props[_fipv] && _fiIterBind.props[_fipv].kind === 'chain') {
+                          _fiTaintSources.push(_fiIterBind.props[_fipv].toks);
+                          _fiKnownVals.push(_fiIterBind.props[_fipv]);
+                        }
                       }
                     } else if (_fiIterBind && _fiIterBind.kind === 'chain') {
                       _fiTaintSources.push(_fiIterBind.toks);
                     }
                     if (_fiTaintSources.length) _forInOfTaint = { varName: _fiVarName, sources: _fiTaintSources };
+                    if (_fiKnownVals.length) _forInOfKnownValues = _fiKnownVals;
                   }
                   break;
                 }
@@ -6362,6 +6482,36 @@
             // Apply for-in/for-of taint to the loop frame binding.
             if (_forInOfTaint && loopFrame.bindings[_forInOfTaint.varName]) {
               loopFrame.bindings[_forInOfTaint.varName] = chainBinding([deriveExprRef.apply(null, [_forInOfTaint.varName].concat(_forInOfTaint.sources))]);
+            }
+            // Pre-populate the may-be lattice for variables assigned
+            // from the for-of/for-in loop variable. For a body like
+            // `s = v` where `v` is the loop variable and the iterable
+            // is a known array, feed every element's value into `s`'s
+            // slot so post-loop refutations over values the loop
+            // never produces fire correctly. Only handles simple
+            // `IDENT = loopVar` assignments — compound RHS (e.g.
+            // `s = v + "x"`) stays opaque on the slot.
+            if (taintEnabled && _forInOfKnownValues && _forInOfLoopVarName) {
+              for (var _asi = j + 1; _asi < bodyEnd; _asi++) {
+                var _ast = tokens[_asi];
+                if (_ast && _ast.type === 'other' && IDENT_RE.test(_ast.text) && _ast.text !== _forInOfLoopVarName) {
+                  var _aeq = tokens[_asi + 1];
+                  var _avar = tokens[_asi + 2];
+                  var _aend = tokens[_asi + 3];
+                  if (_aeq && _aeq.type === 'sep' && _aeq.char === '=' &&
+                      _avar && _avar.type === 'other' && _avar.text === _forInOfLoopVarName &&
+                      _aend && _aend.type === 'sep' && _aend.char === ';') {
+                    for (var _afv = 0; _afv < _forInOfKnownValues.length; _afv++) {
+                      _trackMayBeAssign(_ast.text, _forInOfKnownValues[_afv]);
+                    }
+                  }
+                }
+              }
+              // Suppress the body walker's opaque `loopVar` assignments
+              // into the may-be lattice — the pre-population above has
+              // already fed every concrete value, and letting the body
+              // walk add `other:v` would poison the slot.
+              _activeForOfVars.add(_forInOfLoopVarName);
             }
             // ---------- Enhanced SMT path constraints for loops ----------
             // (a) for-of / for-in: push `<iter>.length > 0` so nested
@@ -6518,6 +6668,9 @@
               condExpr: _loopCondExpr,
               extraFormulas: _extraLoopFormulas,
               extraExprs: _extraLoopExprs,
+              // Carry for-of loop var name so the cleanup at loop
+              // exit can pop it out of _activeForOfVars.
+              forOfVarName: _forInOfKnownValues && _forInOfLoopVarName ? _forInOfLoopVarName : null,
             });
             // Skip past the loop header — the init/cond/update clauses
             // don't count as body mutations, so we resume at the body's

@@ -3267,6 +3267,41 @@ await (async function () {
     { 'a.js': 'function bad(){ throw location.hash; } try { bad(); } catch (e) { document.getElementById("o").innerHTML = e; }' }, 1);
   await checkTaint('catch param no taint when throw is literal',
     { 'a.js': 'try { throw "safe"; } catch (e) { document.getElementById("o").innerHTML = e; }' }, 0);
+  // Branching state machines: every branch of if/else, switch, and
+  // try/catch feeds the may-be lattice so post-branch refutations
+  // over values never assigned in any branch fire.
+  await checkTaint('if/else branches refute',
+    { 'a.js': 'var s="init"; if(Math.random()>0.5) s="a"; else s="b"; if(s==="ready") document.getElementById("o").innerHTML=location.hash;' }, 0);
+  await checkTaint('if/else branches fire',
+    { 'a.js': 'var s="init"; if(Math.random()>0.5) s="a"; else s="ready"; if(s==="ready") document.getElementById("o").innerHTML=location.hash;' }, 1);
+  await checkTaint('switch cases refute',
+    { 'a.js': 'var s="init"; switch(Math.random()|0){case 0:s="a";break;case 1:s="b";break;} if(s==="ready") document.getElementById("o").innerHTML=location.hash;' }, 0);
+  await checkTaint('switch cases fire',
+    { 'a.js': 'var s="init"; switch(Math.random()|0){case 0:s="a";break;case 1:s="ready";break;} if(s==="ready") document.getElementById("o").innerHTML=location.hash;' }, 1);
+  await checkTaint('try/catch branches refute',
+    { 'a.js': 'var s="init"; try{s="try";}catch(e){s="caught";} if(s==="ready") document.getElementById("o").innerHTML=location.hash;' }, 0);
+  await checkTaint('try/catch branches fire',
+    { 'a.js': 'var s="init"; try{s="try";}catch(e){s="ready";} if(s==="ready") document.getElementById("o").innerHTML=location.hash;' }, 1);
+  // for-of / for-in over a known iterable: every element value flows
+  // through the simple `IDENT = loopVar` body assignment into the
+  // may-be lattice.
+  await checkTaint('for-of known array refute',
+    { 'a.js': 'var s="init"; for (var v of ["a","b","c"]) { s=v; } if(s==="ready") document.getElementById("o").innerHTML=location.hash;' }, 0);
+  await checkTaint('for-of known array fire',
+    { 'a.js': 'var s="init"; for (var v of ["a","ready","c"]) { s=v; } if(s==="ready") document.getElementById("o").innerHTML=location.hash;' }, 1);
+  await checkTaint('for-in object keys refute',
+    { 'a.js': 'var s="init"; var o={a:1,b:2}; for (var k in o) { s=k; } if(s==="ready") document.getElementById("o").innerHTML=location.hash;' }, 0);
+  await checkTaint('for-in object keys fire',
+    { 'a.js': 'var s="init"; var o={a:1,ready:2}; for (var k in o) { s=k; } if(s==="ready") document.getElementById("o").innerHTML=location.hash;' }, 1);
+  // Recursion: walker must not unbound on direct or mutual recursion.
+  // Returning null from the inlined walk falls back to the caller's
+  // opaque-call handling which still propagates argument taint.
+  await checkTaint('direct recursion no crash',
+    { 'a.js': 'function f(n){if(n<=0)return 0; return f(n-1)+1;} var x=f(3); if(x===99) document.getElementById("o").innerHTML=location.hash;' }, 0);
+  await checkTaint('recursive taint propagation',
+    { 'a.js': 'function f(n,t){if(n<=0)return t; return f(n-1,t);} document.getElementById("o").innerHTML=f(3,location.hash);' }, 1);
+  await checkTaint('mutual recursion no crash',
+    { 'a.js': 'function even(n){if(n===0)return true; return odd(n-1);} function odd(n){if(n===0)return false; return even(n-1);} even(4); document.getElementById("o").innerHTML=location.hash;' }, 1);
   await checkTaint('var=function handler', { 'a.js': 'var h = function(msg) { eval(msg.data); };\nwindow.addEventListener("message", h, false);' }, 1, { sources: ['postMessage'] });
 
   // --- addEventListener ---
