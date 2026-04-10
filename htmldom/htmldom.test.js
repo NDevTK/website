@@ -3302,6 +3302,13 @@ await (async function () {
     { 'a.js': 'function f(n,t){if(n<=0)return t; return f(n-1,t);} document.getElementById("o").innerHTML=f(3,location.hash);' }, 1);
   await checkTaint('mutual recursion no crash',
     { 'a.js': 'function even(n){if(n===0)return true; return odd(n-1);} function odd(n){if(n===0)return false; return even(n-1);} even(4); document.getElementById("o").innerHTML=location.hash;' }, 1);
+  // State machine via indirect function calls: each setter assigns
+  // a literal to a shared state var; post-call refutation must see
+  // every branch's literal in the lattice to refute the sink gate.
+  await checkTaint('state via fn call branches refute',
+    { 'a.js': 'var s="init"; function setA(){s="a";} function setB(){s="b";} if(Math.random()>0.5) setA(); else setB(); if(s==="ready") document.getElementById("o").innerHTML=location.hash;' }, 0);
+  await checkTaint('state via fn call branches fire',
+    { 'a.js': 'var s="init"; function setA(){s="a";} function setReady(){s="ready";} if(Math.random()>0.5) setA(); else setReady(); if(s==="ready") document.getElementById("o").innerHTML=location.hash;' }, 1);
   await checkTaint('var=function handler', { 'a.js': 'var h = function(msg) { eval(msg.data); };\nwindow.addEventListener("message", h, false);' }, 1, { sources: ['postMessage'] });
 
   // --- addEventListener ---

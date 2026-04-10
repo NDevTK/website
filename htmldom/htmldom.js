@@ -912,8 +912,18 @@
             if (_mbSlot && _mbSlot.complete && _mbSlot.vals && _mbSlot.vals.length > 1) {
               // Use the canonical identity-keyed name as the symbol so
               // smtSat looks up the same slot when emitting the
-              // disjunction extras.
-              return smtSym(_mbKey);
+              // disjunction extras. Tag with the lattice's declared
+              // sort so smtSat emits the disjunction (String lattice
+              // + Int-defaulted sym would otherwise silently drop
+              // the disjunction).
+              var _mbSym = smtSym(_mbKey);
+              var _mbSortVal = _mbSlot.vals[0].sort;
+              var _mbAllSame = true;
+              for (var _mvi = 1; _mvi < _mbSlot.vals.length; _mvi++) {
+                if (_mbSlot.vals[_mvi].sort !== _mbSortVal) { _mbAllSame = false; break; }
+              }
+              if (_mbAllSame) _mbSym.sorts[_mbKey] = _mbSortVal;
+              return _mbSym;
             }
             var fv = fb.toks[0].text;
             if (fv === 'true') return smtConst(true);
@@ -921,6 +931,26 @@
             var nv = Number(fv);
             if (!Number.isNaN(nv)) return smtConst(nv);
             return smtConst(fv);
+          }
+          // Binding is a multi-token chain (e.g. a cond / trycatch /
+          // switchjoin merge) or a non-chain — not a concrete fold
+          // target. Consult the may-be lattice and use its stored
+          // sort for the resulting sym so disjunctions fire. This is
+          // what makes `var s = "init"; if (c) s="a"; else s="b";`
+          // followed by `if (s==="ready") ...` refute: after the
+          // merge, fb is a cond chain, so the fold path above skips
+          // it, but the lattice still contains "init"/"a"/"b".
+          var _mbKey2 = _currentMayBeKey ? _currentMayBeKey(t.text) : t.text;
+          var _mbSlot2 = _currentVarMayBe ? _currentVarMayBe[_mbKey2] : null;
+          if (_mbSlot2 && _mbSlot2.complete && _mbSlot2.vals && _mbSlot2.vals.length > 0) {
+            var _mbSym2 = smtSym(_mbKey2);
+            var _mbSortVal2 = _mbSlot2.vals[0].sort;
+            var _mbAllSame2 = true;
+            for (var _mvi2 = 1; _mvi2 < _mbSlot2.vals.length; _mvi2++) {
+              if (_mbSlot2.vals[_mvi2].sort !== _mbSortVal2) { _mbAllSame2 = false; break; }
+            }
+            if (_mbAllSame2) _mbSym2.sorts[_mbKey2] = _mbSortVal2;
+            return _mbSym2;
           }
         }
         return smtSym(t.text);
