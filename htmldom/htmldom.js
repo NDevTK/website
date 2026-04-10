@@ -4665,7 +4665,33 @@
           }
         }
         let j = k + 1;
-        if (tks[j] && tks[j].type === 'other' && IDENT_OR_PATH_RE.test(tks[j].text)) j++;
+        var _newCtorTok = null;
+        if (tks[j] && tks[j].type === 'other' && IDENT_OR_PATH_RE.test(tks[j].text)) { _newCtorTok = tks[j]; j++; }
+        // `new Ctor(args)` — fire the universal call watchers so
+        // consumers (fetch-trace, dead-code detector, etc.) can
+        // observe constructor calls the same way they observe bare
+        // function calls. The walker otherwise treats new-calls as
+        // opaque refs with just argument taint propagation.
+        if (_callWatchers && _callWatchers.length > 0 && _newCtorTok &&
+            tks[j] && tks[j].type === 'open' && tks[j].char === '(') {
+          try {
+            var _nwArgs = await readCallArgBindings(j, stop);
+            if (_nwArgs) {
+              var _nwInfo = {
+                stage: 'new',
+                reached: true,
+                pathConditions: taintCondStack ? taintCondStack.slice() : [],
+                pathFormulas: pathConstraints ? pathConstraints.slice() : [],
+                mayBe: _varMayBe,
+                resolve: resolve,
+                resolvePath: resolvePath,
+              };
+              for (var _nwi = 0; _nwi < _callWatchers.length; _nwi++) {
+                try { _callWatchers[_nwi](_newCtorTok.text, _nwArgs.bindings, _newCtorTok, _nwInfo); } catch (_) {}
+              }
+            }
+          } catch (_) { /* fall through to opaque handling */ }
+        }
         if (tks[j] && tks[j].type === 'open' && tks[j].char === '(') {
           let d = 1; j++;
           while (j < stop && d > 0) {

@@ -41,6 +41,9 @@ const extractAllDOM = globalThis.__extractAllDOM;
 const JsAnalyzeSchemas = require(path.join(__dirname, 'jsanalyze-schemas.js'));
 const jsanalyze = globalThis.__jsanalyze;
 const JsAnalyzeQuery = require(path.join(__dirname, 'jsanalyze-query.js'));
+const FetchTrace = require(path.join(__dirname, 'fetch-trace.js'));
+const TaintReport = require(path.join(__dirname, 'taint-report.js'));
+const CspDerive = require(path.join(__dirname, 'csp-derive.js'));
 
 // Test harness.
 let pass = 0;
@@ -4407,6 +4410,285 @@ await (async function () {
       if (JSON.stringify(a[0].args) !== JSON.stringify(b[0].args)) return 'mismatched args';
       return null;
     });
+
+  console.log(`  (${pass + fail - before} cases)`);
+})();
+
+// -----------------------------------------------------------------------
+// jsanalyze consumers (Stage 3: fetch-trace + taint-report + csp-derive)
+// -----------------------------------------------------------------------
+await (async function () {
+  const ft = FetchTrace;
+  const tr = TaintReport;
+  const csp = CspDerive;
+  const before = pass + fail;
+  console.log('\njsanalyze consumers');
+  console.log('-------------------');
+
+  async function checkConsumer(name, runFn) {
+    try {
+      const err = await runFn();
+      if (err) {
+        fail++;
+        failures.push({ name, want: 'valid', got: err, input: 'consumer' });
+      } else {
+        pass++;
+      }
+    } catch (e) {
+      fail++;
+      failures.push({ name, want: 'no throw', got: 'threw: ' + e.message + '\n' + e.stack, input: 'consumer' });
+    }
+  }
+
+  // ========== fetch-trace ==========
+
+  await checkConsumer('fetch-trace: simple fetch', async () => {
+    const r = await ft.discover({ 'a.js': 'fetch("/api/users");' });
+    if (r.endpoints.length !== 1) return 'expected 1, got ' + r.endpoints.length;
+    const ep = r.endpoints[0];
+    if (ep.callee !== 'fetch') return 'wrong callee';
+    if (ep.method !== 'GET') return 'expected GET, got ' + ep.method;
+    if (ep.url.kind !== 'concrete' || ep.url.value !== '/api/users') return 'wrong url';
+    return null;
+  });
+
+  await checkConsumer('fetch-trace: POST with headers and JSON body', async () => {
+    const r = await ft.discover({ 'a.js':
+      `fetch("/api", { method: "POST", headers: { "X-Auth": "secret" }, body: JSON.stringify({a:1}) });` });
+    const ep = r.endpoints[0];
+    if (ep.method !== 'POST') return 'method wrong: ' + ep.method;
+    if (!ep.headers['X-Auth']) return 'X-Auth missing';
+    if (ep.headers['X-Auth'].kind !== 'concrete' || ep.headers['X-Auth'].value !== 'secret') return 'X-Auth wrong';
+    if (!ep.body || ep.body.kind !== 'concrete') return 'body not concrete';
+    if (ep.body.value !== '{"a":1}') return 'body wrong: ' + ep.body.value;
+    return null;
+  });
+
+  await checkConsumer('fetch-trace: XHR open+send pairing', async () => {
+    const r = await ft.discover({ 'a.js':
+      `var xhr = new XMLHttpRequest();
+       xhr.open("POST", "/api/submit");
+       xhr.setRequestHeader("Content-Type", "application/json");
+       xhr.send("{}");` });
+    // Expect one XHR endpoint with method, url, header, body all present
+    const xhrEp = r.endpoints.find(e => e.callee === 'XMLHttpRequest');
+    if (!xhrEp) return 'no XHR endpoint; endpoints: ' + JSON.stringify(r.endpoints.map(e => e.callee));
+    if (xhrEp.method !== 'POST' && (!xhrEp.method || xhrEp.method.value !== 'POST')) return 'method wrong';
+    if (!xhrEp.url || (xhrEp.url.value !== '/api/submit' && xhrEp.url !== '/api/submit')) return 'url wrong';
+    if (!xhrEp.headers['Content-Type']) return 'header not captured';
+    if (!xhrEp.body || (xhrEp.body.kind !== 'concrete' && xhrEp.body !== '{}')) return 'body wrong';
+    return null;
+  });
+
+  await checkConsumer('fetch-trace: cross-file resolution', async () => {
+    const r = await ft.discover({
+      'api.js': 'function loadUser(id) { return fetch("/api/users/" + id); }',
+      'app.js': 'loadUser(42);',
+    });
+    const concreteUrls = r.endpoints
+      .filter(ep => ep.url.kind === 'concrete')
+      .map(ep => ep.url.value);
+    if (!concreteUrls.includes('/api/users/42')) {
+      return 'expected concrete /api/users/42, got: ' + JSON.stringify(concreteUrls);
+    }
+    return null;
+  });
+
+  await checkConsumer('fetch-trace: dead code still captured', async () => {
+    const r = await ft.discover({ 'a.js':
+      `function dead() { fetch("/admin/secret"); }
+       fetch("/api/public");` });
+    const urls = r.endpoints.map(ep => ep.url.value || ep.url.template);
+    if (!urls.includes('/admin/secret')) return 'dead code fetch not found';
+    if (!urls.includes('/api/public')) return 'reachable fetch not found';
+    return null;
+  });
+
+  await checkConsumer('fetch-trace: new WebSocket observed', async () => {
+    const r = await ft.discover({ 'a.js': 'new WebSocket("wss://live.example.com/feed");' });
+    const ws = r.endpoints.find(e => e.callee === 'WebSocket');
+    if (!ws) return 'WebSocket endpoint missing';
+    if (ws.method !== 'GET') return 'method wrong';
+    if (ws.url.kind !== 'concrete' || ws.url.value !== 'wss://live.example.com/feed') return 'url wrong';
+    return null;
+  });
+
+  await checkConsumer('fetch-trace: if/else method enumerated as oneOf', async () => {
+    const r = await ft.discover({ 'a.js':
+      `var m = "GET"; if (c) m = "POST"; else m = "PUT";
+       fetch("/api", { method: m });` });
+    const ep = r.endpoints[0];
+    // Method will be either an oneOf shape or a flat string — both acceptable
+    const isOneOf = ep.method && typeof ep.method === 'object' && ep.method.kind === 'oneOf';
+    const vals = isOneOf ? ep.method.values : [ep.method];
+    if (!vals.includes('POST') || !vals.includes('PUT')) return 'expected POST,PUT in method values, got ' + JSON.stringify(vals);
+    return null;
+  });
+
+  await checkConsumer('fetch-trace: summarize produces flat rows', async () => {
+    const r = await ft.discover({ 'a.js': 'fetch("/api/a"); fetch("/api/b");' });
+    const rows = ft.summarize(r);
+    if (rows.length !== 2) return 'expected 2 rows, got ' + rows.length;
+    if (!rows.every(r => r.method === 'GET')) return 'all should be GET';
+    const urls = rows.map(r => r.url).sort();
+    if (urls.join(',') !== '/api/a,/api/b') return 'urls wrong';
+    return null;
+  });
+
+  // ========== taint-report ==========
+
+  await checkConsumer('taint-report: finds innerHTML + eval sinks', async () => {
+    const r = await tr.analyze({ 'a.js':
+      `document.getElementById("o").innerHTML = location.hash;
+       eval(location.search);` });
+    if (r.counts.total < 2) return 'expected >= 2 flows, got ' + r.counts.total;
+    if (r.counts.high < 2) return 'expected >= 2 high, got ' + r.counts.high;
+    if (!r.grouped.bySource.url) return 'url source missing';
+    return null;
+  });
+
+  await checkConsumer('taint-report: groups by sink', async () => {
+    const r = await tr.analyze({ 'a.js':
+      `document.getElementById("a").innerHTML = location.hash;
+       document.getElementById("b").innerHTML = document.cookie;` });
+    if (!r.grouped.bySink.innerHTML) return 'innerHTML group missing';
+    if (r.grouped.bySink.innerHTML.length !== 2) return 'expected 2 innerHTML flows';
+    return null;
+  });
+
+  await checkConsumer('taint-report: render produces readable text', async () => {
+    const r = await tr.analyze({ 'a.js':
+      `document.getElementById("o").innerHTML = location.hash;` });
+    const text = tr.render(r);
+    if (!text.includes('taint report')) return 'header missing';
+    if (!text.includes('url')) return 'source not listed';
+    if (!text.includes('innerHTML')) return 'sink not listed';
+    return null;
+  });
+
+  await checkConsumer('taint-report: no flows = empty report', async () => {
+    const r = await tr.analyze({ 'a.js':
+      `document.getElementById("o").textContent = location.hash;` });
+    if (r.counts.total !== 0) return 'expected 0 flows for textContent, got ' + r.counts.total;
+    return null;
+  });
+
+  // ========== csp-derive ==========
+
+  await checkConsumer('csp-derive: connect-src from fetches', async () => {
+    const p = await csp.derive({ 'a.js':
+      `fetch("/api");
+       fetch("https://api.example.com/data");` });
+    if (!p['connect-src'].includes("'self'")) return "missing 'self'";
+    if (!p['connect-src'].includes('https://api.example.com')) return 'missing absolute origin';
+    return null;
+  });
+
+  await checkConsumer('csp-derive: worker-src from Worker constructor', async () => {
+    const p = await csp.derive({ 'a.js':
+      `new Worker("worker.js");` });
+    if (!p['worker-src'].includes("'self'")) return "worker-src missing 'self'; got " + JSON.stringify(p['worker-src']);
+    return null;
+  });
+
+  await checkConsumer('csp-derive: WebSocket origins', async () => {
+    const p = await csp.derive({ 'a.js':
+      `new WebSocket("wss://live.example.com/feed");` });
+    if (!p['connect-src'].includes('wss://live.example.com')) return 'WebSocket origin missing';
+    return null;
+  });
+
+  await checkConsumer('csp-derive: unsafe-eval flag on eval()', async () => {
+    const p = await csp.derive({ 'a.js': `eval("1+1");` });
+    if (!p['report-unsafe-eval']) return 'unsafe-eval not flagged';
+    return null;
+  });
+
+  await checkConsumer('csp-derive: unsafe-eval flag on Function constructor', async () => {
+    const p = await csp.derive({ 'a.js': `var f = new Function("return 1");` });
+    if (!p['report-unsafe-eval']) return 'unsafe-eval not flagged';
+    return null;
+  });
+
+  await checkConsumer('csp-derive: unsafe-inline flag on tainted innerHTML', async () => {
+    const p = await csp.derive({ 'a.js':
+      `document.getElementById("o").innerHTML = location.hash;` });
+    if (!p['report-unsafe-inline']) return 'unsafe-inline not flagged';
+    return null;
+  });
+
+  await checkConsumer('csp-derive: no network calls = minimal policy', async () => {
+    const p = await csp.derive({ 'a.js': 'var x = 1 + 2;' });
+    // connect-src should just be 'self'
+    if (p['connect-src'].length !== 1 || p['connect-src'][0] !== "'self'") {
+      return 'expected only self, got ' + JSON.stringify(p['connect-src']);
+    }
+    return null;
+  });
+
+  await checkConsumer('csp-derive: header render', async () => {
+    const p = await csp.derive({ 'a.js':
+      `fetch("https://api.example.com/data");
+       eval(location.hash);` });
+    const h = csp.render(p);
+    if (!/script-src/.test(h)) return 'script-src missing';
+    if (!/connect-src/.test(h)) return 'connect-src missing';
+    if (!/unsafe-eval/.test(h)) return 'unsafe-eval missing';
+    return null;
+  });
+
+  // ========== one-walk-many-queries ==========
+  //
+  // This is the key design invariant: a single analyze() can feed
+  // multiple consumers. Run the full pipeline on a realistic bundle
+  // and verify each consumer produces expected output.
+  await checkConsumer('integration: one walk, three consumers', async () => {
+    const bundle = {
+      'api.js': `
+        const ROOT = "/v2/api";
+        function loadUser(id) {
+          return fetch(ROOT + "/users/" + id, {
+            method: "GET",
+            headers: { "Accept": "application/json" }
+          });
+        }
+        function saveUser(user) {
+          return fetch(ROOT + "/users/" + user.id, {
+            method: "PUT",
+            body: JSON.stringify(user)
+          });
+        }
+      `,
+      'app.js': `
+        window.addEventListener("message", function(e) {
+          document.getElementById("out").innerHTML = e.data;
+        });
+        loadUser(42);
+      `,
+    };
+
+    const fetchReport = await ft.discover(bundle);
+    const taintReport = await tr.analyze(bundle);
+    const cspPolicy = await csp.derive(bundle);
+
+    // fetch-trace: should discover loadUser and saveUser endpoints
+    const urls = fetchReport.endpoints.map(ep =>
+      (ep.url && (ep.url.value || ep.url.template)) || '?'
+    );
+    const hasLoadUser = urls.some(u => typeof u === 'string' && u.indexOf('/users/') >= 0);
+    if (!hasLoadUser) return 'loadUser endpoint not discovered: ' + JSON.stringify(urls);
+
+    // taint-report: should find postMessage → innerHTML flow
+    if (!taintReport.counts.total || !taintReport.grouped.bySink.innerHTML) {
+      return 'taint flow missing: ' + JSON.stringify(taintReport.counts);
+    }
+
+    // csp-derive: should emit connect-src 'self' and report unsafe-inline
+    if (!cspPolicy['connect-src'].includes("'self'")) return 'connect-src missing self';
+    if (!cspPolicy['report-unsafe-inline']) return 'unsafe-inline not flagged';
+
+    return null;
+  });
 
   console.log(`  (${pass + fail - before} cases)`);
 })();
