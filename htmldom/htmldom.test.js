@@ -3445,6 +3445,11 @@ await (async function () {
   // indexOf with a sym needle (both haystack and needle tainted).
   await checkTaint('z3: indexOf sym sat',       { 'a.js': 'var x = location.search; var y = location.hash; if (x.indexOf(y) >= 0) { document.getElementById("o").innerHTML = x; }' }, 1);
   await checkTaint('z3: indexOf sym len0 unsat',{ 'a.js': 'var x = location.search; var y = location.hash; if (y.length > 0 && x.length === 0 && x.indexOf(y) >= 0) { document.getElementById("o").innerHTML = x; }' }, 0);
+  // startsWith / includes with a sym needle.
+  await checkTaint('z3: startsWith sym sat',         { 'a.js': 'var x = location.search; var y = location.hash; if (x.startsWith(y)) { document.getElementById("o").innerHTML = x; }' }, 1);
+  await checkTaint('z3: startsWith sym len0 unsat',  { 'a.js': 'var x = location.search; var y = location.hash; if (y.length > 0 && x.length === 0 && x.startsWith(y)) { document.getElementById("o").innerHTML = x; }' }, 0);
+  await checkTaint('z3: includes sym sat',           { 'a.js': 'var x = location.search; var y = location.hash; if (x.includes(y)) { document.getElementById("o").innerHTML = x; }' }, 1);
+  await checkTaint('z3: includes sym len-mismatch unsat', { 'a.js': 'var x = location.search; var y = location.hash; if (x.length < y.length && x.includes(y)) { document.getElementById("o").innerHTML = x; }' }, 0);
 
   // --- IIFE ---
   await checkTaint('IIFE function', { 'a.js': '(function() { document.getElementById("o").innerHTML = location.search; })();' }, 1);

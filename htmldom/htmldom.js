@@ -629,11 +629,24 @@
   }
   // String predicates: startsWith / endsWith / includes. `symObj` is a
   // smtSym() result; `value` is the literal substring.
+  // smtStrProp builds startsWith / endsWith / includes constraints.
+  // The needle (`value`) can be either a literal string OR another sym
+  // formula object — both spell to the same Z3 string-theory primitives,
+  // and both syms get declared as String.
   function smtStrProp(symObj, prop, value) {
     if (!symObj || !symObj.symName) return null;
     var sorts = _mergeSorts(symObj.sorts, null);
     sorts[symObj.symName] = 'String';
-    var v = _quoteSmtString(value);
+    var v;
+    if (typeof value === 'string') {
+      v = _quoteSmtString(value);
+    } else if (value && value.symName) {
+      v = value.expr;
+      sorts = _mergeSorts(sorts, value.sorts);
+      sorts[value.symName] = 'String';
+    } else {
+      return null;
+    }
     if (prop === 'startsWith') return { expr: '(str.prefixof ' + v + ' ' + symObj.expr + ')', sorts: sorts, isBool: true };
     if (prop === 'endsWith')   return { expr: '(str.suffixof ' + v + ' ' + symObj.expr + ')', sorts: sorts, isBool: true };
     if (prop === 'includes')   return { expr: '(str.contains ' + symObj.expr + ' ' + v + ')', sorts: sorts, isBool: true };
@@ -839,12 +852,16 @@
           if (_mMethod === 'endsWith' && _mArgVal !== null) return smtStrProp(_mSymObj, 'endsWith', _mArgVal);
           if (_mMethod === 'includes' && _mArgVal !== null) return smtStrProp(_mSymObj, 'includes', _mArgVal);
           if (_mMethod === 'indexOf' && _mArgVal !== null) return smtArith('indexOf', _mSymObj, smtConst(_mArgVal));
-          // indexOf(IDENT) — second arg is another identifier; if it
-          // resolves to a tainted sym, build (str.indexof base needle 0).
-          if (_mMethod === 'indexOf' && _mArgTok && _mArgTok.type === 'other' && IDENT_RE.test(_mArgTok.text) && toks[start + 3] && toks[start + 3].type === 'close') {
+          // indexOf / startsWith / endsWith / includes with an IDENT
+          // second arg — the needle is itself another (potentially
+          // tainted) sym. Recursively parse the identifier and emit
+          // the corresponding string-theory predicate.
+          if ((_mMethod === 'indexOf' || _mMethod === 'startsWith' || _mMethod === 'endsWith' || _mMethod === 'includes') &&
+              _mArgTok && _mArgTok.type === 'other' && IDENT_RE.test(_mArgTok.text) && toks[start + 3] && toks[start + 3].type === 'close') {
             var _needleParsed = await smtParseAtom([_mArgTok], 0, 1, resolveFunc, resolvePathFunc);
             if (_needleParsed && _needleParsed.symName) {
-              return smtArith('indexOf', _mSymObj, _needleParsed);
+              if (_mMethod === 'indexOf') return smtArith('indexOf', _mSymObj, _needleParsed);
+              return smtStrProp(_mSymObj, _mMethod, _needleParsed);
             }
           }
           // Single-int-literal arg: charAt(N) → (str.at sym N)
