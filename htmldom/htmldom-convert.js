@@ -20,7 +20,7 @@
 //   await hc.extractAllDOM(input)
 //
 // All entry points return the same shapes as the pre-Stage-4b
-// implementations — htmldom.js's 111 behavioral equivalence tests
+// implementations — jsanalyze.js's 111 behavioral equivalence tests
 // and 27 converter sinks verify byte-level compatibility.
 //
 // Implementation:
@@ -30,14 +30,14 @@
 //   via destructuring. The factory runs once per process,
 //   instantiating a closure-scoped copy of the converter that
 //   reads those primitives. The facade awaits the walker's api
-//   (htmldom.js has an async top-level IIFE), installs the
+//   (jsanalyze.js has an async top-level IIFE), installs the
 //   converter, and delegates every call to it.
 
 (function () {
   'use strict';
 
   // ============================================================
-  // Walker resolution — wait for htmldom.js to finish its async
+  // Walker resolution — wait for jsanalyze.js to finish its async
   // initialization and expose __htmldomApi / module.exports.api.
   // ============================================================
   function resolveWalker() {
@@ -46,7 +46,7 @@
     }
     if (typeof module !== 'undefined' && module && typeof require === 'function') {
       try {
-        const api = require('./htmldom.js');
+        const api = require('./jsanalyze.js');
         if (api && api._walkerInternals) return api;
       } catch (_) { /* fall through */ }
     }
@@ -59,7 +59,7 @@
       await new Promise(r => setTimeout(r, 0));
       api = resolveWalker();
     }
-    if (!api) throw new Error('htmldom-convert: htmldom.js walker not available');
+    if (!api) throw new Error('htmldom-convert: jsanalyze.js walker not available');
     return api;
   }
 
@@ -1827,7 +1827,7 @@
   // to the corresponding factory method. Walker diagnostic
   // functions (extractHTML, extractAllHTML, extractAllDOM) pass
   // through to the walker's own implementations since they're
-  // still owned by htmldom.js.
+  // still owned by jsanalyze.js.
 
   let _converter = null;
   let _converterPromise = null;

@@ -33,12 +33,12 @@
       automaticLayout: true,
     });
 
-    // Expose for htmldom.js paste-mode auto-convert.
+    // Expose for jsanalyze.js paste-mode auto-convert.
     window._monacoIn = editor;
     window._monacoOut = { setValue: function() {}, getValue: function() { return ''; } };
 
     // Load jsanalyze-schemas first (needed by the bindingToValue
-    // seam inside htmldom.js). Then htmldom.js (which contains the
+    // seam inside jsanalyze.js). Then jsanalyze.js (which contains the
     // walker + legacy converter). Then the jsanalyze consumer
     // wrappers so page scripts can reach them as globals.
     function appendScript(src, onload) {
@@ -48,7 +48,7 @@
       document.body.appendChild(s);
     }
     appendScript('jsanalyze-schemas.js', function () {
-      appendScript('htmldom.js', function () {
+      appendScript('jsanalyze.js', function () {
         appendScript('jsanalyze-query.js');
         appendScript('htmldom-convert.js');
         appendScript('fetch-trace.js');
@@ -91,7 +91,7 @@
       return files;
     }
 
-    // resolveScriptSrcs and convertPage are in htmldom.js — use the exported API.
+    // resolveScriptSrcs and convertPage are in jsanalyze.js (legacy name) / htmldom-convert — use the exported API.
 
     // --- Sidebar rendering ---
     function renderSidebar() {
@@ -168,7 +168,7 @@
     }
 
     // --- Conversion ---
-    // Use the project-level API from htmldom.js.
+    // Use the project-level API from htmldom-convert.js.
     var convertAllRunning = false;
     var taintResults = null;
     var editorDecorations = [];
@@ -362,7 +362,7 @@
     });
 
     // Initial conversion of the example file.
-    // Wait for htmldom.js to load before converting.
+    // Wait for jsanalyze.js to load before converting.
     var initTimer = setInterval(function() {
       if (globalThis.__convertProject) {
         clearInterval(initTimer);

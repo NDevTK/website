@@ -1,8 +1,8 @@
-// Advanced tests for htmldom.js's extractHTML resolver.
+// Advanced tests for jsanalyze.js's extractHTML resolver.
 //
 // Run with: node htmldom/htmldom.test.js
 //
-// This test file loads htmldom.js under Node by stubbing the browser globals
+// This test file loads jsanalyze.js under Node by stubbing the browser globals
 // it touches at init time, then exercises extractHTML across a range of
 // JavaScript inputs: plain assignments, scope edge cases, concat chains,
 // array .join patterns, templates, and the `<`-content HTML filter.
@@ -12,7 +12,7 @@
 const fs = require('fs');
 const path = require('path');
 
-// Minimal DOM globals — htmldom.js's IIFE calls document.getElementById
+// Minimal DOM globals — jsanalyze.js's IIFE calls document.getElementById
 // at init time for its UI wiring. These provide just enough for the
 // file to load in Node; the analysis functions never use them.
 global.document = {
@@ -22,9 +22,9 @@ global.DOMParser = class {
   parseFromString() { return { body: { childNodes: [] } }; }
 };
 
-// Load htmldom.js and expose its internal extractHTML via globalThis by
+// Load jsanalyze.js and expose its internal extractHTML via globalThis by
 // splicing export lines into the source before eval.
-const src = fs.readFileSync(path.join(__dirname, 'htmldom.js'), 'utf8');
+const src = fs.readFileSync(path.join(__dirname, 'jsanalyze.js'), 'utf8');
 const patched = src.replace(
   'async function extractHTML(input) {',
   // Inject global exports for the walker's internal functions so the
@@ -42,7 +42,7 @@ const extractAllDOM = globalThis.__extractAllDOM;
 
 // jsanalyze public surface — loaded from its own schema module.
 // These are available synchronously because the jsanalyze block
-// in htmldom.js runs before the IIFE's top-level `await convert()`.
+// in jsanalyze.js runs before the IIFE's top-level `await convert()`.
 const JsAnalyzeSchemas = require(path.join(__dirname, 'jsanalyze-schemas.js'));
 const jsanalyze = globalThis.__jsanalyze;
 const JsAnalyzeQuery = require(path.join(__dirname, 'jsanalyze-query.js'));
@@ -52,7 +52,7 @@ const CspDerive = require(path.join(__dirname, 'csp-derive.js'));
 const HtmldomConvert = require(path.join(__dirname, 'htmldom-convert.js'));
 
 // Stage 4b.2: the walker's copies of the converter functions have
-// been deleted from htmldom.js. The test harness now reaches the
+// been deleted from jsanalyze.js. The test harness now reaches the
 // converter exclusively through the HtmldomConvert facade. Legacy
 // __convert* globals are aliases for the facade so existing tests
 // keep working without rewrites.

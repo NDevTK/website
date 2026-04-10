@@ -22,10 +22,10 @@
 // (streaming), it passes `options.watchers` to `analyze` which
 // installs them on the walker directly.
 //
-// The walker itself lives in htmldom.js for now (Stage 1 seam);
-// Stage 5 moves it to jsanalyze.js. This file reaches into the
+// The walker lives in jsanalyze.js (renamed from htmldom.js in Stage 5).
+// This file reaches into the
 // walker via `globalThis.__jsanalyze` / `globalThis.__bindingToValue`
-// so the transition in Stage 5 is just a rename.
+// that the walker's IIFE sets when it loads.
 
 (function () {
   'use strict';
@@ -40,13 +40,13 @@
   }
 
   // === Walker access ===
-  // Reaches into htmldom.js through the same globals the test
-  // harness uses. Stage 5 replaces this with a direct require.
+  // Reaches into jsanalyze.js through the same globals the test
+  // harness uses. Direct require is preferred when available.
   function loadWalker() {
     if (typeof globalThis !== 'undefined' && globalThis.__jsanalyze) return globalThis.__jsanalyze;
     if (typeof require !== 'undefined') {
       try {
-        const api = require('./htmldom.js');
+        const api = require('./jsanalyze.js');
         if (api && api.jsanalyze) return api.jsanalyze;
       } catch (_) {}
     }

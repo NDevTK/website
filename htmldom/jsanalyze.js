@@ -1,42 +1,38 @@
-// HTML to DOM API Converter
+// jsanalyze.js — whole-program symbolic JS interpreter
 //
-// This file currently bundles two things that will be split across
-// Stage 5 of the jsanalyze migration plan (see session notes):
+// The engine file of the jsanalyze static-analysis library.
+// Loads in both Node (CommonJS) and the browser (IIFE, no build
+// step). Consumers never reach into internals — they go through
+// the public `api` object exposed at the end of the IIFE, and
+// (for typed value inspection) through the `bindingToValue`
+// boundary function which converts walker bindings to the
+// versioned shapes defined in jsanalyze-schemas.js.
 //
-//   (1) A whole-program symbolic interpreter for JavaScript — the
-//       core of the planned `jsanalyze` library. Its public surface
-//       is gradually being carved out inside the "=== jsanalyze
-//       public surface ===" banners. Consumers never reach into
-//       walker internals; they go through the `bindingToValue`
-//       boundary function which converts walker bindings to the
-//       versioned shapes in jsanalyze-schemas.js.
+// What lives in this file:
+//   - JS + HTML tokenizers
+//   - Scope-stack walker (buildScopeState)
+//   - SMT-backed path reasoner (Z3 via z3-solver)
+//   - May-be value lattice that feeds SMT disjunctions
+//   - Promise / async / closure / class / Map dispatch tracking
+//   - Callback fixpoint across event handlers, .then, setTimeout
+//   - Virtual DOM extraction (extractAllDOM)
+//   - Taint propagation (traceTaint, traceTaintInJs)
+//   - bindingToValue — the walker → public-Value boundary
 //
-//   (2) The htmldom-convert consumer — an innerHTML → DOM API
-//       rewriter built on (1). It's the oldest consumer and the
-//       most complex; it stays in this file until Stage 4 when it
-//       moves out to htmldom-convert.js.
+// Consumers (each in its own file, each a thin layer over the
+// library's public query primitives):
+//   jsanalyze-query.js    — analyze() entry + query.calls / query.taintFlows
+//                            / query.valueSetOf / query.innerHtmlAssignments
+//                            / query.stringLiterals / query.callGraph
+//   fetch-trace.js        — HTTP API discovery (fetch/XHR/Worker/WS endpoints)
+//   taint-report.js       — human-friendly taint reporter with grouping
+//   csp-derive.js         — Content-Security-Policy derivation from observed calls
+//   htmldom-convert.js    — innerHTML/outerHTML → createElement/appendChild rewriter
 //
-// Stage plan:
-//   Stage 1 (done) — Schema file + bindingToValue seam + tests
-//   Stage 2         — Extract query.js (findCalls, taintFlows, …)
-//   Stage 3         — Write fetch-trace.js + taint-report.js + csp-derive.js
-//                      consumers against the query layer
-//   Stage 4         — Move htmldom-convert out of this file
-//   Stage 5         — Rename remainder to jsanalyze.js
-//
-// Migration map (current function → future location):
-//   tokenize, scanMutations, buildScopeState    → jsanalyze.js (core)
-//   bindingToValue, _schemas, _chain*           → jsanalyze.js (public seam)
-//   traceTaint, traceTaintInJs                  → query layer in jsanalyze-query.js
-//                                                  (thin wrappers kept for compat)
-//   convertJsFile, convertProject,              → htmldom-convert.js (consumer)
-//   convertHtmlMarkup, extractHTML, materialize*
-//   TAINT_*, ELEMENT_SINK_TYPES, EVENT_TAINT_*  → shared classification tables;
-//                                                  exposed by jsanalyze so
-//                                                  consumers can customize.
-//
-// Nothing in this file should be imported directly by a Stage-3+
-// consumer — consumers go through the public jsanalyze API only.
+// The directory is still named htmldom/ because that's the
+// Git-tracked feature area; jsanalyze is the library inside it.
+// The front-end UI lives at htmldom/index.html and wires the
+// walker + converter through monaco-init.js.
 (async function () {
   'use strict';
 
@@ -766,7 +762,7 @@
   // --- Z3 initialisation (mandatory; no fallback) ---
   // smtSat awaits this once; afterwards Z3 is a cached shared Context.
   // Browser pages either pre-load z3-solver and set globalThis.__htmldomZ3Init
-  // to its init function, or htmldom.js will dynamically import the
+  // to its init function, or jsanalyze.js will dynamically import the
   // ES module from a CDN. Node loads via require('z3-solver').
   var _z3 = null;
   var _z3Promise = null;
@@ -1597,7 +1593,7 @@
   // === jsanalyze public surface (Stage 1: seam + schemas) ===
   //
   // Everything below this banner is part of the planned `jsanalyze`
-  // library's public API. It's currently defined inside htmldom.js
+  // library's public API. It's currently defined inside jsanalyze.js
   // so the existing file layout is preserved, but every function
   // here takes ONLY walker-internal types and produces ONLY values
   // conforming to the jsanalyze-schemas.js public shape. The goal
@@ -1617,7 +1613,7 @@
   // Lazy-load the schema module. In Node (tests, consumers) we
   // require() it. In the browser, the schema file is loaded as a
   // separate <script> tag that sets globalThis.JsAnalyzeSchemas
-  // before htmldom.js runs. `_schemas()` resolves the right one.
+  // before jsanalyze.js runs. `_schemas()` resolves the right one.
   var _schemaCache = null;
   function _schemas() {
     if (_schemaCache) return _schemaCache;
@@ -9333,10 +9329,10 @@
     tokenize: tokenize,
     tokenizeHtml: tokenizeHtml,
     // Conversion entry points: Stage 4b.2 removed these from
-    // htmldom.js. Consumers should use the HtmldomConvert facade
+    // jsanalyze.js. Consumers should use the HtmldomConvert facade
     // (globalThis.HtmldomConvert or require('./htmldom-convert.js')).
     // The keys are kept here as getter shims so legacy code that
-    // reaches into htmldom.js's api.convertJsFile continues to
+    // reaches into jsanalyze.js's api.convertJsFile continues to
     // resolve after HtmldomConvert has loaded. The shims return
     // undefined until HtmldomConvert.js executes.
     get convertProject() {
@@ -9348,7 +9344,7 @@
     get convertHtmlMarkup() {
       return (typeof globalThis !== 'undefined' && globalThis.HtmldomConvert) ? globalThis.HtmldomConvert.convertHtmlMarkup : undefined;
     },
-    // Diagnostics / extraction still live in htmldom.js (they're
+    // Diagnostics / extraction still live in jsanalyze.js (they're
     // walker-level extractors, not converter-specific).
     extractHTML: extractHTML,
     extractAllHTML: extractAllHTML,

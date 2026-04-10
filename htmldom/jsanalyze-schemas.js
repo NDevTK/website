@@ -14,7 +14,7 @@
 //   - Loadable in both Node (CommonJS) and the browser (IIFE sets
 //     globalThis.JsAnalyzeSchemas). No build step.
 //   - Pure factories — no walker internals, no external dependencies.
-//     The walker (in htmldom.js / eventually jsanalyze.js) converts
+//     The walker (in jsanalyze.js) converts
 //     its internal binding shape to these types via a boundary
 //     function (`bindingToValue`) so the walker is free to refactor
 //     its internals without breaking consumers.
