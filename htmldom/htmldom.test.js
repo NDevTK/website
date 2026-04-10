@@ -40,6 +40,7 @@ const extractAllDOM = globalThis.__extractAllDOM;
 // in htmldom.js runs before the IIFE's top-level `await convert()`.
 const JsAnalyzeSchemas = require(path.join(__dirname, 'jsanalyze-schemas.js'));
 const jsanalyze = globalThis.__jsanalyze;
+const JsAnalyzeQuery = require(path.join(__dirname, 'jsanalyze-query.js'));
 
 // Test harness.
 let pass = 0;
@@ -4182,6 +4183,230 @@ await (async function () {
     // Already covered by individual cases but add a meta assertion
     return null;
   });
+
+  console.log(`  (${pass + fail - before} cases)`);
+})();
+
+// -----------------------------------------------------------------------
+// jsanalyze query layer (Stage 2: analyze + query primitives)
+// -----------------------------------------------------------------------
+await (async function () {
+  const { analyze, query, schemas: S } = JsAnalyzeQuery;
+  const before = pass + fail;
+  console.log('\njsanalyze query');
+  console.log('---------------');
+
+  async function checkQuery(name, input, opts, predicate) {
+    try {
+      const trace = await analyze(input, opts || { taint: true });
+      const err = predicate(trace);
+      if (err) {
+        fail++;
+        failures.push({ name, want: 'valid', got: err, input: typeof input === 'string' ? input : Object.keys(input).join(',') });
+      } else {
+        pass++;
+      }
+    } catch (e) {
+      fail++;
+      failures.push({ name, want: 'no throw', got: 'threw: ' + e.message, input: typeof input === 'string' ? input : Object.keys(input).join(',') });
+    }
+  }
+
+  // --- analyze() shape ---
+  await checkQuery('analyze returns trace with version',
+    { 'a.js': 'var x = 1;' }, { taint: true },
+    trace => {
+      if (!trace.schemaVersion) return 'missing schemaVersion';
+      if (!Array.isArray(trace.calls)) return 'calls not an array';
+      if (!Array.isArray(trace.taintFlows)) return 'taintFlows not an array';
+      if (!trace.files) return 'files missing';
+      return null;
+    });
+
+  await checkQuery('analyze from string input',
+    'var x = 1; fetch("/api");', { taint: true },
+    trace => {
+      if (!trace.files['<input>.js']) return 'default filename missing';
+      const calls = query.calls(trace, { targets: ['fetch'] });
+      if (calls.length !== 1) return 'expected 1 fetch call, got ' + calls.length;
+      return null;
+    });
+
+  // --- query.calls ---
+  await checkQuery('query.calls filters by target',
+    { 'a.js': 'fetch("/a"); fetch("/b"); document.write("x");' }, { taint: true },
+    trace => {
+      const fetches = query.calls(trace, { targets: ['fetch'] });
+      const writes = query.calls(trace, { targets: ['document.write'] });
+      if (fetches.length !== 2) return 'expected 2 fetches, got ' + fetches.length;
+      if (writes.length !== 1) return 'expected 1 write, got ' + writes.length;
+      return null;
+    });
+
+  await checkQuery('query.calls resolves concrete URLs',
+    { 'a.js': 'var base = "/api"; fetch(base + "/users");' }, { taint: true },
+    trace => {
+      const calls = query.calls(trace, { targets: ['fetch'] });
+      if (calls.length !== 1) return 'expected 1 call';
+      const url = query.asConcrete(calls[0].args[0]);
+      if (url !== '/api/users') return 'expected /api/users, got ' + url;
+      return null;
+    });
+
+  await checkQuery('query.calls extracts RequestInit object',
+    { 'a.js': 'fetch("/api", { method: "POST", headers: { "X-Auth": "abc" } });' }, { taint: true },
+    trace => {
+      const calls = query.calls(trace, { targets: ['fetch'] });
+      const c = calls[0];
+      if (query.asConcrete(c.args[0]) !== '/api') return 'URL wrong';
+      if (query.asConcrete(query.property(c.args[1], 'method')) !== 'POST') return 'method wrong';
+      if (query.asConcrete(query.property(c.args[1], 'headers.X-Auth')) !== 'abc') return 'header wrong';
+      return null;
+    });
+
+  await checkQuery('query.calls enumerates if/else branches as oneOf',
+    { 'a.js': 'var m = "x"; if (c) m = "get"; else m = "set"; fetch("/api", { method: m });' }, { taint: true },
+    trace => {
+      const c = query.calls(trace, { targets: ['fetch'] })[0];
+      const method = query.property(c.args[1], 'method');
+      const vals = query.enumerate(method);
+      if (!vals) return 'enumerate returned null';
+      const sorted = vals.slice().sort();
+      if (sorted.join(',') !== 'get,set') return 'expected [get,set], got ' + JSON.stringify(sorted);
+      return null;
+    });
+
+  await checkQuery('query.calls captures unreachable dead code',
+    { 'a.js': 'function dead() { fetch("/admin/secret"); } fetch("/api/public");' }, { taint: true },
+    trace => {
+      const calls = query.calls(trace, { targets: ['fetch'] });
+      const urls = calls.map(c => query.asConcrete(c.args[0]));
+      if (!urls.includes('/admin/secret')) return 'dead code fetch not found';
+      if (!urls.includes('/api/public')) return 'reachable fetch not found';
+      return null;
+    });
+
+  await checkQuery('query.calls resolves cross-file via inter-procedural',
+    {
+      'a.js': 'function load(id) { return fetch("/api/users/" + id); }',
+      'b.js': 'load(42);',
+    }, { taint: true },
+    trace => {
+      const calls = query.calls(trace, { targets: ['fetch'] });
+      if (calls.length < 1) return 'expected >=1 fetch, got ' + calls.length;
+      const concretes = calls.map(c => query.asConcrete(c.args[0])).filter(Boolean);
+      if (!concretes.includes('/api/users/42')) {
+        return 'expected concrete /api/users/42 from cross-file call; got ' + JSON.stringify(concretes);
+      }
+      return null;
+    });
+
+  // --- query.property ---
+  await checkQuery('query.property navigates nested objects',
+    { 'a.js': 'fetch("/api", { h: { a: { b: "deep" } } });' }, { taint: true },
+    trace => {
+      const c = query.calls(trace, { targets: ['fetch'] })[0];
+      const deep = query.property(c.args[1], 'h.a.b');
+      if (query.asConcrete(deep) !== 'deep') return 'nav failed: ' + S.helpers.stringify(deep);
+      return null;
+    });
+
+  await checkQuery('query.property returns unknown on missing path',
+    { 'a.js': 'fetch("/api", { method: "POST" });' }, { taint: true },
+    trace => {
+      const c = query.calls(trace, { targets: ['fetch'] })[0];
+      const missing = query.property(c.args[1], 'headers.Content-Type');
+      if (missing.kind !== 'unknown') return 'expected unknown, got ' + missing.kind;
+      return null;
+    });
+
+  // --- query.enumerate ---
+  await checkQuery('query.enumerate on concrete',
+    { 'a.js': 'fetch("/api");' }, { taint: true },
+    trace => {
+      const c = query.calls(trace, { targets: ['fetch'] })[0];
+      const vals = query.enumerate(c.args[0]);
+      if (!vals || vals.length !== 1 || vals[0] !== '/api') return 'got ' + JSON.stringify(vals);
+      return null;
+    });
+
+  await checkQuery('query.enumerate on switchjoin',
+    { 'a.js':
+      `var u; switch(k) { case 1: u = "/a"; break; case 2: u = "/b"; break; case 3: u = "/c"; break; }
+       fetch(u);` }, { taint: true },
+    trace => {
+      const calls = query.calls(trace, { targets: ['fetch'] });
+      // Multiple call entries may exist because walker walks each case
+      const allUrls = new Set();
+      for (const c of calls) {
+        const vals = query.enumerate(c.args[0]);
+        if (vals) for (const v of vals) allUrls.add(v);
+      }
+      if (!allUrls.has('/a') || !allUrls.has('/b') || !allUrls.has('/c')) return 'missing URL: ' + JSON.stringify([...allUrls]);
+      return null;
+    });
+
+  // --- query.taintFlows ---
+  await checkQuery('query.taintFlows finds innerHTML sink',
+    { 'a.js': 'document.getElementById("o").innerHTML = location.hash;' }, { taint: true },
+    trace => {
+      const flows = query.taintFlows(trace);
+      if (flows.length !== 1) return 'expected 1 flow, got ' + flows.length;
+      if (!flows[0].sources.includes('url')) return 'expected url source';
+      if (flows[0].sink.prop !== 'innerHTML') return 'expected innerHTML sink';
+      return null;
+    });
+
+  await checkQuery('query.taintFlows filter by source',
+    { 'a.js':
+      `document.getElementById("a").innerHTML = location.hash;
+       document.getElementById("b").innerHTML = document.cookie;` }, { taint: true },
+    trace => {
+      const urlFlows = query.taintFlows(trace, { source: 'url' });
+      const cookieFlows = query.taintFlows(trace, { source: 'cookie' });
+      if (urlFlows.length !== 1) return 'expected 1 url flow, got ' + urlFlows.length;
+      if (cookieFlows.length !== 1) return 'expected 1 cookie flow, got ' + cookieFlows.length;
+      return null;
+    });
+
+  // --- query.callGraph ---
+  await checkQuery('query.callGraph builds nodes and edges',
+    { 'a.js':
+      `function foo() { bar(); }
+       function bar() { fetch("/x"); }
+       foo();` }, { taint: true },
+    trace => {
+      const g = query.callGraph(trace);
+      if (!g.nodes.length) return 'no nodes';
+      if (!g.edges.length) return 'no edges';
+      return null;
+    });
+
+  // --- trace serializability ---
+  await checkQuery('trace round-trips through JSON',
+    { 'a.js': 'fetch("/a"); fetch("/b", { method: "POST" });' }, { taint: true },
+    trace => {
+      let json;
+      try { json = JSON.stringify(trace); }
+      catch (e) { return 'stringify threw: ' + e.message; }
+      const parsed = JSON.parse(json);
+      if (parsed.calls.length !== trace.calls.length) return 'call count mismatch after roundtrip';
+      if (parsed.schemaVersion !== trace.schemaVersion) return 'version mismatch';
+      return null;
+    });
+
+  // --- pure query: never re-runs the walker ---
+  await checkQuery('queries are pure functions over trace',
+    { 'a.js': 'fetch("/a"); fetch("/b");' }, { taint: true },
+    trace => {
+      // Calling the same query twice should return identical results.
+      const a = query.calls(trace, { targets: ['fetch'] });
+      const b = query.calls(trace, { targets: ['fetch'] });
+      if (a.length !== b.length) return 'non-deterministic';
+      // Shallow compare of the first entry
+      if (JSON.stringify(a[0].args) !== JSON.stringify(b[0].args)) return 'mismatched args';
+      return null;
+    });
 
   console.log(`  (${pass + fail - before} cases)`);
 })();
