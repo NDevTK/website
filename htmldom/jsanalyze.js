@@ -772,6 +772,16 @@
   // against z3-solver. The reliable Node signal is
   // `typeof module === 'object' && module.exports` AND
   // `typeof window === 'undefined'`.
+  //
+  // CDN note: jsDelivr's +esm wrapper fails to bundle z3-solver's
+  // CommonJS dependency on async-mutex — the inner require() call
+  // returns null at runtime and crashes the module at
+  // `new async_mutex_1.Mutex()`. esm.sh with `?bundle-deps`
+  // produces a self-contained ESM file that inlines every
+  // transitive CommonJS dep, so z3-solver loads cleanly. The
+  // page's CSP must allow https://esm.sh (script-src for the ESM
+  // import, connect-src for the WASM fetch that z3-solver issues
+  // during init).
   var _z3 = null;
   var _z3Promise = null;
   function _initZ3() {
@@ -786,8 +796,11 @@
         initFn = mod.init;
       } else {
         // Browser (or Monaco loader) path: dynamic ESM import from
-        // jsDelivr. The host page's CSP must allow https://cdn.jsdelivr.net.
-        var mod = await import('https://cdn.jsdelivr.net/npm/z3-solver@4.16.0/+esm');
+        // esm.sh with bundled deps. `?bundle-deps` forces esm.sh to
+        // inline every transitive CommonJS dep (including
+        // async-mutex, which jsDelivr's +esm wrapper fails to
+        // resolve — it leaves a null require result at runtime).
+        var mod = await import('https://esm.sh/z3-solver@4.16.0?bundle-deps');
         initFn = mod.init;
       }
       var api = await initFn();
