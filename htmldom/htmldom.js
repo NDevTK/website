@@ -438,10 +438,13 @@
   function _quoteSmtString(s) { return '"' + s.replace(/"/g, '""') + '"'; }
   function _mergeSorts(a, b) {
     var out = {};
+    var conflict = false;
     if (a) for (var k in a) out[k] = a[k];
     if (b) for (var k2 in b) {
+      if (out[k2] && out[k2] !== b[k2]) conflict = true;
       out[k2] = (out[k2] === 'String' || b[k2] === 'String') ? 'String' : (out[k2] || b[k2]);
     }
+    if (conflict) Object.defineProperty(out, '__conflict', { value: true });
     return out;
   }
   // Coerce a value-typed expression to its boolean form (truthy check).
@@ -494,23 +497,31 @@
   function smtNot(o) {
     if (!o) return null;
     if (o.value && o.value.kind === 'bool') return smtConst(!o.value.val);
-    return { expr: '(not ' + _toBool(o) + ')', sorts: o.sorts, isBool: true };
+    var r = { expr: '(not ' + _toBool(o) + ')', sorts: o.sorts, isBool: true };
+    if (o.incompatible) r.incompatible = true;
+    return r;
   }
   function smtAnd(a, b) {
     if (!a) return b;
     if (!b) return a;
     if (a.value && a.value.kind === 'bool') return a.value.val ? b : a;
     if (b.value && b.value.kind === 'bool') return b.value.val ? a : b;
-    return { expr: '(and ' + _toBool(a) + ' ' + _toBool(b) + ')',
-             sorts: _mergeSorts(a.sorts, b.sorts), isBool: true };
+    var sorts = _mergeSorts(a.sorts, b.sorts);
+    var r = { expr: '(and ' + _toBool(a) + ' ' + _toBool(b) + ')',
+              sorts: sorts, isBool: true };
+    if (a.incompatible || b.incompatible || sorts.__conflict) r.incompatible = true;
+    return r;
   }
   function smtOr(a, b) {
     if (!a) return b;
     if (!b) return a;
     if (a.value && a.value.kind === 'bool') return a.value.val ? a : b;
     if (b.value && b.value.kind === 'bool') return b.value.val ? b : a;
-    return { expr: '(or ' + _toBool(a) + ' ' + _toBool(b) + ')',
-             sorts: _mergeSorts(a.sorts, b.sorts), isBool: true };
+    var sorts = _mergeSorts(a.sorts, b.sorts);
+    var r = { expr: '(or ' + _toBool(a) + ' ' + _toBool(b) + ')',
+              sorts: sorts, isBool: true };
+    if (a.incompatible || b.incompatible || sorts.__conflict) r.incompatible = true;
+    return r;
   }
   function smtCmp(op, l, r) {
     if (!l || !r) return null;
@@ -539,11 +550,15 @@
     else if (op === '>=') smtOp = '>=';
     else if (op === '==' || op === '===') smtOp = '=';
     else if (op === '!=' || op === '!==') {
-      return { expr: '(not (= ' + l.expr + ' ' + r.expr + '))',
-               sorts: sorts, isBool: true };
+      var rne = { expr: '(not (= ' + l.expr + ' ' + r.expr + '))',
+                  sorts: sorts, isBool: true };
+      if (l.incompatible || r.incompatible || sorts.__conflict) rne.incompatible = true;
+      return rne;
     } else return null;
-    return { expr: '(' + smtOp + ' ' + l.expr + ' ' + r.expr + ')',
-             sorts: sorts, isBool: true };
+    var re = { expr: '(' + smtOp + ' ' + l.expr + ' ' + r.expr + ')',
+               sorts: sorts, isBool: true };
+    if (l.incompatible || r.incompatible || sorts.__conflict) re.incompatible = true;
+    return re;
   }
   function smtArith(op, l, r) {
     if (!l || !r) return null;
@@ -571,9 +586,20 @@
           case '%': if (r.value.val !== 0) return smtConst(l.value.val % r.value.val); break;
         }
       }
+      // Sort check: numeric arith requires Int operands. If either side
+      // has a sym already declared as String (from a prior cmp/strProp),
+      // the formula is untranslatable.
+      var arithIncompat = false;
+      if (l.symName && l.sorts[l.symName] === 'String') arithIncompat = true;
+      if (r.symName && r.sorts[r.symName] === 'String') arithIncompat = true;
+      if (l.incompatible || r.incompatible) arithIncompat = true;
       var smtOp = op === '/' ? 'div' : op === '%' ? 'mod' : op;
-      return { expr: '(' + smtOp + ' ' + l.expr + ' ' + r.expr + ')',
-               sorts: _mergeSorts(l.sorts, r.sorts), isBool: false };
+      var sortsA = _mergeSorts(l.sorts, r.sorts);
+      if (sortsA.__conflict) arithIncompat = true;
+      var ra = { expr: '(' + smtOp + ' ' + l.expr + ' ' + r.expr + ')',
+                 sorts: sortsA, isBool: false };
+      if (arithIncompat) ra.incompatible = true;
+      return ra;
     }
     return null;
   }
@@ -637,9 +663,15 @@
     if (!formula) return true;
     // Compile-time fold for fully-concrete results.
     if (formula.value && formula.value.kind === 'bool') return formula.value.val;
+    // Untranslatable formulas (sort conflicts the Z3 type system can't
+    // represent — e.g. a sym used as both Int and String) are
+    // conservatively reported as satisfiable: we don't know enough to
+    // refute the branch.
+    if (formula.incompatible) return true;
     var z3 = await _initZ3();
     var decls = '';
     for (var name in formula.sorts) {
+      if (name === '__conflict') continue;
       decls += '(declare-const ' + _quoteSmtName(name) + ' ' + (formula.sorts[name] || 'Int') + ')\n';
     }
     var smtlib = decls + '(assert ' + _toBool(formula) + ')\n';

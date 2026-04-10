@@ -3421,6 +3421,15 @@ await (async function () {
   await checkTaint('z3: empty string indexof', { 'a.js': 'var x = location.search; if (x.length === 0) { if (x.indexOf("a") >= 0) { document.getElementById("o").innerHTML = x; } }' }, 0);
   await checkTaint('z3: prefix incompat',      { 'a.js': 'var x = location.search; if (x.startsWith("http://")) { if (x.startsWith("javascript:")) { document.getElementById("o").innerHTML = x; } }' }, 0);
 
+  // --- Sort-conflict resilience: a sym used as both String and Int ---
+  // The translator can't represent the JS coercion semantics in Z3's
+  // sorted logic, so the formula is marked untranslatable and the
+  // branch is conservatively kept reachable (no false negatives).
+  await checkTaint('sort: str-then-arith reachable',  { 'a.js': 'var x = location.search; if (x === "abc" && x + 1 > 5) { document.getElementById("o").innerHTML = x; }' }, 1);
+  await checkTaint('sort: prefix-then-arith reachable', { 'a.js': 'var x = location.search; if (x.startsWith("http") && x * 2 > 10) { document.getElementById("o").innerHTML = x; }' }, 1);
+  // Same-sort uses don't trigger the conflict path:
+  await checkTaint('sort: dual-string consistent', { 'a.js': 'var x = location.search; if (x.length > 5 && x === "ab") { document.getElementById("o").innerHTML = x; }' }, 0);
+
   // --- IIFE ---
   await checkTaint('IIFE function', { 'a.js': '(function() { document.getElementById("o").innerHTML = location.search; })();' }, 1);
   await checkTaint('IIFE with args', { 'a.js': '(function(x) { document.getElementById("o").innerHTML = x; })(location.search);' }, 1);
