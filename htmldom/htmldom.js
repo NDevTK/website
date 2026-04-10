@@ -1,4 +1,42 @@
 // HTML to DOM API Converter
+//
+// This file currently bundles two things that will be split across
+// Stage 5 of the jsanalyze migration plan (see session notes):
+//
+//   (1) A whole-program symbolic interpreter for JavaScript — the
+//       core of the planned `jsanalyze` library. Its public surface
+//       is gradually being carved out inside the "=== jsanalyze
+//       public surface ===" banners. Consumers never reach into
+//       walker internals; they go through the `bindingToValue`
+//       boundary function which converts walker bindings to the
+//       versioned shapes in jsanalyze-schemas.js.
+//
+//   (2) The htmldom-convert consumer — an innerHTML → DOM API
+//       rewriter built on (1). It's the oldest consumer and the
+//       most complex; it stays in this file until Stage 4 when it
+//       moves out to htmldom-convert.js.
+//
+// Stage plan:
+//   Stage 1 (done) — Schema file + bindingToValue seam + tests
+//   Stage 2         — Extract query.js (findCalls, taintFlows, …)
+//   Stage 3         — Write fetch-trace.js + taint-report.js + csp-derive.js
+//                      consumers against the query layer
+//   Stage 4         — Move htmldom-convert out of this file
+//   Stage 5         — Rename remainder to jsanalyze.js
+//
+// Migration map (current function → future location):
+//   tokenize, scanMutations, buildScopeState    → jsanalyze.js (core)
+//   bindingToValue, _schemas, _chain*           → jsanalyze.js (public seam)
+//   traceTaint, traceTaintInJs                  → query layer in jsanalyze-query.js
+//                                                  (thin wrappers kept for compat)
+//   convertJsFile, convertProject,              → htmldom-convert.js (consumer)
+//   convertHtmlMarkup, extractHTML, materialize*
+//   TAINT_*, ELEMENT_SINK_TYPES, EVENT_TAINT_*  → shared classification tables;
+//                                                  exposed by jsanalyze so
+//                                                  consumers can customize.
+//
+// Nothing in this file should be imported directly by a Stage-3+
+// consumer — consumers go through the public jsanalyze API only.
 (async function () {
   'use strict';
 
@@ -1553,6 +1591,410 @@
       return null;
     }
     return { target, assignProp, assignOp, chainTokens: r.tokens };
+  }
+
+  // =========================================================================
+  // === jsanalyze public surface (Stage 1: seam + schemas) ===
+  //
+  // Everything below this banner is part of the planned `jsanalyze`
+  // library's public API. It's currently defined inside htmldom.js
+  // so the existing file layout is preserved, but every function
+  // here takes ONLY walker-internal types and produces ONLY values
+  // conforming to the jsanalyze-schemas.js public shape. The goal
+  // is to mark the boundary now so Stage 5's file split is a
+  // mechanical move with no logic changes.
+  //
+  // Nothing inside this region should reach into walker internals
+  // beyond the arguments it's given. Nothing outside this region
+  // should reach into public shapes.
+  //
+  // The boundary function is `bindingToValue` — it converts the
+  // walker's internal binding (chain / object / array / function /
+  // element) into a public `Value` from jsanalyze-schemas. Every
+  // public query primitive goes through this function.
+  // =========================================================================
+
+  // Lazy-load the schema module. In Node (tests, consumers) we
+  // require() it. In the browser, the schema file is loaded as a
+  // separate <script> tag that sets globalThis.JsAnalyzeSchemas
+  // before htmldom.js runs. `_schemas()` resolves the right one.
+  var _schemaCache = null;
+  function _schemas() {
+    if (_schemaCache) return _schemaCache;
+    if (typeof globalThis !== 'undefined' && globalThis.JsAnalyzeSchemas) {
+      _schemaCache = globalThis.JsAnalyzeSchemas;
+      return _schemaCache;
+    }
+    if (typeof require !== 'undefined') {
+      try {
+        _schemaCache = require('./jsanalyze-schemas.js');
+        return _schemaCache;
+      } catch (_) { /* fall through */ }
+    }
+    throw new Error('jsanalyze-schemas.js not available');
+  }
+
+  // Utility: compute (line, col) for a token start position inside
+  // its owning source. Returns { line, col }. 1-indexed.
+  function _tokLineCol(tok) {
+    if (!tok || !tok._src || tok.start == null) return { line: 1, col: 0 };
+    var src = tok._src, pos = tok.start;
+    var line = 1, col = 0;
+    for (var i = 0; i < pos && i < src.length; i++) {
+      if (src.charCodeAt(i) === 10) { line++; col = 0; }
+      else col++;
+    }
+    return { line: line, col: col };
+  }
+
+  // Build a Source (provenance entry) from a walker token and a
+  // source kind. `file` is a display name — the caller passes it
+  // since the walker doesn't always know the file.
+  function _provFromTok(tok, file, kind, snippet) {
+    var S = _schemas();
+    var lc = _tokLineCol(tok);
+    return S.mkSource(file || '<anonymous>', lc.line, lc.col, kind || S.SOURCE_KINDS.INLINE_LITERAL, snippet);
+  }
+
+  // Extract the first token with a usable _src field from a
+  // walker binding (for fallback provenance when we don't have a
+  // dedicated source token).
+  function _anyTokFromBinding(b) {
+    if (!b) return null;
+    if (b.kind === 'chain' && b.toks) {
+      for (var i = 0; i < b.toks.length; i++) {
+        if (b.toks[i] && b.toks[i]._src) return b.toks[i];
+      }
+    }
+    return null;
+  }
+
+  // Try to fold a chain to a single concrete primitive. Returns
+  // null if any token is opaque / symbolic. Handles str, tmpl (text
+  // parts only), and plus separators. Does NOT recurse into
+  // cond/switchjoin/trycatch — those are handled separately by
+  // enumeration.
+  function _chainToConcrete(toks) {
+    if (!toks) return null;
+    var s = '';
+    var hasContent = false;
+    for (var i = 0; i < toks.length; i++) {
+      var t = toks[i];
+      if (t.type === 'plus') continue;
+      if (t.type === 'str') { s += t.text; hasContent = true; continue; }
+      if (t.type === 'tmpl' && t.parts) {
+        for (var j = 0; j < t.parts.length; j++) {
+          var p = t.parts[j];
+          if (p.kind === 'text') { s += p.raw || ''; hasContent = true; }
+          else return null; // hole with an expression — not concrete
+        }
+        continue;
+      }
+      return null;
+    }
+    return hasContent ? s : null;
+  }
+
+  // Enumerate every concrete string a chain could take by
+  // distributing over branch tokens (cond/switchjoin/trycatch).
+  // Returns an array of strings, or null if any branch is not
+  // fully enumerable.
+  function _chainEnumerate(toks) {
+    if (!toks) return null;
+    var accs = [''];
+    for (var i = 0; i < toks.length; i++) {
+      var t = toks[i];
+      if (t.type === 'plus') continue;
+      if (t.type === 'str') {
+        for (var a = 0; a < accs.length; a++) accs[a] = accs[a] + t.text;
+        continue;
+      }
+      if (t.type === 'tmpl' && t.parts) {
+        var sub = [''];
+        for (var pi = 0; pi < t.parts.length; pi++) {
+          var p = t.parts[pi];
+          if (p.kind === 'text') {
+            for (var s2 = 0; s2 < sub.length; s2++) sub[s2] = sub[s2] + (p.raw || '');
+          } else return null;
+        }
+        var next0 = [];
+        for (var a2 = 0; a2 < accs.length; a2++) for (var s3 = 0; s3 < sub.length; s3++) next0.push(accs[a2] + sub[s3]);
+        accs = next0;
+        continue;
+      }
+      if (t.type === 'cond') {
+        var l = _chainEnumerate(t.ifTrue), r = _chainEnumerate(t.ifFalse);
+        if (!l || !r) return null;
+        var next1 = [];
+        for (var a3 = 0; a3 < accs.length; a3++) {
+          for (var li = 0; li < l.length; li++) next1.push(accs[a3] + l[li]);
+          for (var ri = 0; ri < r.length; ri++) next1.push(accs[a3] + r[ri]);
+        }
+        accs = next1;
+        continue;
+      }
+      if (t.type === 'switchjoin' || t.type === 'switch') {
+        if (!t.branches) return null;
+        var bs = [];
+        for (var bi = 0; bi < t.branches.length; bi++) {
+          var be = _chainEnumerate(t.branches[bi].chain);
+          if (!be) return null;
+          bs.push(be);
+        }
+        var next2 = [];
+        for (var a4 = 0; a4 < accs.length; a4++) for (var b = 0; b < bs.length; b++) for (var v = 0; v < bs[b].length; v++) next2.push(accs[a4] + bs[b][v]);
+        accs = next2;
+        continue;
+      }
+      if (t.type === 'trycatch') {
+        var tb = _chainEnumerate(t.tryBody), cb = _chainEnumerate(t.catchBody);
+        if (!tb || !cb) return null;
+        var next3 = [];
+        for (var a5 = 0; a5 < accs.length; a5++) {
+          for (var ti = 0; ti < tb.length; ti++) next3.push(accs[a5] + tb[ti]);
+          for (var ci = 0; ci < cb.length; ci++) next3.push(accs[a5] + cb[ci]);
+        }
+        accs = next3;
+        continue;
+      }
+      return null; // opaque token (other, etc.)
+    }
+    // Dedupe
+    var seen = Object.create(null), out = [];
+    for (var o = 0; o < accs.length; o++) {
+      if (!seen[accs[o]]) { seen[accs[o]] = 1; out.push(accs[o]); }
+    }
+    return out;
+  }
+
+  // Infer an UnknownReason for an opaque token (type === 'other').
+  // Uses the token's taint set to distinguish user-input from
+  // plain unresolved-identifier. Known taint-source expressions
+  // (location.hash, document.cookie, etc.) map to user-input.
+  // Runtime-random APIs map to runtime-random. Everything else
+  // falls through to unresolved-identifier.
+  function _inferUnknownReason(tok) {
+    var S = _schemas();
+    if (tok && tok.taint && (tok.taint.size > 0 || tok.taint.length > 0)) return S.UNKNOWN_REASONS.USER_INPUT;
+    var text = tok && tok.text ? tok.text : '';
+    if (/\bMath\.random\b/.test(text)) return S.UNKNOWN_REASONS.RUNTIME_RANDOM;
+    if (/\bcrypto\.(randomUUID|getRandomValues)\b/.test(text)) return S.UNKNOWN_REASONS.RUNTIME_RANDOM;
+    if (/\bDate\.now\b/.test(text) || /\bperformance\.now\b/.test(text)) return S.UNKNOWN_REASONS.RUNTIME_RANDOM;
+    if (/^(fetch|XMLHttpRequest|IndexedDB|Cache)\b/.test(text)) return S.UNKNOWN_REASONS.OPAQUE_EXTERNAL;
+    return S.UNKNOWN_REASONS.UNRESOLVED_IDENTIFIER;
+  }
+
+  // Extract taint labels from a walker token. Internal taint is a
+  // Set of label strings; the public schema uses arrays.
+  function _tokTaintArray(tok) {
+    if (!tok || !tok.taint) return null;
+    if (tok.taint instanceof Set) {
+      var arr = [];
+      tok.taint.forEach(function (l) { arr.push(l); });
+      return arr.length ? arr : null;
+    }
+    if (Array.isArray(tok.taint)) return tok.taint.length ? tok.taint.slice() : null;
+    return null;
+  }
+
+  // Core boundary: walker binding → public Value.
+  //
+  // `options` is `{ file, provenanceKind, maxDepth }`. The file
+  // name is stamped on generated Source entries. provenanceKind
+  // defaults to 'inline-literal' for leaf sources and 'branch-merge'
+  // for merged branches. maxDepth guards against cyclic object
+  // bindings (rare but possible with self-referential structures).
+  function bindingToValue(binding, options) {
+    var S = _schemas();
+    options = options || {};
+    var depth = options._depth || 0;
+    var maxDepth = options.maxDepth || 32;
+    if (depth >= maxDepth) {
+      return S.value.unknown(S.UNKNOWN_REASONS.RECURSION_CAP, null, []);
+    }
+    var file = options.file || '<anonymous>';
+
+    if (!binding) {
+      return S.value.unknown(S.UNKNOWN_REASONS.UNRESOLVED_IDENTIFIER, null, []);
+    }
+
+    // --- chain binding ---
+    if (binding.kind === 'chain') {
+      return _chainBindingToValue(binding, { file: file, _depth: depth + 1, maxDepth: maxDepth });
+    }
+
+    // --- object binding ---
+    if (binding.kind === 'object') {
+      var props = Object.create(null);
+      for (var k in binding.props) {
+        if (k.indexOf('__') === 0 || k.indexOf('_') === 0) continue;
+        props[k] = bindingToValue(binding.props[k], { file: file, _depth: depth + 1, maxDepth: maxDepth });
+      }
+      var anyTok = null;
+      // Try to find a provenance token from any prop
+      for (var k2 in binding.props) {
+        anyTok = _anyTokFromBinding(binding.props[k2]);
+        if (anyTok) break;
+      }
+      var objProv = anyTok ? [_provFromTok(anyTok, file, S.SOURCE_KINDS.INLINE_LITERAL)] : [];
+      return S.value.object(props, objProv);
+    }
+
+    // --- array binding ---
+    if (binding.kind === 'array') {
+      var elems = [];
+      for (var i = 0; i < binding.elems.length; i++) {
+        elems.push(bindingToValue(binding.elems[i], { file: file, _depth: depth + 1, maxDepth: maxDepth }));
+      }
+      return S.value.array(elems, []);
+    }
+
+    // --- function binding ---
+    if (binding.kind === 'function') {
+      var paramNames = [];
+      if (binding.params) for (var pi = 0; pi < binding.params.length; pi++) paramNames.push(binding.params[pi].name || ('arg' + pi));
+      return S.value.function(
+        binding.name || null,
+        paramNames,
+        { bodyStart: binding.bodyStart, bodyEnd: binding.bodyEnd },
+        []
+      );
+    }
+
+    // --- element binding (DOM virtual element) ---
+    if (binding.kind === 'element') {
+      var elProps = Object.create(null);
+      elProps['__element'] = S.value.concrete(true, []);
+      elProps['tag'] = S.value.concrete(binding.tag || 'unknown', []);
+      if (binding.attrs) {
+        var attrProps = Object.create(null);
+        for (var an in binding.attrs) {
+          attrProps[an] = bindingToValue(binding.attrs[an], { file: file, _depth: depth + 1, maxDepth: maxDepth });
+        }
+        elProps['attrs'] = S.value.object(attrProps, []);
+      }
+      return S.value.object(elProps, []);
+    }
+
+    // Fallback for unknown binding kinds — surfaces as opaque-external.
+    return S.value.unknown(S.UNKNOWN_REASONS.OPAQUE_EXTERNAL, null, []);
+  }
+
+  // Chain binding → Value. Handles the common cases:
+  //   - single str token                  → concrete
+  //   - every tok fold-able to literal    → concrete
+  //   - every tok enumerable via branches → oneOf
+  //   - single opaque 'other' token       → unknown with inferred reason
+  //   - multi-token with symbolic holes   → template
+  function _chainBindingToValue(chainBind, options) {
+    var S = _schemas();
+    var toks = chainBind.toks;
+    var file = options.file;
+    if (!toks || toks.length === 0) {
+      return S.value.unknown(S.UNKNOWN_REASONS.UNRESOLVED_IDENTIFIER, null, []);
+    }
+
+    // Single str token — concrete with inline-literal provenance.
+    if (toks.length === 1 && toks[0].type === 'str') {
+      var prov = toks[0]._src ? [_provFromTok(toks[0], file, S.SOURCE_KINDS.INLINE_LITERAL)] : [];
+      return S.value.concrete(toks[0].text, prov);
+    }
+
+    // Single opaque 'other' token — unknown with inferred reason + taint.
+    if (toks.length === 1 && toks[0].type === 'other') {
+      var reason = _inferUnknownReason(toks[0]);
+      var taint = _tokTaintArray(toks[0]);
+      var oprov = toks[0]._src ? [_provFromTok(toks[0], file, S.SOURCE_KINDS.INLINE_LITERAL, toks[0].text)] : [];
+      return S.value.unknown(reason, taint, oprov);
+    }
+
+    // Try full concrete fold first.
+    var concrete = _chainToConcrete(toks);
+    if (concrete !== null) {
+      var firstTok = toks.find(function (t) { return t && t._src; });
+      var cprov = firstTok ? [_provFromTok(firstTok, file, S.SOURCE_KINDS.INLINE_LITERAL)] : [];
+      return S.value.concrete(concrete, cprov);
+    }
+
+    // Try enumeration over branches.
+    var enumerated = _chainEnumerate(toks);
+    if (enumerated && enumerated.length > 0) {
+      if (enumerated.length === 1) {
+        var e0 = toks.find(function (t) { return t && t._src; });
+        var eprov = e0 ? [_provFromTok(e0, file, S.SOURCE_KINDS.BRANCH_MERGE)] : [];
+        return S.value.concrete(enumerated[0], eprov);
+      }
+      var bprov = toks[0] && toks[0]._src ? [_provFromTok(toks[0], file, S.SOURCE_KINDS.BRANCH_MERGE)] : [];
+      return S.value.oneOf(enumerated, S.ONE_OF_SOURCES.BRANCH, bprov);
+    }
+
+    // Build template: walk tokens, collect literal run + hole runs.
+    var parts = [];
+    var cur = '';
+    for (var ti = 0; ti < toks.length; ti++) {
+      var t = toks[ti];
+      if (t.type === 'plus') continue;
+      if (t.type === 'str') { cur += t.text; continue; }
+      if (t.type === 'tmpl' && t.parts) {
+        for (var tpi = 0; tpi < t.parts.length; tpi++) {
+          var tp = t.parts[tpi];
+          if (tp.kind === 'text') cur += (tp.raw || '');
+          else {
+            if (cur) { parts.push(S.part.literal(cur)); cur = ''; }
+            var holeVal = S.value.unknown(S.UNKNOWN_REASONS.UNRESOLVED_IDENTIFIER, null, []);
+            parts.push(S.part.hole(holeVal, tp.expr || null));
+          }
+        }
+        continue;
+      }
+      if (t.type === 'cond' || t.type === 'switchjoin' || t.type === 'switch' || t.type === 'trycatch') {
+        if (cur) { parts.push(S.part.literal(cur)); cur = ''; }
+        // Recursively convert this branch token as a synthetic chain.
+        var branchVal = _chainBindingToValue({ kind: 'chain', toks: [t] }, options);
+        parts.push(S.part.hole(branchVal, null));
+        continue;
+      }
+      // Opaque 'other' or anything else
+      if (cur) { parts.push(S.part.literal(cur)); cur = ''; }
+      var hReason = _inferUnknownReason(t);
+      var hTaint = _tokTaintArray(t);
+      var hProv = t._src ? [_provFromTok(t, file, S.SOURCE_KINDS.INLINE_LITERAL, t.text)] : [];
+      parts.push(S.part.hole(
+        S.value.unknown(hReason, hTaint, hProv),
+        t.text || null
+      ));
+    }
+    if (cur) parts.push(S.part.literal(cur));
+
+    if (parts.length === 0) {
+      return S.value.unknown(S.UNKNOWN_REASONS.UNRESOLVED_IDENTIFIER, null, []);
+    }
+    // If the template collapsed to a single literal part, return concrete.
+    if (parts.length === 1 && parts[0].kind === 'literal') {
+      return S.value.concrete(parts[0].value, []);
+    }
+    return S.value.template(parts, []);
+  }
+
+  // =========================================================================
+  // === end jsanalyze public surface ===
+  // =========================================================================
+
+  // Early global export of the jsanalyze translation layer so tests and
+  // consumers can reach it synchronously — before the IIFE's top-level
+  // `await convert()` suspends execution. Definitions above this point
+  // are hoisted, so referencing them here is safe. The full api export
+  // at the end of the IIFE is unchanged and runs after the await.
+  if (typeof globalThis !== 'undefined') {
+    globalThis.__bindingToValue = bindingToValue;
+    globalThis.__jsanalyze = {
+      bindingToValue: bindingToValue,
+      // buildScopeState / scanMutations / tokenize are hoisted
+      // function declarations too; they're callable here.
+      buildScopeState: buildScopeState,
+      scanMutations: scanMutations,
+      tokenize: tokenize,
+    };
   }
 
   async function extractHTML(input) {
@@ -10571,6 +11013,15 @@
     ELEMENT_SINK_TYPES: ELEMENT_SINK_TYPES,
     TAINT_SANITIZERS: TAINT_SANITIZERS,
     EVENT_TAINT_SOURCES: EVENT_TAINT_SOURCES,
+    // jsanalyze public surface (stage 1 — seam only, stable shape)
+    jsanalyze: {
+      bindingToValue: bindingToValue,
+      // Allow tests + consumers to reach the walker for now.
+      // Stage 2 will expose a proper `analyze()` entry point.
+      buildScopeState: buildScopeState,
+      scanMutations: scanMutations,
+      tokenize: tokenize,
+    },
   };
 
   if (typeof globalThis !== 'undefined') {
@@ -10579,6 +11030,7 @@
     globalThis.__convertJsFile = convertJsFile;
     globalThis.__traceTaint = traceTaint;
     globalThis.__htmldomApi = api;
+    globalThis.__bindingToValue = bindingToValue;
   }
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = api;
