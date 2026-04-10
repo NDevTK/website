@@ -85,17 +85,27 @@
     }
 
     // Step 2: load z3-built.js so it populates window.initZ3.
+    // Resolve against document.baseURI so this works regardless
+    // of whether the page is served at the site root or a subpath.
     if (typeof window.initZ3 !== 'function') {
-      await loadClassicScript(VENDOR_DIR + 'z3-built.js');
+      var z3BuiltUrl = new URL(VENDOR_DIR + 'z3-built.js', document.baseURI).href;
+      await loadClassicScript(z3BuiltUrl);
       if (typeof window.initZ3 !== 'function') {
         throw new Error('jsanalyze-z3-browser: z3-built.js loaded but window.initZ3 is not a function');
       }
     }
 
     // Step 3: dynamic-import the pre-bundled ESM wrapper.
-    // `./` is relative to the current module — resolved against
-    // the page URL since this file is loaded as a classic script.
-    var mod = await import(VENDOR_DIR + 'browser.esm.js');
+    //
+    // Dynamic import() treats its argument as a *module specifier*,
+    // not a URL — which means a bare-looking string like
+    // 'vendor/z3-solver/browser.esm.js' is rejected with
+    // "Failed to resolve module specifier". We build an absolute
+    // URL from the current document's base URI so the path is
+    // unambiguous regardless of how the page is served (subpath,
+    // dev server, production, etc.).
+    var esmUrl = new URL(VENDOR_DIR + 'browser.esm.js', document.baseURI).href;
+    var mod = await import(esmUrl);
     // The esbuild bundle uses `export default require_browser()`
     // so `mod.default` is the z3-solver browser.js module object.
     // Fall back to direct exports if a future bundle variant
