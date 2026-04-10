@@ -3322,6 +3322,22 @@ await (async function () {
     { 'a.js': 'var ok=false; if(ok) document.getElementById("o").innerHTML=location.hash;' }, 0);
   await checkTaint('loop-var equality refute inside body',
     { 'a.js': 'for (var x of ["a","b"]) { if(x==="trusted") document.getElementById("o").innerHTML=location.hash; }' }, 0);
+  // async arrow functions + expression body sink detection in .then
+  // chains: both `async () => {...}` and `async x => x` parse, and
+  // expression-body arrows running the statement walker over the
+  // body catch sinks shaped like `v => sink = v` inside .then.
+  await checkTaint('async arrow stored + called',
+    { 'a.js': 'var f = async () => { var d = await fetch("/api"); document.getElementById("o").innerHTML = d; }; f();' }, 1);
+  await checkTaint('IIFE async arrow',
+    { 'a.js': '(async () => { var d = await fetch("/api"); document.getElementById("o").innerHTML = d; })();' }, 1);
+  await checkTaint('async single-param arrow',
+    { 'a.js': 'var f = async x => { document.getElementById("o").innerHTML = x; }; f(location.hash);' }, 1);
+  await checkTaint('expr body arrow sink inside then',
+    { 'a.js': 'Promise.resolve(location.hash).then(v => document.getElementById("o").innerHTML = v);' }, 1);
+  await checkTaint('Promise.reject expr catch sink',
+    { 'a.js': 'Promise.reject(location.hash).catch(e => document.getElementById("o").innerHTML = e);' }, 1);
+  await checkTaint('deep then chain expr body sinks',
+    { 'a.js': 'fetch("/" + location.hash).then(r => r.text()).then(t => document.getElementById("o").innerHTML = t);' }, 1);
   await checkTaint('var=function handler', { 'a.js': 'var h = function(msg) { eval(msg.data); };\nwindow.addEventListener("message", h, false);' }, 1, { sources: ['postMessage'] });
 
   // --- addEventListener ---

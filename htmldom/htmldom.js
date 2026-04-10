@@ -3165,8 +3165,17 @@
     // { params, arrowNext } where `arrowNext` is the index just after `=>`,
     // or null if `k` doesn't start an arrow function.
     const peekArrow = (k, stop) => {
-      const t = tks[k];
+      let t = tks[k];
       if (!t) return null;
+      // `async` prefix: `async ident => ...` / `async (params) => ...`.
+      // The walker doesn't distinguish async from sync arrows — await
+      // propagates through its argument as a transparent operator —
+      // so we simply skip the keyword and parse the rest normally.
+      if (t.type === 'other' && t.text === 'async') {
+        k = k + 1;
+        t = tks[k];
+        if (!t) return null;
+      }
       // Single-param form: `ident => body`.
       if (t.type === 'other' && IDENT_RE.test(t.text)) {
         const arrow = tks[k + 1];
@@ -4765,6 +4774,16 @@
           ri++;
         }
       } else {
+        // Expression-body arrow: `v => expr`. We run the statement
+        // walker over [bodyStart, bodyEnd) too, so assignment-shaped
+        // expression bodies like `v => document.body.innerHTML = v`
+        // trigger sink detection (the statement walker's element /
+        // element-attribute sink handlers fire during walkRange).
+        // Then we also read the expression's value for the caller's
+        // return-value taint propagation.
+        if (taintEnabled) {
+          try { await walkRange(fn.bodyStart, fn.bodyEnd); } catch (_) {}
+        }
         const r = await readConcatExpr(fn.bodyStart, fn.bodyEnd, TERMS_NONE);
         if (r && r.next === fn.bodyEnd) result = r.toks;
       }
