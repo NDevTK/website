@@ -4676,6 +4676,45 @@
       // Combine all case results into a switch token; queue post-switch range.
       switch_merge:   'merge cases into switch token; queue tail range',
     };
+    // Statement-kind transitions fired from within the `range` task's
+    // dispatcher. This table doesn't directly drive dispatch (the
+    // dispatcher is still an if-chain for historical reasons) but it
+    // documents every statement kind the state machine recognises and
+    // names its effect on the configuration (S, B, P, T, L).
+    const STATEMENT_DISPATCH = {
+      // Scoping
+      'var':           'decl-block-scope(name); mutate B',
+      'let':           'decl-block-scope(name); mutate B',
+      'const':         'decl-block-scope(name); mutate B',
+      // Control flow — branching
+      'if':            'queue if_restore/if_merge; push cond to P; walk if-body',
+      'else':          'handled inline by preceding `if`',
+      'switch':        'queue switch_merge; fan out switch_case tasks',
+      'case':          'handled inside switch_case transition',
+      'default':       'handled inside switch_case transition',
+      // Control flow — iteration
+      'for':           'compute loop cond formula; push to P; walk body; pop on exit',
+      'while':         'compute loop cond formula; push to P; walk body; pop on exit',
+      'do':            'walk body then eval while-cond; push/pop cond on P',
+      'break':         'advance past innermost loopStack bodyEnd',
+      'continue':      'advance to next iteration (approx: run to bodyEnd)',
+      // Control flow — exceptions
+      'try':           'queue try_restore/try_merge; walk try-body',
+      'catch':         'handled inside try_restore transition',
+      'finally':       'handled inside try_merge transition',
+      'throw':         'mark rest of range dead (current scope)',
+      // Functions & classes
+      'function':      'bind function in outer frame; walk body in new frame',
+      'class':         'parse methods into classBinding; walk body',
+      'return':        'mark rest of range dead within function frame',
+      // Modules & misc
+      'import':        'skip statement',
+      'export':        'strip and walk decl',
+      'with':          'skip body (scope unpredictable)',
+      'debugger':      'skip',
+      // Expression statements are handled after the keyword dispatch.
+      'expression':    'read LHS; if assign, mutate B; if call, side-effects',
+    };
     // State-machine invariant: keep track of the intended path-constraint
     // stack depth so mismatched push/pop on the `pathConstraints` /
     // `taintCondStack` pair can be detected early (in debug builds).
@@ -4885,6 +4924,12 @@
       // as a named variable rather than inlining the one-iteration chain.
       while (loopStack.length > 0 && i >= loopStack[loopStack.length - 1].bodyEnd) {
         const entry = loopStack.pop();
+        // Pop enhanced constraints first (reverse order of push).
+        if (entry.extraFormulas && entry.extraFormulas.length) {
+          for (var _ef = entry.extraFormulas.length - 1; _ef >= 0; _ef--) {
+            _popPathConstraint(entry.extraFormulas[_ef], entry.extraExprs[_ef]);
+          }
+        }
         // Pop the loop condition from P/T — the post-loop world has no
         // guarantee that the loop predicate still holds (we approximate
         // it as unknown rather than as `!cond`, since loop exit can
@@ -5588,13 +5633,161 @@
             if (_forInOfTaint && loopFrame.bindings[_forInOfTaint.varName]) {
               loopFrame.bindings[_forInOfTaint.varName] = chainBinding([deriveExprRef.apply(null, [_forInOfTaint.varName].concat(_forInOfTaint.sources))]);
             }
+            // ---------- Enhanced SMT path constraints for loops ----------
+            // (a) for-of / for-in: push `<iter>.length > 0` so nested
+            //     conditions inside the body can reason about iteration.
+            // (b) Counter loops `for (var i = INT; i OP INT; ...)`: push
+            //     bound constraints on `i` tight to the init value so
+            //     nested conditions testing `i` can fold.
+            var _extraLoopFormulas = [];
+            var _extraLoopExprs = [];
+            if (taintEnabled && t.text === 'for') {
+              // Detect for-of / for-in and push iter.length > 0.
+              for (var _foi = i + 2; _foi < j; _foi++) {
+                if (tokens[_foi].type === 'other' && (tokens[_foi].text === 'in' || tokens[_foi].text === 'of')) {
+                  var _iterStart = _foi + 1;
+                  var _iterEnd = j;
+                  if (_iterStart < _iterEnd) {
+                    var _iterSrc = tokens[_iterStart]._src.slice(
+                      tokens[_iterStart].start,
+                      tokens[_iterEnd - 1].end
+                    );
+                    // Construct a length>0 atom via a synthetic token.
+                    var _iterToks = [{ type: 'other', text: _iterSrc + '.length', _src: tokens[_iterStart]._src, start: tokens[_iterStart].start, end: tokens[_iterEnd - 1].end }];
+                    var _lenAtom = smtParseAtom(_iterToks, 0, 1, resolve, resolvePath);
+                    if (_lenAtom) {
+                      var _lenFormula = smtCmp('>', _lenAtom, smtConst(0));
+                      _extraLoopFormulas.push(_lenFormula);
+                      _extraLoopExprs.push(_iterSrc + '.length > 0');
+                    }
+                  }
+                  break;
+                }
+              }
+              // Detect counter loop `for (var i = INT; i OP ...; i++/--)`.
+              // Only activate when ALL three pieces match (otherwise skip).
+              (function() {
+                var _ci = i + 2;
+                // Skip `var`/`let`/`const`.
+                if (tokens[_ci] && tokens[_ci].type === 'other' &&
+                    (tokens[_ci].text === 'var' || tokens[_ci].text === 'let' || tokens[_ci].text === 'const')) _ci++;
+                var _cName = tokens[_ci] && tokens[_ci].type === 'other' && IDENT_RE.test(tokens[_ci].text) ? tokens[_ci].text : null;
+                if (!_cName) return;
+                // `=` literal int.
+                var _eqTok = tokens[_ci + 1];
+                if (!_eqTok || !((_eqTok.type === 'sep' && _eqTok.char === '=') || (_eqTok.type === 'op' && _eqTok.text === '='))) return;
+                var _cInitTok = tokens[_ci + 2];
+                if (!_cInitTok || _cInitTok.type !== 'other' || !/^-?\d+$/.test(_cInitTok.text)) return;
+                var _cInit = parseInt(_cInitTok.text, 10);
+                // The update clause (third section) must contain `i++`/`i--`/`i+=N`/`i-=N`
+                // so we know direction. Find it via semicolons.
+                var _sc1 = -1, _sc2 = -1;
+                for (var _sk = i + 2; _sk < j; _sk++) {
+                  if (tokens[_sk].type === 'sep' && tokens[_sk].char === ';') {
+                    if (_sc1 < 0) _sc1 = _sk; else { _sc2 = _sk; break; }
+                  }
+                }
+                if (_sc1 < 0 || _sc2 < 0) return;
+                // Direction and step: `i++` / `i+=N` → ascending step N;
+                //                     `i--` / `i-=N` → descending step N.
+                var _ascending = null;
+                var _step = 1;
+                for (var _uk = _sc2 + 1; _uk < j; _uk++) {
+                  var _ut = tokens[_uk];
+                  if (_ut.type === 'other' && _ut.text === _cName) {
+                    var _un = tokens[_uk + 1];
+                    if (_un && _un.type === 'op' && _un.text === '++') { _ascending = true; _step = 1; break; }
+                    if (_un && _un.type === 'op' && _un.text === '--') { _ascending = false; _step = 1; break; }
+                    if (_un && _un.type === 'op' && (_un.text === '+=' || _un.text === '-=')) {
+                      var _sTok = tokens[_uk + 2];
+                      if (_sTok && _sTok.type === 'other' && /^\d+$/.test(_sTok.text)) {
+                        _ascending = _un.text === '+=';
+                        _step = parseInt(_sTok.text, 10);
+                        break;
+                      }
+                    }
+                  }
+                  if (_ut.type === 'op' && (_ut.text === '++' || _ut.text === '--')) {
+                    var _un2 = tokens[_uk + 1];
+                    if (_un2 && _un2.type === 'other' && _un2.text === _cName) {
+                      _ascending = _ut.text === '++'; _step = 1;
+                      break;
+                    }
+                  }
+                }
+                if (_ascending === null || _step <= 0) return;
+                var _cSym = smtSym(_cName);
+                // Push init-side bound: `i >= init` (ascending) or `i <= init` (descending).
+                var _cFormula = smtCmp(_ascending ? '>=' : '<=', _cSym, smtConst(_cInit));
+                _extraLoopFormulas.push(_cFormula);
+                _extraLoopExprs.push(_cName + ' ' + (_ascending ? '>=' : '<=') + ' ' + _cInit);
+                // BOUNDED UNROLLING as an SMT refinement: if the loop has
+                // a concrete upper bound AND the iteration count is ≤
+                // UNROLL_LIMIT, push a disjunction of concrete values
+                // `i === init || i === init±step || ...` so the theory
+                // solver can prove properties that depend on specific
+                // iteration values, not just the range [init, bound).
+                var UNROLL_LIMIT = 8;
+                var _boundTok = null;
+                var _boundOp = null;
+                // Condition parsed as `i OP LIT` or `LIT OP i`.
+                for (var _bk = _sc1 + 1; _bk < _sc2; _bk++) {
+                  var _bt = tokens[_bk];
+                  if (_bt.type === 'op' && /^(<|<=|>|>=)$/.test(_bt.text)) {
+                    var _lhs = tokens[_bk - 1], _rhs = tokens[_bk + 1];
+                    if (_lhs && _rhs && _lhs.type === 'other' && _rhs.type === 'other') {
+                      if (_lhs.text === _cName && /^-?\d+$/.test(_rhs.text)) {
+                        _boundTok = _rhs; _boundOp = _bt.text;
+                      } else if (_rhs.text === _cName && /^-?\d+$/.test(_lhs.text)) {
+                        _boundTok = _lhs;
+                        // Flip op when counter is on the right.
+                        _boundOp = { '<':'>', '>':'<', '<=':'>=', '>=':'<=' }[_bt.text];
+                      }
+                    }
+                    break;
+                  }
+                }
+                if (_boundTok) {
+                  var _bound = parseInt(_boundTok.text, 10);
+                  var _iterCount;
+                  if (_ascending) {
+                    if (_boundOp === '<') _iterCount = Math.max(0, Math.ceil((_bound - _cInit) / _step));
+                    else if (_boundOp === '<=') _iterCount = Math.max(0, Math.floor((_bound - _cInit) / _step) + 1);
+                    else return;
+                  } else {
+                    if (_boundOp === '>') _iterCount = Math.max(0, Math.ceil((_cInit - _bound) / _step));
+                    else if (_boundOp === '>=') _iterCount = Math.max(0, Math.floor((_cInit - _bound) / _step) + 1);
+                    else return;
+                  }
+                  if (_iterCount > 0 && _iterCount <= UNROLL_LIMIT) {
+                    // Build disjunction: i === v_0 OR i === v_1 OR ...
+                    var _disj = null;
+                    var _disjExprs = [];
+                    for (var _it = 0; _it < _iterCount; _it++) {
+                      var _val = _ascending ? (_cInit + _it * _step) : (_cInit - _it * _step);
+                      var _atom = smtCmp('===', _cSym, smtConst(_val));
+                      _disj = _disj ? smtOr(_disj, _atom) : _atom;
+                      _disjExprs.push(_cName + ' === ' + _val);
+                    }
+                    _extraLoopFormulas.push(_disj);
+                    _extraLoopExprs.push('unroll(' + _iterCount + '): ' + _disjExprs.join(' || '));
+                  }
+                }
+              })();
+            }
             // Push the loop condition onto P/T — it holds inside the body.
             _pushPathConstraint(_loopPathFormula, _loopCondExpr);
+            // Push the enhanced constraints (iterator length / counter bound).
+            for (var _elf = 0; _elf < _extraLoopFormulas.length; _elf++) {
+              _pushPathConstraint(_extraLoopFormulas[_elf], _extraLoopExprs[_elf]);
+            }
             loopStack.push({
               id, kind: t.text, headerSrc, bodyEnd, frame: loopFrame,
               modifiedVars: new Set(),
               pathFormula: _loopPathFormula,
               condExpr: _loopCondExpr,
+              extraFormulas: _extraLoopFormulas,
+              extraExprs: _extraLoopExprs,
             });
             // Skip past the loop header — the init/cond/update clauses
             // don't count as body mutations, so we resume at the body's

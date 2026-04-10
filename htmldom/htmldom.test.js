@@ -3389,6 +3389,20 @@ function render() {
   checkTaint('sm: while cond propagates', { 'a.js': 'var x = location.search; while (x < 3) { if (x > 5) { document.getElementById("o").innerHTML = x; } }' }, 0);
   checkTaint('sm: for cond propagates', { 'a.js': 'var x = location.search; for (var i = 0; x < 3; i++) { if (x > 5) { document.getElementById("o").innerHTML = x; } }' }, 0);
   checkTaint('sm: while cond compatible', { 'a.js': 'var x = location.search; while (x > 3) { if (x > 5) { document.getElementById("o").innerHTML = x; } }' }, 1);
+  // Counter-loop bound constraint: for (var i = 0; i < 10; i++) pushes
+  // BOTH `i < 10` (loop cond) AND `i >= 0` (init-bound) onto P.
+  checkTaint('sm: counter bound unsat', { 'a.js': 'var x = location.search; for (var i = 0; i < 10; i++) { if (i < 0) { document.getElementById("o").innerHTML = x; } }' }, 0);
+  checkTaint('sm: counter bound sat', { 'a.js': 'var x = location.search; for (var i = 0; i < 10; i++) { if (i >= 0) { document.getElementById("o").innerHTML = x; } }' }, 1);
+  // for-of / for-in push iter.length > 0 into P so conditions testing
+  // length inside the body fold.
+  checkTaint('sm: for-of len unsat', { 'a.js': 'var arr = [location.search]; for (var v of arr) { if (arr.length === 0) { document.getElementById("o").innerHTML = v; } }' }, 0);
+  // Bounded-unrolling disjunction: `for (var i = 0; i < 4; i++)` pushes
+  // `i === 0 || i === 1 || i === 2 || i === 3` so conditions testing a
+  // specific out-of-range value inside the body fold to unsat.
+  checkTaint('sm: unroll specific unsat', { 'a.js': 'var x = location.search; for (var i = 0; i < 4; i++) { if (i === 7) { document.getElementById("o").innerHTML = x; } }' }, 0);
+  checkTaint('sm: unroll specific sat', { 'a.js': 'var x = location.search; for (var i = 0; i < 4; i++) { if (i === 2) { document.getElementById("o").innerHTML = x; } }' }, 1);
+  // Descending counter: for (i=3; i>=0; i--) — enumerate 3,2,1,0.
+  checkTaint('sm: unroll descending unsat', { 'a.js': 'var x = location.search; for (var i = 3; i >= 0; i--) { if (i > 5) { document.getElementById("o").innerHTML = x; } }' }, 0);
 
   // --- IIFE ---
   checkTaint('IIFE function', { 'a.js': '(function() { document.getElementById("o").innerHTML = location.search; })();' }, 1);
