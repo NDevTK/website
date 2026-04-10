@@ -357,6 +357,39 @@ loading on first use:
 4. Registers `globalThis.__htmldomZ3Init` as a lazy wrapper that
    runs steps 1–3 on first call, then calls `mod.init()`.
 
+### Cross-origin isolation (`SharedArrayBuffer`)
+
+z3-solver's WASM build was compiled with pthread support.
+Emscripten pthreads use `SharedArrayBuffer`, which browsers only
+expose to **cross-origin isolated** pages — pages served with
+these HTTP headers:
+
+```
+Cross-Origin-Opener-Policy:   same-origin
+Cross-Origin-Embedder-Policy: credentialless
+```
+
+Static file servers like `python -m http.server` don't send
+those headers, so the page isn't cross-origin isolated by
+default and any call into Z3 crashes with
+`pthread_create: environment does not support SharedArrayBuffer`.
+
+To fix this without requiring server configuration, `index.html`
+ships two tiny files:
+
+- **`coi-serviceworker.js`** — a service worker that intercepts
+  the navigation request and re-emits it with COOP + COEP
+  headers.
+- **`coi-register.js`** — a classic script that registers the
+  SW on first load and reloads once so the page enters SW
+  control. A session-storage flag prevents reload loops in
+  browsers that don't yet support `credentialless` COEP
+  (notably Safari).
+
+`coi-register.js` is loaded as the first `<script>` in
+`index.html` so COI is active before Monaco or jsanalyze
+start loading.
+
 `jsanalyze.js`'s `_initZ3` picks up `globalThis.__htmldomZ3Init`
 on its first branch and uses it directly — it does no DOM,
 dynamic-import, or CDN work itself. Node continues to use

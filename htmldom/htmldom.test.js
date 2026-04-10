@@ -3929,6 +3929,11 @@ await (async function () {
     'vendor/z3-solver/z3-built.wasm',
     'vendor/z3-solver/browser.esm.js',
     'jsanalyze-z3-browser.js',
+    // Cross-origin isolation service worker — required so
+    // SharedArrayBuffer is available for Z3's pthread WASM build
+    // on statically hosted pages.
+    'coi-serviceworker.js',
+    'coi-register.js',
   ];
   for (const rel of required) {
     const abs = path.join(__dirname, rel);
