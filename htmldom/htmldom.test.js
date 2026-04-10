@@ -3309,6 +3309,19 @@ await (async function () {
     { 'a.js': 'var s="init"; function setA(){s="a";} function setB(){s="b";} if(Math.random()>0.5) setA(); else setB(); if(s==="ready") document.getElementById("o").innerHTML=location.hash;' }, 0);
   await checkTaint('state via fn call branches fire',
     { 'a.js': 'var s="init"; function setA(){s="a";} function setReady(){s="ready";} if(Math.random()>0.5) setA(); else setReady(); if(s==="ready") document.getElementById("o").innerHTML=location.hash;' }, 1);
+  // Boolean state gating: JS-falsy primitives encoded as strings
+  // ("false", "null", "undefined", "0", "NaN") resolve to SMT false
+  // in a bool context. Combined with single-value may-be pinning,
+  // this lets nested if-in-loop refutations fire when the inner
+  // condition never matches any loop element.
+  await checkTaint('nested if-in-loop unreachable refute',
+    { 'a.js': 'var allowed=false; for (var x of ["a","b"]) { if(x==="trusted") allowed=true; } if(allowed) document.getElementById("o").innerHTML=location.hash;' }, 0);
+  await checkTaint('nested if-in-loop reachable fire',
+    { 'a.js': 'var allowed=false; for (var x of ["a","trusted"]) { if(x==="trusted") allowed=true; } if(allowed) document.getElementById("o").innerHTML=location.hash;' }, 1);
+  await checkTaint('bool false direct refute',
+    { 'a.js': 'var ok=false; if(ok) document.getElementById("o").innerHTML=location.hash;' }, 0);
+  await checkTaint('loop-var equality refute inside body',
+    { 'a.js': 'for (var x of ["a","b"]) { if(x==="trusted") document.getElementById("o").innerHTML=location.hash; }' }, 0);
   await checkTaint('var=function handler', { 'a.js': 'var h = function(msg) { eval(msg.data); };\nwindow.addEventListener("message", h, false);' }, 1, { sources: ['postMessage'] });
 
   // --- addEventListener ---

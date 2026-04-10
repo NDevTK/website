@@ -477,11 +477,30 @@
     if (o.value) {
       if (o.value.kind === 'bool') return o.value.val ? 'true' : 'false';
       if (o.value.kind === 'int')  return o.value.val !== 0  ? 'true' : 'false';
-      if (o.value.kind === 'str')  return o.value.val !== '' ? 'true' : 'false';
+      if (o.value.kind === 'str') {
+        // JS semantics: "false" / "null" / "undefined" / "NaN" are
+        // the string forms of JS-falsy primitives and should resolve
+        // to SMT false for boolean-context checks. Non-empty strings
+        // are otherwise truthy.
+        var sv = o.value.val;
+        if (sv === '' || sv === 'false' || sv === 'null' || sv === 'undefined' || sv === 'NaN' || sv === '0') return 'false';
+        return 'true';
+      }
     }
     if (o.symName) {
       var sort = o.sorts[o.symName] || 'Int';
-      if (sort === 'String') return '(not (= ' + o.expr + ' ""))';
+      if (sort === 'String') {
+        // Unknown string sym — check it's not any of the JS-falsy
+        // primitive string forms. When combined with a may-be
+        // disjunction pinning the sym to a specific value (e.g.
+        // "false"), Z3 can refute the bool-context test correctly.
+        return '(and (not (= ' + o.expr + ' ""))' +
+               ' (not (= ' + o.expr + ' "false"))' +
+               ' (not (= ' + o.expr + ' "null"))' +
+               ' (not (= ' + o.expr + ' "undefined"))' +
+               ' (not (= ' + o.expr + ' "NaN"))' +
+               ' (not (= ' + o.expr + ' "0")))';
+      }
       return '(not (= ' + o.expr + ' 0))';
     }
     return '(not (= ' + o.expr + ' 0))';
@@ -780,7 +799,13 @@
         // aliases of the same object hit the same slot.
         var lookupKey = _currentMayBeKey ? _currentMayBeKey(name) : name;
         var slot = _currentVarMayBe[lookupKey];
-        if (slot && slot.complete && slot.vals && slot.vals.length > 1) {
+        // Emit a may-be disjunction (or `(= sym v)` for single-value
+        // slots) whenever the lattice has at least one concrete value.
+        // Single-value slots still pin the sym to a specific literal,
+        // which lets refutations fire when the current binding is an
+        // opaque post-loop / post-if synthetic value but the lattice
+        // still records the single literal actually held.
+        if (slot && slot.complete && slot.vals && slot.vals.length >= 1) {
           // Only emit when the recorded sort matches the formula sort
           // (mixing Int and String literals on the same symbol would
           // produce a sort-mismatched disjunction).
@@ -789,11 +814,15 @@
             if (slot.vals[_vi].sort !== sort) { sortOk = false; break; }
           }
           if (sortOk) {
-            var lits = [];
-            for (var _vj = 0; _vj < slot.vals.length; _vj++) {
-              lits.push('(= ' + _quoteSmtName(name) + ' ' + slot.vals[_vj].lit + ')');
+            if (slot.vals.length === 1) {
+              extras += '(assert (= ' + _quoteSmtName(name) + ' ' + slot.vals[0].lit + '))\n';
+            } else {
+              var lits = [];
+              for (var _vj = 0; _vj < slot.vals.length; _vj++) {
+                lits.push('(= ' + _quoteSmtName(name) + ' ' + slot.vals[_vj].lit + ')');
+              }
+              extras += '(assert (or ' + lits.join(' ') + '))\n';
             }
-            extras += '(assert (or ' + lits.join(' ') + '))\n';
           }
         }
       }
@@ -6536,6 +6565,15 @@
                     }
                   }
                 }
+              }
+              // Also feed the loop variable's OWN may-be slot with every
+              // iterable element. When a nested condition tests the loop
+              // variable (e.g. `if (v === "trusted")`), smtParseAtom
+              // consults the lattice and emits a disjunction over the
+              // concrete element set, letting Z3 refute branches the
+              // iterable can never produce.
+              for (var _lfv = 0; _lfv < _forInOfKnownValues.length; _lfv++) {
+                _trackMayBeAssign(_forInOfLoopVarName, _forInOfKnownValues[_lfv]);
               }
               // Suppress the body walker's opaque `loopVar` assignments
               // into the may-be lattice — the pre-population above has
