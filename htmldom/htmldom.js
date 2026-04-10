@@ -2664,6 +2664,45 @@
     // (with optional attached .concat/.join method), parenthesized
     // subexpressions, array literals, and object literals.
     const readBase = (k, stop) => {
+      // Collect prefix operators iteratively instead of recursing.
+      // Two kinds: keyword prefixes (await/yield/typeof/void/delete) and
+      // operator prefixes (-/+/!/~). Collected in order, then applied in
+      // reverse after the base operand is read.
+      const prefixes = [];
+      while (k < stop) {
+        const pt = tks[k];
+        if (!pt) return null;
+        if (pt.type === 'other' && (pt.text === 'await' || pt.text === 'yield' || pt.text === 'typeof' || pt.text === 'void' || pt.text === 'delete')) {
+          prefixes.push({ kind: 'keyword', text: pt.text });
+          k++;
+          continue;
+        }
+        if (pt.type === 'op' && (pt.text === '-' || pt.text === '+' || pt.text === '!' || pt.text === '~')) {
+          prefixes.push({ kind: 'unary', text: pt.text });
+          k++;
+          continue;
+        }
+        break;
+      }
+      // Parse the base operand (everything after prefixes).
+      var baseResult = _readBaseCore(k, stop);
+      // Apply collected prefix operators in reverse order.
+      if (!baseResult) return null;
+      for (var _pi = prefixes.length - 1; _pi >= 0; _pi--) {
+        var _pf = prefixes[_pi];
+        if (_pf.kind === 'keyword') {
+          var _et = chainAsExprText(baseResult.bind);
+          if (_et === null) return null;
+          baseResult = { bind: chainBinding([exprRef(_pf.text + ' ' + _et)]), next: baseResult.next };
+        } else {
+          var _applied = applyUnary(_pf.text, baseResult.bind);
+          if (!_applied) return null;
+          baseResult = { bind: _applied, next: baseResult.next };
+        }
+      }
+      return baseResult;
+    };
+    const _readBaseCore = (k, stop) => {
       const t = tks[k];
       if (!t) return null;
       // `new X(args)` / `new X.Y` / `new X` — absorb the constructor call
@@ -2688,24 +2727,6 @@
         var _newTaint = checkTaintSource(_newText);
         if (_newTaint) _newRef.taint = _newTaint;
         return { bind: chainBinding([_newRef]), next: j };
-      }
-      // `await expr` / `yield expr` / `void expr` / `typeof expr` / `delete expr`:
-      // evaluate the expression and surface a canonical symbolic form.
-      if (t.type === 'other' && (t.text === 'await' || t.text === 'yield' || t.text === 'typeof' || t.text === 'void' || t.text === 'delete')) {
-        const inner = readBase(k + 1, stop);
-        if (!inner) return null;
-        const et = chainAsExprText(inner.bind);
-        if (et === null) return null;
-        const text = t.text + ' ' + et;
-        return { bind: chainBinding([exprRef(text)]), next: inner.next };
-      }
-      // Unary operators: `-`, `+`, `!`, `~`.
-      if (t.type === 'op' && (t.text === '-' || t.text === '+' || t.text === '!' || t.text === '~')) {
-        const inner = readBase(k + 1, stop);
-        if (!inner) return null;
-        const applied = applyUnary(t.text, inner.bind);
-        if (!applied) return null;
-        return { bind: applied, next: inner.next };
       }
       if (t.type === 'str') return { bind: chainBinding([t]), next: k + 1 };
       if (t.type === 'tmpl') {
@@ -3196,50 +3217,126 @@
     // expressions. Reads an atom then greedily consumes operator-operand
     // pairs while their precedence is at least `minPrec`. Concrete operands
     // fold to literals; unknown subparts yield canonical symbolic text.
+    // Classify a token as a binary operator and return its precedence.
+    const _getOpPrec = (tok) => {
+      if (!tok) return null;
+      if (tok.type === 'op' && BINOP_PREC[tok.text] !== undefined)
+        return { text: tok.text, prec: BINOP_PREC[tok.text] };
+      if (tok.type === 'plus') return { text: '+', prec: 12 };
+      if (tok.type === 'other' && (tok.text === 'in' || tok.text === 'instanceof'))
+        return { text: tok.text, prec: 10 };
+      return null;
+    };
+    // Iterative Pratt parser. Uses explicit stacks instead of recursive
+    // calls so deeply nested expressions can't overflow the JS call stack.
     const parseArithExpr = (k, stop, minPrec) => {
       minPrec = minPrec || 0;
-      const base = readBase(k, stop);
-      if (!base) return null;
-      const r = applySuffixes(base.bind, base.next, stop);
-      let cur = r.bind;
-      let next = r.next;
-      while (next < stop) {
-        const opTok = tks[next];
-        let opText, prec;
-        if (opTok && opTok.type === 'op' && BINOP_PREC[opTok.text] !== undefined) {
-          opText = opTok.text; prec = BINOP_PREC[opText];
-        } else if (opTok && opTok.type === 'plus') {
-          // Treat `+` at precedence 12: numeric add when both operands are
-          // number literals, otherwise leave it to the concat-chain parser.
-          opText = '+'; prec = 12;
-        } else if (opTok && opTok.type === 'other' && (opTok.text === 'in' || opTok.text === 'instanceof')) {
-          // `in` / `instanceof` share relational precedence (10) and are
-          // always runtime-opaque — they fold to `(lhs in rhs)` / similar.
-          opText = opTok.text; prec = 10;
-        } else break;
-        if (prec < minPrec) break;
-        const nextMinPrec = opText === '**' ? prec : prec + 1;
-        const right = parseArithExpr(next + 1, stop, nextMinPrec);
-        if (!right) break;
-        const combined = combineArith(cur, opText, right.bind);
-        if (!combined) break;
-        cur = combined;
-        next = right.next;
+      // Operator stack for binary precedence climbing.
+      const opStack = [];
+      // Ternary stack for nested `cond ? a : b` expressions.
+      const ternStack = [];
+      var pos = k;
+      var curMinPrec = minPrec;
+      // Main loop with two phases: 'read' reads the next operand,
+      // 'process' handles operators and ternary. No recursive calls.
+      var cur = null;
+      var next = pos;
+      var needOperand = true;
+      for (;;) {
+        // --- Phase 1: Read operand (when needed) ---
+        if (needOperand) {
+          const base = readBase(pos, stop);
+          if (!base) {
+            // No operand — unwind stack and restore.
+            while (opStack.length > 0) {
+              const top = opStack.pop();
+              if (cur) {
+                const c = combineArith(top.left, top.op, cur);
+                if (c) { cur = c; curMinPrec = top.minPrec; continue; }
+              }
+              cur = top.left; next = top.nextPos; curMinPrec = top.minPrec;
+            }
+            if (!cur) return null;
+            break;
+          }
+          const r = applySuffixes(base.bind, base.next, stop);
+          cur = r.bind;
+          next = r.next;
+          needOperand = false;
+        }
+        // --- Phase 2: Process operators and ternary ---
+        // Check for binary operator.
+        const opInfo = _getOpPrec(tks[next]);
+        if (opInfo && opInfo.prec >= curMinPrec && next < stop) {
+          // Push current state and read right operand.
+          opStack.push({ left: cur, op: opInfo.text, minPrec: curMinPrec, nextPos: next });
+          curMinPrec = opInfo.text === '**' ? opInfo.prec : opInfo.prec + 1;
+          pos = next + 1;
+          needOperand = true;
+          continue;
+        }
+        // No operator at current precedence. Pop stack and combine.
+        if (opStack.length > 0) {
+          const top = opStack[opStack.length - 1];
+          const c = combineArith(top.left, top.op, cur);
+          if (!c) {
+            // Combine failed. Restore to before the failed operator.
+            opStack.pop();
+            cur = top.left;
+            next = top.nextPos;
+            curMinPrec = top.minPrec;
+            // Unwind remaining stack.
+            while (opStack.length > 0) {
+              const t2 = opStack.pop();
+              const c2 = combineArith(t2.left, t2.op, cur);
+              if (c2) { cur = c2; curMinPrec = t2.minPrec; }
+              else { cur = t2.left; next = t2.nextPos; curMinPrec = t2.minPrec; }
+            }
+            break;
+          }
+          opStack.pop();
+          cur = c;
+          curMinPrec = top.minPrec;
+          continue; // re-check for operators at restored precedence
+        }
+        // Stack empty, no more binary ops. Handle ternary.
+        if (!cur || cur.kind !== 'chain') break;
+        const q = tks[next];
+        if (q && q.type === 'other' && q.text === '?') {
+          ternStack.push({ cond: cur, ifTrue: null });
+          pos = next + 1;
+          curMinPrec = 0;
+          needOperand = true;
+          continue;
+        }
+        // Check if completing a ternary branch.
+        if (ternStack.length > 0) {
+          const top = ternStack[ternStack.length - 1];
+          if (top.ifTrue === null) {
+            const colon = tks[next];
+            if (colon && colon.type === 'other' && colon.text === ':') {
+              top.ifTrue = cur;
+              pos = next + 1;
+              curMinPrec = 0;
+              needOperand = true;
+              continue;
+            }
+            // No colon — incomplete ternary.
+            ternStack.pop();
+            cur = top.cond;
+          } else {
+            // False-branch done. Combine.
+            ternStack.pop();
+            cur = combineTernary(top.cond, top.ifTrue, cur);
+            if (!cur) return null;
+            // Don't set needOperand — cur is already set from combine.
+            // Loop back to check for more ternary pops or operators.
+            continue;
+          }
+        }
+        break;
       }
       if (!cur || cur.kind !== 'chain') return null;
-      // Ternary at the lowest precedence: `cond ? a : b`.
-      const q = tks[next];
-      if (minPrec === 0 && q && q.type === 'other' && q.text === '?') {
-        const t = parseArithExpr(next + 1, stop, 0);
-        if (!t) return { bind: cur, next };
-        const colon = tks[t.next];
-        if (!colon || colon.type !== 'other' || colon.text !== ':') return { bind: cur, next };
-        const f = parseArithExpr(t.next + 1, stop, 0);
-        if (!f) return { bind: cur, next };
-        cur = combineTernary(cur, t.bind, f.bind);
-        if (!cur) return null;
-        next = f.next;
-      }
       return { bind: cur, next };
     };
 
@@ -3545,8 +3642,227 @@
     };
 
     let stop = Math.min(stopAt, tokens.length);
+    // Iterative scope walker. Uses an explicit work stack instead of
+    // recursive walkRange calls so deeply nested control flow can't
+    // overflow the JS call stack. Each entry is a typed task:
+    //   range           — walk token range [start, end)
+    //   if_restore      — after if-body: capture bindings, restore, start else
+    //   if_merge        — after else-body: merge if/else bindings
+    //   try_restore     — after try-body: capture, restore, start catch
+    //   try_merge       — after catch-body: merge, queue finally
+    //   switch_case     — after previous case: restore, walk next case
+    //   switch_merge    — after all cases: merge results
+    const _ws = []; // work stack (LIFO)
+    const _walkPush = (subStart, subEnd, resumeStart, resumeEnd) => {
+      _ws.push({ type: 'range', start: resumeStart, end: resumeEnd });
+      _ws.push({ type: 'range', start: subStart, end: subEnd });
+    };
+    // Shared helper: expand loopVars in a binding's chain tokens.
+    const _expandBindWithLVs = (bind, branchLVs) => {
+      if (!bind || bind.kind !== 'chain') return bind ? bind.toks : [];
+      const lvMap = Object.create(null);
+      for (const lv of branchLVs) {
+        if (!lvMap[lv.name]) lvMap[lv.name] = [];
+        lvMap[lv.name].push(lv);
+      }
+      const expand = (toks) => {
+        const out = [];
+        for (const t of toks) {
+          if (t.type === 'other' && IDENT_RE.test(t.text) && lvMap[t.text] && lvMap[t.text].length) {
+            const lv = lvMap[t.text].pop();
+            for (const vt of expand(lv.chain)) out.push(vt);
+            lvMap[t.text].push(lv);
+          } else out.push(t);
+        }
+        return out;
+      };
+      return expand(bind.toks);
+    };
+    // Shared helper: snapshot all current bindings.
+    const _snapshotBindings = () => {
+      const snap = Object.create(null);
+      for (let si = stack.length - 1; si >= 0; si--)
+        for (const name in stack[si].bindings)
+          if (!(name in snap)) snap[name] = stack[si].bindings[name];
+      return snap;
+    };
     const walkRange = (startI, endI) => {
-    for (let i = startI; i < endI; i++) {
+    _ws.push({ type: 'range', start: startI, end: endI });
+    while (_ws.length > 0) {
+    const _task = _ws.pop();
+    // --- Action: restore bindings after if-body, then walk else ---
+    if (_task.type === 'if_restore') {
+      _task.ctx.ifLoopVars = loopVars.splice(_task.ctx.lvBefore);
+      if (taintCondStack) taintCondStack.pop();
+      const ifBindings = Object.create(null);
+      for (let si = stack.length - 1; si >= 0; si--)
+        for (const name in stack[si].bindings)
+          if (!(name in ifBindings)) ifBindings[name] = stack[si].bindings[name];
+      _task.ctx.ifBindings = ifBindings;
+      for (const name in _task.snapshot) assignName(name, _task.snapshot[name]);
+      if (taintCondStack) taintCondStack.push('!(' + _task.ctx.condExpr + ')');
+      _task.ctx.lvBefore2 = loopVars.length;
+      if (_task.elseStart > 0 && _task.elseEnd > _task.elseStart)
+        _ws.push({ type: 'range', start: _task.elseStart, end: _task.elseEnd });
+      continue;
+    }
+    // --- Action: merge if/else branch bindings ---
+    if (_task.type === 'if_merge') {
+      if (taintCondStack) taintCondStack.pop();
+      const ctx = _task.ctx;
+      const elseLoopVars = loopVars.splice(ctx.lvBefore2);
+      const elseBindings = Object.create(null);
+      for (let si = stack.length - 1; si >= 0; si--)
+        for (const name in stack[si].bindings)
+          if (!(name in elseBindings)) elseBindings[name] = stack[si].bindings[name];
+      const expandWithLVs = _expandBindWithLVs;
+      for (const name in ctx.ifBindings) {
+        const ifB = ctx.ifBindings[name];
+        const elB = elseBindings[name] || _task.snapshot[name];
+        if (!ifB || ifB.kind !== 'chain') continue;
+        if (!elB || elB.kind !== 'chain') continue;
+        const ifFull = expandWithLVs(ifB, ctx.ifLoopVars);
+        const elFull = expandWithLVs(elB, elseLoopVars);
+        if (JSON.stringify(ifFull) === JSON.stringify(elFull)) continue;
+        const snapB = _task.snapshot[name];
+        if (snapB && snapB.kind === 'chain') {
+          const snapFull = snapB.toks;
+          const ifAppended = chainStartsWith(ifFull, snapFull);
+          const elAppended = chainStartsWith(elFull, snapFull);
+          const ifExtra = ifAppended ? stripLeadingPlus(ifFull.slice(snapFull.length)) : ifFull;
+          const elExtra = elAppended ? stripLeadingPlus(elFull.slice(snapFull.length)) : elFull;
+          const currentLoopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
+          if (!ifAppended || !elAppended) {
+            const condTok = { type: 'cond', condExpr: ctx.condExpr, ifTrue: ifFull, ifFalse: elFull };
+            if (currentLoopId !== null) condTok.loopId = currentLoopId;
+            assignName(name, chainBinding([condTok]));
+          } else {
+            const condTok = { type: 'cond', condExpr: ctx.condExpr, ifTrue: ifExtra, ifFalse: elExtra };
+            if (currentLoopId !== null) condTok.loopId = currentLoopId;
+            assignName(name, chainBinding([...snapB.toks, SYNTH_PLUS, condTok]));
+          }
+          if (loopStack.length > 0) loopStack[loopStack.length - 1].modifiedVars.add(name);
+        }
+      }
+      for (const name in ctx.ifBindings) {
+        if (trackBuildVar && trackBuildVar.has(name)) continue;
+        const ifB = ctx.ifBindings[name];
+        const elB = elseBindings[name] || _task.snapshot[name];
+        if (ifB === elB) continue;
+        if (JSON.stringify(ifB) === JSON.stringify(elB)) continue;
+        assignName(name, chainBinding([exprRef(name)]));
+      }
+      continue;
+    }
+    // --- Action: restore after try-body, walk catch ---
+    if (_task.type === 'try_restore') {
+      const tryLoopVars = loopVars.splice(_task.lvBefore);
+      const tryBindings = Object.create(null);
+      for (let si = stack.length - 1; si >= 0; si--)
+        for (const name in stack[si].bindings)
+          if (!(name in tryBindings)) tryBindings[name] = stack[si].bindings[name];
+      for (const name in _task.snapshot) assignName(name, _task.snapshot[name]);
+      _task.ctx.tryBindings = tryBindings;
+      _task.ctx.tryLoopVars = tryLoopVars;
+      _task.ctx.lvBefore2 = loopVars.length;
+      if (_task.catchStart >= 0)
+        _ws.push({ type: 'range', start: _task.catchStart, end: _task.catchEnd });
+      continue;
+    }
+    // --- Action: merge try/catch, then queue finally ---
+    if (_task.type === 'try_merge') {
+      const ctx = _task.ctx;
+      const catchLoopVars = loopVars.splice(ctx.lvBefore2);
+      const catchBindings = Object.create(null);
+      for (let si = stack.length - 1; si >= 0; si--)
+        for (const name in stack[si].bindings)
+          if (!(name in catchBindings)) catchBindings[name] = stack[si].bindings[name];
+      const expandWithLVs = _expandBindWithLVs;
+      for (const name in ctx.tryBindings) {
+        if (!ctx.tryBindings[name] || ctx.tryBindings[name].kind !== 'chain') continue;
+        const tryB = ctx.tryBindings[name];
+        const catchB = catchBindings[name] || _task.snapshot[name];
+        if (!catchB || catchB.kind !== 'chain') continue;
+        const tryFull = expandWithLVs(tryB, ctx.tryLoopVars);
+        const catchFull = expandWithLVs(catchB, catchLoopVars);
+        if (JSON.stringify(tryFull) === JSON.stringify(catchFull)) continue;
+        const snapB = _task.snapshot[name];
+        if (snapB && snapB.kind === 'chain') {
+          if (trackBuildVar && trackBuildVar.has(name)) {
+            const snapFull = snapB.toks;
+            const tryAppended = chainStartsWith(tryFull, snapFull);
+            const catchAppended = chainStartsWith(catchFull, snapFull);
+            const tryExtra = tryAppended ? stripLeadingPlus(tryFull.slice(snapFull.length)) : tryFull;
+            const catchExtra = catchAppended ? stripLeadingPlus(catchFull.slice(snapFull.length)) : catchFull;
+            const tryCatchTok = { type: 'trycatch', tryBody: tryExtra, catchBody: catchExtra, catchParam: _task.catchParam };
+            if (tryAppended && catchAppended) assignName(name, chainBinding([...snapB.toks, SYNTH_PLUS, tryCatchTok]));
+            else assignName(name, chainBinding([tryCatchTok]));
+          } else {
+            assignName(name, chainBinding([exprRef(name)]));
+          }
+        }
+      }
+      if (_task.finallyStart >= 0)
+        _ws.push({ type: 'range', start: _task.finallyStart, end: _task.finallyEnd });
+      continue;
+    }
+    // --- Action: restore snapshot, walk one switch case body ---
+    if (_task.type === 'switch_case') {
+      for (const name in _task.snapshot) assignName(name, _task.snapshot[name]);
+      _ws.push({ type: 'switch_capture', cs: _task.cs, caseResults: _task.caseResults });
+      _ws.push({ type: 'range', start: _task.cs.bodyStart, end: _task.cs.bodyEnd });
+      continue;
+    }
+    // --- Action: capture bindings after a switch case body ---
+    if (_task.type === 'switch_capture') {
+      const bindings = _snapshotBindings();
+      _task.caseResults.push({ label: _task.cs.label, caseExpr: _task.cs.caseExpr, bindings });
+      continue;
+    }
+    // --- Action: merge all switch case results ---
+    if (_task.type === 'switch_merge') {
+      const caseResults = _task.caseResults;
+      const snapshot = _task.snapshot;
+      if (trackBuildVar) {
+        for (const bv of trackBuildVar) {
+          const snapB = snapshot[bv];
+          if (!snapB || snapB.kind !== 'chain') continue;
+          const snapFull = snapB.toks;
+          const branches = [];
+          let allAppended = true;
+          for (const cr of caseResults) {
+            const b = cr.bindings[bv];
+            if (b && b.kind === 'chain') {
+              const full = b.toks;
+              const appended = chainStartsWith(full, snapFull);
+              if (!appended) allAppended = false;
+              const extra = appended ? stripLeadingPlus(full.slice(snapFull.length)) : full;
+              branches.push({ label: cr.label, caseExpr: cr.caseExpr, chain: extra });
+            }
+          }
+          if (branches.length) {
+            const switchTok = { type: 'switch', discExpr: _task.discExpr || '/* switch */', branches };
+            if (allAppended) assignName(bv, chainBinding([...snapB.toks, SYNTH_PLUS, switchTok]));
+            else assignName(bv, chainBinding([switchTok]));
+          }
+        }
+      }
+      const switchChanged = new Set();
+      for (const cr2 of caseResults) {
+        for (const name in cr2.bindings) {
+          if (trackBuildVar && trackBuildVar.has(name)) continue;
+          const b = cr2.bindings[name];
+          const snap = snapshot[name];
+          if (b && (!snap || JSON.stringify(b) !== JSON.stringify(snap))) switchChanged.add(name);
+        }
+      }
+      for (const name of switchChanged) assignName(name, chainBinding([exprRef(name)]));
+      _ws.push({ type: 'range', start: _task.switchEnd, end: _task.resumeEnd });
+      continue;
+    }
+    // --- Process a token range ---
+    var _rangeEnd = _task.end;
+    for (let i = _task.start; i < _rangeEnd; i++) {
       // Pop any loops whose body we've walked past (and their shadow frames).
       // For each variable modified during the loop, capture its final chain
       // as a loopVar entry AND replace its binding with a single reference
@@ -3608,8 +3924,8 @@
         if (trackBuildVar && loopStack.length > 0 && (trackBuildVarDepth < 0 || funcDepth() === trackBuildVarDepth)) {
           // Include optional label and semicolon.
           let stmtEnd = i + 1;
-          if (stmtEnd < endI && tokens[stmtEnd].type === 'other' && IDENT_RE.test(tokens[stmtEnd].text)) stmtEnd++;
-          if (stmtEnd < endI && tokens[stmtEnd].type === 'sep' && tokens[stmtEnd].char === ';') stmtEnd++;
+          if (stmtEnd < _rangeEnd && tokens[stmtEnd].type === 'other' && IDENT_RE.test(tokens[stmtEnd].text)) stmtEnd++;
+          if (stmtEnd < _rangeEnd && tokens[stmtEnd].type === 'sep' && tokens[stmtEnd].char === ';') stmtEnd++;
           const first = tokens[i];
           const last = tokens[stmtEnd - 1];
           const stmtSrc = first._src.slice(first.start, last.end);
@@ -3765,15 +4081,17 @@
             }
             if (concrete === true) {
               // Walk only if-body; skip else chain.
-              walkRange(j + 1, ifEnd);
-              i = (elseEnd > 0 ? elseEnd : ifEnd) - 1;
-              continue;
+              var _resume = (elseEnd > 0 ? elseEnd : ifEnd);
+              _ws.push({ type: 'range', start: _resume, end: _rangeEnd });
+              _rangeEnd = ifEnd; i = j; continue;
             } else if (concrete === false) {
               // Skip if-body; walk else-body (if present).
+              var _resume = (elseEnd > 0 ? elseEnd : ifEnd);
               if (elseStart > 0) {
-                walkRange(elseStart, elseEnd);
+                _ws.push({ type: 'range', start: _resume, end: _rangeEnd });
+                _rangeEnd = elseEnd; i = elseStart - 1; continue;
               }
-              i = (elseEnd > 0 ? elseEnd : ifEnd) - 1;
+              i = _resume - 1;
               continue;
             }
             // Opaque condition: snapshot bindings, walk both branches,
@@ -3781,121 +4099,21 @@
             // tokens if the branches differ.
             const condExpr = condVal ? chainAsExprText(condVal.binding) : null;
             if (condExpr) {
-              // Snapshot current bindings.
-              const snapshot = Object.create(null);
-              for (let si = stack.length - 1; si >= 0; si--) {
-                for (const name in stack[si].bindings) {
-                  if (!(name in snapshot)) snapshot[name] = stack[si].bindings[name];
-                }
-              }
-              // Walk if-body using the full walker; capture loopVars created.
+              // Opaque condition: use state machine to snapshot, walk
+              // if-body, restore, walk else-body, then merge — all via
+              // the work stack so no recursive walkRange calls are needed.
+              const snapshot = _snapshotBindings();
+              var _elS = (elseStart > 0 && elseEnd > elseStart) ? elseStart : 0;
+              var _elE = (elseStart > 0 && elseEnd > elseStart) ? elseEnd : 0;
+              var _resumeAt = (elseEnd > 0 ? elseEnd : ifEnd);
+              var _oCtx = { condExpr, lvBefore: loopVars.length };
+              // LIFO: push resume, merge, restore (which queues else), then if-body runs next.
+              _ws.push({ type: 'range', start: _resumeAt, end: _rangeEnd });
+              _ws.push({ type: 'if_merge', ctx: _oCtx, snapshot });
+              _ws.push({ type: 'if_restore', ctx: _oCtx, snapshot, elseStart: _elS, elseEnd: _elE });
+              // Walk if-body next (push taint condition first).
               if (taintCondStack) taintCondStack.push(condExpr);
-              const lvBefore = loopVars.length;
-              walkRange(j + 1, ifEnd);
-              const ifLoopVars = loopVars.splice(lvBefore);
-              if (taintCondStack) taintCondStack.pop();
-              // Capture if-branch bindings.
-              const ifBindings = Object.create(null);
-              for (let si = stack.length - 1; si >= 0; si--) {
-                for (const name in stack[si].bindings) {
-                  if (!(name in ifBindings)) ifBindings[name] = stack[si].bindings[name];
-                }
-              }
-              // Restore snapshot and walk else-body.
-              for (const name in snapshot) {
-                assignName(name, snapshot[name]);
-              }
-              if (taintCondStack) taintCondStack.push('!(' + condExpr + ')');
-              const lvBefore2 = loopVars.length;
-              if (elseStart > 0 && elseEnd > elseStart) {
-                walkRange(elseStart, elseEnd);
-              }
-              if (taintCondStack) taintCondStack.pop();
-              const elseLoopVars = loopVars.splice(lvBefore2);
-              // Merge: for any binding that differs between branches,
-              // produce a cond token.
-              const elseBindings = Object.create(null);
-              for (let si = stack.length - 1; si >= 0; si--) {
-                for (const name in stack[si].bindings) {
-                  if (!(name in elseBindings)) elseBindings[name] = stack[si].bindings[name];
-                }
-              }
-              // Helper: expand loopVars into a binding's chain to get
-              // the full content including loop iterations.
-              const expandWithLVs = (bind, branchLVs) => {
-                if (!bind || bind.kind !== 'chain') return bind ? bind.toks : [];
-                const lvMap = Object.create(null);
-                for (const lv of branchLVs) {
-                  if (!lvMap[lv.name]) lvMap[lv.name] = [];
-                  lvMap[lv.name].push(lv);
-                }
-                const expand = (toks) => {
-                  const out = [];
-                  for (const t of toks) {
-                    if (t.type === 'other' && IDENT_RE.test(t.text) && lvMap[t.text] && lvMap[t.text].length) {
-                      const lv = lvMap[t.text].pop();
-                      for (const vt of expand(lv.chain)) out.push(vt);
-                      lvMap[t.text].push(lv);
-                    } else {
-                      out.push(t);
-                    }
-                  }
-                  return out;
-                };
-                return expand(bind.toks);
-              };
-              for (const name in ifBindings) {
-                const ifB = ifBindings[name];
-                const elB = elseBindings[name] || snapshot[name];
-                if (!ifB || ifB.kind !== 'chain') continue;
-                if (!elB || elB.kind !== 'chain') continue;
-                // Expand loopVars in each branch to get full content.
-                const ifFull = expandWithLVs(ifB, ifLoopVars);
-                const elFull = expandWithLVs(elB, elseLoopVars);
-                if (JSON.stringify(ifFull) === JSON.stringify(elFull)) continue;
-                const snapB = snapshot[name];
-                if (snapB && snapB.kind === 'chain') {
-                  const snapFull = snapB.toks;
-                  const ifAppended = chainStartsWith(ifFull, snapFull);
-                  const elAppended = chainStartsWith(elFull, snapFull);
-                  const ifExtra = ifAppended ? stripLeadingPlus(ifFull.slice(snapFull.length)) : ifFull;
-                  const elExtra = elAppended ? stripLeadingPlus(elFull.slice(snapFull.length)) : elFull;
-                  const currentLoopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
-                  if (!ifAppended || !elAppended) {
-                    // At least one branch did `html = ...` (full replacement).
-                    // Emit as a ternary: the whole value depends on the condition.
-                    const condTok = {
-                      type: 'cond', condExpr,
-                      ifTrue: ifFull,
-                      ifFalse: elFull,
-                    };
-                    if (currentLoopId !== null) condTok.loopId = currentLoopId;
-                    // The chain IS the cond — no snapshot prefix.
-                    assignName(name, chainBinding([condTok]));
-                  } else {
-                    const condTok = {
-                      type: 'cond', condExpr,
-                      ifTrue: ifExtra,
-                      ifFalse: elExtra,
-                    };
-                    if (currentLoopId !== null) condTok.loopId = currentLoopId;
-                    assignName(name, chainBinding([...snapB.toks, SYNTH_PLUS, condTok]));
-                  }
-                  if (loopStack.length > 0) loopStack[loopStack.length - 1].modifiedVars.add(name);
-                }
-              }
-              // Non-build vars that differ between branches become opaque
-              // so subsequent code doesn't use a stale concrete value.
-              for (const name in ifBindings) {
-                if (trackBuildVar && trackBuildVar.has(name)) continue;
-                const ifB = ifBindings[name];
-                const elB = elseBindings[name] || snapshot[name];
-                if (ifB === elB) continue;
-                if (JSON.stringify(ifB) === JSON.stringify(elB)) continue;
-                assignName(name, chainBinding([exprRef(name)]));
-              }
-              i = (elseEnd > 0 ? elseEnd : ifEnd) - 1;
-              continue;
+              _rangeEnd = ifEnd; i = j; continue;
             }
             // Condition too complex to represent — preserve the entire
             // if/else as raw source so no code is silently dropped.
@@ -3976,86 +4194,15 @@
               k = finallyEnd;
             }
           }
-          // Snapshot, walk try body.
-          const snapshot = Object.create(null);
-          for (let si = stack.length - 1; si >= 0; si--) {
-            for (const name in stack[si].bindings) {
-              if (!(name in snapshot)) snapshot[name] = stack[si].bindings[name];
-            }
-          }
-          const lvBefore = loopVars.length;
-          walkRange(i + 1, tryEnd);
-          const tryLoopVars = loopVars.splice(lvBefore);
-          const tryBindings = Object.create(null);
-          for (let si = stack.length - 1; si >= 0; si--) {
-            for (const name in stack[si].bindings) {
-              if (!(name in tryBindings)) tryBindings[name] = stack[si].bindings[name];
-            }
-          }
-          // Restore and walk catch body.
-          for (const name in snapshot) assignName(name, snapshot[name]);
-          const lvBefore2 = loopVars.length;
-          if (catchStart >= 0) walkRange(catchStart, catchEnd);
-          const catchLoopVars = loopVars.splice(lvBefore2);
-          const catchBindings = Object.create(null);
-          for (let si = stack.length - 1; si >= 0; si--) {
-            for (const name in stack[si].bindings) {
-              if (!(name in catchBindings)) catchBindings[name] = stack[si].bindings[name];
-            }
-          }
-          // Merge build var: try = one branch, catch = other.
-          const expandWithLVs = (bind, branchLVs) => {
-            if (!bind || bind.kind !== 'chain') return bind ? bind.toks : [];
-            const lvMap = Object.create(null);
-            for (const lv of branchLVs) {
-              if (!lvMap[lv.name]) lvMap[lv.name] = [];
-              lvMap[lv.name].push(lv);
-            }
-            const expand = (toks) => {
-              const out = [];
-              for (const ct of toks) {
-                if (ct.type === 'other' && IDENT_RE.test(ct.text) && lvMap[ct.text] && lvMap[ct.text].length) {
-                  const lv = lvMap[ct.text].pop();
-                  for (const vt of expand(lv.chain)) out.push(vt);
-                  lvMap[ct.text].push(lv);
-                } else out.push(ct);
-              }
-              return out;
-            };
-            return expand(bind.toks);
-          };
-          for (const name in tryBindings) {
-            if (!tryBindings[name] || tryBindings[name].kind !== 'chain') continue;
-            const tryB = tryBindings[name];
-            const catchB = catchBindings[name] || snapshot[name];
-            if (!catchB || catchB.kind !== 'chain') continue;
-            const tryFull = expandWithLVs(tryB, tryLoopVars);
-            const catchFull = expandWithLVs(catchB, catchLoopVars);
-            if (JSON.stringify(tryFull) === JSON.stringify(catchFull)) continue;
-            const snapB = snapshot[name];
-            if (snapB && snapB.kind === 'chain') {
-              if (trackBuildVar && trackBuildVar.has(name)) {
-                const snapFull = snapB.toks;
-                const tryAppended = chainStartsWith(tryFull, snapFull);
-                const catchAppended = chainStartsWith(catchFull, snapFull);
-                const tryExtra = tryAppended ? stripLeadingPlus(tryFull.slice(snapFull.length)) : tryFull;
-                const catchExtra = catchAppended ? stripLeadingPlus(catchFull.slice(snapFull.length)) : catchFull;
-                const tryCatchTok = { type: 'trycatch', tryBody: tryExtra, catchBody: catchExtra, catchParam };
-                if (tryAppended && catchAppended) {
-                  assignName(name, chainBinding([...snapB.toks, SYNTH_PLUS, tryCatchTok]));
-                } else {
-                  // Full replacement in at least one branch.
-                  assignName(name, chainBinding([tryCatchTok]));
-                }
-              } else {
-                assignName(name, chainBinding([exprRef(name)]));
-              }
-            }
-          }
-          // Walk finally body unconditionally (it always runs).
-          if (finallyStart >= 0) walkRange(finallyStart, finallyEnd);
-          i = k - 1;
-          continue;
+          // Use state machine for try/catch/finally.
+          const snapshot = _snapshotBindings();
+          var _tCtx = { lvBefore: loopVars.length };
+          // LIFO: push resume, finally, merge, catch-range, restore, then try-body runs next.
+          _ws.push({ type: 'range', start: k, end: _rangeEnd });
+          _ws.push({ type: 'try_merge', ctx: _tCtx, snapshot, catchParam, finallyStart, finallyEnd });
+          _ws.push({ type: 'try_restore', ctx: _tCtx, snapshot, catchStart, catchEnd, lvBefore: loopVars.length });
+          // Walk try-body next.
+          _rangeEnd = tryEnd; continue;
         }
       }
 
@@ -4110,65 +4257,15 @@
               }
             }
             const caseResults = [];
-            for (const cs of cases) {
-              // Restore snapshot.
-              for (const name in snapshot) assignName(name, snapshot[name]);
-              walkRange(cs.bodyStart, cs.bodyEnd);
-              const bindings = Object.create(null);
-              for (let si = stack.length - 1; si >= 0; si--) {
-                for (const name in stack[si].bindings) {
-                  if (!(name in bindings)) bindings[name] = stack[si].bindings[name];
-                }
-              }
-              caseResults.push({ label: cs.label, caseExpr: cs.caseExpr, bindings });
+            // Use state machine to walk each case body iteratively.
+            _ws.push({ type: 'switch_merge', snapshot, cases, caseResults, discExpr, switchEnd, resumeEnd: _rangeEnd });
+            // Push case bodies in reverse so first case is processed first (LIFO).
+            for (var _ci = cases.length - 1; _ci >= 0; _ci--) {
+              _ws.push({ type: 'switch_case', snapshot, cs: cases[_ci], caseResults });
             }
-            // Merge: produce a switchcase token for the build var.
-            if (trackBuildVar) {
-              for (const bv of trackBuildVar) {
-                const snapB = snapshot[bv];
-                if (!snapB || snapB.kind !== 'chain') continue;
-                const snapFull = snapB.toks;
-                const branches = [];
-                let allAppended = true;
-                for (const cr of caseResults) {
-                  const b = cr.bindings[bv];
-                  if (b && b.kind === 'chain') {
-                    const full = b.toks;
-                    const appended = chainStartsWith(full, snapFull);
-                    if (!appended) allAppended = false;
-                    const extra = appended ? stripLeadingPlus(full.slice(snapFull.length)) : full;
-                    branches.push({ label: cr.label, caseExpr: cr.caseExpr, chain: extra });
-                  }
-                }
-                if (branches.length) {
-                  const switchTok = { type: 'switch', discExpr: discExpr || '/* switch */', branches };
-                  if (allAppended) {
-                    assignName(bv, chainBinding([...snapB.toks, SYNTH_PLUS, switchTok]));
-                  } else {
-                    assignName(bv, chainBinding([switchTok]));
-                  }
-                }
-              }
-            }
-            // Non-build vars that differ across cases: make opaque so
-            // the resolver doesn't statically pick the last case's value.
-            // Collect all names assigned in any case.
-            const switchChanged = new Set();
-            for (const cr2 of caseResults) {
-              for (const name in cr2.bindings) {
-                if (trackBuildVar && trackBuildVar.has(name)) continue;
-                const b = cr2.bindings[name];
-                const snap = snapshot[name];
-                // Changed if: exists in case but not snapshot, or differs.
-                if (b && (!snap || JSON.stringify(b) !== JSON.stringify(snap))) {
-                  switchChanged.add(name);
-                }
-              }
-            }
-            for (const name of switchChanged) {
-              assignName(name, chainBinding([exprRef(name)]));
-            }
-            i = switchEnd - 1;
+            // Don't process any more tokens in this range — let the stack handle it.
+            _rangeEnd = i; continue;
+            // (merge logic moved to switch_merge action handler)
             continue;
           }
         }
@@ -4219,9 +4316,8 @@
                 id, kind: 'do', headerSrc, bodyEnd: doEnd, frame: loopFrame,
                 modifiedVars: new Set(),
               });
-              walkRange(i + 1, bodyEnd);
-              i = doEnd - 1;
-              continue;
+              _ws.push({ type: 'range', start: doEnd, end: _rangeEnd });
+              _rangeEnd = bodyEnd; continue;
             }
           }
         }
@@ -4852,12 +4948,12 @@
         if (bracketTok && bracketTok.type === 'open' && bracketTok.char === '[') {
           // Walk past balanced [...] and any following .prop, [...], or (...)
           let j = i + 1;
-          while (j < endI) {
+          while (j < _rangeEnd) {
             const jt = tokens[j];
             if (jt.type === 'open' && (jt.char === '[' || jt.char === '(')) {
               const match = jt.char === '[' ? ']' : ')';
               let d = 1; j++;
-              while (j < endI && d > 0) {
+              while (j < _rangeEnd && d > 0) {
                 if (tokens[j].type === 'open' && tokens[j].char === jt.char) d++;
                 else if (tokens[j].type === 'close' && tokens[j].char === match) d--;
                 j++;
@@ -4874,7 +4970,7 @@
               (afterTok.char === '=' || afterTok.char === '+=' || afterTok.char === '-=' ||
                afterTok.char === '*=' || afterTok.char === '/=')) {
             // Bracket-access assignment: items[i].seen = true
-            const stmtEndIdx = skipExpr(j + 1, endI);
+            const stmtEndIdx = skipExpr(j + 1, _rangeEnd);
             // Preserve the statement in build var chains.
             if (trackBuildVar && (trackBuildVarDepth < 0 || funcDepth() === trackBuildVarDepth)) {
               const first = tokens[i];
@@ -4899,7 +4995,7 @@
           // (e.g. items[i].doSomething()). Skip to statement boundary.
           let stmtEnd = j;
           let sd = 0;
-          while (stmtEnd < endI) {
+          while (stmtEnd < _rangeEnd) {
             const st = tokens[stmtEnd];
             if (st.type === 'open') sd++;
             else if (st.type === 'close') sd--;
@@ -4927,6 +5023,7 @@
         }
       }
     }
+    } // end while (_ws)
     };
     walkRange(0, stop);
 
