@@ -1771,6 +1771,10 @@
     // Promise continuation — applyMethod's then/catch/finally handler
     // walks the callback with the receiver's taint as the first arg.
     'then', 'catch', 'finally',
+    // Map / Set / WeakMap / WeakSet key-indexed ops — applyMethod
+    // dispatches these against a _mapLike object binding so dispatcher
+    // tables and lookup caches flow through the may-be lattice.
+    'set', 'get', 'has', 'add', 'delete', 'clear',
   ]);
 
   const MATH_CONSTANTS = {
@@ -2126,6 +2130,17 @@
         return;
       }
       if (slot.complete === false) return; // already poisoned for SMT
+      // Expand a conditional chain `(cond) ? a : b` into two separate
+      // may-be entries — both branches are reachable values. Without
+      // this, the lattice is poisoned the moment a ternary is assigned
+      // to a tracked variable, losing refutation power over loop /
+      // switch / branch state.
+      if (binding && binding.kind === 'chain' && binding.toks.length === 1 && binding.toks[0].type === 'cond') {
+        var _condTok = binding.toks[0];
+        if (_condTok.ifTrue) _trackMayBeAssign(name, chainBinding(_condTok.ifTrue));
+        if (_condTok.ifFalse) _trackMayBeAssign(name, chainBinding(_condTok.ifFalse));
+        return;
+      }
       // Encode the assignment to detect duplicates and check encodability.
       var lit = _bindingToConcreteLit(binding);
       if (!lit) {
@@ -3471,6 +3486,70 @@
 
     // Apply a method call: .concat on chain, or .join on array.
     const applyMethod = async (bind, method, parenIdx, stop) => {
+      // Map / Set / WeakMap / WeakSet — model key-indexed ops as plain
+      // object prop reads/writes so dispatcher tables built via
+      // `.set(key, fn)` / `.get(key)` flow through the same may-be
+      // lattice as object dispatchers.
+      if (bind && bind.kind === 'object' && bind._mapLike) {
+        if (method === 'set') {
+          var _msArgs = await readCallArgBindings(parenIdx, stop);
+          if (_msArgs && _msArgs.bindings.length >= 2) {
+            var _msKey = chainAsKnownString(_msArgs.bindings[0]);
+            var _msVal = _msArgs.bindings[1];
+            if (_msKey !== null) {
+              bind.props[_msKey] = _msVal;
+              // Feed may-be lattice so indirect-dispatch walking sees
+              // every function registered under ANY key.
+              if (_msVal && _msVal.kind === 'function') {
+                var _msSlotKey = '#' + bind.__objId + '.' + _msKey;
+                if (!_varMayBe[_msSlotKey]) _varMayBe[_msSlotKey] = { vals: [], keys: Object.create(null), complete: true, fns: null, fnIds: null };
+                var _msSlot = _varMayBe[_msSlotKey];
+                if (!_msSlot.fns) { _msSlot.fns = []; _msSlot.fnIds = Object.create(null); }
+                var _msFkey = _msVal.bodyStart + ':' + _msVal.bodyEnd;
+                if (!_msSlot.fnIds[_msFkey]) { _msSlot.fnIds[_msFkey] = true; _msSlot.fns.push(_msVal); }
+              }
+            } else {
+              // Opaque key — stash under a wildcard slot so indirect
+              // dispatch still sees the function.
+              if (_msVal && _msVal.kind === 'function') {
+                var _mswKey = '#' + bind.__objId + '.*';
+                if (!bind.props['__mapStar']) bind.props['__mapStar'] = [];
+                bind.props['__mapStar'].push(_msVal);
+              }
+            }
+            return { bind: bind, next: _msArgs.next };
+          }
+        }
+        if (method === 'get') {
+          var _mgArgs = await readCallArgBindings(parenIdx, stop);
+          if (_mgArgs && _mgArgs.bindings.length >= 1) {
+            var _mgKey = chainAsKnownString(_mgArgs.bindings[0]);
+            if (_mgKey !== null && bind.props[_mgKey]) {
+              return { bind: bind.props[_mgKey], next: _mgArgs.next };
+            }
+            // Opaque key: return an opaque chain so a subsequent
+            // bare-call through applySuffixes falls back to the
+            // indirect-call dispatch path over the may-be fn set.
+            return { bind: chainBinding([exprRef('map.get(*)')]), next: _mgArgs.next };
+          }
+        }
+        if (method === 'has') {
+          var _mhArgs = await readCallArgBindings(parenIdx, stop);
+          if (_mhArgs) return { bind: chainBinding([exprRef('map.has(*)')]), next: _mhArgs.next };
+        }
+        if (method === 'add' && bind._mapLike === 'Set') {
+          var _maArgs = await readCallArgBindings(parenIdx, stop);
+          if (_maArgs && _maArgs.bindings.length >= 1) {
+            var _maKey = chainAsKnownString(_maArgs.bindings[0]);
+            if (_maKey !== null) bind.props[_maKey] = chainBinding([makeSynthStr('true')]);
+            return { bind: bind, next: _maArgs.next };
+          }
+        }
+        if (method === 'delete' || method === 'clear') {
+          var _mdArgs = await readCallArgBindings(parenIdx, stop);
+          if (_mdArgs) return { bind: chainBinding([makeSynthStr('true')]), next: _mdArgs.next };
+        }
+      }
       if (method === 'concat') {
         // Array concat: [].concat(arr) → merge elements.
         if (bind && bind.kind === 'array') {
@@ -4003,6 +4082,29 @@
               await instantiateFunction(_ctorFn, _ctorArgBinds, _inst);
             }
             return { bind: _inst, next: _newJ };
+          }
+          // `new Map()` / `new Set()` / `new WeakMap()` / `new WeakSet()` —
+          // model as an empty object binding. The shared method-call path
+          // at applyMethod / applySuffixes then treats `.set(k, v)` as a
+          // key-indexed write and `.get(k)` as a read, so dispatchers
+          // and lookup tables propagate taint + flow through the same
+          // machinery plain objects use.
+          if (_newName.text === 'Map' || _newName.text === 'Set' ||
+              _newName.text === 'WeakMap' || _newName.text === 'WeakSet') {
+            var _mObj = objectBinding(Object.create(null));
+            _mObj._mapLike = _newName.text;
+            var _mJ = k + 2;
+            if (tks[_mJ] && tks[_mJ].type === 'open' && tks[_mJ].char === '(') {
+              // Skip balanced parens; initializer entries are ignored
+              // (rare in practice for dispatcher tables).
+              var _mnd = 1; _mJ++;
+              while (_mJ < stop && _mnd > 0) {
+                if (tks[_mJ].type === 'open' && tks[_mJ].char === '(') _mnd++;
+                else if (tks[_mJ].type === 'close' && tks[_mJ].char === ')') _mnd--;
+                _mJ++;
+              }
+            }
+            return { bind: _mObj, next: _mJ };
           }
         }
         let j = k + 1;
@@ -5107,6 +5209,21 @@
           if (!(name in snap)) snap[name] = stack[si].bindings[name];
       return snap;
     };
+    // Restore a variable's binding from a snapshot without feeding the
+    // may-be lattice. Snapshots are purely structural rewinds — the
+    // lattice already recorded every prior value the variable held, so
+    // re-running _trackMayBeAssign on an opaque synthetic restoration
+    // chain (e.g. the post-loop deriveExprRef) would poison the slot
+    // and destroy refutation power for every branch that follows.
+    const _restoreBinding = (name, value) => {
+      for (let si = stack.length - 1; si >= 0; si--) {
+        if (name in stack[si].bindings) {
+          stack[si].bindings[name] = value;
+          return;
+        }
+      }
+      if (stack.length > 0) stack[0].bindings[name] = value;
+    };
     // -------------------------------------------------------------------
     // walkRange: iterative SMT-integrated state machine
     // -------------------------------------------------------------------
@@ -5262,7 +5379,7 @@
       _task.ctx.ifLoopVars = loopVars.splice(_task.ctx.lvBefore);
       _popPathConstraint(_task.ctx.pathFormula, _task.ctx.condExpr);
       _task.ctx.ifBindings = _snapshotBindings();
-      for (const name in _task.snapshot) assignName(name, _task.snapshot[name]);
+      for (const name in _task.snapshot) _restoreBinding(name, _task.snapshot[name]);
       _pushPathConstraint(smtNot(_task.ctx.pathFormula), '!(' + _task.ctx.condExpr + ')');
       _task.ctx.negPushed = true;
       _task.ctx.lvBefore2 = loopVars.length;
@@ -5311,10 +5428,27 @@
     if (_task.type === 'try_restore') {
       const tryLoopVars = loopVars.splice(_task.lvBefore);
       const tryBindings = _snapshotBindings();
-      for (const name in _task.snapshot) assignName(name, _task.snapshot[name]);
+      for (const name in _task.snapshot) _restoreBinding(name, _task.snapshot[name]);
       _task.ctx.tryBindings = tryBindings;
       _task.ctx.tryLoopVars = tryLoopVars;
       _task.ctx.lvBefore2 = loopVars.length;
+      // Bind the catch parameter to an opaque chain tagged with every
+      // taint source that could flow through a throw inside the try
+      // body (including throws inside any function called from it).
+      // Without this, `throw location.hash` → `catch (e) { sink(e) }`
+      // looks like a safe use of an unbound variable.
+      if (taintEnabled && _task.catchStart >= 0 && _task.ctx.catchParamName) {
+        var _tcCatchRef = exprRef(_task.ctx.catchParamName);
+        if (_task.ctx.throwTaint && _task.ctx.throwTaint.size) {
+          _tcCatchRef.taint = new Set(_task.ctx.throwTaint);
+        }
+        // Declare the catch parameter in the current block so the
+        // catch body can resolve it. The body's `{` will push a new
+        // block frame on top, but declBlock attaches to the current
+        // topBlock() which is the ambient frame — good enough for
+        // lookups since catch params shadow nothing else.
+        declBlock(_task.ctx.catchParamName, chainBinding([_tcCatchRef]));
+      }
       if (_task.catchStart >= 0)
         _ws.push({ type: 'range', start: _task.catchStart, end: _task.catchEnd });
       continue;
@@ -5356,7 +5490,7 @@
     //     formula onto P/T while walking the body, and queue switch_capture
     //     to pop P/T and record the resulting bindings. ---
     if (_task.type === 'switch_case') {
-      for (const name in _task.snapshot) assignName(name, _task.snapshot[name]);
+      for (const name in _task.snapshot) _restoreBinding(name, _task.snapshot[name]);
       var _cs = _task.cs;
       var _caseFormula = null;
       var _caseCondExpr = null;
@@ -5487,7 +5621,20 @@
               loop: { id: entry.id, kind: entry.kind, headerSrc: entry.headerSrc },
               chain: b.toks,
             });
-            assignName(name, chainBinding([deriveExprRef(name, b.toks)]));
+            // Replace the binding in place without poisoning the may-be
+            // lattice. The per-iteration body assignments have already
+            // fed every reachable literal into the lattice; the opaque
+            // post-loop synthetic value is only needed so downstream
+            // references resolve to a stable name for extraction /
+            // serialization purposes. Calling assignName here would
+            // route through _trackMayBeAssign and poison the slot.
+            var _postLoopChain = chainBinding([deriveExprRef(name, b.toks)]);
+            for (let _sf = stack.length - 1; _sf >= 0; _sf--) {
+              if (name in stack[_sf].bindings) {
+                stack[_sf].bindings[name] = _postLoopChain;
+                break;
+              }
+            }
           }
         }
       }
@@ -5816,6 +5963,62 @@
           // Use state machine for try/catch/finally.
           const snapshot = _snapshotBindings();
           var _tCtx = { lvBefore: loopVars.length };
+          // Scan the try body for `throw <expr>` statements and any
+          // functions called that might throw. Collect the union of
+          // every taint source reachable via a throw so the catch
+          // param gets bound to an opaque chain carrying that taint.
+          // This makes `try { throw location.hash } catch (e) { sink(e) }`
+          // a taint flow the analyser can see.
+          var _throwTaint = null;
+          if (taintEnabled) {
+            var _scanThrowsIn = function(scanStart, scanEnd, visited) {
+              visited = visited || Object.create(null);
+              for (var _ti = scanStart; _ti < scanEnd; _ti++) {
+                var _tk = tokens[_ti];
+                if (!_tk) continue;
+                if (_tk.type === 'other' && _tk.text === 'throw') {
+                  // Find the end of the throw expression.
+                  var _teEnd = _ti + 1, _td = 0;
+                  while (_teEnd < scanEnd) {
+                    var _tet = tokens[_teEnd];
+                    if (_tet.type === 'open') _td++;
+                    else if (_tet.type === 'close') _td--;
+                    else if (_td === 0 && _tet.type === 'sep' && _tet.char === ';') break;
+                    _teEnd++;
+                  }
+                  // Collect any taint source in the throw expression range.
+                  for (var _tej = _ti + 1; _tej < _teEnd; _tej++) {
+                    var _ttk = tokens[_tej];
+                    if (_ttk && _ttk.type === 'other') {
+                      var _tsrc = checkTaintSource(_ttk.text);
+                      if (_tsrc) {
+                        if (!_throwTaint) _throwTaint = new Set();
+                        for (var _tsl of _tsrc) _throwTaint.add(_tsl);
+                      }
+                    }
+                  }
+                  continue;
+                }
+                // Recurse into called functions (up to a fixed depth).
+                if (_tk.type === 'other' && IDENT_OR_PATH_RE.test(_tk.text)) {
+                  var _tnext = tokens[_ti + 1];
+                  if (_tnext && _tnext.type === 'open' && _tnext.char === '(') {
+                    var _tfb = resolve(_tk.text.split('.')[0]);
+                    if (_tfb && _tfb.kind === 'function') {
+                      var _tfKey = _tfb.bodyStart + ':' + _tfb.bodyEnd;
+                      if (!visited[_tfKey]) {
+                        visited[_tfKey] = true;
+                        _scanThrowsIn(_tfb.bodyStart, _tfb.bodyEnd, visited);
+                      }
+                    }
+                  }
+                }
+              }
+            };
+            _scanThrowsIn(i + 2, tryEnd - 1);
+          }
+          _tCtx.throwTaint = _throwTaint;
+          _tCtx.catchParamName = catchParam;
           if (catchStart < 0) {
             // No catch — try body state persists. Just walk try + finally.
             _ws.push({ type: 'range', start: k, end: _rangeEnd });
@@ -7203,6 +7406,19 @@
               if (argResult) {
                 applyElementMethod(baseBind, method, argResult.bindings);
                 i = argResult.next - 1;
+                continue;
+              }
+            }
+            // Map / Set / WeakMap / WeakSet statements: `.set(k, v)`,
+            // `.add(v)`, `.delete(k)`, `.clear()` mutate the receiver
+            // in place. Route through applyMethod which handles the
+            // mapLike dispatch (see the Map/Set block at the top of
+            // applyMethod for semantics).
+            if (baseBind && baseBind.kind === 'object' && baseBind._mapLike &&
+                (method === 'set' || method === 'add' || method === 'delete' || method === 'clear' || method === 'has' || method === 'get')) {
+              var _mapStmtResult = await applyMethod(baseBind, method, i + 1, stop);
+              if (_mapStmtResult) {
+                i = _mapStmtResult.next - 1;
                 continue;
               }
             }

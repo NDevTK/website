@@ -3240,6 +3240,33 @@ await (async function () {
     { 'a.js': 'class C { constructor(){this.state="idle";} go(v){if(this.state==="ready"){document.getElementById("o").innerHTML=v;}} } new C().go(location.hash);' }, 0);
   await checkTaint('class this.state transition then fire',
     { 'a.js': 'class C { constructor(){this.state="idle";} arm(){this.state="ready";} go(v){if(this.state==="ready"){document.getElementById("o").innerHTML=v;}} } var c=new C(); c.arm(); c.go(location.hash);' }, 1);
+  // Loop body assignments feeding the may-be lattice: ternaries, fixed
+  // strings, and while loops should fully populate the lattice so
+  // post-loop refutations against values never assigned inside fire.
+  await checkTaint('loop body ternary refute',
+    { 'a.js': 'var state="idle"; for(var i=0;i<10;i++){state=(i%2===0)?"even":"odd";} if(state==="ready"){document.getElementById("o").innerHTML=location.hash;}' }, 0);
+  await checkTaint('loop body fixed fire',
+    { 'a.js': 'var state="idle"; for(var i=0;i<10;i++){state="ready";} if(state==="ready"){document.getElementById("o").innerHTML=location.hash;}' }, 1);
+  await checkTaint('while loop body refute',
+    { 'a.js': 'var state="idle"; var i=0; while(i<5){state="loading"; i++;} if(state==="ready"){document.getElementById("o").innerHTML=location.hash;}' }, 0);
+  // Map / Set key-indexed storage: `.set(k, v)` + `.get(k)` on a
+  // `new Map()` flow taint through the key-indexed slot, and
+  // `.get(k)()` resolves the stored function for indirect dispatch.
+  await checkTaint('map set+get taint store',
+    { 'a.js': 'var m=new Map(); m.set("msg",location.hash); var y=m.get("msg"); document.getElementById("o").innerHTML=y;' }, 1);
+  await checkTaint('map inline get taint',
+    { 'a.js': 'var m=new Map(); m.set("msg",location.hash); document.getElementById("o").innerHTML=m.get("msg");' }, 1);
+  await checkTaint('map dispatch get then call',
+    { 'a.js': 'var m=new Map(); m.set("a",function(v){document.getElementById("o").innerHTML=v;}); m.get("a")(location.hash);' }, 1);
+  // Throw + catch: a tainted value thrown inside the try block (either
+  // directly or via a function call) becomes the catch parameter's
+  // source, so sinks reading the caught value see the taint.
+  await checkTaint('throw tainted into catch param',
+    { 'a.js': 'try { throw location.hash; } catch (e) { document.getElementById("o").innerHTML = e; }' }, 1);
+  await checkTaint('throw from called fn into catch',
+    { 'a.js': 'function bad(){ throw location.hash; } try { bad(); } catch (e) { document.getElementById("o").innerHTML = e; }' }, 1);
+  await checkTaint('catch param no taint when throw is literal',
+    { 'a.js': 'try { throw "safe"; } catch (e) { document.getElementById("o").innerHTML = e; }' }, 0);
   await checkTaint('var=function handler', { 'a.js': 'var h = function(msg) { eval(msg.data); };\nwindow.addEventListener("message", h, false);' }, 1, { sources: ['postMessage'] });
 
   // --- addEventListener ---
