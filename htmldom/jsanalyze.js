@@ -773,15 +773,27 @@
   // `typeof module === 'object' && module.exports` AND
   // `typeof window === 'undefined'`.
   //
-  // CDN note: jsDelivr's +esm wrapper fails to bundle z3-solver's
-  // CommonJS dependency on async-mutex — the inner require() call
-  // returns null at runtime and crashes the module at
-  // `new async_mutex_1.Mutex()`. esm.sh with `?bundle-deps`
-  // produces a self-contained ESM file that inlines every
-  // transitive CommonJS dep, so z3-solver loads cleanly. The
-  // page's CSP must allow https://esm.sh (script-src for the ESM
-  // import, connect-src for the WASM fetch that z3-solver issues
-  // during init).
+  // CDN notes:
+  //   - jsDelivr's `/+esm` wrapper fails to bundle z3-solver's
+  //     CommonJS dependency on async-mutex — the inner require()
+  //     call returns null at runtime and crashes the module at
+  //     `new async_mutex_1.Mutex()`. esm.sh with `?bundle-deps`
+  //     produces a self-contained ESM file that inlines every
+  //     transitive CommonJS dep.
+  //
+  //   - z3-solver's browser build (build/browser.js) reads
+  //     `global.initZ3` from its init() function. That global is
+  //     set by loading `build/z3-built.js` as a classic <script>
+  //     tag — the WASM loader is a UMD file that declares
+  //     `var initZ3 = (...)()` at top level, which becomes a
+  //     window property on load. The browser build's init() then
+  //     reads `global.initZ3`, which is undefined in browsers
+  //     unless we shim `window.global = window` first.
+  //
+  //   - The page's CSP must allow https://esm.sh + https://cdn.jsdelivr.net
+  //     in both script-src (for the ESM import + classic WASM
+  //     loader script) and connect-src (for the WASM sub-resource
+  //     fetch that z3-built.js issues during its initialisation).
   var _z3 = null;
   var _z3Promise = null;
   function _initZ3() {
@@ -795,11 +807,33 @@
         var mod = require('z3-solver');
         initFn = mod.init;
       } else {
-        // Browser (or Monaco loader) path: dynamic ESM import from
-        // esm.sh with bundled deps. `?bundle-deps` forces esm.sh to
-        // inline every transitive CommonJS dep (including
-        // async-mutex, which jsDelivr's +esm wrapper fails to
-        // resolve — it leaves a null require result at runtime).
+        // Browser (or Monaco loader) path. Three steps:
+        //
+        //   (1) Shim `window.global = window` so z3-solver's
+        //       browser build can read `global.initZ3` without
+        //       hitting ReferenceError.
+        //
+        //   (2) Load z3-built.js as a classic <script> tag so it
+        //       populates `window.initZ3` with the WASM loader.
+        //       (An ESM import won't work — the file is a UMD
+        //       classic script that declares `var initZ3` at top
+        //       level, and ESM doesn't promote top-level `var`
+        //       to window properties.)
+        //
+        //   (3) Dynamic-import the high-level browser module from
+        //       esm.sh with bundled deps. Its init() reads
+        //       `global.initZ3` (now resolved via our shim) and
+        //       wires it into the low-level loader.
+        if (typeof window.global === 'undefined') window.global = window;
+        if (typeof window.initZ3 !== 'function') {
+          await new Promise(function (resolve, reject) {
+            var s = document.createElement('script');
+            s.src = 'https://cdn.jsdelivr.net/npm/z3-solver@4.16.0/build/z3-built.js';
+            s.onload = resolve;
+            s.onerror = function () { reject(new Error('failed to load z3-built.js from cdn.jsdelivr.net')); };
+            document.head.appendChild(s);
+          });
+        }
         var mod = await import('https://esm.sh/z3-solver@4.16.0?bundle-deps');
         initFn = mod.init;
       }
