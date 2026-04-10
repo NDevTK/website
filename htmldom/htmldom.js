@@ -2637,6 +2637,8 @@
           case 'READ_CONCAT_ARGS':       _stepReadConcatArgs(_f); break;
           case 'READ_CALL_ARG_BINDINGS': _stepReadCallArgBindings(_f); break;
           case 'READ_CONCAT_ARGS':       _stepReadConcatArgs(_f); break;
+          case 'READ_VALUE':             { const r = readValue(_f.k, _f.stop, _f.terms); _completeFrame(r); break; }
+          case 'READ_CONCAT_EXPR':       { const r = readConcatExpr(_f.i, _f.stop, _f.terms); _completeFrame(r); break; }
           default: _completeFrame(null); break;
         }
       }
@@ -2652,12 +2654,21 @@
       return _evalLoop();
     };
     const _stepReadObjectLit = (frame) => {
-      // Consume child readValue result
+      // Consume child result based on resume phase
       if (_resultSlot.has) {
-        const val = _consumeResult();
-        if (!val) { _completeFrame(null); return; }
-        frame.props[frame._waitingKey] = val.binding; frame.i = val.next;
-        const sep = tks[frame.i]; if (sep && sep.type === 'sep' && sep.char === ',') frame.i++;
+        if (frame._rp === 'val') {
+          const val = _consumeResult();
+          if (!val) { _completeFrame(null); return; }
+          frame.props[frame._waitingKey] = val.binding; frame.i = val.next;
+          const sep = tks[frame.i]; if (sep && sep.type === 'sep' && sep.char === ',') frame.i++;
+          frame._rp = null;
+        } else if (frame._rp === 'computed') {
+          const inner = _consumeResult();
+          if (!inner || !inner.toks || inner.toks.length !== 1 || inner.toks[0].type !== 'str') { _completeFrame(null); return; }
+          frame._pendingKey = inner.toks[0].text;
+          frame.i = frame._computedEnd + 1;
+          frame._rp = null;
+        }
       }
       const props = frame.props, stop = frame.stop;
       while (frame.i < stop) {
@@ -2669,41 +2680,40 @@
           if (IDENT_OR_PATH_RE.test(name)) { const b = resolvePath(name); if (b && b.kind === 'object') { for (const kk in b.props) props[kk] = b.props[kk]; frame.i++; const sep = tks[frame.i]; if (sep && sep.type === 'sep' && sep.char === ',') { frame.i++; continue; } break; } }
           _completeFrame(null); return;
         }
-        var keyName = null;
-        if (tk.type === 'str') { keyName = tk.text; frame.i++; }
-        else if (tk.type === 'other') {
-          if (tk.text.endsWith(':') && IDENT_RE.test(tk.text.slice(0, -1))) {
-            keyName = tk.text.slice(0, -1); frame.i++;
-            frame._waitingKey = keyName;
-            const val = readValue(frame.i, stop, TERMS_OBJ);
-            if (!val) { _completeFrame(null); return; }
-            props[keyName] = val.binding; frame.i = val.next;
-            const sep = tks[frame.i]; if (sep && sep.type === 'sep' && sep.char === ',') { frame.i++; continue; } break;
-          }
-          if (IDENT_RE.test(tk.text)) {
-            if ((tk.text === 'get' || tk.text === 'set' || tk.text === 'async') && tks[frame.i + 1] && tks[frame.i + 1].type === 'other' && IDENT_RE.test(tks[frame.i + 1].text) && tks[frame.i + 2] && tks[frame.i + 2].type === 'open' && tks[frame.i + 2].char === '(') {
-              var _gsPrefix = tk.text; frame.i++; keyName = tks[frame.i].text; frame.i++;
-              var _gsParams = [], _gsJ = frame.i;
-              if (tks[_gsJ] && tks[_gsJ].type === 'open' && tks[_gsJ].char === '(') { _gsJ++; while (_gsJ < stop) { if (tks[_gsJ].type === 'close' && tks[_gsJ].char === ')') { _gsJ++; break; } var _gsp = parseParamWithDefault(tks, _gsJ, stop); if (_gsp) { _gsParams.push(_gsp.param); _gsJ = _gsp.next; } else _gsJ++; if (tks[_gsJ] && tks[_gsJ].type === 'sep' && tks[_gsJ].char === ',') _gsJ++; } }
-              if (tks[_gsJ] && tks[_gsJ].type === 'open' && tks[_gsJ].char === '{') {
-                var _gsBD = 1, _gsBE = _gsJ + 1;
-                while (_gsBE < stop && _gsBD > 0) { if (tks[_gsBE].type === 'open' && tks[_gsBE].char === '{') _gsBD++; if (tks[_gsBE].type === 'close' && tks[_gsBE].char === '}') _gsBD--; _gsBE++; }
-                var _gsFnBind = functionBinding(_gsParams, _gsJ, _gsBE, true);
-                if (_gsPrefix === 'get') props['__getter_' + keyName] = _gsFnBind; else props[keyName] = _gsFnBind;
-                frame.i = _gsBE; if (tks[frame.i] && tks[frame.i].type === 'sep' && tks[frame.i].char === ',') frame.i++;
-                continue;
-              }
-            } else { keyName = tk.text; frame.i++; }
+        var keyName = frame._pendingKey || null; frame._pendingKey = null;
+        if (!keyName) {
+          if (tk.type === 'str') { keyName = tk.text; frame.i++; }
+          else if (tk.type === 'other') {
+            if (tk.text.endsWith(':') && IDENT_RE.test(tk.text.slice(0, -1))) {
+              keyName = tk.text.slice(0, -1); frame.i++;
+              frame._waitingKey = keyName; frame._rp = 'val';
+              _evalStack.push({ type: 'READ_VALUE', k: frame.i, stop, terms: TERMS_OBJ, phase: 0 });
+              return;
+            }
+            if (IDENT_RE.test(tk.text)) {
+              if ((tk.text === 'get' || tk.text === 'set' || tk.text === 'async') && tks[frame.i + 1] && tks[frame.i + 1].type === 'other' && IDENT_RE.test(tks[frame.i + 1].text) && tks[frame.i + 2] && tks[frame.i + 2].type === 'open' && tks[frame.i + 2].char === '(') {
+                var _gsPrefix = tk.text; frame.i++; keyName = tks[frame.i].text; frame.i++;
+                var _gsParams = [], _gsJ = frame.i;
+                if (tks[_gsJ] && tks[_gsJ].type === 'open' && tks[_gsJ].char === '(') { _gsJ++; while (_gsJ < stop) { if (tks[_gsJ].type === 'close' && tks[_gsJ].char === ')') { _gsJ++; break; } var _gsp = parseParamWithDefault(tks, _gsJ, stop); if (_gsp) { _gsParams.push(_gsp.param); _gsJ = _gsp.next; } else _gsJ++; if (tks[_gsJ] && tks[_gsJ].type === 'sep' && tks[_gsJ].char === ',') _gsJ++; } }
+                if (tks[_gsJ] && tks[_gsJ].type === 'open' && tks[_gsJ].char === '{') {
+                  var _gsBD = 1, _gsBE = _gsJ + 1;
+                  while (_gsBE < stop && _gsBD > 0) { if (tks[_gsBE].type === 'open' && tks[_gsBE].char === '{') _gsBD++; if (tks[_gsBE].type === 'close' && tks[_gsBE].char === '}') _gsBD--; _gsBE++; }
+                  var _gsFnBind = functionBinding(_gsParams, _gsJ, _gsBE, true);
+                  if (_gsPrefix === 'get') props['__getter_' + keyName] = _gsFnBind; else props[keyName] = _gsFnBind;
+                  frame.i = _gsBE; if (tks[frame.i] && tks[frame.i].type === 'sep' && tks[frame.i].char === ',') frame.i++;
+                  continue;
+                }
+              } else { keyName = tk.text; frame.i++; }
+            } else { _completeFrame(null); return; }
+          } else if (tk.type === 'open' && tk.char === '[') {
+            let depth = 1, j = frame.i + 1;
+            while (j < stop && depth > 0) { if (tks[j].type === 'open' && tks[j].char === '[') depth++; else if (tks[j].type === 'close' && tks[j].char === ']') depth--; if (depth === 0) break; j++; }
+            if (!tks[j] || tks[j].type !== 'close') { _completeFrame(null); return; }
+            frame._rp = 'computed'; frame._computedEnd = j;
+            _evalStack.push({ type: 'READ_CONCAT_EXPR', i: frame.i + 1, stop: j, terms: TERMS_NONE, phase: 0, out: [] });
+            return;
           } else { _completeFrame(null); return; }
-        } else if (tk.type === 'open' && tk.char === '[') {
-          let depth = 1, j = frame.i + 1;
-          while (j < stop && depth > 0) { if (tks[j].type === 'open' && tks[j].char === '[') depth++; else if (tks[j].type === 'close' && tks[j].char === ']') depth--; if (depth === 0) break; j++; }
-          if (!tks[j] || tks[j].type !== 'close') { _completeFrame(null); return; }
-          const inner = readConcatExpr(frame.i + 1, j, TERMS_NONE);
-          if (!inner || !inner.toks || inner.toks.length !== 1) { _completeFrame(null); return; }
-          if (inner.toks[0].type === 'str') keyName = inner.toks[0].text; else { _completeFrame(null); return; }
-          frame.i = j + 1;
-        } else { _completeFrame(null); return; }
+        }
         if (tks[frame.i] && tks[frame.i].type === 'open' && tks[frame.i].char === '(') {
           let d = 1; frame.i++; while (frame.i < stop && d > 0) { if (tks[frame.i].type === 'open' && tks[frame.i].char === '(') d++; if (tks[frame.i].type === 'close' && tks[frame.i].char === ')') d--; frame.i++; }
           if (tks[frame.i] && tks[frame.i].type === 'open' && tks[frame.i].char === '{') { let bd = 1; frame.i++; while (frame.i < stop && bd > 0) { if (tks[frame.i].type === 'open' && tks[frame.i].char === '{') bd++; if (tks[frame.i].type === 'close' && tks[frame.i].char === '}') bd--; frame.i++; } }
@@ -2718,11 +2728,9 @@
         if (colon.type === 'other' && colon.text === ':') { frame.i++; }
         else if (colon.type === 'other' && colon.text.startsWith(':')) { _completeFrame(null); return; }
         else { _completeFrame(null); return; }
-        frame._waitingKey = keyName;
-        const val = readValue(frame.i, stop, TERMS_OBJ);
-        if (!val) { _completeFrame(null); return; }
-        props[keyName] = val.binding; frame.i = val.next;
-        const sep = tks[frame.i]; if (sep && sep.type === 'sep' && sep.char === ',') { frame.i++; continue; } break;
+        frame._waitingKey = keyName; frame._rp = 'val';
+        _evalStack.push({ type: 'READ_VALUE', k: frame.i, stop, terms: TERMS_OBJ, phase: 0 });
+        return;
       }
       const close = tks[frame.i];
       if (!close || close.type !== 'close' || close.char !== '}') { _completeFrame(null); return; }
@@ -2757,13 +2765,9 @@
           }
           _completeFrame(null); return;
         }
-        // readValue call — still direct for now, becomes frame push when readValue is converted
-        const val = readValue(frame.i, frame.stop, TERMS_ARR);
-        if (!val) { _completeFrame(null); return; }
-        frame.elems.push(val.binding); frame.i = val.next;
-        const sep = tks[frame.i];
-        if (sep && sep.type === 'sep' && sep.char === ',') { frame.i++; continue; }
-        break;
+        // Push READ_VALUE child frame and yield.
+        _evalStack.push({ type: 'READ_VALUE', k: frame.i, stop: frame.stop, terms: TERMS_ARR, phase: 0 });
+        return; // result consumed at top on next _evalLoop iteration
       }
       const close = tks[frame.i];
       if (!close || close.type !== 'close' || close.char !== ']') { _completeFrame(null); return; }
@@ -4485,11 +4489,8 @@
           else frame.bindings.push(chainBinding([deriveExprRef(_sn, _sb && _sb.kind === 'chain' ? _sb.toks : null)]));
           frame.i++; if (tks[frame.i] && tks[frame.i].type === 'sep' && tks[frame.i].char === ',') { frame.i++; continue; } break;
         }
-        const v = readValue(frame.i, frame.stop, TERMS_ARG);
-        if (!v) { _completeFrame(null); return; }
-        frame.bindings.push(v.binding); frame.i = v.next;
-        const sep = tks[frame.i];
-        if (sep && sep.type === 'sep' && sep.char === ',') { frame.i++; continue; } break;
+        _evalStack.push({ type: 'READ_VALUE', k: frame.i, stop: frame.stop, terms: TERMS_ARG, phase: 0 });
+        return; // result consumed at top on next _evalLoop iteration
       }
       const rp = tks[frame.i];
       if (!rp || rp.type !== 'close' || rp.char !== ')') { _completeFrame(null); return; }
@@ -4513,15 +4514,10 @@
       }
       if (tks[frame.i] && tks[frame.i].type === 'close' && tks[frame.i].char === ')') { _completeFrame({ args: frame.args, next: frame.i + 1 }); return; }
       if (frame.i < frame.stop) {
-        const arg = readConcatExpr(frame.i, frame.stop, TERMS_ARG);
-        if (!arg) { _completeFrame(null); return; }
-        frame.args.push(arg.toks); frame.i = arg.next;
-        const sep = tks[frame.i];
-        if (sep && sep.type === 'sep' && sep.char === ',') { frame.i++; const arg2 = readConcatExpr(frame.i, frame.stop, TERMS_ARG); if (!arg2) { _completeFrame(null); return; } frame.args.push(arg2.toks); frame.i = arg2.next; while (tks[frame.i] && tks[frame.i].type === 'sep' && tks[frame.i].char === ',') { frame.i++; const an = readConcatExpr(frame.i, frame.stop, TERMS_ARG); if (!an) break; frame.args.push(an.toks); frame.i = an.next; } }
+        _evalStack.push({ type: 'READ_CONCAT_EXPR', i: frame.i, stop: frame.stop, terms: TERMS_ARG, phase: 0, out: [] });
+        return; // result consumed at top on next iteration
       }
-      const rp = tks[frame.i];
-      if (!rp || rp.type !== 'close' || rp.char !== ')') { _completeFrame(null); return; }
-      _completeFrame({ args: frame.args, next: frame.i + 1 });
+      _completeFrame(null);
     };
 
     // Read a concat chain (operand [+ operand]*) starting at `k`, stopping at
