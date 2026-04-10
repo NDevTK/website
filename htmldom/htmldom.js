@@ -560,9 +560,10 @@
     if (l.incompatible || r.incompatible || sorts.__conflict) re.incompatible = true;
     return re;
   }
-  function smtArith(op, l, r) {
+  function smtArith(op, l, r, r2) {
     if (!l || !r) return null;
-    // String theory: x.length, x.indexOf(literal)
+    // String theory: x.length, x.indexOf(literal), x.charAt(n),
+    // x.substring(start,end), x.substr(start,len), x.slice(start,end)
     if (op === 'length' && l.symName) {
       var sortsL = _mergeSorts(l.sorts, null);
       sortsL[l.symName] = 'String';
@@ -573,6 +574,24 @@
       sortsI[l.symName] = 'String';
       return { expr: '(str.indexof ' + l.expr + ' ' + r.expr + ' 0)',
                sorts: sortsI, isBool: false };
+    }
+    if (op === 'charAt' && l.symName && r.value && r.value.kind === 'int') {
+      var sortsC = _mergeSorts(l.sorts, null);
+      sortsC[l.symName] = 'String';
+      return { expr: '(str.at ' + l.expr + ' ' + r.expr + ')', sorts: sortsC, isBool: false };
+    }
+    if ((op === 'substring' || op === 'substr' || op === 'slice') &&
+        l.symName && r.value && r.value.kind === 'int' && r2 && r2.value && r2.value.kind === 'int') {
+      var sortsS = _mergeSorts(l.sorts, null);
+      sortsS[l.symName] = 'String';
+      // JS substring(start, end) and slice(start, end) take a half-open
+      // range; SMT-LIB str.substr takes (start, length).
+      // substr(start, length) already matches SMT semantics.
+      var startV = r.value.val, secondV = r2.value.val;
+      var lenV = (op === 'substr') ? secondV : (secondV - startV);
+      if (lenV < 0) lenV = 0;
+      return { expr: '(str.substr ' + l.expr + ' ' + startV + ' ' + lenV + ')',
+               sorts: sortsS, isBool: false };
     }
     // Numeric arithmetic.
     if (op === '+' || op === '-' || op === '*' || op === '/' || op === '%') {
@@ -801,20 +820,36 @@
           _mIsSym = _ht(_mRb);
         }
         if (_mIsSym) {
-          // Find the argument (single string literal).
+          // Resolve aliases for consistent symbolic ID.
+          var _mResolvedBase = _mBase;
+          if (_mRb && _mRb.kind === 'chain' && _mRb.toks.length === 1 && _mRb.toks[0].type === 'other') _mResolvedBase = _mRb.toks[0].text;
+          var _mSymObj = smtSym(_mResolvedBase);
+          // Single-string-literal arg: startsWith / endsWith / includes / indexOf
           var _mArgTok = toks[start + 2];
           var _mArgVal = null;
           if (_mArgTok && _mArgTok.type === 'str' && toks[start + 3] && toks[start + 3].type === 'close') {
             _mArgVal = _mArgTok.text;
           }
-          // Resolve aliases for consistent symbolic ID.
-          var _mResolvedBase = _mBase;
-          if (_mRb && _mRb.kind === 'chain' && _mRb.toks.length === 1 && _mRb.toks[0].type === 'other') _mResolvedBase = _mRb.toks[0].text;
-          var _mSymObj = smtSym(_mResolvedBase);
           if (_mMethod === 'startsWith' && _mArgVal !== null) return smtStrProp(_mSymObj, 'startsWith', _mArgVal);
           if (_mMethod === 'endsWith' && _mArgVal !== null) return smtStrProp(_mSymObj, 'endsWith', _mArgVal);
           if (_mMethod === 'includes' && _mArgVal !== null) return smtStrProp(_mSymObj, 'includes', _mArgVal);
-          if (_mMethod === 'indexOf' && _mArgVal !== null) return smtArith('indexOf', smtSym(_mResolvedBase), smtConst(_mArgVal));
+          if (_mMethod === 'indexOf' && _mArgVal !== null) return smtArith('indexOf', _mSymObj, smtConst(_mArgVal));
+          // Single-int-literal arg: charAt(N) → (str.at sym N)
+          var _mIntArg = null;
+          if (_mArgTok && _mArgTok.type === 'other' && /^-?\d+$/.test(_mArgTok.text) && toks[start + 3] && toks[start + 3].type === 'close') {
+            _mIntArg = parseInt(_mArgTok.text, 10);
+          }
+          if (_mMethod === 'charAt' && _mIntArg !== null) return smtArith('charAt', _mSymObj, smtConst(_mIntArg));
+          // Two-int-literal args: substring(START, END), substr(START, LEN), slice(START, END)
+          if ((_mMethod === 'substring' || _mMethod === 'substr' || _mMethod === 'slice') &&
+              _mArgTok && _mArgTok.type === 'other' && /^-?\d+$/.test(_mArgTok.text) &&
+              toks[start + 3] && toks[start + 3].type === 'sep' && toks[start + 3].char === ',' &&
+              toks[start + 4] && toks[start + 4].type === 'other' && /^-?\d+$/.test(toks[start + 4].text) &&
+              toks[start + 5] && toks[start + 5].type === 'close') {
+            var _mA0 = parseInt(_mArgTok.text, 10);
+            var _mA1 = parseInt(toks[start + 4].text, 10);
+            return smtArith(_mMethod, _mSymObj, smtConst(_mA0), smtConst(_mA1));
+          }
           // .length is a property, not a method call.
         }
       }

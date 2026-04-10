@@ -3430,6 +3430,16 @@ await (async function () {
   // Same-sort uses don't trigger the conflict path:
   await checkTaint('sort: dual-string consistent', { 'a.js': 'var x = location.search; if (x.length > 5 && x === "ab") { document.getElementById("o").innerHTML = x; }' }, 0);
 
+  // --- SMT power: charAt → str.at, substring → str.substr ---
+  // The translator emits Z3 string-theory ops for these patterns so the
+  // solver can refute branches that constrain the same character or
+  // substring to two different values.
+  await checkTaint('z3: charAt unsat',    { 'a.js': 'var x = location.search; if (x.charAt(0) === "a" && x.charAt(0) === "b") { document.getElementById("o").innerHTML = x; }' }, 0);
+  await checkTaint('z3: charAt sat',      { 'a.js': 'var x = location.search; if (x.charAt(0) === "/") { document.getElementById("o").innerHTML = x; }' }, 1);
+  await checkTaint('z3: substring unsat', { 'a.js': 'var x = location.search; if (x.substring(0, 4) === "http" && x.substring(0, 4) === "ftpx") { document.getElementById("o").innerHTML = x; }' }, 0);
+  await checkTaint('z3: substring sat',   { 'a.js': 'var x = location.search; if (x.substring(0, 4) === "http") { document.getElementById("o").innerHTML = x; }' }, 1);
+  await checkTaint('z3: slice unsat',     { 'a.js': 'var x = location.search; if (x.slice(0, 4) === "http" && x.slice(0, 4) === "data") { document.getElementById("o").innerHTML = x; }' }, 0);
+
   // --- IIFE ---
   await checkTaint('IIFE function', { 'a.js': '(function() { document.getElementById("o").innerHTML = location.search; })();' }, 1);
   await checkTaint('IIFE with args', { 'a.js': '(function(x) { document.getElementById("o").innerHTML = x; })(location.search);' }, 1);
