@@ -3533,6 +3533,22 @@ await (async function () {
   await checkTaint('alias: refute miss across alias',
     { 'a.js': 'var obj = {v: "init"}; var x = obj; window.addEventListener("hashchange", function() { x.v = "X"; }); window.addEventListener("message", function(e) { if (obj.v === "Z") document.getElementById("o").innerHTML = e.data; });' }, 0);
 
+  // --- Multi-segment + nested-alias may-be ---
+  // Lattice keys are rooted at the LEAF container's __objId, not the
+  // path's first segment. obj.inner.v and an alias x.v (where
+  // x = obj.inner) both canonicalise to #<innerId>.v so writes
+  // through any path are visible to reads through any other path.
+  await checkTaint('mayBe deep: hit',
+    { 'a.js': 'var obj = {a: {b: {c: "init"}}}; window.addEventListener("hashchange", function() { obj.a.b.c = "X"; }); window.addEventListener("message", function(e) { if (obj.a.b.c === "X") document.getElementById("o").innerHTML = e.data; });' }, 1);
+  await checkTaint('mayBe deep: refute',
+    { 'a.js': 'var obj = {a: {b: {c: "init"}}}; window.addEventListener("hashchange", function() { obj.a.b.c = "X"; }); window.addEventListener("message", function(e) { if (obj.a.b.c === "Z") document.getElementById("o").innerHTML = e.data; });' }, 0);
+  await checkTaint('mayBe nested alias: 3-way hit',
+    { 'a.js': 'var obj = {inner: {v: "init"}}; var x = obj.inner; window.addEventListener("hashchange", function() { obj.inner.v = "X"; }); window.addEventListener("popstate", function() { obj.inner.v = "Y"; }); window.addEventListener("message", function(e) { if (x.v === "X") document.getElementById("o").innerHTML = e.data; });' }, 1);
+  await checkTaint('mayBe nested alias: 3-way refute',
+    { 'a.js': 'var obj = {inner: {v: "init"}}; var x = obj.inner; window.addEventListener("hashchange", function() { obj.inner.v = "X"; }); window.addEventListener("popstate", function() { obj.inner.v = "Y"; }); window.addEventListener("message", function(e) { if (x.v === "Z") document.getElementById("o").innerHTML = e.data; });' }, 0);
+  await checkTaint('mayBe nested alias: write x.v read deep',
+    { 'a.js': 'var obj = {inner: {v: "init"}}; var x = obj.inner; window.addEventListener("hashchange", function() { x.v = "X"; }); window.addEventListener("message", function(e) { if (obj.inner.v === "X") document.getElementById("o").innerHTML = e.data; });' }, 1);
+
   // --- IIFE ---
   await checkTaint('IIFE function', { 'a.js': '(function() { document.getElementById("o").innerHTML = location.search; })();' }, 1);
   await checkTaint('IIFE with args', { 'a.js': '(function(x) { document.getElementById("o").innerHTML = x; })(location.search);' }, 1);

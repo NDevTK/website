@@ -2076,23 +2076,26 @@
       return { lit: _quoteSmtString(t.text), sort: 'String' };
     }
     // Resolve a may-be lattice key. For plain variable names this is
-    // just the name. For property paths (`obj.prop`) we walk the path
-    // through the binding stack and replace the root segment with the
-    // resolved object's stable identity (`#<objId>`), so any alias of
-    // the object — `var x = obj; x.prop` — maps to the same key. If
-    // the path can't be resolved to an identity-rooted form (e.g. the
-    // root isn't a known object) we fall back to the textual path,
-    // which still works for the common case where the variable holding
-    // the object isn't aliased.
+    // just the name. For property paths (`obj.prop` or `obj.a.b.c`)
+    // we walk every segment EXCEPT the last through the binding stack,
+    // so that the deepest container's stable identity is the key root.
+    // This makes both \`obj.inner.v\` and an alias \`x.v\` (where x = obj.inner)
+    // canonicalise to the same `#<innerId>.v` slot — the slot belongs
+    // to the LEAF object, not the path used to reach it.
     function _mayBeKey(textPath) {
       if (typeof textPath !== 'string') return null;
       var dot = textPath.indexOf('.');
       if (dot < 0) return textPath;
-      var root = textPath.slice(0, dot);
-      var rest = textPath.slice(dot); // includes leading '.'
-      var b = resolve(root);
+      var parts = textPath.split('.');
+      var b = resolve(parts[0]);
+      // Walk every segment except the last through the binding stack
+      // so the canonical key is rooted at the leaf container's id.
+      for (var i = 1; i < parts.length - 1 && b; i++) {
+        if (b.kind !== 'object') { b = null; break; }
+        b = b.props[parts[i]] || null;
+      }
       if (b && (b.kind === 'object' || b.kind === 'array') && b.__objId) {
-        return '#' + b.__objId + rest;
+        return '#' + b.__objId + '.' + parts[parts.length - 1];
       }
       return textPath;
     }
@@ -6841,26 +6844,42 @@
         if (eqTok && eqTok.type === 'sep' && (eqTok.char === '=' || eqTok.char === '+=')) {
           const parts = t.text.split('.');
           const baseBind = resolve(parts[0]);
-          // Object property assignment: obj.prop = value
-          if (baseBind && baseBind.kind === 'object' && parts.length === 2) {
-            const r = await readValue(i + 2, stop, TERMS_TOP);
-            if (r && r.binding) {
-              if (eqTok.char === '+=') {
-                var prev = baseBind.props[parts[1]];
-                if (prev && prev.kind === 'chain' && r.binding.kind === 'chain') {
-                  baseBind.props[parts[1]] = chainBinding([...prev.toks, SYNTH_PLUS, ...r.binding.toks]);
-                } else {
-                  baseBind.props[parts[1]] = r.binding;
-                }
-              } else {
-                baseBind.props[parts[1]] = r.binding;
-              }
-              // May-be lattice: track the full path so smtSat can emit
-              // a (or (= |obj.prop| v1) (= |obj.prop| v2) ...) disjunction.
-              _trackMayBeAssign(t.text, baseBind.props[parts[1]]);
+          // Object property assignment: obj.prop = value, or
+          // multi-segment obj.a.b.c = value. Walk through the
+          // intermediate segments to find the deepest object,
+          // then set the final segment.
+          if (baseBind && baseBind.kind === 'object' && parts.length >= 2) {
+            // Walk to the leaf container.
+            var _container = baseBind;
+            var _walkOk = true;
+            for (var _pi = 1; _pi < parts.length - 1; _pi++) {
+              var _next = _container.props[parts[_pi]];
+              if (!_next || _next.kind !== 'object') { _walkOk = false; break; }
+              _container = _next;
             }
-            i = skipExpr(i + 2, stop) - 1;
-            continue;
+            if (_walkOk) {
+              const r = await readValue(i + 2, stop, TERMS_TOP);
+              if (r && r.binding) {
+                var _leaf = parts[parts.length - 1];
+                if (eqTok.char === '+=') {
+                  var prev = _container.props[_leaf];
+                  if (prev && prev.kind === 'chain' && r.binding.kind === 'chain') {
+                    _container.props[_leaf] = chainBinding([...prev.toks, SYNTH_PLUS, ...r.binding.toks]);
+                  } else {
+                    _container.props[_leaf] = r.binding;
+                  }
+                } else {
+                  _container.props[_leaf] = r.binding;
+                }
+                // May-be lattice: track the full path so smtSat can emit
+                // a (or (= |obj.prop| v1) (= |obj.prop| v2) ...) disjunction.
+                // _mayBeKey will canonicalise via __objId so any alias of
+                // the leaf container hits the same slot.
+                _trackMayBeAssign(t.text, _container.props[_leaf]);
+              }
+              i = skipExpr(i + 2, stop) - 1;
+              continue;
+            }
           }
           if (baseBind && baseBind.kind === 'element') {
             const r = await readValue(i + 2, stop, TERMS_TOP);
