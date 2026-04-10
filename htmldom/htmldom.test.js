@@ -4763,6 +4763,29 @@ await (async function () {
     return null;
   });
 
+  // Stage 4b.1: facade now delegates to a factory copy of the
+  // converter, not the walker's built-in. These tests prove the
+  // factory produces byte-identical output to the walker's copy
+  // across realistic inputs — the strangler-fig equivalence
+  // check before the walker's copies get deleted in 4b.2.
+  async function eq(name, input) {
+    await checkFacade('equiv: ' + name, async () => {
+      const walkerOut = await globalThis.__convertJsFile(input);
+      const factoryOut = await hc.convertJsFile(input);
+      if (walkerOut !== factoryOut) {
+        return 'MISMATCH\nwalker:\n' + walkerOut + '\nfactory:\n' + factoryOut;
+      }
+      return null;
+    });
+  }
+
+  await eq('simple innerHTML', `document.getElementById("o").innerHTML = "<div>hello</div>";`);
+  await eq('nested with attrs', `document.getElementById("o").innerHTML = "<div class='x'><span>y</span></div>";`);
+  await eq('template literal', `var name = "World"; document.getElementById("o").innerHTML = \`<p>Hi \${name}!</p>\`;`);
+  await eq('loop build', `var html = "<ul>"; for (var i = 0; i < 3; i++) { html += "<li>" + i + "</li>"; } html += "</ul>"; document.getElementById("o").innerHTML = html;`);
+  await eq('if branching', `var cls = "default"; if (err) cls = "error"; document.getElementById("o").innerHTML = "<p class='" + cls + "'>msg</p>";`);
+  await eq('no innerHTML passthrough', `var x = 1 + 2; console.log(x);`);
+
   console.log(`  (${pass + fail - before} cases)`);
 })();
 

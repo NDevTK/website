@@ -11052,6 +11052,52 @@
       scanMutations: scanMutations,
       tokenize: tokenize,
     },
+    // Walker internals exposed for htmldom-convert.js's factory
+    // (Stage 4b). Consumers OTHER than htmldom-convert should use
+    // the jsanalyze query layer — these are walker-private and
+    // will migrate to jsanalyze.js in Stage 5.
+    _walkerInternals: {
+      // Tokenizers & parsers
+      tokenize: tokenize,
+      tokenizeHtml: tokenizeHtml,
+      decodeHtmlEntities: decodeHtmlEntities,
+      decodeJsString: decodeJsString,
+      serializeHtmlTokens: serializeHtmlTokens,
+      parseStyleDecls: parseStyleDecls,
+      scanMutations: scanMutations,
+      // Walker
+      buildScopeState: buildScopeState,
+      extractHTML: extractHTML,
+      extractAllHTML: extractAllHTML,
+      extractAllDOM: extractAllDOM,
+      traceTaint: traceTaint,
+      traceTaintInJs: traceTaintInJs,
+      bindingToValue: bindingToValue,
+      // Binding primitives
+      collectChainTaint: collectChainTaint,
+      getElementTag: getElementTag,
+      isSanitizer: isSanitizer,
+      isNavSink: isNavSink,
+      isIdlProp: isIdlProp,
+      classifySink: classifySink,
+      countLines: countLines,
+      makeVar: makeVar,
+      jsStr: jsStr,
+      // Regex & classification tables
+      IDENT_RE: IDENT_RE,
+      PATH_RE: PATH_RE,
+      ATTR_TO_PROP: ATTR_TO_PROP,
+      BOOLEAN_ATTRS: BOOLEAN_ATTRS,
+      VOID_ELEMENTS: VOID_ELEMENTS,
+      SVG_TAGS: SVG_TAGS,
+      NAV_SAFE_FILTER: NAV_SAFE_FILTER,
+      TAINT_SOURCES: TAINT_SOURCES,
+      TAINT_SINKS: TAINT_SINKS,
+      TAINT_CALL_SINKS: TAINT_CALL_SINKS,
+      TAINT_SANITIZERS: TAINT_SANITIZERS,
+      ELEMENT_SINK_TYPES: ELEMENT_SINK_TYPES,
+      EVENT_TAINT_SOURCES: EVENT_TAINT_SOURCES,
+    },
   };
 
   if (typeof globalThis !== 'undefined') {
