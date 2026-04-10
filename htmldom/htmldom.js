@@ -2151,6 +2151,24 @@
         slot.keys = null;
       }
     }
+    // Snapshot the scope chain (BY REFERENCE) visible at closure
+    // creation time. The returned array holds references to the
+    // actual frame objects, so mutations made after the closure is
+    // created — whether by the outer function before it returns, or
+    // by other callbacks sharing the same var — remain visible when
+    // the closure is later invoked.
+    //
+    // instantiateFunction pushes any captured frames that are not
+    // already on the live stack (preventing duplicates when a closure
+    // is called synchronously before the outer function has returned)
+    // and pops them in reverse order on exit.
+    function _snapshotClosureForCapture() {
+      // Return a shallow copy of the current stack; each entry is a
+      // reference to the same frame object the walker is currently
+      // using. If the outer function later pops the frame, our
+      // reference keeps it alive for later re-entry.
+      return stack.slice();
+    }
     // Look up the function may-be set for a call target identifier.
     // Returns the array of function bindings the variable may resolve
     // to, or null if no function entries are tracked.
@@ -3153,7 +3171,15 @@
         else if (tks[bodyEnd].type === 'close' && tks[bodyEnd].char === '}') depth--;
         bodyEnd++;
       }
-      return { binding: functionBinding(params, fj, bodyEnd, true), next: bodyEnd };
+      var _fnBind = functionBinding(params, fj, bodyEnd, true);
+      // Closure capture: snapshot every binding visible at function-
+      // expression creation time. When the function is later called
+      // (potentially after the creating scope has returned), the
+      // captured bindings are pushed onto the stack so reads from
+      // within the body still see the outer-scope values — including
+      // any taint attached to them.
+      _fnBind.capturedScope = _snapshotClosureForCapture();
+      return { binding: _fnBind, next: bodyEnd };
     };
 
     const readValue = async (k, stop, terms) => {
@@ -3167,8 +3193,10 @@
       if (arrow) {
         const body = readArrowBody(arrow.arrowNext, stop);
         if (!body) return null;
+        var _aBind = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock);
+        _aBind.capturedScope = _snapshotClosureForCapture();
         return {
-          binding: functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock),
+          binding: _aBind,
           next: body.next,
         };
       }
@@ -3307,6 +3335,27 @@
           next = j + 1;
           continue;
         }
+        // Bare trailing call on a function-valued result:
+        // `outer()()`, `a()()()`, `(cond ? f : g)()`, `obj.factory()()`.
+        // Without this the second `(` is unreachable and the returned
+        // closure's body is never walked.
+        if (t.type === 'open' && t.char === '(' && bind && bind.kind === 'function') {
+          var _bcallArgs = await readCallArgBindings(next, stop);
+          if (!_bcallArgs) break;
+          var _bcallResult = await instantiateFunction(bind, _bcallArgs.bindings, null);
+          if (_bcallResult && _bcallResult.kind && _bcallResult.kind !== 'chain') {
+            bind = _bcallResult;
+          } else if (_bcallResult && _bcallResult.kind === 'chain') {
+            bind = _bcallResult;
+          } else if (_bcallResult && Array.isArray(_bcallResult)) {
+            bind = chainBinding(_bcallResult);
+          } else {
+            // Opaque result: keep the chain going with an unknown ref.
+            bind = chainBinding([exprRef('()')]);
+          }
+          next = _bcallArgs.next;
+          continue;
+        }
         // Separate-token method call: `].join(sep)` or `'a'.concat(...)`.
         // Also handles `.prop.concat(...)` / `.prop.join(...)` when attached.
         if (t.type === 'other' && /^(?:\.[A-Za-z_$][A-Za-z0-9_$]*)+$/.test(t.text)) {
@@ -3393,6 +3442,13 @@
               var _omResult = await instantiateFunction(cur, _omArgs.bindings, bind);
               if (_omResult && _omResult.kind) { bind = _omResult; next = _omArgs.next; continue; }
               if (_omResult) { bind = chainBinding(_omResult); next = _omArgs.next; continue; }
+              // Void method: no return value. Still consume the whole
+              // `.method(args)` range and produce an opaque chain so
+              // the bare-trailing-call handler above doesn't re-invoke
+              // the method without `this` on the next iteration.
+              bind = chainBinding([exprRef('()')]);
+              next = _omArgs.next;
+              continue;
             }
           }
           // Getter on object: auto-invoke.
@@ -3537,7 +3593,7 @@
           const arrow = peekArrow(parenIdx + 1, stop);
           if (arrow) {
             const body = readArrowBody(arrow.arrowNext, stop);
-            if (body) { fn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock); fnNext = body.next; }
+            if (body) { fn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock); fn.capturedScope = _snapshotClosureForCapture(); fnNext = body.next; }
           }
           if (!fn) {
             var fexpr = await readFunctionExpr(parenIdx + 1, stop);
@@ -3604,7 +3660,7 @@
           const arrow = peekArrow(parenIdx + 1, stop);
           if (arrow && arrow.params.length === 2) {
             const body = readArrowBody(arrow.arrowNext, stop);
-            if (body) { reduceFn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock); reduceFnNext = body.next; }
+            if (body) { reduceFn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock); reduceFn.capturedScope = _snapshotClosureForCapture(); reduceFnNext = body.next; }
           }
           if (!reduceFn) {
             var rfexpr = await readFunctionExpr(parenIdx + 1, stop);
@@ -3687,6 +3743,7 @@
           const body = readArrowBody(arrow.arrowNext, stop);
           if (body) {
             fn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock);
+            fn.capturedScope = _snapshotClosureForCapture();
             fnEnd = body.next;
           }
         }
@@ -3919,16 +3976,32 @@
         if (_newName && _newName.type === 'other' && IDENT_RE.test(_newName.text)) {
           var _newBind = resolve(_newName.text);
           if (_newBind && _newBind.kind === 'object' && _newBind._isClass) {
-            // Class instantiation: create instance with class methods.
-            var _newJ = k + 2;
-            if (tks[_newJ] && tks[_newJ].type === 'open' && tks[_newJ].char === '(') {
-              var _nd = 1; _newJ++;
-              while (_newJ < stop && _nd > 0) { if (tks[_newJ].type === 'open' && tks[_newJ].char === '(') _nd++; if (tks[_newJ].type === 'close' && tks[_newJ].char === ')') _nd--; _newJ++; }
-            }
-            // Create instance object with copies of all class methods.
+            // Class instantiation: create instance with class methods,
+            // then run the constructor with `this` bound to the new
+            // instance so any `this.prop = arg` writes populate the
+            // instance object (and feed the may-be lattice).
             var _instProps = Object.create(null);
             for (var _ck in _newBind.props) _instProps[_ck] = _newBind.props[_ck];
             var _inst = objectBinding(_instProps);
+            var _newJ = k + 2;
+            var _ctorArgs = null;
+            if (tks[_newJ] && tks[_newJ].type === 'open' && tks[_newJ].char === '(') {
+              // Parse constructor args as concat chains so tainted
+              // arguments flow into `this.foo = arg` assignments.
+              _ctorArgs = await readCallArgBindings(_newJ, stop);
+              if (_ctorArgs) {
+                _newJ = _ctorArgs.next;
+              } else {
+                // Parse failed: skip balanced parens.
+                var _nd = 1; _newJ++;
+                while (_newJ < stop && _nd > 0) { if (tks[_newJ].type === 'open' && tks[_newJ].char === '(') _nd++; if (tks[_newJ].type === 'close' && tks[_newJ].char === ')') _nd--; _newJ++; }
+              }
+            }
+            var _ctorFn = _instProps['constructor'];
+            if (_ctorFn && _ctorFn.kind === 'function') {
+              var _ctorArgBinds = _ctorArgs ? _ctorArgs.bindings : [];
+              await instantiateFunction(_ctorFn, _ctorArgBinds, _inst);
+            }
             return { bind: _inst, next: _newJ };
           }
         }
@@ -4343,6 +4416,21 @@
     // Pushes a temporary scope with param→arg bindings, parses the body
     // expression in the original token array, then pops the scope.
     const instantiateFunction = async (fn, argBindings, thisBinding) => {
+      // Closure capture: push any captured-scope frames (by reference)
+      // that aren't already on the live stack, so reads of outer
+      // variables resolve through the closure. We push only
+      // previously-popped frames to avoid duplicates when a closure
+      // is called synchronously within its defining scope.
+      var _pushedCaptureFrames = [];
+      if (fn.capturedScope) {
+        for (var _ci = 0; _ci < fn.capturedScope.length; _ci++) {
+          var capFr = fn.capturedScope[_ci];
+          if (!capFr) continue;
+          if (stack.indexOf(capFr) >= 0) continue; // already live
+          stack.push(capFr);
+          _pushedCaptureFrames.push(capFr);
+        }
+      }
       stack.push({ bindings: Object.create(null), isFunction: true });
       const frame = stack[stack.length - 1];
       // Bind 'this' if provided (for method calls on objects).
@@ -4465,6 +4553,11 @@
       tks = savedTks;
       taintFnDepth = savedTaintFnDepth;
       stack.pop();
+      // Pop captured frames in reverse order of push.
+      for (var _pc = _pushedCaptureFrames.length - 1; _pc >= 0; _pc--) {
+        var _top = stack[stack.length - 1];
+        if (_top === _pushedCaptureFrames[_pc]) stack.pop();
+      }
       // Expand any loopVars created during the function body walk.
       if (result && fnLoopVars && fnLoopVars.length > 0) {
         const lvByName = Object.create(null);
@@ -6370,8 +6463,12 @@
             declFunction(_clsName.text, _clsBinding);
           }
           // Don't skip body — let the walker continue through it
-          // so extraction and inner declarations are processed.
-          i = _clsIdx; // point to '{', the walker will push a scope frame
+          // so extraction and inner declarations are processed. The
+          // `for` loop's `i++` will land on `_clsIdx` (the `{`), where
+          // the frame-push handler runs and bumps taintFnDepth so
+          // method bodies walked raw don't emit findings without a
+          // calling context.
+          i = _clsIdx - 1;
           pendingFunctionBrace = true;
           continue;
         }
@@ -6731,11 +6828,43 @@
           }
         }
       }
+      // Bare `new ClassName(...)` as a statement, possibly with trailing
+      // method calls: `new C().go();`, `new C(x).a().b();`. The walker
+      // otherwise has no handler for statement-initial `new`, so the
+      // instantiation and every chained method would go unanalysed.
+      // Route the whole expression through readValue so readBaseCore's
+      // `new` handler returns the instance and applySuffixes walks the
+      // trailing `.method(args)` chain with the instance as `this`.
+      if (t.type === 'other' && t.text === 'new') {
+        var _newResult = await readValue(i, stop, TERMS_TOP);
+        if (_newResult) { i = _newResult.next - 1; continue; }
+      }
       // Bare function call as a statement: `render(input);` or `obj.method(args);`.
       // Resolve the callee; if it's a function binding, inline it for side effects.
       if (t.type === 'other' && IDENT_OR_PATH_RE.test(t.text)) {
         const callParen = tokens[i + 1];
         if (callParen && callParen.type === 'open' && callParen.char === '(') {
+          // Chained-call peek: `outer()()`, `factory()()`, `a()()()`.
+          // If what follows the first `)` is another `(`, route the
+          // whole chain through readValue so applySuffixes's bare-call
+          // handler walks each invocation and the returned closure's
+          // body is actually analysed (including captured taint).
+          if (taintEnabled) {
+            var _ccDepth = 1, _ccK = i + 2;
+            while (_ccK < stop && _ccDepth > 0) {
+              if (tokens[_ccK].type === 'open' && tokens[_ccK].char === '(') _ccDepth++;
+              else if (tokens[_ccK].type === 'close' && tokens[_ccK].char === ')') _ccDepth--;
+              if (_ccDepth === 0) break;
+              _ccK++;
+            }
+            if (_ccDepth === 0) {
+              var _ccAfter = tokens[_ccK + 1];
+              if (_ccAfter && _ccAfter.type === 'open' && _ccAfter.char === '(') {
+                var _ccResult = await readValue(i, stop, TERMS_TOP);
+                if (_ccResult) { i = _ccResult.next - 1; continue; }
+              }
+            }
+          }
           // Promise continuation peek BEFORE the inline-call path:
           // `load().then(d => sink(d))` should be routed through
           // readValue so the .then callback flows through applyMethod
@@ -6761,7 +6890,17 @@
           if (calleeBind && calleeBind.kind === 'function') {
             var callArgs = await readCallArgBindings(i + 1, stop);
             if (callArgs) {
-              await instantiateFunction(calleeBind, callArgs.bindings);
+              // Method call on an object path: bind the receiver as
+              // `this` so the body can read/write `this.prop` against
+              // the instance. Without this, `c.setIt(v)` where setIt
+              // does `this.foo = v` loses the assignment because
+              // `this` resolves to null.
+              var _calleeThis = null;
+              var _calleeDot = t.text.lastIndexOf('.');
+              if (_calleeDot > 0) {
+                _calleeThis = await resolvePath(t.text.slice(0, _calleeDot));
+              }
+              await instantiateFunction(calleeBind, callArgs.bindings, _calleeThis);
               // Indirect-call may-be: if the callee variable was also
               // assigned OTHER function values (e.g. `var f = cond ? a : b`
               // or sequential reassignment from different code paths),
@@ -7390,6 +7529,12 @@
 
     // Phase 1: single forward walk.
     await walkRange(0, stop);
+    // Dedupe after phase 1 so duplicate findings emitted from the
+    // same source location (e.g. a class-method body walked both at
+    // class-definition time and at `new C().go()` call-site time)
+    // collapse before either the user sees them or the phase-2
+    // convergence signature is computed.
+    if (taintEnabled) _dedupeFindings();
 
     // Phase 2: callback fixpoint. Iterate all callbacks registered
     // during phase 1 until findings + bindings + may-be lattices
@@ -7397,7 +7542,6 @@
     // in, never leave) so adding it to the convergence signature
     // doesn't break termination.
     if (taintEnabled && _pendingCallbacks && _pendingCallbacks.length > 0) {
-      _dedupeFindings();
       const _snapshotBindingsJson = function () {
         var snap = Object.create(null);
         for (var _si = stack.length - 1; _si >= 0; _si--) {

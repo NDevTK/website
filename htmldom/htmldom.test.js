@@ -3220,6 +3220,26 @@ await (async function () {
   await checkTaint('callback passed as arg', { 'a.js': 'function apply(fn,val){fn(val);} function sink(x){document.getElementById("o").innerHTML=x;} apply(sink,location.search);' }, 1);
   await checkTaint('closure capture', { 'a.js': 'var x=location.search; function get(){return x;} document.getElementById("o").innerHTML=get();' }, 1);
   await checkTaint('nested closure', { 'a.js': 'var x=location.search; function outer(){function inner(){return x;} return inner();} document.getElementById("o").innerHTML=outer();' }, 1);
+  // Closure capture: returned inner function reads an outer local. The
+  // inner fn's capturedScope must pin the outer frame so the body walk
+  // sees the captured var after the outer function has returned.
+  await checkTaint('closure returned (stored)', { 'a.js': 'function outer(){var t=location.hash; return function(){document.getElementById("o").innerHTML=t;};} var fn=outer(); fn();' }, 1);
+  await checkTaint('closure returned (chained)', { 'a.js': 'function outer(){var t=location.hash; return function(){document.getElementById("o").innerHTML=t;};} outer()();' }, 1);
+  await checkTaint('closure arrow chained', { 'a.js': 'var outer=()=>{var t=location.hash; return ()=>{document.getElementById("o").innerHTML=t;};}; outer()();' }, 1);
+  await checkTaint('closure triple chained', { 'a.js': 'function a(){var t=location.hash; return function(){return function(){document.getElementById("o").innerHTML=t;};};} a()()();' }, 1);
+  // Class methods: `new C().method(...)` chained, `c.method(...)` stored,
+  // `c.setIt(x); c.read();` with `this.prop = ...` cross-method state,
+  // and constructor parameter flowing into `this.prop`.
+  await checkTaint('class method this.foo set/read',
+    { 'a.js': 'class C { setIt(v){this.foo=v;} render(){document.getElementById("o").innerHTML=this.foo;} } var c=new C(); c.setIt(location.hash); c.render();' }, 1);
+  await checkTaint('class new().go() chained',
+    { 'a.js': 'class C { go(v){document.getElementById("o").innerHTML=v;} } new C().go(location.hash);' }, 1);
+  await checkTaint('class constructor param into this.prop',
+    { 'a.js': 'class C { constructor(v){this.foo=v;} render(){document.getElementById("o").innerHTML=this.foo;} } var c=new C(location.hash); c.render();' }, 1);
+  await checkTaint('class this.state refute via may-be lattice',
+    { 'a.js': 'class C { constructor(){this.state="idle";} go(v){if(this.state==="ready"){document.getElementById("o").innerHTML=v;}} } new C().go(location.hash);' }, 0);
+  await checkTaint('class this.state transition then fire',
+    { 'a.js': 'class C { constructor(){this.state="idle";} arm(){this.state="ready";} go(v){if(this.state==="ready"){document.getElementById("o").innerHTML=v;}} } var c=new C(); c.arm(); c.go(location.hash);' }, 1);
   await checkTaint('var=function handler', { 'a.js': 'var h = function(msg) { eval(msg.data); };\nwindow.addEventListener("message", h, false);' }, 1, { sources: ['postMessage'] });
 
   // --- addEventListener ---
