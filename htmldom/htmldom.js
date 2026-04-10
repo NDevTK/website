@@ -6363,6 +6363,15 @@
           }
           if (hasInit) {
             declBind(nameTok.text, value);
+            // Object literal initializer: register every property's
+            // initial value in the may-be lattice keyed by the full
+            // path. This catches `var s = {v: "init"}` so that later
+            // `s.v = "X"` joins into the same lattice slot.
+            if (value && value.kind === 'object' && taintEnabled) {
+              for (var _olP in value.props) {
+                _trackMayBeAssign(nameTok.text + '.' + _olP, value.props[_olP]);
+              }
+            }
             if (trackBuildVar && trackBuildVar.has(nameTok.text)) {
               // Only set buildVarDeclStart at the outer scope level, not
               // inside inlined functions. When instantiateFunction enables
@@ -6784,6 +6793,7 @@
                 ? chainBinding([makeSynthStr(String(n + delta))])
                 : chainBinding([deriveExprRef(t.text, cur ? cur.toks : null)]);
             }
+            _trackMayBeAssign(t.text, baseBind.props[parts[1]]);
           }
           i = i + 1;
           continue;
@@ -6806,6 +6816,9 @@
               } else {
                 baseBind.props[parts[1]] = r.binding;
               }
+              // May-be lattice: track the full path so smtSat can emit
+              // a (or (= |obj.prop| v1) (= |obj.prop| v2) ...) disjunction.
+              _trackMayBeAssign(t.text, baseBind.props[parts[1]]);
             }
             i = skipExpr(i + 2, stop) - 1;
             continue;

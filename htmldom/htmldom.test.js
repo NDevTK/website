@@ -3506,6 +3506,21 @@ await (async function () {
   await checkTaint('mayBe: tainted assignment poisons lattice',
     { 'a.js': 'var s = "init"; s = location.search; window.addEventListener("message", function(e) { if (s === "Z") document.getElementById("o").innerHTML = e.data; });' }, 1);
 
+  // --- Object property may-be lattice ---
+  // Same lattice machinery as plain variables, but keyed by the full
+  // path (e.g. `s.v`). Initial values from object literals
+  // (`var s = {v: "init"}`) join the slot at declaration time.
+  await checkTaint('mayBe prop: init in lattice',
+    { 'a.js': 'var s = {v: "init"}; window.addEventListener("hashchange", function() { s.v = "X"; }); window.addEventListener("message", function(e) { if (s.v === "init") document.getElementById("o").innerHTML = e.data; });' }, 1);
+  await checkTaint('mayBe prop: cross-handler hit',
+    { 'a.js': 'var s = {v: "init"}; window.addEventListener("hashchange", function() { s.v = "X"; }); window.addEventListener("message", function(e) { if (s.v === "X") document.getElementById("o").innerHTML = e.data; });' }, 1);
+  await checkTaint('mayBe prop: refute miss',
+    { 'a.js': 'var s = {v: "init"}; window.addEventListener("hashchange", function() { s.v = "X"; }); window.addEventListener("message", function(e) { if (s.v === "Z") document.getElementById("o").innerHTML = e.data; });' }, 0);
+  await checkTaint('mayBe prop: multi-handler refute',
+    { 'a.js': 'var s = {v: "init"}; window.addEventListener("hashchange", function() { s.v = "A"; }); window.addEventListener("popstate", function() { s.v = "B"; }); window.addEventListener("message", function(e) { if (s.v === "C") document.getElementById("o").innerHTML = e.data; });' }, 0);
+  await checkTaint('mayBe prop: multi-handler hit B',
+    { 'a.js': 'var s = {v: "init"}; window.addEventListener("hashchange", function() { s.v = "A"; }); window.addEventListener("popstate", function() { s.v = "B"; }); window.addEventListener("message", function(e) { if (s.v === "B") document.getElementById("o").innerHTML = e.data; });' }, 1);
+
   // --- IIFE ---
   await checkTaint('IIFE function', { 'a.js': '(function() { document.getElementById("o").innerHTML = location.search; })();' }, 1);
   await checkTaint('IIFE with args', { 'a.js': '(function(x) { document.getElementById("o").innerHTML = x; })(location.search);' }, 1);
