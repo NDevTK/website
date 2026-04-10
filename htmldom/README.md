@@ -198,5 +198,37 @@ A Node.js test harness lives in `htmldom.test.js`:
 node htmldom/htmldom.test.js
 ```
 
-The harness loads `htmldom.js` with minimal DOM stubs, exposes the
-three extract functions, and runs inline assertions. 370+ tests.
+The harness loads `jsanalyze.js` (the symbolic interpreter engine)
+and its consumers with minimal DOM stubs, exposes the extract
+functions, and runs inline assertions. 895+ tests covering:
+
+- Token + scope walker behavior
+- Virtual DOM extraction
+- Behavioral equivalence (converted output runs identically in JSDOM)
+- Taint flow tracing with SMT refutation
+- DOM API conversion output
+- jsanalyze schema factories + validation
+- jsanalyze query primitives (`analyze`, `query.calls`, `query.taintFlows`, …)
+- Consumer outputs (`fetch-trace`, `taint-report`, `csp-derive`, `htmldom-convert`)
+
+## Library layout
+
+After the Stage-5 split the `htmldom/` directory contains:
+
+| File                    | Role                                                              |
+|-------------------------|-------------------------------------------------------------------|
+| `jsanalyze.js`          | Core: tokenizer, walker, SMT, taint, virtual DOM, binding seam    |
+| `jsanalyze-schemas.js`  | Public `Value` factories, versioned schema, validation            |
+| `jsanalyze-query.js`    | `analyze()` entry + query primitives over a Trace                 |
+| `fetch-trace.js`        | Consumer: HTTP endpoint discovery (fetch/XHR/WS/Worker)           |
+| `taint-report.js`       | Consumer: human-readable taint flow reporter                      |
+| `csp-derive.js`         | Consumer: Content-Security-Policy generator                      |
+| `htmldom-convert.js`    | Consumer: innerHTML/outerHTML → DOM API rewriter                 |
+| `htmldom.test.js`       | Shared test harness                                               |
+| `index.html`            | Browser UI                                                        |
+| `monaco-init.js`        | UI bootstrap (loads the scripts in dependency order)              |
+
+Consumers depend on `jsanalyze-query.js` + `jsanalyze-schemas.js`.
+None of them reach into `jsanalyze.js` directly — the walker's
+internals are accessed only via the boundary functions exposed
+on the public `api` object.

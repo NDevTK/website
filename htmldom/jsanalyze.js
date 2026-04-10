@@ -1,5 +1,39 @@
-// HTML to DOM API Converter
-(function () {
+// jsanalyze.js — whole-program symbolic JS interpreter
+//
+// The engine file of the jsanalyze static-analysis library.
+// Loads in both Node (CommonJS) and the browser (IIFE, no build
+// step). Consumers never reach into internals — they go through
+// the public `api` object exposed at the end of the IIFE, and
+// (for typed value inspection) through the `bindingToValue`
+// boundary function which converts walker bindings to the
+// versioned shapes defined in jsanalyze-schemas.js.
+//
+// What lives in this file:
+//   - JS + HTML tokenizers
+//   - Scope-stack walker (buildScopeState)
+//   - SMT-backed path reasoner (Z3 via z3-solver)
+//   - May-be value lattice that feeds SMT disjunctions
+//   - Promise / async / closure / class / Map dispatch tracking
+//   - Callback fixpoint across event handlers, .then, setTimeout
+//   - Virtual DOM extraction (extractAllDOM)
+//   - Taint propagation (traceTaint, traceTaintInJs)
+//   - bindingToValue — the walker → public-Value boundary
+//
+// Consumers (each in its own file, each a thin layer over the
+// library's public query primitives):
+//   jsanalyze-query.js    — analyze() entry + query.calls / query.taintFlows
+//                            / query.valueSetOf / query.innerHtmlAssignments
+//                            / query.stringLiterals / query.callGraph
+//   fetch-trace.js        — HTTP API discovery (fetch/XHR/Worker/WS endpoints)
+//   taint-report.js       — human-friendly taint reporter with grouping
+//   csp-derive.js         — Content-Security-Policy derivation from observed calls
+//   htmldom-convert.js    — innerHTML/outerHTML → createElement/appendChild rewriter
+//
+// The directory is still named htmldom/ because that's the
+// Git-tracked feature area; jsanalyze is the library inside it.
+// The front-end UI lives at htmldom/index.html and wires the
+// walker + converter through monaco-init.js.
+(async function () {
   'use strict';
 
   // IDL properties that reflect HTML attributes on common elements.
@@ -123,6 +157,7 @@
     'sessionStorage':     'storage',
   };
   // Patterns matched against full expressions (method calls, etc.).
+  // The walker matches by the call's NAME prefix (the part before `(`).
   const TAINT_SOURCE_CALLS = {
     'localStorage.getItem':    'storage',
     'sessionStorage.getItem':  'storage',
@@ -130,12 +165,34 @@
     'decodeURIComponent':      'url', // preserves taint, not a sanitizer
     'decodeURI':               'url',
     'atob':                    'url', // often used to decode tainted base64
+    // Network — any data flowing back from a server is attacker-influenced.
+    'fetch':                   'network',
+    // XHR + IndexedDB + Cache API — server/storage payload.
+    'XMLHttpRequest':          'network',
+    'IDBObjectStore.get':      'storage',
+    'caches.match':            'storage',
   };
   // Event handler parameter sources: addEventListener type → param.property → label.
   const EVENT_TAINT_SOURCES = {
-    'message':    { 'data': 'postMessage', 'origin': 'postMessage' },
-    'hashchange': { 'newURL': 'url', 'oldURL': 'url' },
-    'popstate':   { 'state': 'url' },
+    // postMessage
+    'message':            { 'data': 'postMessage', 'origin': 'postMessage' },
+    // URL changes
+    'hashchange':         { 'newURL': 'url', 'oldURL': 'url' },
+    'popstate':           { 'state': 'url' },
+    // BroadcastChannel cross-tab messages
+    'messageerror':       { 'data': 'postMessage' },
+    // WebSocket / EventSource: server-pushed data
+    'open':               { 'data': 'network' },
+    // FileReader / progress events: file contents
+    'load':               { 'target.result': 'file', 'target.responseText': 'network', 'target.response': 'network' },
+    'loadend':            { 'target.result': 'file', 'target.responseText': 'network', 'target.response': 'network' },
+    // Drag & drop: dataTransfer payload from another origin
+    'drop':               { 'dataTransfer.getData': 'dragdrop', 'dataTransfer.files': 'file' },
+    'paste':              { 'clipboardData.getData': 'clipboard' },
+    // Network errors that may carry tainted URLs
+    'error':              { 'message': 'network', 'filename': 'url' },
+    // Storage events fire when another tab writes — payload is attacker-influenced
+    'storage':            { 'newValue': 'storage', 'oldValue': 'storage', 'url': 'url' },
   };
 
   // Sink classification: property → {type, severity, elementDependent}.
@@ -232,7 +289,7 @@
       } else if (t.type === 'trycatch') {
         merge(collectChainTaint(t.tryBody));
         merge(collectChainTaint(t.catchBody));
-      } else if (t.type === 'switch' && t.branches) {
+      } else if ((t.type === 'switch' || t.type === 'switchjoin') && t.branches) {
         for (var bi = 0; bi < t.branches.length; bi++) {
           merge(collectChainTaint(t.branches[bi].chain));
         }
@@ -416,369 +473,405 @@
   //   - Event handler invocation counts (handler fires N times)
   //   - Any value derived from the above through operations
 
-  // --- Formula AST ---
-  // Each node: { type, ... } where type is one of:
-  //   sym    — symbolic variable: { id, name }
-  //   const  — concrete value: { value }
-  //   not    — negation: { arg }
-  //   and    — conjunction: { args: [...] }  (flattened)
-  //   or     — disjunction: { args: [...] }  (flattened)
-  //   cmp    — comparison: { op, left, right }
-  //   arith  — arithmetic: { op, left, right }
+  // --- Formula representation ---
+  // Each formula is a small object carrying its SMT-LIB s-expression
+  // alongside the metadata Z3 needs to type-check it:
+  //
+  //   { expr:    string  -- SMT-LIB s-expression
+  //     sorts:   { name → 'Int'|'String' }  -- declarations needed
+  //     isBool:  bool    -- true if expr is already a Bool s-expression
+  //     value:   { kind: 'bool'|'int'|'str', val } | undefined
+  //                       -- present for fully-concrete formulas, used
+  //                          for compile-time const folding
+  //     symName: string  -- when this object is a single sym, its name
+  //                          (used by smtCmp/smtStrProp to upgrade sort)
+  //   }
+  //
+  // The builders below construct these objects directly. There is no
+  // intermediate AST: smtSat just emits `(declare-const ...)` from
+  // `sorts` and `(assert <expr>)` and feeds it to Z3.
 
+  function _quoteSmtName(s) { return '|' + s.replace(/\|/g, '_') + '|'; }
+  function _quoteSmtString(s) { return '"' + s.replace(/"/g, '""') + '"'; }
+  function _mergeSorts(a, b) {
+    var out = {};
+    var conflict = false;
+    if (a) for (var k in a) out[k] = a[k];
+    if (b) for (var k2 in b) {
+      if (out[k2] && out[k2] !== b[k2]) conflict = true;
+      out[k2] = (out[k2] === 'String' || b[k2] === 'String') ? 'String' : (out[k2] || b[k2]);
+    }
+    if (conflict) Object.defineProperty(out, '__conflict', { value: true });
+    return out;
+  }
+  // Coerce a value-typed expression to its boolean form (truthy check).
+  function _toBool(o) {
+    if (!o) return 'true';
+    if (o.isBool) return o.expr;
+    if (o.value) {
+      if (o.value.kind === 'bool') return o.value.val ? 'true' : 'false';
+      if (o.value.kind === 'int')  return o.value.val !== 0  ? 'true' : 'false';
+      if (o.value.kind === 'str') {
+        // JS semantics: "false" / "null" / "undefined" / "NaN" are
+        // the string forms of JS-falsy primitives and should resolve
+        // to SMT false for boolean-context checks. Non-empty strings
+        // are otherwise truthy.
+        var sv = o.value.val;
+        if (sv === '' || sv === 'false' || sv === 'null' || sv === 'undefined' || sv === 'NaN' || sv === '0') return 'false';
+        return 'true';
+      }
+    }
+    if (o.symName) {
+      var sort = o.sorts[o.symName] || 'Int';
+      if (sort === 'String') {
+        // Unknown string sym — check it's not any of the JS-falsy
+        // primitive string forms. When combined with a may-be
+        // disjunction pinning the sym to a specific value (e.g.
+        // "false"), Z3 can refute the bool-context test correctly.
+        return '(and (not (= ' + o.expr + ' ""))' +
+               ' (not (= ' + o.expr + ' "false"))' +
+               ' (not (= ' + o.expr + ' "null"))' +
+               ' (not (= ' + o.expr + ' "undefined"))' +
+               ' (not (= ' + o.expr + ' "NaN"))' +
+               ' (not (= ' + o.expr + ' "0")))';
+      }
+      return '(not (= ' + o.expr + ' 0))';
+    }
+    return '(not (= ' + o.expr + ' 0))';
+  }
+
+  // Symbol identity tracking. Each symbolic variable name has a stable
+  // numeric id used by code that needs to compare symbols structurally.
   var _nextSymId = 0;
   var _symNameMap = Object.create(null);
-
-  function smtSym(name) {
-    if (name in _symNameMap) return { type: 'sym', id: _symNameMap[name], name: name };
+  function _symIdFor(name) {
+    if (name in _symNameMap) return _symNameMap[name];
     var id = _nextSymId++;
     _symNameMap[name] = id;
-    return { type: 'sym', id: id, name: name };
-  }
-  function smtConst(value) { return { type: 'const', value: value }; }
-  function smtNot(e) { return !e ? null : e.type === 'not' ? e.arg : e.type === 'const' ? smtConst(!e.value) : { type: 'not', arg: e }; }
-  function smtAnd(a, b) { return !a ? b : !b ? a : a.type === 'const' ? (a.value ? b : a) : b.type === 'const' ? (b.value ? a : b) : { type: 'and', left: a, right: b }; }
-  function smtOr(a, b) { return !a ? b : !b ? a : a.type === 'const' ? (a.value ? a : b) : b.type === 'const' ? (b.value ? b : a) : { type: 'or', left: a, right: b }; }
-  function smtCmp(op, l, r) { return { type: 'cmp', op: op, left: l, right: r }; }
-  function smtArith(op, l, r) { return { type: 'arith', op: op, left: l, right: r }; }
-  // String theory constraints:
-  //   strProp: { symId, prop, value } — e.g. x.startsWith("http"), x.length === 0
-  function smtStrProp(symId, prop, value) { return { type: 'strProp', symId: symId, prop: prop, value: value }; }
-
-  function smtHasSym(e) {
-    if (!e) return false;
-    if (e.type === 'sym' || e.type === 'strProp') return true;
-    if (e.type === 'const') return false;
-    return (e.left && smtHasSym(e.left)) || (e.right && smtHasSym(e.right)) || (e.arg && smtHasSym(e.arg));
+    return id;
   }
 
-  // --- Normalize: push NOT inward (NNF), flatten AND/OR ---
-  var _flipCmp = { '<':'>=', '>':'<=', '<=':'>', '>=':'<', '==':'!=', '===':'!==', '!=':'==', '!==':'===' };
-  var _swapCmp = { '>':'<', '<':'>', '>=':'<=', '<=':'>=', '==':'==', '===':'===', '!=':'!=', '!==':'!==' };
-  function smtNNF(f) {
-    if (!f) return f;
-    if (f.type === 'const' || f.type === 'sym') return f;
-    if (f.type === 'and') return smtAnd(smtNNF(f.left), smtNNF(f.right));
-    if (f.type === 'or') return smtOr(smtNNF(f.left), smtNNF(f.right));
-    if (f.type === 'cmp' || f.type === 'arith') return f;
-    if (f.type === 'not') {
-      var a = f.arg;
-      if (a.type === 'const') return smtConst(!a.value);
-      if (a.type === 'sym') return f; // NOT(sym) stays
-      if (a.type === 'not') return smtNNF(a.arg);
-      if (a.type === 'and') return smtOr(smtNNF(smtNot(a.left)), smtNNF(smtNot(a.right)));
-      if (a.type === 'or') return smtAnd(smtNNF(smtNot(a.left)), smtNNF(smtNot(a.right)));
-      if (a.type === 'cmp') return smtCmp(_flipCmp[a.op] || a.op, a.left, a.right);
-      return f;
+  function smtSym(name) {
+    var id = _symIdFor(name);
+    var sorts = Object.create(null);
+    sorts[name] = 'Int';
+    return { expr: _quoteSmtName(name), sorts: sorts, isBool: false, symName: name, symId: id };
+  }
+  function smtConst(value) {
+    if (typeof value === 'boolean') {
+      return { expr: value ? 'true' : 'false', sorts: {}, isBool: true, value: { kind: 'bool', val: value } };
     }
-    return f;
-  }
-
-  // --- Collect all atomic constraints from a conjunction (NNF form) ---
-  // Returns array of cmp/not nodes. Returns null if formula contains OR (non-conjunctive).
-  function smtCollectAtoms(f) {
-    if (!f) return [];
-    if (f.type === 'const') return f.value ? [] : null; // false = unsat
-    if (f.type === 'and') {
-      var l = smtCollectAtoms(f.left), r = smtCollectAtoms(f.right);
-      if (!l || !r) return null;
-      return l.concat(r);
+    if (typeof value === 'number') {
+      var n = value < 0 ? '(- ' + (-value) + ')' : String(value);
+      return { expr: n, sorts: {}, isBool: false, value: { kind: 'int', val: value } };
     }
-    if (f.type === 'cmp' || f.type === 'not' || f.type === 'strProp') return [f];
-    if (f.type === 'or') return null; // can't flatten disjunction
-    if (f.type === 'sym') return []; // symbolic = satisfiable, no constraint
-    return [];
+    if (typeof value === 'string') {
+      return { expr: _quoteSmtString(value), sorts: {}, isBool: false, value: { kind: 'str', val: value } };
+    }
+    return { expr: 'true', sorts: {}, isBool: true, value: { kind: 'bool', val: true } };
   }
-
-  // --- Theory solver: arithmetic bounds + relational + equality ---
-  // Checks if a set of atomic constraints is jointly satisfiable.
-  // Handles: sym OP const, sym OP sym, arith(sym,const) OP const/sym.
-  function smtTheorySat(atoms) {
-    if (!atoms) return false; // null = had a const(false)
-    // Evaluate any fully-concrete atoms first.
-    for (var ci = 0; ci < atoms.length; ci++) {
-      var ca = atoms[ci];
-      if (ca.type === 'cmp' && ca.left.type === 'const' && ca.right.type === 'const') {
-        var lv = ca.left.value, rv = ca.right.value;
-        var ok;
-        switch (ca.op) {
-          case '<': ok = lv < rv; break; case '>': ok = lv > rv; break;
-          case '<=': ok = lv <= rv; break; case '>=': ok = lv >= rv; break;
-          case '==': case '===': ok = lv === rv; break;
-          case '!=': case '!==': ok = lv !== rv; break;
-          default: ok = true;
-        }
-        if (!ok) return false; // concrete comparison fails → unsat
+  function smtNot(o) {
+    if (!o) return null;
+    if (o.value && o.value.kind === 'bool') return smtConst(!o.value.val);
+    var r = { expr: '(not ' + _toBool(o) + ')', sorts: o.sorts, isBool: true };
+    if (o.incompatible) r.incompatible = true;
+    return r;
+  }
+  function smtAnd(a, b) {
+    if (!a) return b;
+    if (!b) return a;
+    if (a.value && a.value.kind === 'bool') return a.value.val ? b : a;
+    if (b.value && b.value.kind === 'bool') return b.value.val ? a : b;
+    var sorts = _mergeSorts(a.sorts, b.sorts);
+    var r = { expr: '(and ' + _toBool(a) + ' ' + _toBool(b) + ')',
+              sorts: sorts, isBool: true };
+    if (a.incompatible || b.incompatible || sorts.__conflict) r.incompatible = true;
+    return r;
+  }
+  function smtOr(a, b) {
+    if (!a) return b;
+    if (!b) return a;
+    if (a.value && a.value.kind === 'bool') return a.value.val ? a : b;
+    if (b.value && b.value.kind === 'bool') return b.value.val ? b : a;
+    var sorts = _mergeSorts(a.sorts, b.sorts);
+    var r = { expr: '(or ' + _toBool(a) + ' ' + _toBool(b) + ')',
+              sorts: sorts, isBool: true };
+    if (a.incompatible || b.incompatible || sorts.__conflict) r.incompatible = true;
+    return r;
+  }
+  function smtCmp(op, l, r) {
+    if (!l || !r) return null;
+    // Compile-time fold for fully-concrete operands.
+    if (l.value && r.value && l.value.kind === r.value.kind) {
+      var lv = l.value.val, rv = r.value.val, ok;
+      switch (op) {
+        case '<':  ok = lv < rv; break;
+        case '>':  ok = lv > rv; break;
+        case '<=': ok = lv <= rv; break;
+        case '>=': ok = lv >= rv; break;
+        case '==': case '===': ok = lv === rv; break;
+        case '!=': case '!==': ok = lv !== rv; break;
+        default: ok = true;
+      }
+      return smtConst(ok);
+    }
+    // Sort upgrade: a sym compared with a string literal becomes String.
+    var sorts = _mergeSorts(l.sorts, r.sorts);
+    if (l.symName && r.value && r.value.kind === 'str') sorts[l.symName] = 'String';
+    if (r.symName && l.value && l.value.kind === 'str') sorts[r.symName] = 'String';
+    var smtOp;
+    if (op === '<')  smtOp = '<';
+    else if (op === '>')  smtOp = '>';
+    else if (op === '<=') smtOp = '<=';
+    else if (op === '>=') smtOp = '>=';
+    else if (op === '==' || op === '===') smtOp = '=';
+    else if (op === '!=' || op === '!==') {
+      var rne = { expr: '(not (= ' + l.expr + ' ' + r.expr + '))',
+                  sorts: sorts, isBool: true };
+      if (l.incompatible || r.incompatible || sorts.__conflict) rne.incompatible = true;
+      return rne;
+    } else return null;
+    var re = { expr: '(' + smtOp + ' ' + l.expr + ' ' + r.expr + ')',
+               sorts: sorts, isBool: true };
+    if (l.incompatible || r.incompatible || sorts.__conflict) re.incompatible = true;
+    return re;
+  }
+  function smtArith(op, l, r, r2) {
+    if (!l || !r) return null;
+    // String theory: x.length, x.indexOf(literal), x.charAt(n),
+    // x.substring(start,end), x.substr(start,len), x.slice(start,end)
+    if (op === 'length' && l.symName) {
+      var sortsL = _mergeSorts(l.sorts, null);
+      sortsL[l.symName] = 'String';
+      return { expr: '(str.len ' + l.expr + ')', sorts: sortsL, isBool: false };
+    }
+    if (op === 'indexOf' && l.symName) {
+      // The needle can be a literal string (r.value) OR another sym
+      // (r.symName) — both are valid second args to str.indexof.
+      if ((r.value && r.value.kind === 'str') || r.symName) {
+        var sortsI = _mergeSorts(l.sorts, null);
+        sortsI[l.symName] = 'String';
+        if (r.symName) sortsI[r.symName] = 'String';
+        return { expr: '(str.indexof ' + l.expr + ' ' + r.expr + ' 0)',
+                 sorts: sortsI, isBool: false };
       }
     }
-    // Per-symbol bounds: { symId → { lo, hi, loStrict, hiStrict, eqs:[], neqs:[] } }
-    var bounds = Object.create(null);
-    // Relational pairs: [{leftId, rightId, op}] for sym OP sym constraints
-    var relations = [];
-    var getBounds = function(id) {
-      if (!bounds[id]) bounds[id] = { lo: -Infinity, hi: Infinity, loStrict: false, hiStrict: false, eqs: [], neqs: [] };
-      return bounds[id];
-    };
-    var addBound = function(id, op, val) {
-      var b = getBounds(id);
-      if (typeof val === 'number') {
+    if (op === 'charAt' && l.symName && r.value && r.value.kind === 'int') {
+      var sortsC = _mergeSorts(l.sorts, null);
+      sortsC[l.symName] = 'String';
+      return { expr: '(str.at ' + l.expr + ' ' + r.expr + ')', sorts: sortsC, isBool: false };
+    }
+    if ((op === 'substring' || op === 'substr' || op === 'slice') &&
+        l.symName && r.value && r.value.kind === 'int' && r2 && r2.value && r2.value.kind === 'int') {
+      var sortsS = _mergeSorts(l.sorts, null);
+      sortsS[l.symName] = 'String';
+      // JS substring(start, end) and slice(start, end) take a half-open
+      // range; SMT-LIB str.substr takes (start, length).
+      // substr(start, length) already matches SMT semantics.
+      var startV = r.value.val, secondV = r2.value.val;
+      var lenV = (op === 'substr') ? secondV : (secondV - startV);
+      if (lenV < 0) lenV = 0;
+      return { expr: '(str.substr ' + l.expr + ' ' + startV + ' ' + lenV + ')',
+               sorts: sortsS, isBool: false };
+    }
+    // String concatenation: + with at least one String operand. JS
+    // overloads + for both numeric add and string concat; we detect
+    // the string variant whenever one side is a string literal (the
+    // common pattern \`"prefix" + x\` / \`x + ".html"\`) and translate
+    // to (str.++ a b), declaring any sym operand as String.
+    if (op === '+') {
+      var lIsStr = !!(l.value && l.value.kind === 'str') || (l.symName && l.sorts[l.symName] === 'String');
+      var rIsStr = !!(r.value && r.value.kind === 'str') || (r.symName && r.sorts[r.symName] === 'String');
+      if (lIsStr || rIsStr) {
+        // Const fold.
+        if (l.value && l.value.kind === 'str' && r.value && r.value.kind === 'str') {
+          return smtConst(l.value.val + r.value.val);
+        }
+        var sortsCat = _mergeSorts(l.sorts, r.sorts);
+        if (l.symName) sortsCat[l.symName] = 'String';
+        if (r.symName) sortsCat[r.symName] = 'String';
+        var ccIncompat = false;
+        if (l.incompatible || r.incompatible || sortsCat.__conflict) ccIncompat = true;
+        var rcc = { expr: '(str.++ ' + l.expr + ' ' + r.expr + ')',
+                    sorts: sortsCat, isBool: false };
+        if (ccIncompat) rcc.incompatible = true;
+        return rcc;
+      }
+    }
+    // Numeric arithmetic.
+    if (op === '+' || op === '-' || op === '*' || op === '/' || op === '%') {
+      // Const fold.
+      if (l.value && l.value.kind === 'int' && r.value && r.value.kind === 'int') {
         switch (op) {
-          case '>': if (val >= b.lo) { b.lo = val; b.loStrict = true; } break;
-          case '>=': if (val > b.lo || (val === b.lo && !b.loStrict)) { b.lo = val; b.loStrict = false; } break;
-          case '<': if (val <= b.hi) { b.hi = val; b.hiStrict = true; } break;
-          case '<=': if (val < b.hi || (val === b.hi && !b.hiStrict)) { b.hi = val; b.hiStrict = false; } break;
-          case '===': case '==': b.eqs.push(val); break;
-          case '!==': case '!=': b.neqs.push(val); break;
-        }
-      } else {
-        if (op === '===' || op === '==') b.eqs.push(val);
-        else if (op === '!==' || op === '!=') b.neqs.push(val);
-      }
-    };
-    // Extract constraints from atoms.
-    for (var i = 0; i < atoms.length; i++) {
-      var a = atoms[i];
-      if (a.type === 'cmp') {
-        var L = a.left, R = a.right, op = a.op;
-        if (L.type === 'sym' && R.type === 'const') { addBound(L.id, op, R.value); }
-        else if (R.type === 'sym' && L.type === 'const') { addBound(R.id, _swapCmp[op] || op, L.value); }
-        else if (L.type === 'sym' && R.type === 'sym') { relations.push({ leftId: L.id, rightId: R.id, op: op }); }
-        // arith(sym, const) OP const: e.g. (x + 1) > 5 → x > 4
-        else if (L.type === 'arith' && R.type === 'const') {
-          if (L.left.type === 'sym' && L.right.type === 'const') {
-            var adjusted = null;
-            if (L.op === '+') adjusted = R.value - L.right.value;
-            else if (L.op === '-') adjusted = R.value + L.right.value;
-            if (adjusted !== null) addBound(L.left.id, op, adjusted);
-          }
-          // Any arith expression with a sym operand: create synthetic variable.
-          // Handles arith(sym, sym), arith('length', sym, _), arith('indexOf', sym, _), etc.
-          if (L.left.type === 'sym') {
-            var exprKey = 'expr:' + L.left.id + ':' + L.op + ':' + (L.right.type === 'sym' ? L.right.id : L.right.type === 'const' ? L.right.value : '_');
-            var exprId = smtSym(exprKey).id;
-            addBound(exprId, op, R.value);
-          }
-        }
-        else if (R.type === 'arith' && L.type === 'const') {
-          if (R.left.type === 'sym' && R.right.type === 'const') {
-            var adjusted2 = null;
-            if (R.op === '+') adjusted2 = L.value - R.right.value;
-            else if (R.op === '-') adjusted2 = L.value + R.right.value;
-            if (adjusted2 !== null) addBound(R.left.id, _swapCmp[op] || op, adjusted2);
-          }
-          if (R.left.type === 'sym') {
-            var exprKey2 = 'expr:' + R.left.id + ':' + R.op + ':' + (R.right.type === 'sym' ? R.right.id : R.right.type === 'const' ? R.right.value : '_');
-            var exprId2 = smtSym(exprKey2).id;
-            addBound(exprId2, _swapCmp[op] || op, L.value);
-          }
+          case '+': return smtConst(l.value.val + r.value.val);
+          case '-': return smtConst(l.value.val - r.value.val);
+          case '*': return smtConst(l.value.val * r.value.val);
+          case '/': if (r.value.val !== 0) return smtConst(l.value.val / r.value.val); break;
+          case '%': if (r.value.val !== 0) return smtConst(l.value.val % r.value.val); break;
         }
       }
-      // NOT(sym) is like sym == false — no arithmetic bound.
+      // Sort check: numeric arith requires Int operands. If either side
+      // has a sym already declared as String (from a prior cmp/strProp),
+      // the formula is untranslatable.
+      var arithIncompat = false;
+      if (l.symName && l.sorts[l.symName] === 'String') arithIncompat = true;
+      if (r.symName && r.sorts[r.symName] === 'String') arithIncompat = true;
+      if (l.incompatible || r.incompatible) arithIncompat = true;
+      var smtOp = op === '/' ? 'div' : op === '%' ? 'mod' : op;
+      var sortsA = _mergeSorts(l.sorts, r.sorts);
+      if (sortsA.__conflict) arithIncompat = true;
+      var ra = { expr: '(' + smtOp + ' ' + l.expr + ' ' + r.expr + ')',
+                 sorts: sortsA, isBool: false };
+      if (arithIncompat) ra.incompatible = true;
+      return ra;
     }
-    // Check per-variable bound contradictions.
-    for (var sid in bounds) {
-      var b = bounds[sid];
-      if (b.loStrict || b.hiStrict) { if (b.lo >= b.hi) return false; }
-      else { if (b.lo > b.hi) return false; }
-      if (b.eqs.length >= 2) { for (var j = 1; j < b.eqs.length; j++) if (b.eqs[j] !== b.eqs[0]) return false; }
-      if (b.eqs.length >= 1) {
-        for (var k = 0; k < b.neqs.length; k++) if (b.neqs[k] === b.eqs[0]) return false;
-        var ev = b.eqs[0];
-        if (typeof ev === 'number') {
-          if (b.loStrict ? ev <= b.lo : ev < b.lo) return false;
-          if (b.hiStrict ? ev >= b.hi : ev > b.hi) return false;
-        }
-      }
+    return null;
+  }
+  // String predicates: startsWith / endsWith / includes. `symObj` is a
+  // smtSym() result; `value` is the literal substring.
+  // smtStrProp builds startsWith / endsWith / includes constraints.
+  // The needle (`value`) can be either a literal string OR another sym
+  // formula object — both spell to the same Z3 string-theory primitives,
+  // and both syms get declared as String.
+  function smtStrProp(symObj, prop, value) {
+    if (!symObj || !symObj.symName) return null;
+    var sorts = _mergeSorts(symObj.sorts, null);
+    sorts[symObj.symName] = 'String';
+    var v;
+    if (typeof value === 'string') {
+      v = _quoteSmtString(value);
+    } else if (value && value.symName) {
+      v = value.expr;
+      sorts = _mergeSorts(sorts, value.sorts);
+      sorts[value.symName] = 'String';
+    } else {
+      return null;
     }
-    // Check relational constraints via transitive closure.
-    // Build a directed graph: edge from A to B with weight means A + weight <= B (or <).
-    // Use Floyd-Warshall to detect negative cycles (contradiction).
-    // --- String theory: check string property constraints ---
-    // Collect strProp atoms per symbolic variable.
-    var strConstraints = Object.create(null); // symId → [{prop, value}]
-    // Also collect length constraints for string-length correlation.
-    var lengthBounds = Object.create(null); // symId → bounds
-    for (var si = 0; si < atoms.length; si++) {
-      var sa = atoms[si];
-      if (sa.type === 'strProp') {
-        if (!strConstraints[sa.symId]) strConstraints[sa.symId] = [];
-        strConstraints[sa.symId].push({ prop: sa.prop, value: sa.value });
-      }
-      // cmp where left is arith('length', sym, _) and right is const
-      // e.g. x.length === 0
-      if (sa.type === 'cmp' && sa.left && sa.left.type === 'arith' && sa.left.op === 'length' && sa.left.left.type === 'sym' && sa.right.type === 'const') {
-        var _lsId = sa.left.left.id;
-        if (!lengthBounds[_lsId]) lengthBounds[_lsId] = { eqs: [], lo: -Infinity, hi: Infinity };
-        var _lv = sa.right.value;
-        if (typeof _lv === 'number') {
-          switch (sa.op) {
-            case '===': case '==': lengthBounds[_lsId].eqs.push(_lv); break;
-            case '>': lengthBounds[_lsId].lo = Math.max(lengthBounds[_lsId].lo, _lv + 1); break;
-            case '>=': lengthBounds[_lsId].lo = Math.max(lengthBounds[_lsId].lo, _lv); break;
-            case '<': lengthBounds[_lsId].hi = Math.min(lengthBounds[_lsId].hi, _lv - 1); break;
-            case '<=': lengthBounds[_lsId].hi = Math.min(lengthBounds[_lsId].hi, _lv); break;
-          }
-        }
-      }
-      // cmp where left is arith('indexOf', sym, const) and right is const
-      // e.g. x.indexOf("a") >= 0
-      if (sa.type === 'cmp' && sa.left && sa.left.type === 'arith' && sa.left.op === 'indexOf' && sa.left.left.type === 'sym' && sa.left.right.type === 'const' && sa.right.type === 'const') {
-        var _isId = sa.left.left.id;
-        var _idxStr = sa.left.right.value;
-        // indexOf >= 0 means string contains the substring → like includes.
-        if ((sa.op === '>=' && sa.right.value === 0) || (sa.op === '>' && sa.right.value === -1)) {
-          if (!strConstraints[_isId]) strConstraints[_isId] = [];
-          strConstraints[_isId].push({ prop: 'includes', value: _idxStr });
-        }
-      }
-    }
-    // Check string contradictions.
-    for (var scId in strConstraints) {
-      var sc = strConstraints[scId];
-      // startsWith contradictions: two different prefixes where neither is a prefix of the other.
-      var starts = sc.filter(function(c) { return c.prop === 'startsWith'; });
-      for (var s1 = 0; s1 < starts.length; s1++) {
-        for (var s2 = s1 + 1; s2 < starts.length; s2++) {
-          var p1 = starts[s1].value, p2 = starts[s2].value;
-          if (!p1.startsWith(p2) && !p2.startsWith(p1)) return false;
-        }
-      }
-      // endsWith contradictions.
-      var ends = sc.filter(function(c) { return c.prop === 'endsWith'; });
-      for (var e1 = 0; e1 < ends.length; e1++) {
-        for (var e2 = e1 + 1; e2 < ends.length; e2++) {
-          var s1e = ends[e1].value, s2e = ends[e2].value;
-          if (!s1e.endsWith(s2e) && !s2e.endsWith(s1e)) return false;
-        }
-      }
-      // length === 0 contradicts includes/startsWith/endsWith with non-empty string.
-      var lb = lengthBounds[scId];
-      if (lb && lb.eqs.indexOf(0) >= 0) {
-        for (var sci = 0; sci < sc.length; sci++) {
-          if (sc[sci].value && sc[sci].value.length > 0) return false;
-        }
-      }
-      if (lb && lb.hi === 0) {
-        for (var sci2 = 0; sci2 < sc.length; sci2++) {
-          if (sc[sci2].value && sc[sci2].value.length > 0) return false;
-        }
-      }
-    }
+    if (prop === 'startsWith') return { expr: '(str.prefixof ' + v + ' ' + symObj.expr + ')', sorts: sorts, isBool: true };
+    if (prop === 'endsWith')   return { expr: '(str.suffixof ' + v + ' ' + symObj.expr + ')', sorts: sorts, isBool: true };
+    if (prop === 'includes')   return { expr: '(str.contains ' + symObj.expr + ' ' + v + ')', sorts: sorts, isBool: true };
+    return null;
+  }
 
-    var allIds = Object.keys(bounds).map(Number);
-    for (var ri = 0; ri < relations.length; ri++) {
-      var rel = relations[ri];
-      if (allIds.indexOf(rel.leftId) < 0) allIds.push(rel.leftId);
-      if (allIds.indexOf(rel.rightId) < 0) allIds.push(rel.rightId);
-    }
-    if (relations.length > 0 && allIds.length <= 20) {
-      // Build difference constraints: x OP y → difference bounds.
-      // x > y means x - y > 0, i.e. y - x < 0.
-      // We track: dist[i][j] = max proven lower bound on (var_i - var_j).
-      var n = allIds.length;
-      var idxOf = Object.create(null);
-      for (var ii = 0; ii < n; ii++) idxOf[allIds[ii]] = ii;
-      // dist[i][j] = upper bound on (j - i), i.e. j <= i + dist[i][j].
-      var dist = [];
-      for (var di = 0; di < n; di++) {
-        dist[di] = [];
-        for (var dj = 0; dj < n; dj++) dist[di][dj] = di === dj ? 0 : Infinity;
+  function smtHasSym(o) {
+    if (!o || !o.sorts) return false;
+    for (var k in o.sorts) return true;
+    return false;
+  }
+
+  // --- Z3 initialisation (mandatory; no fallback) ---
+  // smtSat awaits this once; afterwards Z3 is a cached shared Context.
+  // Browser pages either pre-load z3-solver and set globalThis.__htmldomZ3Init
+  // to its init function, or jsanalyze.js will dynamically import the
+  // ES module from a CDN. Node loads via require('z3-solver').
+  var _z3 = null;
+  var _z3Promise = null;
+  function _initZ3() {
+    if (_z3Promise) return _z3Promise;
+    _z3Promise = (async function () {
+      var initFn = null;
+      if (typeof globalThis !== 'undefined' && typeof globalThis.__htmldomZ3Init === 'function') {
+        initFn = globalThis.__htmldomZ3Init;
+      } else if (typeof require === 'function') {
+        // Node path.
+        var mod = require('z3-solver');
+        initFn = mod.init;
+      } else {
+        // Browser fallback: dynamic ESM import from jsDelivr. The host
+        // page's CSP must allow https://cdn.jsdelivr.net.
+        var mod = await import('https://cdn.jsdelivr.net/npm/z3-solver@4.16.0/+esm');
+        initFn = mod.init;
       }
-      // Add relational edges.
-      for (var re = 0; re < relations.length; re++) {
-        var r = relations[re];
-        var li = idxOf[r.leftId], ri2 = idxOf[r.rightId];
-        if (li === undefined || ri2 === undefined) continue;
-        // x > y → y - x < 0 → dist[x][y] = min(dist[x][y], -1) (strict)
-        // x >= y → y - x <= 0 → dist[x][y] = min(dist[x][y], 0)
-        // x < y → x - y < 0 → dist[y][x] = min(dist[y][x], -1)
-        // x <= y → x - y <= 0 → dist[y][x] = min(dist[y][x], 0)
-        // x == y → both directions = 0
-        switch (r.op) {
-          case '>': dist[li][ri2] = Math.min(dist[li][ri2], -1); break;
-          case '>=': dist[li][ri2] = Math.min(dist[li][ri2], 0); break;
-          case '<': dist[ri2][li] = Math.min(dist[ri2][li], -1); break;
-          case '<=': dist[ri2][li] = Math.min(dist[ri2][li], 0); break;
-          case '===': case '==':
-            dist[li][ri2] = Math.min(dist[li][ri2], 0);
-            dist[ri2][li] = Math.min(dist[ri2][li], 0);
-            break;
-        }
-      }
-      // Also add const bounds as edges to a virtual "zero" node — not needed for
-      // pure relational contradictions but helps with mixed constraints.
-      // Floyd-Warshall: find shortest paths (min weights).
-      for (var fk = 0; fk < n; fk++) {
-        for (var fi = 0; fi < n; fi++) {
-          for (var fj = 0; fj < n; fj++) {
-            if (dist[fi][fk] + dist[fk][fj] < dist[fi][fj]) {
-              dist[fi][fj] = dist[fi][fk] + dist[fk][fj];
+      var api = await initFn();
+      var ctx = api.Context('htmldom');
+      _z3 = { api: api, Context: ctx, Solver: ctx.Solver };
+      return _z3;
+    })();
+    return _z3Promise;
+  }
+
+  // --- Main satisfiability checker (Z3) ---
+  // Every formula goes through Z3. There is no fallback solver.
+  // The formula is already in SMT-LIB form (built by the smt* helpers
+  // above); smtSat just emits the necessary `(declare-const ...)` lines
+  // from `formula.sorts`, asserts `formula` (coerced to Bool), and asks
+  // Z3 to check satisfiability.
+  // Per-walk may-be lattice. buildScopeState sets these to its own
+  // _varMayBe map and _mayBeKey resolver for the duration of phase 1 +
+  // phase 2 walks; smtSat reads them when emitting extra
+  // (or (= sym v1) (= sym v2) ...) constraints for variables whose
+  // value space is fully enumerated. _currentMayBeKey normalises
+  // textual paths to identity-keyed canonical form so aliases of the
+  // same object look up the same lattice slot.
+  var _currentVarMayBe = null;
+  var _currentMayBeKey = null;
+
+  async function smtSat(formula) {
+    if (!formula) return true;
+    // Compile-time fold for fully-concrete results.
+    if (formula.value && formula.value.kind === 'bool') return formula.value.val;
+    // Untranslatable formulas (sort conflicts the Z3 type system can't
+    // represent — e.g. a sym used as both Int and String) are
+    // conservatively reported as satisfiable: we don't know enough to
+    // refute the branch.
+    if (formula.incompatible) return true;
+    var z3 = await _initZ3();
+    var decls = '';
+    var extras = '';
+    for (var name in formula.sorts) {
+      if (name === '__conflict') continue;
+      var sort = formula.sorts[name] || 'Int';
+      decls += '(declare-const ' + _quoteSmtName(name) + ' ' + sort + ')\n';
+      // Emit a may-be disjunction if the variable's value space is
+      // fully enumerated (every assignment was a literal we could
+      // encode). The disjunction tells Z3 the sym CAN ONLY equal one
+      // of these specific values, which lets it refute paths
+      // requiring any other value — even when the values were set
+      // in a different callback / branch / loop iteration.
+      if (_currentVarMayBe) {
+        // Resolve the lookup key to its identity-canonical form so
+        // aliases of the same object hit the same slot.
+        var lookupKey = _currentMayBeKey ? _currentMayBeKey(name) : name;
+        var slot = _currentVarMayBe[lookupKey];
+        // Emit a may-be disjunction (or `(= sym v)` for single-value
+        // slots) whenever the lattice has at least one concrete value.
+        // Single-value slots still pin the sym to a specific literal,
+        // which lets refutations fire when the current binding is an
+        // opaque post-loop / post-if synthetic value but the lattice
+        // still records the single literal actually held.
+        if (slot && slot.complete && slot.vals && slot.vals.length >= 1) {
+          // Only emit when the recorded sort matches the formula sort
+          // (mixing Int and String literals on the same symbol would
+          // produce a sort-mismatched disjunction).
+          var sortOk = true;
+          for (var _vi = 0; _vi < slot.vals.length; _vi++) {
+            if (slot.vals[_vi].sort !== sort) { sortOk = false; break; }
+          }
+          if (sortOk) {
+            if (slot.vals.length === 1) {
+              extras += '(assert (= ' + _quoteSmtName(name) + ' ' + slot.vals[0].lit + '))\n';
+            } else {
+              var lits = [];
+              for (var _vj = 0; _vj < slot.vals.length; _vj++) {
+                lits.push('(= ' + _quoteSmtName(name) + ' ' + slot.vals[_vj].lit + ')');
+              }
+              extras += '(assert (or ' + lits.join(' ') + '))\n';
             }
           }
         }
       }
-      // Negative cycle on diagonal = contradiction.
-      for (var ci = 0; ci < n; ci++) {
-        if (dist[ci][ci] < 0) return false;
-      }
     }
-    return true;
+    var smtlib = decls + extras + '(assert ' + _toBool(formula) + ')\n';
+    var solver = new z3.Solver();
+    solver.fromString(smtlib);
+    var result = await solver.check();
+    return result !== 'unsat';
   }
-
-  // --- Main satisfiability checker ---
-  function smtSat(formula) {
-    if (!formula) return true;
-    var nnf = smtNNF(formula);
-    if (!nnf) return true;
-    if (nnf.type === 'const') return !!nnf.value;
-    if (nnf.type === 'sym') return true;
-    // Try to collect atoms from pure conjunction.
-    var atoms = smtCollectAtoms(nnf);
-    if (atoms !== null) return smtTheorySat(atoms);
-    // Disjunction: at least one branch must be satisfiable.
-    if (nnf.type === 'or') return smtSat(nnf.left) || smtSat(nnf.right);
-    // Conjunction with nested OR: distribute AND over OR (DNF conversion).
-    // A ∧ (B ∨ C) = (A ∧ B) ∨ (A ∧ C). Check each conjunct.
-    if (nnf.type === 'and') {
-      var orChild = null, otherChild = null;
-      if (nnf.left.type === 'or') { orChild = nnf.left; otherChild = nnf.right; }
-      else if (nnf.right.type === 'or') { orChild = nnf.right; otherChild = nnf.left; }
-      if (orChild) {
-        return smtSat(smtAnd(otherChild, orChild.left)) || smtSat(smtAnd(otherChild, orChild.right));
-      }
-      // Nested AND with deeper OR: flatten and retry.
-      // Collect all conjuncts, find the first OR, distribute.
-      var conjuncts = [];
-      var _flatAnd = function(f) { if (f.type === 'and') { _flatAnd(f.left); _flatAnd(f.right); } else conjuncts.push(f); };
-      _flatAnd(nnf);
-      for (var ci = 0; ci < conjuncts.length; ci++) {
-        if (conjuncts[ci].type === 'or') {
-          var rest = null;
-          for (var cj = 0; cj < conjuncts.length; cj++) {
-            if (cj !== ci) rest = rest ? smtAnd(rest, conjuncts[cj]) : conjuncts[cj];
-          }
-          return smtSat(smtAnd(rest, conjuncts[ci].left)) || smtSat(smtAnd(rest, conjuncts[ci].right));
-        }
-      }
-    }
-    // Comparison with concrete operands.
-    if (nnf.type === 'cmp' && nnf.left.type === 'const' && nnf.right.type === 'const') {
-      var l = nnf.left.value, r = nnf.right.value;
-      switch (nnf.op) {
-        case '<': return l < r; case '>': return l > r;
-        case '<=': return l <= r; case '>=': return l >= r;
-        case '==': case '===': return l === r;
-        case '!=': case '!==': return l !== r;
-      }
-    }
-    return true;
-  }
-
   // --- Condition parser: raw JS tokens → SMT formula ---
   // Operator precedence: || < && < comparisons < atoms
   var _cmpOps = { '<':1, '>':1, '<=':1, '>=':1, '==':1, '!=':1, '===':1, '!==':1 };
 
-  function smtParseExpr(toks, start, end, resolveFunc, resolvePathFunc) {
+  async function smtParseExpr(toks, start, end, resolveFunc, resolvePathFunc) {
     if (start >= end) return null;
     // Find lowest-precedence binary operator at depth 0.
     // Precedence (low→high): || < && < comparisons < +/- < */% < atoms
@@ -795,51 +888,38 @@
       else if ((toks[i].type === 'op' && (tt === '-')) || (toks[i].type === 'plus')) { lastAdd = i; lastAddOp = tt === '-' ? '-' : '+'; }
       else if (toks[i].type === 'op' && (tt === '*' || tt === '/' || tt === '%')) { lastMul = i; lastMulOp = tt; }
     }
-    if (lastOr >= 0) return smtOr(smtParseExpr(toks, start, lastOr, resolveFunc, resolvePathFunc), smtParseExpr(toks, lastOr + 1, end, resolveFunc, resolvePathFunc));
-    if (lastAnd >= 0) return smtAnd(smtParseExpr(toks, start, lastAnd, resolveFunc, resolvePathFunc), smtParseExpr(toks, lastAnd + 1, end, resolveFunc, resolvePathFunc));
+    if (lastOr >= 0) return smtOr(await smtParseExpr(toks, start, lastOr, resolveFunc, resolvePathFunc), await smtParseExpr(toks, lastOr + 1, end, resolveFunc, resolvePathFunc));
+    if (lastAnd >= 0) return smtAnd(await smtParseExpr(toks, start, lastAnd, resolveFunc, resolvePathFunc), await smtParseExpr(toks, lastAnd + 1, end, resolveFunc, resolvePathFunc));
     if (lastCmp >= 0) {
-      var cl = smtParseExpr(toks, start, lastCmp, resolveFunc, resolvePathFunc);
-      var cr = smtParseExpr(toks, lastCmp + 1, end, resolveFunc, resolvePathFunc);
+      var cl = await smtParseExpr(toks, start, lastCmp, resolveFunc, resolvePathFunc);
+      var cr = await smtParseExpr(toks, lastCmp + 1, end, resolveFunc, resolvePathFunc);
       return (cl && cr) ? smtCmp(lastCmpOp, cl, cr) : null;
     }
     if (lastAdd >= 0) {
-      var al = smtParseExpr(toks, start, lastAdd, resolveFunc, resolvePathFunc);
-      var ar = smtParseExpr(toks, lastAdd + 1, end, resolveFunc, resolvePathFunc);
-      if (al && ar) {
-        // Fold const + const.
-        if (al.type === 'const' && ar.type === 'const' && typeof al.value === 'number' && typeof ar.value === 'number') {
-          return smtConst(lastAddOp === '+' ? al.value + ar.value : al.value - ar.value);
-        }
-        return smtArith(lastAddOp, al, ar);
-      }
+      var al = await smtParseExpr(toks, start, lastAdd, resolveFunc, resolvePathFunc);
+      var ar = await smtParseExpr(toks, lastAdd + 1, end, resolveFunc, resolvePathFunc);
+      if (al && ar) return smtArith(lastAddOp, al, ar);
     }
     if (lastMul >= 0) {
-      var ml = smtParseExpr(toks, start, lastMul, resolveFunc, resolvePathFunc);
-      var mr = smtParseExpr(toks, lastMul + 1, end, resolveFunc, resolvePathFunc);
-      if (ml && mr) {
-        if (ml.type === 'const' && mr.type === 'const' && typeof ml.value === 'number' && typeof mr.value === 'number') {
-          if (lastMulOp === '*') return smtConst(ml.value * mr.value);
-          if (lastMulOp === '/' && mr.value !== 0) return smtConst(ml.value / mr.value);
-          if (lastMulOp === '%' && mr.value !== 0) return smtConst(ml.value % mr.value);
-        }
-        return smtArith(lastMulOp, ml, mr);
-      }
+      var ml = await smtParseExpr(toks, start, lastMul, resolveFunc, resolvePathFunc);
+      var mr = await smtParseExpr(toks, lastMul + 1, end, resolveFunc, resolvePathFunc);
+      if (ml && mr) return smtArith(lastMulOp, ml, mr);
     }
-    return smtParseAtom(toks, start, end, resolveFunc, resolvePathFunc);
+    return await smtParseAtom(toks, start, end, resolveFunc, resolvePathFunc);
   }
 
-  function smtParseAtom(toks, start, end, resolveFunc, resolvePathFunc) {
+  async function smtParseAtom(toks, start, end, resolveFunc, resolvePathFunc) {
     if (start >= end) return null;
     // NOT prefix.
     if (toks[start].type === 'op' && toks[start].text === '!') {
-      var inner = smtParseAtom(toks, start + 1, end, resolveFunc, resolvePathFunc);
+      var inner = await smtParseAtom(toks, start + 1, end, resolveFunc, resolvePathFunc);
       return inner ? smtNot(inner) : null;
     }
     // Parenthesized.
     if (toks[start].type === 'open' && toks[start].char === '(') {
       var d2 = 1, j2 = start + 1;
       while (j2 < end && d2 > 0) { if (toks[j2].type === 'open') d2++; if (toks[j2].type === 'close') d2--; j2++; }
-      return smtParseExpr(toks, start + 1, j2 - 1, resolveFunc, resolvePathFunc);
+      return await smtParseExpr(toks, start + 1, j2 - 1, resolveFunc, resolvePathFunc);
     }
     // Single token.
     if (end === start + 1) {
@@ -855,7 +935,7 @@
         // Identifier: check if symbolic (tainted / event-modified).
         var root = t.text.split('.')[0];
         if (IDENT_RE.test(root)) {
-          var rb = resolveFunc(root);
+          var rb = await resolveFunc(root);
           if (rb) {
             // Check root binding for taint (recursive into arrays/objects).
             var _hasTaint = function(b) {
@@ -878,14 +958,62 @@
             }
           }
           // Resolve full path to concrete value.
-          var fb = resolvePathFunc(t.text);
+          var fb = await resolvePathFunc(t.text);
           if (fb && fb.kind === 'chain' && fb.toks.length === 1 && fb.toks[0].type === 'str') {
+            // Before folding to a single concrete value, check the
+            // may-be lattice. If the variable has been assigned more
+            // than one distinct literal across the analyzed program
+            // (e.g. set in two different callbacks), DON'T fold to
+            // the current value — return a sym so smtSat emits the
+            // (or (= sym v1) (= sym v2) …) disjunction over the full
+            // value space. Without this, the SMT layer would only
+            // see whichever value happened to be most-recently
+            // assigned in source order, missing branches that depend
+            // on other values in the may-be set.
+            var _mbKey = _currentMayBeKey ? _currentMayBeKey(t.text) : t.text;
+            var _mbSlot = _currentVarMayBe ? _currentVarMayBe[_mbKey] : null;
+            if (_mbSlot && _mbSlot.complete && _mbSlot.vals && _mbSlot.vals.length > 1) {
+              // Use the canonical identity-keyed name as the symbol so
+              // smtSat looks up the same slot when emitting the
+              // disjunction extras. Tag with the lattice's declared
+              // sort so smtSat emits the disjunction (String lattice
+              // + Int-defaulted sym would otherwise silently drop
+              // the disjunction).
+              var _mbSym = smtSym(_mbKey);
+              var _mbSortVal = _mbSlot.vals[0].sort;
+              var _mbAllSame = true;
+              for (var _mvi = 1; _mvi < _mbSlot.vals.length; _mvi++) {
+                if (_mbSlot.vals[_mvi].sort !== _mbSortVal) { _mbAllSame = false; break; }
+              }
+              if (_mbAllSame) _mbSym.sorts[_mbKey] = _mbSortVal;
+              return _mbSym;
+            }
             var fv = fb.toks[0].text;
             if (fv === 'true') return smtConst(true);
             if (fv === 'false' || fv === 'null' || fv === 'undefined' || fv === '') return smtConst(false);
             var nv = Number(fv);
             if (!Number.isNaN(nv)) return smtConst(nv);
             return smtConst(fv);
+          }
+          // Binding is a multi-token chain (e.g. a cond / trycatch /
+          // switchjoin merge) or a non-chain — not a concrete fold
+          // target. Consult the may-be lattice and use its stored
+          // sort for the resulting sym so disjunctions fire. This is
+          // what makes `var s = "init"; if (c) s="a"; else s="b";`
+          // followed by `if (s==="ready") ...` refute: after the
+          // merge, fb is a cond chain, so the fold path above skips
+          // it, but the lattice still contains "init"/"a"/"b".
+          var _mbKey2 = _currentMayBeKey ? _currentMayBeKey(t.text) : t.text;
+          var _mbSlot2 = _currentVarMayBe ? _currentVarMayBe[_mbKey2] : null;
+          if (_mbSlot2 && _mbSlot2.complete && _mbSlot2.vals && _mbSlot2.vals.length > 0) {
+            var _mbSym2 = smtSym(_mbKey2);
+            var _mbSortVal2 = _mbSlot2.vals[0].sort;
+            var _mbAllSame2 = true;
+            for (var _mvi2 = 1; _mvi2 < _mbSlot2.vals.length; _mvi2++) {
+              if (_mbSlot2.vals[_mvi2].sort !== _mbSortVal2) { _mbAllSame2 = false; break; }
+            }
+            if (_mbAllSame2) _mbSym2.sorts[_mbKey2] = _mbSortVal2;
+            return _mbSym2;
           }
         }
         return smtSym(t.text);
@@ -901,28 +1029,76 @@
         var _mMethod = _mPath.slice(_mDot + 1);
         // Resolve the base to check if it's symbolic.
         var _mRoot = _mBase.split('.')[0];
-        var _mRb = resolveFunc(_mRoot);
+        var _mRb = await resolveFunc(_mRoot);
         var _mIsSym = false;
         if (_mRb) {
           var _ht = function(b) { if (!b) return false; if (b.kind==='chain') return !!collectChainTaint(b.toks); if (b.kind==='array') { for (var e=0;e<b.elems.length;e++) if (_ht(b.elems[e])) return true; } if (b.kind==='object') { for (var k in b.props) if (_ht(b.props[k])) return true; } return false; };
           _mIsSym = _ht(_mRb);
         }
         if (_mIsSym) {
-          // Find the argument (single string literal).
+          // Resolve aliases for consistent symbolic ID.
+          var _mResolvedBase = _mBase;
+          if (_mRb && _mRb.kind === 'chain' && _mRb.toks.length === 1 && _mRb.toks[0].type === 'other') _mResolvedBase = _mRb.toks[0].text;
+          var _mSymObj = smtSym(_mResolvedBase);
+          // Single-string-literal arg: startsWith / endsWith / includes / indexOf
           var _mArgTok = toks[start + 2];
           var _mArgVal = null;
           if (_mArgTok && _mArgTok.type === 'str' && toks[start + 3] && toks[start + 3].type === 'close') {
             _mArgVal = _mArgTok.text;
           }
-          // Resolve aliases for consistent symbolic ID.
-          var _mResolvedBase = _mBase;
-          if (_mRb && _mRb.kind === 'chain' && _mRb.toks.length === 1 && _mRb.toks[0].type === 'other') _mResolvedBase = _mRb.toks[0].text;
-          var _mSymId = smtSym(_mResolvedBase).id;
-          if (_mMethod === 'startsWith' && _mArgVal !== null) return smtStrProp(_mSymId, 'startsWith', _mArgVal);
-          if (_mMethod === 'endsWith' && _mArgVal !== null) return smtStrProp(_mSymId, 'endsWith', _mArgVal);
-          if (_mMethod === 'includes' && _mArgVal !== null) return smtStrProp(_mSymId, 'includes', _mArgVal);
-          if (_mMethod === 'indexOf' && _mArgVal !== null) return smtArith('indexOf', smtSym(_mResolvedBase), smtConst(_mArgVal));
+          if (_mMethod === 'startsWith' && _mArgVal !== null) return smtStrProp(_mSymObj, 'startsWith', _mArgVal);
+          if (_mMethod === 'endsWith' && _mArgVal !== null) return smtStrProp(_mSymObj, 'endsWith', _mArgVal);
+          if (_mMethod === 'includes' && _mArgVal !== null) return smtStrProp(_mSymObj, 'includes', _mArgVal);
+          if (_mMethod === 'indexOf' && _mArgVal !== null) return smtArith('indexOf', _mSymObj, smtConst(_mArgVal));
+          // indexOf / startsWith / endsWith / includes with an IDENT
+          // second arg — the needle is itself another (potentially
+          // tainted) sym. Recursively parse the identifier and emit
+          // the corresponding string-theory predicate.
+          if ((_mMethod === 'indexOf' || _mMethod === 'startsWith' || _mMethod === 'endsWith' || _mMethod === 'includes') &&
+              _mArgTok && _mArgTok.type === 'other' && IDENT_RE.test(_mArgTok.text) && toks[start + 3] && toks[start + 3].type === 'close') {
+            var _needleParsed = await smtParseAtom([_mArgTok], 0, 1, resolveFunc, resolvePathFunc);
+            if (_needleParsed && _needleParsed.symName) {
+              if (_mMethod === 'indexOf') return smtArith('indexOf', _mSymObj, _needleParsed);
+              return smtStrProp(_mSymObj, _mMethod, _needleParsed);
+            }
+          }
+          // Single-int-literal arg: charAt(N) → (str.at sym N)
+          var _mIntArg = null;
+          if (_mArgTok && _mArgTok.type === 'other' && /^-?\d+$/.test(_mArgTok.text) && toks[start + 3] && toks[start + 3].type === 'close') {
+            _mIntArg = parseInt(_mArgTok.text, 10);
+          }
+          if (_mMethod === 'charAt' && _mIntArg !== null) return smtArith('charAt', _mSymObj, smtConst(_mIntArg));
+          // Two-int-literal args: substring(START, END), substr(START, LEN), slice(START, END)
+          if ((_mMethod === 'substring' || _mMethod === 'substr' || _mMethod === 'slice') &&
+              _mArgTok && _mArgTok.type === 'other' && /^-?\d+$/.test(_mArgTok.text) &&
+              toks[start + 3] && toks[start + 3].type === 'sep' && toks[start + 3].char === ',' &&
+              toks[start + 4] && toks[start + 4].type === 'other' && /^-?\d+$/.test(toks[start + 4].text) &&
+              toks[start + 5] && toks[start + 5].type === 'close') {
+            var _mA0 = parseInt(_mArgTok.text, 10);
+            var _mA1 = parseInt(toks[start + 4].text, 10);
+            return smtArith(_mMethod, _mSymObj, smtConst(_mA0), smtConst(_mA1));
+          }
           // .length is a property, not a method call.
+        }
+      }
+    }
+    // Pattern: IDENT[NUM] — bracket index access. Equivalent to charAt
+    // for strings. Example: x[0] === "/" becomes (str.at |x| 0).
+    if (end >= start + 4 &&
+        toks[start].type === 'other' &&
+        toks[start + 1].type === 'open' && toks[start + 1].char === '[' &&
+        toks[start + 2].type === 'other' && /^-?\d+$/.test(toks[start + 2].text) &&
+        toks[start + 3].type === 'close' && toks[start + 3].char === ']') {
+      var _bxBase = toks[start].text;
+      var _bxRoot = _bxBase.split('.')[0];
+      var _bxRb = await resolveFunc(_bxRoot);
+      if (_bxRb) {
+        var _bxht = function(b) { if (!b) return false; if (b.kind==='chain') return !!collectChainTaint(b.toks); if (b.kind==='array') { for (var e=0;e<b.elems.length;e++) if (_bxht(b.elems[e])) return true; } if (b.kind==='object') { for (var k in b.props) if (_bxht(b.props[k])) return true; } return false; };
+        if (_bxht(_bxRb)) {
+          var _bxResolved = _bxBase;
+          if (_bxRb.kind === 'chain' && _bxRb.toks.length === 1 && _bxRb.toks[0].type === 'other') _bxResolved = _bxRb.toks[0].text;
+          var _bxIdx = parseInt(toks[start + 2].text, 10);
+          return smtArith('charAt', smtSym(_bxResolved), smtConst(_bxIdx));
         }
       }
     }
@@ -930,7 +1106,7 @@
     if (end === start + 1 && toks[start].type === 'other' && toks[start].text.endsWith('.length')) {
       var _lBase = toks[start].text.slice(0, -7);
       var _lRoot = _lBase.split('.')[0];
-      var _lRb = resolveFunc(_lRoot);
+      var _lRb = await resolveFunc(_lRoot);
       if (_lRb) {
         var _lt = function(b) { if (!b) return false; if (b.kind==='chain') return !!collectChainTaint(b.toks); if (b.kind==='array') { for (var e=0;e<b.elems.length;e++) if (_lt(b.elems[e])) return true; } if (b.kind==='object') { for (var k in b.props) if (_lt(b.props[k])) return true; } return false; };
         if (_lt(_lRb)) return smtArith('length', smtSym(_lBase), smtConst(0));
@@ -943,8 +1119,8 @@
   // condTokens: raw JS tokens of the condition expression
   // pathConstraintStack: array of SMT formulas from enclosing branches
   // Returns { sat, unsat } or null if purely concrete.
-  function smtCheckCondition(condTokens, resolveFunc, resolvePathFunc, pathConstraintStack) {
-    var formula = smtParseExpr(condTokens, 0, condTokens.length, resolveFunc, resolvePathFunc);
+  async function smtCheckCondition(condTokens, resolveFunc, resolvePathFunc, pathConstraintStack) {
+    var formula = await smtParseExpr(condTokens, 0, condTokens.length, resolveFunc, resolvePathFunc);
     if (!formula) return null;
     // Combine with path constraints: the full context is
     // pathConstraint[0] ∧ pathConstraint[1] ∧ ... ∧ formula
@@ -961,7 +1137,9 @@
       context = smtAnd(pathConj, formula);
       negContext = smtAnd(pathConj, smtNot(formula));
     }
-    return { sat: smtSat(context), unsat: smtSat(negContext) };
+    var sat = await smtSat(context);
+    var unsat = await smtSat(negContext);
+    return { sat: sat, unsat: unsat };
   }
 
   // -----------------------------------------------------------------------
@@ -977,11 +1155,11 @@
   //   - ops:      the sequence of DOM operations the script performs
   //   - roots:    elements that weren't appended to another tracked element
   //   - html:     a per-element HTML serialization (best-effort)
-  function extractAllDOM(input) {
+  async function extractAllDOM(input) {
     const trimmed = input.trim();
     if (!trimmed) return { elements: [], ops: [], roots: [], html: {} };
     const tokens = tokenize(trimmed);
-    const state = buildScopeState(tokens, tokens.length, scanMutations(tokens));
+    const state = await buildScopeState(tokens, tokens.length, scanMutations(tokens));
     const elements = state.domElements;
     const roots = elements.filter((el) => !el.attached);
     const html = {};
@@ -1112,7 +1290,7 @@
     return out;
   }
 
-  function extractAllHTML(input) {
+  async function extractAllHTML(input) {
     const trimmed = input.trim();
     if (!trimmed) return [];
     const tokens = tokenize(trimmed);
@@ -1121,7 +1299,7 @@
     // Extract each assignment independently first.
     const singles = [];
     for (const assign of assigns) {
-      const result = extractOneAssignment(tokens, assign);
+      const result = await extractOneAssignment(tokens, assign);
       if (!result) continue;
       result.srcStart = assign.srcStart;
       result.srcEnd = assign.srcEnd;
@@ -1201,7 +1379,7 @@
       // Build scope state with all build vars tracked.
       const lastAssign = group[group.length - 1]._assign;
       const extMut = scanMutations(tokens);
-      const state = buildScopeState(tokens, lastAssign.rhsStart, extMut, allBuildVars);
+      const state = await buildScopeState(tokens, lastAssign.rhsStart, extMut, allBuildVars);
 
       // Extract each build var's chain, expand loopVars, and build
       // a mapping of varName → expanded chain.
@@ -1308,7 +1486,7 @@
   // Produce a { target, assignProp, assignOp, chainTokens, ... } record
   // for a single innerHTML/outerHTML assignment located in `tokens`.
   // Returns null if the target is known to NOT be a DOM element.
-  function extractOneAssignment(tokens, assign) {
+  async function extractOneAssignment(tokens, assign) {
     const target = assign.target;
     const assignProp = assign.prop;
     const assignOp = assign.op;
@@ -1345,7 +1523,7 @@
       if (isBuildVar) buildVars.push(rt.text);
     }
     const buildVar = buildVars.length === 1 ? buildVars[0] : null;
-    const r = resolveIdentifiers(tokens, assign.rhsStart, assign.rhsEnd, buildVars.length ? buildVars : null);
+    const r = await resolveIdentifiers(tokens, assign.rhsStart, assign.rhsEnd, buildVars.length ? buildVars : null);
 
     // Verify the target is not a known non-element. Extract the base
     // variable name from the target (e.g. "el" from "el.innerHTML").
@@ -1411,7 +1589,411 @@
     return { target, assignProp, assignOp, chainTokens: r.tokens };
   }
 
-  function extractHTML(input) {
+  // =========================================================================
+  // === jsanalyze public surface (Stage 1: seam + schemas) ===
+  //
+  // Everything below this banner is part of the planned `jsanalyze`
+  // library's public API. It's currently defined inside jsanalyze.js
+  // so the existing file layout is preserved, but every function
+  // here takes ONLY walker-internal types and produces ONLY values
+  // conforming to the jsanalyze-schemas.js public shape. The goal
+  // is to mark the boundary now so Stage 5's file split is a
+  // mechanical move with no logic changes.
+  //
+  // Nothing inside this region should reach into walker internals
+  // beyond the arguments it's given. Nothing outside this region
+  // should reach into public shapes.
+  //
+  // The boundary function is `bindingToValue` — it converts the
+  // walker's internal binding (chain / object / array / function /
+  // element) into a public `Value` from jsanalyze-schemas. Every
+  // public query primitive goes through this function.
+  // =========================================================================
+
+  // Lazy-load the schema module. In Node (tests, consumers) we
+  // require() it. In the browser, the schema file is loaded as a
+  // separate <script> tag that sets globalThis.JsAnalyzeSchemas
+  // before jsanalyze.js runs. `_schemas()` resolves the right one.
+  var _schemaCache = null;
+  function _schemas() {
+    if (_schemaCache) return _schemaCache;
+    if (typeof globalThis !== 'undefined' && globalThis.JsAnalyzeSchemas) {
+      _schemaCache = globalThis.JsAnalyzeSchemas;
+      return _schemaCache;
+    }
+    if (typeof require !== 'undefined') {
+      try {
+        _schemaCache = require('./jsanalyze-schemas.js');
+        return _schemaCache;
+      } catch (_) { /* fall through */ }
+    }
+    throw new Error('jsanalyze-schemas.js not available');
+  }
+
+  // Utility: compute (line, col) for a token start position inside
+  // its owning source. Returns { line, col }. 1-indexed.
+  function _tokLineCol(tok) {
+    if (!tok || !tok._src || tok.start == null) return { line: 1, col: 0 };
+    var src = tok._src, pos = tok.start;
+    var line = 1, col = 0;
+    for (var i = 0; i < pos && i < src.length; i++) {
+      if (src.charCodeAt(i) === 10) { line++; col = 0; }
+      else col++;
+    }
+    return { line: line, col: col };
+  }
+
+  // Build a Source (provenance entry) from a walker token and a
+  // source kind. `file` is a display name — the caller passes it
+  // since the walker doesn't always know the file.
+  function _provFromTok(tok, file, kind, snippet) {
+    var S = _schemas();
+    var lc = _tokLineCol(tok);
+    return S.mkSource(file || '<anonymous>', lc.line, lc.col, kind || S.SOURCE_KINDS.INLINE_LITERAL, snippet);
+  }
+
+  // Extract the first token with a usable _src field from a
+  // walker binding (for fallback provenance when we don't have a
+  // dedicated source token).
+  function _anyTokFromBinding(b) {
+    if (!b) return null;
+    if (b.kind === 'chain' && b.toks) {
+      for (var i = 0; i < b.toks.length; i++) {
+        if (b.toks[i] && b.toks[i]._src) return b.toks[i];
+      }
+    }
+    return null;
+  }
+
+  // Try to fold a chain to a single concrete primitive. Returns
+  // null if any token is opaque / symbolic. Handles str, tmpl (text
+  // parts only), and plus separators. Does NOT recurse into
+  // cond/switchjoin/trycatch — those are handled separately by
+  // enumeration.
+  function _chainToConcrete(toks) {
+    if (!toks) return null;
+    var s = '';
+    var hasContent = false;
+    for (var i = 0; i < toks.length; i++) {
+      var t = toks[i];
+      if (t.type === 'plus') continue;
+      if (t.type === 'str') { s += t.text; hasContent = true; continue; }
+      if (t.type === 'tmpl' && t.parts) {
+        for (var j = 0; j < t.parts.length; j++) {
+          var p = t.parts[j];
+          if (p.kind === 'text') { s += p.raw || ''; hasContent = true; }
+          else return null; // hole with an expression — not concrete
+        }
+        continue;
+      }
+      return null;
+    }
+    return hasContent ? s : null;
+  }
+
+  // Enumerate every concrete string a chain could take by
+  // distributing over branch tokens (cond/switchjoin/trycatch).
+  // Returns an array of strings, or null if any branch is not
+  // fully enumerable.
+  function _chainEnumerate(toks) {
+    if (!toks) return null;
+    var accs = [''];
+    for (var i = 0; i < toks.length; i++) {
+      var t = toks[i];
+      if (t.type === 'plus') continue;
+      if (t.type === 'str') {
+        for (var a = 0; a < accs.length; a++) accs[a] = accs[a] + t.text;
+        continue;
+      }
+      if (t.type === 'tmpl' && t.parts) {
+        var sub = [''];
+        for (var pi = 0; pi < t.parts.length; pi++) {
+          var p = t.parts[pi];
+          if (p.kind === 'text') {
+            for (var s2 = 0; s2 < sub.length; s2++) sub[s2] = sub[s2] + (p.raw || '');
+          } else return null;
+        }
+        var next0 = [];
+        for (var a2 = 0; a2 < accs.length; a2++) for (var s3 = 0; s3 < sub.length; s3++) next0.push(accs[a2] + sub[s3]);
+        accs = next0;
+        continue;
+      }
+      if (t.type === 'cond') {
+        var l = _chainEnumerate(t.ifTrue), r = _chainEnumerate(t.ifFalse);
+        if (!l || !r) return null;
+        var next1 = [];
+        for (var a3 = 0; a3 < accs.length; a3++) {
+          for (var li = 0; li < l.length; li++) next1.push(accs[a3] + l[li]);
+          for (var ri = 0; ri < r.length; ri++) next1.push(accs[a3] + r[ri]);
+        }
+        accs = next1;
+        continue;
+      }
+      if (t.type === 'switchjoin' || t.type === 'switch') {
+        if (!t.branches) return null;
+        var bs = [];
+        for (var bi = 0; bi < t.branches.length; bi++) {
+          var be = _chainEnumerate(t.branches[bi].chain);
+          if (!be) return null;
+          bs.push(be);
+        }
+        var next2 = [];
+        for (var a4 = 0; a4 < accs.length; a4++) for (var b = 0; b < bs.length; b++) for (var v = 0; v < bs[b].length; v++) next2.push(accs[a4] + bs[b][v]);
+        accs = next2;
+        continue;
+      }
+      if (t.type === 'trycatch') {
+        var tb = _chainEnumerate(t.tryBody), cb = _chainEnumerate(t.catchBody);
+        if (!tb || !cb) return null;
+        var next3 = [];
+        for (var a5 = 0; a5 < accs.length; a5++) {
+          for (var ti = 0; ti < tb.length; ti++) next3.push(accs[a5] + tb[ti]);
+          for (var ci = 0; ci < cb.length; ci++) next3.push(accs[a5] + cb[ci]);
+        }
+        accs = next3;
+        continue;
+      }
+      return null; // opaque token (other, etc.)
+    }
+    // Dedupe
+    var seen = Object.create(null), out = [];
+    for (var o = 0; o < accs.length; o++) {
+      if (!seen[accs[o]]) { seen[accs[o]] = 1; out.push(accs[o]); }
+    }
+    return out;
+  }
+
+  // Infer an UnknownReason for an opaque token (type === 'other').
+  // Uses the token's taint set to distinguish user-input from
+  // plain unresolved-identifier. Known taint-source expressions
+  // (location.hash, document.cookie, etc.) map to user-input.
+  // Runtime-random APIs map to runtime-random. Everything else
+  // falls through to unresolved-identifier.
+  function _inferUnknownReason(tok) {
+    var S = _schemas();
+    if (tok && tok.taint && (tok.taint.size > 0 || tok.taint.length > 0)) return S.UNKNOWN_REASONS.USER_INPUT;
+    var text = tok && tok.text ? tok.text : '';
+    if (/\bMath\.random\b/.test(text)) return S.UNKNOWN_REASONS.RUNTIME_RANDOM;
+    if (/\bcrypto\.(randomUUID|getRandomValues)\b/.test(text)) return S.UNKNOWN_REASONS.RUNTIME_RANDOM;
+    if (/\bDate\.now\b/.test(text) || /\bperformance\.now\b/.test(text)) return S.UNKNOWN_REASONS.RUNTIME_RANDOM;
+    if (/^(fetch|XMLHttpRequest|IndexedDB|Cache)\b/.test(text)) return S.UNKNOWN_REASONS.OPAQUE_EXTERNAL;
+    return S.UNKNOWN_REASONS.UNRESOLVED_IDENTIFIER;
+  }
+
+  // Extract taint labels from a walker token. Internal taint is a
+  // Set of label strings; the public schema uses arrays.
+  function _tokTaintArray(tok) {
+    if (!tok || !tok.taint) return null;
+    if (tok.taint instanceof Set) {
+      var arr = [];
+      tok.taint.forEach(function (l) { arr.push(l); });
+      return arr.length ? arr : null;
+    }
+    if (Array.isArray(tok.taint)) return tok.taint.length ? tok.taint.slice() : null;
+    return null;
+  }
+
+  // Core boundary: walker binding → public Value.
+  //
+  // `options` is `{ file, provenanceKind, maxDepth }`. The file
+  // name is stamped on generated Source entries. provenanceKind
+  // defaults to 'inline-literal' for leaf sources and 'branch-merge'
+  // for merged branches. maxDepth guards against cyclic object
+  // bindings (rare but possible with self-referential structures).
+  function bindingToValue(binding, options) {
+    var S = _schemas();
+    options = options || {};
+    var depth = options._depth || 0;
+    var maxDepth = options.maxDepth || 32;
+    if (depth >= maxDepth) {
+      return S.value.unknown(S.UNKNOWN_REASONS.RECURSION_CAP, null, []);
+    }
+    var file = options.file || '<anonymous>';
+
+    if (!binding) {
+      return S.value.unknown(S.UNKNOWN_REASONS.UNRESOLVED_IDENTIFIER, null, []);
+    }
+
+    // --- chain binding ---
+    if (binding.kind === 'chain') {
+      return _chainBindingToValue(binding, { file: file, _depth: depth + 1, maxDepth: maxDepth });
+    }
+
+    // --- object binding ---
+    if (binding.kind === 'object') {
+      var props = Object.create(null);
+      for (var k in binding.props) {
+        if (k.indexOf('__') === 0 || k.indexOf('_') === 0) continue;
+        props[k] = bindingToValue(binding.props[k], { file: file, _depth: depth + 1, maxDepth: maxDepth });
+      }
+      var anyTok = null;
+      // Try to find a provenance token from any prop
+      for (var k2 in binding.props) {
+        anyTok = _anyTokFromBinding(binding.props[k2]);
+        if (anyTok) break;
+      }
+      var objProv = anyTok ? [_provFromTok(anyTok, file, S.SOURCE_KINDS.INLINE_LITERAL)] : [];
+      return S.value.object(props, objProv);
+    }
+
+    // --- array binding ---
+    if (binding.kind === 'array') {
+      var elems = [];
+      for (var i = 0; i < binding.elems.length; i++) {
+        elems.push(bindingToValue(binding.elems[i], { file: file, _depth: depth + 1, maxDepth: maxDepth }));
+      }
+      return S.value.array(elems, []);
+    }
+
+    // --- function binding ---
+    if (binding.kind === 'function') {
+      var paramNames = [];
+      if (binding.params) for (var pi = 0; pi < binding.params.length; pi++) paramNames.push(binding.params[pi].name || ('arg' + pi));
+      return S.value.function(
+        binding.name || null,
+        paramNames,
+        { bodyStart: binding.bodyStart, bodyEnd: binding.bodyEnd },
+        []
+      );
+    }
+
+    // --- element binding (DOM virtual element) ---
+    if (binding.kind === 'element') {
+      var elProps = Object.create(null);
+      elProps['__element'] = S.value.concrete(true, []);
+      elProps['tag'] = S.value.concrete(binding.tag || 'unknown', []);
+      if (binding.attrs) {
+        var attrProps = Object.create(null);
+        for (var an in binding.attrs) {
+          attrProps[an] = bindingToValue(binding.attrs[an], { file: file, _depth: depth + 1, maxDepth: maxDepth });
+        }
+        elProps['attrs'] = S.value.object(attrProps, []);
+      }
+      return S.value.object(elProps, []);
+    }
+
+    // Fallback for unknown binding kinds — surfaces as opaque-external.
+    return S.value.unknown(S.UNKNOWN_REASONS.OPAQUE_EXTERNAL, null, []);
+  }
+
+  // Chain binding → Value. Handles the common cases:
+  //   - single str token                  → concrete
+  //   - every tok fold-able to literal    → concrete
+  //   - every tok enumerable via branches → oneOf
+  //   - single opaque 'other' token       → unknown with inferred reason
+  //   - multi-token with symbolic holes   → template
+  function _chainBindingToValue(chainBind, options) {
+    var S = _schemas();
+    var toks = chainBind.toks;
+    var file = options.file;
+    if (!toks || toks.length === 0) {
+      return S.value.unknown(S.UNKNOWN_REASONS.UNRESOLVED_IDENTIFIER, null, []);
+    }
+
+    // Single str token — concrete with inline-literal provenance.
+    if (toks.length === 1 && toks[0].type === 'str') {
+      var prov = toks[0]._src ? [_provFromTok(toks[0], file, S.SOURCE_KINDS.INLINE_LITERAL)] : [];
+      return S.value.concrete(toks[0].text, prov);
+    }
+
+    // Single opaque 'other' token — unknown with inferred reason + taint.
+    if (toks.length === 1 && toks[0].type === 'other') {
+      var reason = _inferUnknownReason(toks[0]);
+      var taint = _tokTaintArray(toks[0]);
+      var oprov = toks[0]._src ? [_provFromTok(toks[0], file, S.SOURCE_KINDS.INLINE_LITERAL, toks[0].text)] : [];
+      return S.value.unknown(reason, taint, oprov);
+    }
+
+    // Try full concrete fold first.
+    var concrete = _chainToConcrete(toks);
+    if (concrete !== null) {
+      var firstTok = toks.find(function (t) { return t && t._src; });
+      var cprov = firstTok ? [_provFromTok(firstTok, file, S.SOURCE_KINDS.INLINE_LITERAL)] : [];
+      return S.value.concrete(concrete, cprov);
+    }
+
+    // Try enumeration over branches.
+    var enumerated = _chainEnumerate(toks);
+    if (enumerated && enumerated.length > 0) {
+      if (enumerated.length === 1) {
+        var e0 = toks.find(function (t) { return t && t._src; });
+        var eprov = e0 ? [_provFromTok(e0, file, S.SOURCE_KINDS.BRANCH_MERGE)] : [];
+        return S.value.concrete(enumerated[0], eprov);
+      }
+      var bprov = toks[0] && toks[0]._src ? [_provFromTok(toks[0], file, S.SOURCE_KINDS.BRANCH_MERGE)] : [];
+      return S.value.oneOf(enumerated, S.ONE_OF_SOURCES.BRANCH, bprov);
+    }
+
+    // Build template: walk tokens, collect literal run + hole runs.
+    var parts = [];
+    var cur = '';
+    for (var ti = 0; ti < toks.length; ti++) {
+      var t = toks[ti];
+      if (t.type === 'plus') continue;
+      if (t.type === 'str') { cur += t.text; continue; }
+      if (t.type === 'tmpl' && t.parts) {
+        for (var tpi = 0; tpi < t.parts.length; tpi++) {
+          var tp = t.parts[tpi];
+          if (tp.kind === 'text') cur += (tp.raw || '');
+          else {
+            if (cur) { parts.push(S.part.literal(cur)); cur = ''; }
+            var holeVal = S.value.unknown(S.UNKNOWN_REASONS.UNRESOLVED_IDENTIFIER, null, []);
+            parts.push(S.part.hole(holeVal, tp.expr || null));
+          }
+        }
+        continue;
+      }
+      if (t.type === 'cond' || t.type === 'switchjoin' || t.type === 'switch' || t.type === 'trycatch') {
+        if (cur) { parts.push(S.part.literal(cur)); cur = ''; }
+        // Recursively convert this branch token as a synthetic chain.
+        var branchVal = _chainBindingToValue({ kind: 'chain', toks: [t] }, options);
+        parts.push(S.part.hole(branchVal, null));
+        continue;
+      }
+      // Opaque 'other' or anything else
+      if (cur) { parts.push(S.part.literal(cur)); cur = ''; }
+      var hReason = _inferUnknownReason(t);
+      var hTaint = _tokTaintArray(t);
+      var hProv = t._src ? [_provFromTok(t, file, S.SOURCE_KINDS.INLINE_LITERAL, t.text)] : [];
+      parts.push(S.part.hole(
+        S.value.unknown(hReason, hTaint, hProv),
+        t.text || null
+      ));
+    }
+    if (cur) parts.push(S.part.literal(cur));
+
+    if (parts.length === 0) {
+      return S.value.unknown(S.UNKNOWN_REASONS.UNRESOLVED_IDENTIFIER, null, []);
+    }
+    // If the template collapsed to a single literal part, return concrete.
+    if (parts.length === 1 && parts[0].kind === 'literal') {
+      return S.value.concrete(parts[0].value, []);
+    }
+    return S.value.template(parts, []);
+  }
+
+  // =========================================================================
+  // === end jsanalyze public surface ===
+  // =========================================================================
+
+  // Early global export of the jsanalyze translation layer so tests and
+  // consumers can reach it synchronously — before the IIFE's top-level
+  // `await convert()` suspends execution. Definitions above this point
+  // are hoisted, so referencing them here is safe. The full api export
+  // at the end of the IIFE is unchanged and runs after the await.
+  if (typeof globalThis !== 'undefined') {
+    globalThis.__bindingToValue = bindingToValue;
+    globalThis.__jsanalyze = {
+      bindingToValue: bindingToValue,
+      // buildScopeState / scanMutations / tokenize are hoisted
+      // function declarations too; they're callable here.
+      buildScopeState: buildScopeState,
+      scanMutations: scanMutations,
+      tokenize: tokenize,
+    };
+  }
+
+  async function extractHTML(input) {
     const trimmed = input.trim();
     if (!trimmed) return { target: null, assignProp: null, assignOp: null, chainTokens: [] };
     if (trimmed.startsWith('<')) return { target: null, assignProp: null, assignOp: null, chainTokens: [{ type: 'str', text: trimmed }] };
@@ -1428,7 +2010,7 @@
     // Resolve identifier references inside the RHS using the scope state at
     // the assignment site.
     if (assign) {
-      const result = extractOneAssignment(tokens, assign);
+      const result = await extractOneAssignment(tokens, assign);
       // If target is a known non-element, fall through to no-innerHTML path.
       if (result) return result;
     }
@@ -1441,7 +2023,7 @@
       (t.type === 'tmpl') ||
       (t.type === 'plus'));
     if (hasHtmlHint) {
-      const r = resolveIdentifiers(tokens, 0, tokens.length);
+      const r = await resolveIdentifiers(tokens, 0, tokens.length);
       if (r.parsed) {
         return { target, assignProp, assignOp, chainTokens: r.tokens, loopInfoMap: r.loopInfo };
       }
@@ -1683,6 +2265,13 @@
     'repeat', 'slice', 'substring', 'substr', 'charAt', 'indexOf', 'lastIndexOf',
     'includes', 'startsWith', 'endsWith', 'padStart', 'padEnd', 'toString',
     'split', 'reverse', 'map', 'filter', 'forEach', 'reduce',
+    // Promise continuation — applyMethod's then/catch/finally handler
+    // walks the callback with the receiver's taint as the first arg.
+    'then', 'catch', 'finally',
+    // Map / Set / WeakMap / WeakSet key-indexed ops — applyMethod
+    // dispatches these against a _mapLike object binding so dispatcher
+    // tables and lookup caches flow through the may-be lattice.
+    'set', 'get', 'has', 'add', 'delete', 'clear',
   ]);
 
   const MATH_CONSTANTS = {
@@ -1694,9 +2283,14 @@
   // A chain binding wraps an array of operand/plus tokens. Object and array
   // bindings hold named or indexed child bindings (each itself a chain,
   // object, or array) so member access and destructuring can walk into them.
+  // Each object binding gets a stable identity (`__objId`) so that the
+  // may-be lattice and other identity-sensitive analyses can track aliasing
+  // (`var x = obj; x.foo = "Y"` → `obj.foo` and `x.foo` resolve to the
+  // same lattice slot because they're the same underlying object).
   const chainBinding = (toks) => ({ kind: 'chain', toks });
-  const objectBinding = (props) => ({ kind: 'object', props });
-  const arrayBinding = (elems) => ({ kind: 'array', elems });
+  var _nextObjId = 0;
+  const objectBinding = (props) => ({ kind: 'object', props, __objId: ++_nextObjId });
+  const arrayBinding = (elems) => ({ kind: 'array', elems, __objId: ++_nextObjId });
   const functionBinding = (params, bodyStart, bodyEnd, isBlock) => ({
     kind: 'function', params, bodyStart, bodyEnd, isBlock,
   });
@@ -1907,7 +2501,8 @@
     return externallyMutable;
   }
 
-  function buildScopeState(tokens, stopAt, externallyMutable, trackBuildVarInit, taintConfig) {
+  async function buildScopeState(tokens, stopAt, externallyMutable, trackBuildVarInit, taintConfig, options) {
+    options = options || {};
     const stack = [{ bindings: Object.create(null), isFunction: true }];
     let pendingFunctionBrace = false;
     let pendingFunctionParams = null;
@@ -1924,6 +2519,226 @@
     // outer-scope variables inside handlers produce values that depend
     // on the number of handler invocations (attacker-controlled).
     var inEventHandler = false;
+    // Pending callbacks for the phase-2 fixpoint. Each entry is
+    // { fn: functionBinding, params: paramBindings, isEventHandler: bool }.
+    // The fixpoint in buildScopeState's finalize block re-walks every
+    // entry on each iteration so callbacks see the cumulative state
+    // of every other callback.
+    const _pendingCallbacks = [];
+    // Call watchers: external consumers (fetch tracers, API discovery,
+    // sink finders, etc.) register callbacks here. The walker invokes
+    // every registered watcher for each call site it sees, passing
+    // (callee, argBindings, token, info). Watchers read the fully
+    // resolved argument bindings — concat chains, object literals,
+    // arrays, function refs — and record whatever shape they need.
+    // Registration happens via the public options object before
+    // buildScopeState runs.
+    const _callWatchers = (options && options.callWatchers) ? options.callWatchers.slice() : [];
+    // ----------------------------------------------------------------
+    // Per-variable may-be value lattice
+    // ----------------------------------------------------------------
+    // For each variable name we record EVERY value the walker has
+    // assigned to it. The set is the JOIN of all reaching definitions
+    // and is exactly what an SMT solver needs to reason about state
+    // mutated indirectly across callbacks, branches and loops.
+    //
+    //   _varMayBe[name] = { vals: [binding, ...], keys: { json → true },
+    //                       complete: bool }
+    //
+    // `complete` is true iff EVERY observed assignment was a binding
+    // we can faithfully encode as a single SMT-LIB literal (a chain
+    // of one literal-string token, or a chain of one literal-number
+    // token). Once any assignment of an opaque / tainted / multi-token
+    // chain happens, complete flips to false: we can no longer
+    // enumerate the value space, so the set is conservatively
+    // unbounded and SMT must NOT receive a closed disjunction over
+    // it (that would be unsound — it would falsely exclude the
+    // unencoded values).
+    //
+    // smtSat consults _varMayBe at SAT-check time. For every symbol
+    // declared in the formula whose may-be set is complete with more
+    // than one literal value, smtSat emits an extra
+    //   (assert (or (= sym v1) (= sym v2) ...))
+    // alongside the main assertion. Z3 then refutes any path that
+    // requires sym to take a value outside the enumerated set.
+    //
+    // The phase-2 callback fixpoint includes _varMayBe in its
+    // convergence signature, so iteration continues until no new
+    // values are added to any variable's set. The lattice is
+    // monotone (values only ever join in, never leave) so
+    // convergence is guaranteed in a bounded number of iterations.
+    const _varMayBe = Object.create(null);
+    // Active for-of / for-in loop variable names. When the body's
+    // walker assigns `s = loopVar`, the RHS resolves to an opaque
+    // `other:loopVar` reference — without a guard, that would
+    // poison `s`'s may-be slot. Loop handlers add the loop var name
+    // on entry and remove it on exit; _trackMayBeAssign checks the
+    // set and skips the opaque self-reference so the pre-populated
+    // per-element values aren't clobbered.
+    const _activeForOfVars = new Set();
+    function _bindingToConcreteLit(b) {
+      // Returns null if the binding cannot be expressed as a single
+      // SMT-LIB literal. Returns { lit, sort } otherwise where sort
+      // is 'String' or 'Int' and lit is the s-expression form.
+      if (!b || b.kind !== 'chain') return null;
+      if (b.toks.length !== 1) return null;
+      var t = b.toks[0];
+      if (t.type !== 'str') return null;
+      // collectChainTaint will report any taint on the operand —
+      // tainted operands are unencodable.
+      if (t.taint && t.taint.size) return null;
+      var n = Number(t.text);
+      if (!Number.isNaN(n) && String(n) === t.text) {
+        return { lit: n < 0 ? '(- ' + (-n) + ')' : String(n), sort: 'Int' };
+      }
+      // String literal — emit as a quoted SMT string.
+      return { lit: _quoteSmtString(t.text), sort: 'String' };
+    }
+    // Resolve a may-be lattice key. For plain variable names this is
+    // just the name. For property paths (`obj.prop` or `obj.a.b.c`)
+    // we walk every segment EXCEPT the last through the binding stack,
+    // so that the deepest container's stable identity is the key root.
+    // This makes both \`obj.inner.v\` and an alias \`x.v\` (where x = obj.inner)
+    // canonicalise to the same `#<innerId>.v` slot — the slot belongs
+    // to the LEAF object, not the path used to reach it.
+    function _mayBeKey(textPath) {
+      if (typeof textPath !== 'string') return null;
+      var dot = textPath.indexOf('.');
+      if (dot < 0) return textPath;
+      var parts = textPath.split('.');
+      var b = resolve(parts[0]);
+      // Walk every segment except the last through the binding stack
+      // so the canonical key is rooted at the leaf container's id.
+      for (var i = 1; i < parts.length - 1 && b; i++) {
+        if (b.kind !== 'object') { b = null; break; }
+        b = b.props[parts[i]] || null;
+      }
+      if (b && (b.kind === 'object' || b.kind === 'array') && b.__objId) {
+        return '#' + b.__objId + '.' + parts[parts.length - 1];
+      }
+      return textPath;
+    }
+    function _trackMayBeAssign(name, binding) {
+      if (!taintEnabled) return;
+      var k0 = _mayBeKey(name);
+      if (!k0) return;
+      if (!_varMayBe[k0]) _varMayBe[k0] = { vals: [], keys: Object.create(null), complete: true, fns: null, fnIds: null };
+      var slot = _varMayBe[k0];
+      // Function-typed assignments are tracked separately so the
+      // walker's indirect-call dispatch can walk EVERY function the
+      // variable may resolve to. This is the call-target may-be set;
+      // it doesn't contribute to the SMT disjunction (functions can't
+      // be encoded as Z3 literals) but it lets us drive the
+      // interprocedural analysis through dispatcher patterns.
+      if (binding && binding.kind === 'function') {
+        if (!slot.fns) { slot.fns = []; slot.fnIds = Object.create(null); }
+        var fkey = binding.bodyStart + ':' + binding.bodyEnd;
+        if (!slot.fnIds[fkey]) {
+          slot.fnIds[fkey] = true;
+          slot.fns.push(binding);
+          if (slot.fns.length > 32) {
+            // Cap to prevent runaway re-walks. Beyond this many call
+            // targets the precision win is marginal anyway.
+            slot.fns = slot.fns.slice(0, 32);
+          }
+        }
+        return;
+      }
+      // If the RHS is an opaque ref to an active for-of loop variable,
+      // skip — we've pre-populated every iteration's concrete value
+      // via the for-of pre-scan and don't want to poison the slot
+      // with the body walker's symbolic view.
+      if (binding && binding.kind === 'chain' && binding.toks.length === 1 &&
+          binding.toks[0].type === 'other' &&
+          _activeForOfVars.has(binding.toks[0].text)) {
+        return;
+      }
+      if (slot.complete === false) return; // already poisoned for SMT
+      // Expand a conditional chain `(cond) ? a : b` into two separate
+      // may-be entries — both branches are reachable values. Without
+      // this, the lattice is poisoned the moment a ternary is assigned
+      // to a tracked variable, losing refutation power over loop /
+      // switch / branch state.
+      if (binding && binding.kind === 'chain' && binding.toks.length === 1 && binding.toks[0].type === 'cond') {
+        var _condTok = binding.toks[0];
+        if (_condTok.ifTrue) _trackMayBeAssign(name, chainBinding(_condTok.ifTrue));
+        if (_condTok.ifFalse) _trackMayBeAssign(name, chainBinding(_condTok.ifFalse));
+        return;
+      }
+      // Same treatment for `trycatch` tokens (try/catch merge) and
+      // `switchcase` tokens (switch merge): both are two-alternative
+      // join tokens and every alternative is a reachable runtime value.
+      if (binding && binding.kind === 'chain' && binding.toks.length === 1 && binding.toks[0].type === 'trycatch') {
+        var _tcTok = binding.toks[0];
+        if (_tcTok.tryBody) _trackMayBeAssign(name, chainBinding(_tcTok.tryBody));
+        if (_tcTok.catchBody) _trackMayBeAssign(name, chainBinding(_tcTok.catchBody));
+        return;
+      }
+      if (binding && binding.kind === 'chain' && binding.toks.length === 1 &&
+          (binding.toks[0].type === 'switch' || binding.toks[0].type === 'switchjoin')) {
+        var _scTok = binding.toks[0];
+        if (_scTok.branches) {
+          for (var _sci = 0; _sci < _scTok.branches.length; _sci++) {
+            var _sCase = _scTok.branches[_sci];
+            if (_sCase && _sCase.chain) _trackMayBeAssign(name, chainBinding(_sCase.chain));
+          }
+        }
+        return;
+      }
+      // Encode the assignment to detect duplicates and check encodability.
+      var lit = _bindingToConcreteLit(binding);
+      if (!lit) {
+        // Opaque / tainted / multi-token / non-chain assignment —
+        // the may-be set can no longer enumerate every reachable value
+        // for SMT purposes. (Function entries in slot.fns are still
+        // valid; we only poison the SMT side.)
+        slot.complete = false;
+        slot.vals = null; // free, no longer needed
+        slot.keys = null;
+        return;
+      }
+      var k = lit.sort + ':' + lit.lit;
+      if (slot.keys[k]) return;
+      slot.keys[k] = true;
+      slot.vals.push({ lit: lit.lit, sort: lit.sort });
+      // Cap the lattice size as a performance guard. If the cap is hit
+      // we conservatively poison the slot rather than emitting a
+      // partial disjunction.
+      if (slot.vals.length > 32) {
+        slot.complete = false;
+        slot.vals = null;
+        slot.keys = null;
+      }
+    }
+    // Snapshot the scope chain (BY REFERENCE) visible at closure
+    // creation time. The returned array holds references to the
+    // actual frame objects, so mutations made after the closure is
+    // created — whether by the outer function before it returns, or
+    // by other callbacks sharing the same var — remain visible when
+    // the closure is later invoked.
+    //
+    // instantiateFunction pushes any captured frames that are not
+    // already on the live stack (preventing duplicates when a closure
+    // is called synchronously before the outer function has returned)
+    // and pops them in reverse order on exit.
+    function _snapshotClosureForCapture() {
+      // Return a shallow copy of the current stack; each entry is a
+      // reference to the same frame object the walker is currently
+      // using. If the outer function later pops the frame, our
+      // reference keeps it alive for later re-entry.
+      return stack.slice();
+    }
+    // Look up the function may-be set for a call target identifier.
+    // Returns the array of function bindings the variable may resolve
+    // to, or null if no function entries are tracked.
+    function _funcMayBeFor(name) {
+      if (!_varMayBe) return null;
+      var k = _mayBeKey(name);
+      if (!k) return null;
+      var slot = _varMayBe[k];
+      if (!slot || !slot.fns || slot.fns.length === 0) return null;
+      return slot.fns;
+    }
     // Track function scope depth for taint. Findings inside function
     // bodies walked at definition time (not via instantiateFunction)
     // should be suppressed because there's no calling context.
@@ -2001,12 +2816,18 @@
       // Suppress findings inside function bodies walked at definition time.
       // These are re-walked via instantiateFunction with proper context.
       if (taintFnDepth > 0) return;
+      // Snapshot the current SMT path-constraint formulas so a post-hoc
+      // verification backend (e.g. Z3) can re-check reachability without
+      // re-running the walker. The formulas are internal SMT AST nodes
+      // (see smtSym/smtCmp/smtAnd/...).
+      var _formulaSnapshot = pathConstraints ? pathConstraints.slice() : [];
       taintFindings.push({
         type: sinkType,
         severity: severity,
         sink: { prop: prop, elementTag: elementTag || null },
         sources: Array.from(taintLabels),
         conditions: pathConditions ? pathConditions.slice() : [],
+        formulas: _formulaSnapshot,
         location: location || null,
       });
     };
@@ -2018,7 +2839,7 @@
       var tag = getElementTag(el);
       var sinkInfo = classifySink(propName, tag);
       if (sinkInfo && sinkInfo.severity !== 'safe') {
-        var loc = tok && tok._src ? { expr: tok.text || propName, line: countLines(tok._src, tok.start) } : null;
+        var loc = tok && tok._src ? { expr: tok.text || propName, line: countLines(tok._src, tok.start), pos: tok.start } : null;
         recordTaintFinding(sinkInfo.type, sinkInfo.severity, propName, tag, taint, taintCondStack, loc);
       }
     };
@@ -2051,7 +2872,7 @@
         var toks = ab.kind === 'chain' ? ab.toks : null;
         var taint = toks ? collectChainTaint(toks) : null;
         if (taint && taint.size) {
-          var loc = tok && tok._src ? { expr: callExpr, line: countLines(tok._src, tok.start) } : null;
+          var loc = tok && tok._src ? { expr: callExpr, line: countLines(tok._src, tok.start), pos: tok.start } : null;
           recordTaintFinding(sinkInfo.type, sinkInfo.severity, callExpr, null, taint, taintCondStack, loc);
           break;
         }
@@ -2192,18 +3013,31 @@
     // Track names explicitly declared with var/let/const/function.
     // Used to distinguish `var location = x` (local) from `location = x` (global write).
     const declaredNames = new Set();
-    const declBlock = (name, value) => { declaredNames.add(name); topBlock().bindings[name] = asRef(name, value); };
+    const declBlock = (name, value) => {
+      declaredNames.add(name);
+      topBlock().bindings[name] = asRef(name, value);
+      _trackMayBeAssign(name, value);
+    };
     const declFunction = (name, value) => {
       declaredNames.add(name);
       for (let i = stack.length - 1; i >= 0; i--) {
-        if (stack[i].isFunction) { stack[i].bindings[name] = asRef(name, value); return; }
+        if (stack[i].isFunction) {
+          stack[i].bindings[name] = asRef(name, value);
+          _trackMayBeAssign(name, value);
+          return;
+        }
       }
     };
     const assignName = (name, value) => {
       for (let i = stack.length - 1; i >= 0; i--) {
-        if (name in stack[i].bindings) { stack[i].bindings[name] = asRef(name, value); return; }
+        if (name in stack[i].bindings) {
+          stack[i].bindings[name] = asRef(name, value);
+          _trackMayBeAssign(name, value);
+          return;
+        }
       }
       stack[0].bindings[name] = asRef(name, value); // implicit global
+      _trackMayBeAssign(name, value);
     };
     const resolve = (name) => {
       for (let i = stack.length - 1; i >= 0; i--) {
@@ -2214,7 +3048,7 @@
     // Walk a dotted path ('obj.a.b') resolving into object/array/chain
     // bindings. Handles `.length` specially on arrays and on chains whose
     // operands are all known string/template literals.
-    const resolvePath = (path) => {
+    const resolvePath = async (path) => {
       const parts = path.split('.');
       let b = resolve(parts[0]);
       for (let i = 1; i < parts.length && b; i++) {
@@ -2223,7 +3057,7 @@
           // Check for getter: __getter_prop is a function that returns the value.
           var _getter = b.props['__getter_' + p];
           if (_getter && _getter.kind === 'function') {
-            var _getResult = instantiateFunction(_getter, []);
+            var _getResult = await instantiateFunction(_getter, []);
             if (_getResult && _getResult.kind) b = _getResult;
             else if (_getResult) b = chainBinding(_getResult);
             else b = null;
@@ -2263,7 +3097,7 @@
     };
     // Flatten a binding to plain text if possible (all parts are string
     // literals or templates whose exprs all resolve). Returns null otherwise.
-    const bindingToText = (b) => {
+    const bindingToText = async (b) => {
       if (!b) return null;
       if (b.kind !== 'chain') return null;
       let text = '';
@@ -2271,7 +3105,7 @@
         if (t.type === 'plus') continue;
         if (t.type === 'str') { text += t.text; continue; }
         if (t.type === 'tmpl') {
-          const rw = templateToText(t);
+          const rw = await templateToText(t);
           if (rw === null) return null;
           text += rw;
           continue;
@@ -2282,12 +3116,12 @@
     };
     // Re-tokenize an expression source string and parse it as a concat chain
     // using the in-scope bindings. Returns the chain token list or null.
-    const evalExprSrc = (src) => {
+    const evalExprSrc = async (src) => {
       const exprTokens = tokenize(src);
       if (!exprTokens.length) return null;
       const saved = tks;
       tks = exprTokens;
-      const r = readConcatExpr(0, exprTokens.length, TERMS_NONE);
+      const r = await readConcatExpr(0, exprTokens.length, TERMS_NONE);
       tks = saved;
       if (!r || r.next !== exprTokens.length) return null;
       return r.toks;
@@ -2295,24 +3129,24 @@
 
     // Rewrite a template literal as plain text by resolving each ${expr}.
     // Returns null if any expr can't be resolved to plain text.
-    const templateToText = (tok) => {
+    const templateToText = async (tok) => {
       let text = '';
       for (const p of tok.parts) {
         if (p.kind === 'text') { text += decodeJsString(p.raw, '`'); continue; }
         // Fast path: bare identifier/member path.
         if (TEMPLATE_EXPR_PATH_RE.test(p.expr)) {
           const path = p.expr.replace(/\s+/g, '');
-          const b = resolvePath(path);
+          const b = await resolvePath(path);
           if (!b) return null;
-          const t2 = bindingToText(b);
+          const t2 = await bindingToText(b);
           if (t2 === null) return null;
           text += t2;
           continue;
         }
         // General expression: re-tokenize and evaluate as a concat chain.
-        const chain = evalExprSrc(p.expr);
+        const chain = await evalExprSrc(p.expr);
         if (!chain) return null;
-        const t2 = bindingToText(chainBinding(chain));
+        const t2 = await bindingToText(chainBinding(chain));
         if (t2 === null) return null;
         text += t2;
       }
@@ -2320,10 +3154,10 @@
     };
     // Rewrite a tmpl token in place to inline every resolvable expr; falls
     // back to the original token if any expr can't be resolved.
-    const rewriteTemplate = (tok) => {
+    const rewriteTemplate = async (tok) => {
       if (tok.type !== 'tmpl') return tok;
       // All-resolvable fast path: full text.
-      const asText = templateToText(tok);
+      const asText = await templateToText(tok);
       if (asText !== null) return makeSynthStr(asText);
       // Partial rewrite: replace resolvable exprs with their plain text, keep
       // others. Coalesce adjacent text parts afterward.
@@ -2335,10 +3169,10 @@
         var _tmplChain = null;
         if (TEMPLATE_EXPR_PATH_RE.test(p.expr)) {
           const path = p.expr.replace(/\s+/g, '');
-          const b = resolvePath(path);
-          if (b) { resolvedText = bindingToText(b); if (b.kind === 'chain') _tmplChain = b.toks; }
+          const b = await resolvePath(path);
+          if (b) { resolvedText = await bindingToText(b); if (b.kind === 'chain') _tmplChain = b.toks; }
         } else {
-          const chain = evalExprSrc(p.expr);
+          const chain = await evalExprSrc(p.expr);
           _tmplChain = chain;
           if (chain) {
             // Check if the chain contains structured tokens (cond, trycatch, switch).
@@ -2365,7 +3199,7 @@
               // Return a synthetic chain token that expandChain can handle.
               return { type: '_chain', toks: out };
             }
-            resolvedText = bindingToText(chainBinding(chain));
+            resolvedText = await bindingToText(chainBinding(chain));
           }
         }
         if (resolvedText !== null) {
@@ -2559,9 +3393,9 @@
     // Resolve a default-value token range to a binding. Falls through to a
     // chain reference if the expression isn't foldable, so the name still
     // binds to *something* deterministic rather than null.
-    const resolveDefault = (dflt) => {
+    const resolveDefault = async (dflt) => {
       if (!dflt) return null;
-      const r = readValue(dflt.start, dflt.end, null);
+      const r = await readValue(dflt.start, dflt.end, null);
       if (r && r.binding) return r.binding;
       const toks = [];
       for (let j = dflt.start; j < dflt.end; j++) toks.push(tks[j]);
@@ -2569,17 +3403,17 @@
     };
 
     // Bind names from `pattern` by walking into `source` (a binding).
-    const applyPatternBindings = (pattern, source, bind) => {
+    const applyPatternBindings = async (pattern, source, bind) => {
       if (pattern.kind === 'obj-pattern') {
         const props = source && source.kind === 'object' ? source.props : null;
         const seen = Object.create(null);
         for (const entry of pattern.entries) {
           seen[entry.key] = true;
           let val = props ? (props[entry.key] || null) : null;
-          if (val === null && entry.dflt) val = resolveDefault(entry.dflt);
+          if (val === null && entry.dflt) val = await resolveDefault(entry.dflt);
           if (entry.nested) {
             // Nested destructuring: recursively apply pattern.
-            applyPatternBindings(entry.nested, val, bind);
+            await applyPatternBindings(entry.nested, val, bind);
           } else {
             bind(entry.name, val);
           }
@@ -2603,7 +3437,7 @@
           const entry = pattern.entries[i];
           if (entry === null) continue;
           let val = elems ? (elems[i] || null) : null;
-          if (val === null && entry.dflt) val = resolveDefault(entry.dflt);
+          if (val === null && entry.dflt) val = await resolveDefault(entry.dflt);
           bind(entry.name, val);
         }
         if (pattern.rest) {
@@ -2626,19 +3460,19 @@
     const _resultSlot = { value: null, has: false };
     const _completeFrame = (result) => { _evalStack.pop(); _resultSlot.value = result; _resultSlot.has = true; };
     const _consumeResult = () => { if (!_resultSlot.has) return undefined; const v = _resultSlot.value; _resultSlot.value = null; _resultSlot.has = false; return v; };
-    const _evalLoop = () => {
+    const _evalLoop = async () => {
       const baseDepth = _evalStack.length - 1;
       while (_evalStack.length > baseDepth) {
         const _f = _evalStack[_evalStack.length - 1];
         switch (_f.type) {
-          case 'READ_ARRAY_LIT':         _stepReadArrayLit(_f); break;
-          case 'READ_OBJECT_LIT':        _stepReadObjectLit(_f); break;
-          case 'READ_CALL_ARG_BINDINGS': _stepReadCallArgBindings(_f); break;
+          case 'READ_ARRAY_LIT':         await _stepReadArrayLit(_f); break;
+          case 'READ_OBJECT_LIT':        await _stepReadObjectLit(_f); break;
+          case 'READ_CALL_ARG_BINDINGS': await _stepReadCallArgBindings(_f); break;
           case 'READ_CONCAT_ARGS':       _stepReadConcatArgs(_f); break;
-          case 'READ_CALL_ARG_BINDINGS': _stepReadCallArgBindings(_f); break;
+          case 'READ_CALL_ARG_BINDINGS': await _stepReadCallArgBindings(_f); break;
           case 'READ_CONCAT_ARGS':       _stepReadConcatArgs(_f); break;
-          case 'READ_VALUE':             { const r = readValue(_f.k, _f.stop, _f.terms); _completeFrame(r); break; }
-          case 'READ_CONCAT_EXPR':       { const r = readConcatExpr(_f.i, _f.stop, _f.terms); _completeFrame(r); break; }
+          case 'READ_VALUE':             { const r = await readValue(_f.k, _f.stop, _f.terms); _completeFrame(r); break; }
+          case 'READ_CONCAT_EXPR':       { const r = await readConcatExpr(_f.i, _f.stop, _f.terms); _completeFrame(r); break; }
           default: _completeFrame(null); break;
         }
       }
@@ -2648,12 +3482,12 @@
     // Read an object literal `{ key: value, ... }` starting at index `k`.
     // Keys are bare identifiers or quoted strings. Values are any readValue
     // (chain, nested object, or nested array). Returns { binding, next }.
-    const readObjectLit = (k, stop) => {
+    const readObjectLit = async (k, stop) => {
       if (!tks[k] || tks[k].type !== 'open' || tks[k].char !== '{') return null;
       _evalStack.push({ type: 'READ_OBJECT_LIT', i: k + 1, stop, props: Object.create(null), _waitingKey: null });
-      return _evalLoop();
+      return await _evalLoop();
     };
-    const _stepReadObjectLit = (frame) => {
+    const _stepReadObjectLit = async (frame) => {
       // Consume child result based on resume phase
       if (_resultSlot.has) {
         if (frame._rp === 'val') {
@@ -2677,7 +3511,7 @@
         if (tk.type === 'close' && tk.char === '}') break;
         if (tk.type === 'other' && tk.text.startsWith('...')) {
           const name = tk.text.slice(3);
-          if (IDENT_OR_PATH_RE.test(name)) { const b = resolvePath(name); if (b && b.kind === 'object') { for (const kk in b.props) props[kk] = b.props[kk]; frame.i++; const sep = tks[frame.i]; if (sep && sep.type === 'sep' && sep.char === ',') { frame.i++; continue; } break; } }
+          if (IDENT_OR_PATH_RE.test(name)) { const b = await resolvePath(name); if (b && b.kind === 'object') { for (const kk in b.props) props[kk] = b.props[kk]; frame.i++; const sep = tks[frame.i]; if (sep && sep.type === 'sep' && sep.char === ',') { frame.i++; continue; } break; } }
           _completeFrame(null); return;
         }
         var keyName = frame._pendingKey || null; frame._pendingKey = null;
@@ -2738,12 +3572,12 @@
     };
 
     // Read an array literal `[ v, v, ... ]`. Returns { binding, next } or null.
-    const readArrayLit = (k, stop) => {
+    const readArrayLit = async (k, stop) => {
       if (!tks[k] || tks[k].type !== 'open' || tks[k].char !== '[') return null;
       _evalStack.push({ type: 'READ_ARRAY_LIT', i: k + 1, stop, elems: [] });
-      return _evalLoop();
+      return await _evalLoop();
     };
-    const _stepReadArrayLit = (frame) => {
+    const _stepReadArrayLit = async (frame) => {
       if (_resultSlot.has) {
         const val = _consumeResult();
         if (!val) { _completeFrame(null); return; }
@@ -2760,7 +3594,7 @@
         if (tk.type === 'other' && tk.text.startsWith('...')) {
           const name = tk.text.slice(3);
           if (IDENT_OR_PATH_RE.test(name)) {
-            const b = resolvePath(name);
+            const b = await resolvePath(name);
             if (b && b.kind === 'array') { for (const e of b.elems) frame.elems.push(e); frame.i++; const sep = tks[frame.i]; if (sep && sep.type === 'sep' && sep.char === ',') { frame.i++; continue; } break; }
           }
           _completeFrame(null); return;
@@ -2779,8 +3613,17 @@
     // { params, arrowNext } where `arrowNext` is the index just after `=>`,
     // or null if `k` doesn't start an arrow function.
     const peekArrow = (k, stop) => {
-      const t = tks[k];
+      let t = tks[k];
       if (!t) return null;
+      // `async` prefix: `async ident => ...` / `async (params) => ...`.
+      // The walker doesn't distinguish async from sync arrows — await
+      // propagates through its argument as a transparent operator —
+      // so we simply skip the keyword and parse the rest normally.
+      if (t.type === 'other' && t.text === 'async') {
+        k = k + 1;
+        t = tks[k];
+        if (!t) return null;
+      }
       // Single-param form: `ident => body`.
       if (t.type === 'other' && IDENT_RE.test(t.text)) {
         const arrow = tks[k + 1];
@@ -2844,7 +3687,7 @@
     // parsing. Returns { binding, next } or null.
     // Parse a function expression: function [name](params) { body }.
     // Returns { binding: functionBinding, next } or null.
-    const readFunctionExpr = (k, stop) => {
+    const readFunctionExpr = async (k, stop) => {
       var ft = tks[k];
       if (!ft || ft.type !== 'other' || ft.text !== 'function') return null;
       var fk = k + 1;
@@ -2896,22 +3739,32 @@
         else if (tks[bodyEnd].type === 'close' && tks[bodyEnd].char === '}') depth--;
         bodyEnd++;
       }
-      return { binding: functionBinding(params, fj, bodyEnd, true), next: bodyEnd };
+      var _fnBind = functionBinding(params, fj, bodyEnd, true);
+      // Closure capture: snapshot every binding visible at function-
+      // expression creation time. When the function is later called
+      // (potentially after the creating scope has returned), the
+      // captured bindings are pushed onto the stack so reads from
+      // within the body still see the outer-scope values — including
+      // any taint attached to them.
+      _fnBind.capturedScope = _snapshotClosureForCapture();
+      return { binding: _fnBind, next: bodyEnd };
     };
 
-    const readValue = (k, stop, terms) => {
+    const readValue = async (k, stop, terms) => {
       const t = tks[k];
       if (!t) return null;
       // Function expression: function(params) { body }
-      var fnExpr = readFunctionExpr(k, stop);
+      var fnExpr = await readFunctionExpr(k, stop);
       if (fnExpr) return fnExpr;
       // Arrow function (it can start with `(` or with an ident).
       const arrow = peekArrow(k, stop);
       if (arrow) {
         const body = readArrowBody(arrow.arrowNext, stop);
         if (!body) return null;
+        var _aBind = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock);
+        _aBind.capturedScope = _snapshotClosureForCapture();
         return {
-          binding: functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock),
+          binding: _aBind,
           next: body.next,
         };
       }
@@ -2921,31 +3774,31 @@
       // the RHS is a bare literal or member access. If the next top-level
       // token is `+`, escalate to concat-chain parsing so the result
       // becomes the first operand.
-      const arith = parseArithExpr(k, stop, 0);
+      const arith = await parseArithExpr(k, stop, 0);
       if (arith && arith.bind) {
         const nt = tks[arith.next];
         if (nt && nt.type === 'plus') {
-          const r = readConcatExpr(k, stop, terms);
+          const r = await readConcatExpr(k, stop, terms);
           if (r) return { binding: chainBinding(r.toks), next: r.next };
         }
         return { binding: arith.bind, next: arith.next };
       }
       // Fall back to readBase for typed bindings (array/object) that
       // parseArithExpr rejected because they're not chain results.
-      const base = readBase(k, stop);
+      const base = await readBase(k, stop);
       if (base) {
-        const s = applySuffixes(base.bind, base.next, stop);
+        const s = await applySuffixes(base.bind, base.next, stop);
         if (s.bind) {
           const nt = tks[s.next];
           if (nt && nt.type === 'plus') {
-            const r = readConcatExpr(k, stop, terms);
+            const r = await readConcatExpr(k, stop, terms);
             if (r) return { binding: chainBinding(r.toks), next: r.next };
           }
           return { binding: s.bind, next: s.next };
         }
       }
       // Fall through: chain parsing (with opaque-capture for unresolved).
-      const r = readConcatExpr(k, stop, terms);
+      const r = await readConcatExpr(k, stop, terms);
       if (r) return { binding: chainBinding(r.toks), next: r.next };
       return null;
     };
@@ -2960,7 +3813,7 @@
 
     // Apply `[key]` subscripts and separate-token `.method(args)` calls as
     // postfix accessors on a typed binding. Returns { bind, next }.
-    const applySuffixes = (bind, next, stop) => {
+    const applySuffixes = async (bind, next, stop) => {
       while (next < stop && bind) {
         const t = tks[next];
         if (!t) break;
@@ -3002,7 +3855,7 @@
           if (!close || close.type !== 'close' || close.char !== ']') break;
           let resolved = false;
           if (j > next + 1) {
-            const inner = parseArithExpr(next + 1, j, 0);
+            const inner = await parseArithExpr(next + 1, j, 0);
             if (inner && inner.next === j && inner.bind && inner.bind.toks.length === 1 && inner.bind.toks[0].type === 'str') {
               const keyText = inner.bind.toks[0].text;
               const asNum = Number(keyText);
@@ -3048,6 +3901,27 @@
             }
           }
           next = j + 1;
+          continue;
+        }
+        // Bare trailing call on a function-valued result:
+        // `outer()()`, `a()()()`, `(cond ? f : g)()`, `obj.factory()()`.
+        // Without this the second `(` is unreachable and the returned
+        // closure's body is never walked.
+        if (t.type === 'open' && t.char === '(' && bind && bind.kind === 'function') {
+          var _bcallArgs = await readCallArgBindings(next, stop);
+          if (!_bcallArgs) break;
+          var _bcallResult = await instantiateFunction(bind, _bcallArgs.bindings, null);
+          if (_bcallResult && _bcallResult.kind && _bcallResult.kind !== 'chain') {
+            bind = _bcallResult;
+          } else if (_bcallResult && _bcallResult.kind === 'chain') {
+            bind = _bcallResult;
+          } else if (_bcallResult && Array.isArray(_bcallResult)) {
+            bind = chainBinding(_bcallResult);
+          } else {
+            // Opaque result: keep the chain going with an unknown ref.
+            bind = chainBinding([exprRef('()')]);
+          }
+          next = _bcallArgs.next;
           continue;
         }
         // Separate-token method call: `].join(sep)` or `'a'.concat(...)`.
@@ -3097,28 +3971,59 @@
             }
           }
           if (isMethodCall) {
-            const r = applyMethod(cur, lastSeg, next + 1, stop);
-            if (!r) break;
-            bind = r.bind;
-            next = r.next;
-            continue;
+            const r = await applyMethod(cur, lastSeg, next + 1, stop);
+            if (r) {
+              bind = r.bind;
+              next = r.next;
+              continue;
+            }
+            // applyMethod returned null — fall through to the
+            // object-method-call path below for cases like a thenable
+            // object whose .then property is a user-defined function.
+            // (applyMethod's then handler only fires when the receiver
+            // is a chain; an object with a .then function should be
+            // dispatched via the inline-method path.)
+            if (cur && cur.kind === 'object' && cur.props && cur.props[lastSeg] && cur.props[lastSeg].kind === 'function') {
+              // fall through to the function-call branch below
+            } else {
+              break;
+            }
           }
           // Object method call: cur is a function binding accessed via .prop,
           // followed by (args). Inline the function.
-          if (isCall && cur && cur.kind === 'function') {
-            var _omArgs = readCallArgBindings(next + 1, stop);
+          if (isCall && cur && cur.kind === 'object' && cur.props && cur.props[lastSeg] && cur.props[lastSeg].kind === 'function') {
+            var _omFn = cur.props[lastSeg];
+            var _omArgs = await readCallArgBindings(next + 1, stop);
             if (_omArgs) {
-              // Pass the receiver object as 'this' for method calls.
-              var _omResult = instantiateFunction(cur, _omArgs.bindings, bind);
+              var _omResult = await instantiateFunction(_omFn, _omArgs.bindings, cur);
               if (_omResult && _omResult.kind) { bind = _omResult; next = _omArgs.next; continue; }
               if (_omResult) { bind = chainBinding(_omResult); next = _omArgs.next; continue; }
+              bind = chainBinding([exprRef('()')]);
+              next = _omArgs.next;
+              continue;
+            }
+          }
+          if (isCall && cur && cur.kind === 'function') {
+            var _omArgs = await readCallArgBindings(next + 1, stop);
+            if (_omArgs) {
+              // Pass the receiver object as 'this' for method calls.
+              var _omResult = await instantiateFunction(cur, _omArgs.bindings, bind);
+              if (_omResult && _omResult.kind) { bind = _omResult; next = _omArgs.next; continue; }
+              if (_omResult) { bind = chainBinding(_omResult); next = _omArgs.next; continue; }
+              // Void method: no return value. Still consume the whole
+              // `.method(args)` range and produce an opaque chain so
+              // the bare-trailing-call handler above doesn't re-invoke
+              // the method without `this` on the next iteration.
+              bind = chainBinding([exprRef('()')]);
+              next = _omArgs.next;
+              continue;
             }
           }
           // Getter on object: auto-invoke.
           if (!isCall && cur && cur.kind === 'object' && cur.props['__getter_' + lastSeg]) {
             var _gtrFn = cur.props['__getter_' + lastSeg];
             if (_gtrFn.kind === 'function') {
-              var _gtrResult = instantiateFunction(_gtrFn, []);
+              var _gtrResult = await instantiateFunction(_gtrFn, []);
               if (_gtrResult && _gtrResult.kind) { cur = _gtrResult; }
               else if (_gtrResult) { cur = chainBinding(_gtrResult); }
             }
@@ -3133,11 +4038,75 @@
     };
 
     // Apply a method call: .concat on chain, or .join on array.
-    const applyMethod = (bind, method, parenIdx, stop) => {
+    const applyMethod = async (bind, method, parenIdx, stop) => {
+      // Map / Set / WeakMap / WeakSet — model key-indexed ops as plain
+      // object prop reads/writes so dispatcher tables built via
+      // `.set(key, fn)` / `.get(key)` flow through the same may-be
+      // lattice as object dispatchers.
+      if (bind && bind.kind === 'object' && bind._mapLike) {
+        if (method === 'set') {
+          var _msArgs = await readCallArgBindings(parenIdx, stop);
+          if (_msArgs && _msArgs.bindings.length >= 2) {
+            var _msKey = chainAsKnownString(_msArgs.bindings[0]);
+            var _msVal = _msArgs.bindings[1];
+            if (_msKey !== null) {
+              bind.props[_msKey] = _msVal;
+              // Feed may-be lattice so indirect-dispatch walking sees
+              // every function registered under ANY key.
+              if (_msVal && _msVal.kind === 'function') {
+                var _msSlotKey = '#' + bind.__objId + '.' + _msKey;
+                if (!_varMayBe[_msSlotKey]) _varMayBe[_msSlotKey] = { vals: [], keys: Object.create(null), complete: true, fns: null, fnIds: null };
+                var _msSlot = _varMayBe[_msSlotKey];
+                if (!_msSlot.fns) { _msSlot.fns = []; _msSlot.fnIds = Object.create(null); }
+                var _msFkey = _msVal.bodyStart + ':' + _msVal.bodyEnd;
+                if (!_msSlot.fnIds[_msFkey]) { _msSlot.fnIds[_msFkey] = true; _msSlot.fns.push(_msVal); }
+              }
+            } else {
+              // Opaque key — stash under a wildcard slot so indirect
+              // dispatch still sees the function.
+              if (_msVal && _msVal.kind === 'function') {
+                var _mswKey = '#' + bind.__objId + '.*';
+                if (!bind.props['__mapStar']) bind.props['__mapStar'] = [];
+                bind.props['__mapStar'].push(_msVal);
+              }
+            }
+            return { bind: bind, next: _msArgs.next };
+          }
+        }
+        if (method === 'get') {
+          var _mgArgs = await readCallArgBindings(parenIdx, stop);
+          if (_mgArgs && _mgArgs.bindings.length >= 1) {
+            var _mgKey = chainAsKnownString(_mgArgs.bindings[0]);
+            if (_mgKey !== null && bind.props[_mgKey]) {
+              return { bind: bind.props[_mgKey], next: _mgArgs.next };
+            }
+            // Opaque key: return an opaque chain so a subsequent
+            // bare-call through applySuffixes falls back to the
+            // indirect-call dispatch path over the may-be fn set.
+            return { bind: chainBinding([exprRef('map.get(*)')]), next: _mgArgs.next };
+          }
+        }
+        if (method === 'has') {
+          var _mhArgs = await readCallArgBindings(parenIdx, stop);
+          if (_mhArgs) return { bind: chainBinding([exprRef('map.has(*)')]), next: _mhArgs.next };
+        }
+        if (method === 'add' && bind._mapLike === 'Set') {
+          var _maArgs = await readCallArgBindings(parenIdx, stop);
+          if (_maArgs && _maArgs.bindings.length >= 1) {
+            var _maKey = chainAsKnownString(_maArgs.bindings[0]);
+            if (_maKey !== null) bind.props[_maKey] = chainBinding([makeSynthStr('true')]);
+            return { bind: bind, next: _maArgs.next };
+          }
+        }
+        if (method === 'delete' || method === 'clear') {
+          var _mdArgs = await readCallArgBindings(parenIdx, stop);
+          if (_mdArgs) return { bind: chainBinding([makeSynthStr('true')]), next: _mdArgs.next };
+        }
+      }
       if (method === 'concat') {
         // Array concat: [].concat(arr) → merge elements.
         if (bind && bind.kind === 'array') {
-          var _cArgs = readCallArgBindings(parenIdx, stop);
+          var _cArgs = await readCallArgBindings(parenIdx, stop);
           if (_cArgs) {
             var _cElems = bind.elems.slice();
             for (var _ci = 0; _ci < _cArgs.bindings.length; _ci++) {
@@ -3150,7 +4119,7 @@
         }
         // String concat.
         if (!bind || bind.kind !== 'chain') return null;
-        const args = readConcatArgs(parenIdx, stop);
+        const args = await readConcatArgs(parenIdx, stop);
         if (!args) return null;
         const toks = bind.toks.slice();
         for (const a of args.args) { toks.push(SYNTH_PLUS); for (const v of a) toks.push(v); }
@@ -3185,7 +4154,7 @@
         for (let e = 0; e < elems.length; e++) {
           const eb = elems[e];
           if (!eb || eb.kind !== 'chain') return null;
-          if (e > 0) { out.push(SYNTH_PLUS); out.push(rewriteTemplate(sepTok)); out.push(SYNTH_PLUS); }
+          if (e > 0) { out.push(SYNTH_PLUS); out.push(await rewriteTemplate(sepTok)); out.push(SYNTH_PLUS); }
           for (const vt of eb.toks) out.push(vt);
         }
         return { bind: chainBinding(out), next: parenIdx + 3 };
@@ -3195,7 +4164,7 @@
       if (bind && bind.kind === 'chain') {
         const s = chainAsKnownString(bind);
         if (s !== null) {
-          const args = readConcatArgs(parenIdx, stop);
+          const args = await readConcatArgs(parenIdx, stop);
           if (!args) return null;
           const argVals = [];
           let allConcrete = true;
@@ -3256,10 +4225,10 @@
           const arrow = peekArrow(parenIdx + 1, stop);
           if (arrow) {
             const body = readArrowBody(arrow.arrowNext, stop);
-            if (body) { fn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock); fnNext = body.next; }
+            if (body) { fn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock); fn.capturedScope = _snapshotClosureForCapture(); fnNext = body.next; }
           }
           if (!fn) {
-            var fexpr = readFunctionExpr(parenIdx + 1, stop);
+            var fexpr = await readFunctionExpr(parenIdx + 1, stop);
             if (fexpr) { fn = fexpr.binding; fnNext = fexpr.next; }
           }
           if (!fn) {
@@ -3277,14 +4246,14 @@
             // Walk callback for each element to detect side effects
             // (e.g. el.innerHTML = item inside the callback).
             for (const el of bind.elems) {
-              if (el) instantiateFunction(fn, [el]);
+              if (el) await instantiateFunction(fn, [el]);
             }
             return { bind: chainBinding([makeSynthStr('undefined')]), next: fnNext + 1 };
           }
           const results = [];
           for (const el of bind.elems) {
             if (!el) return null;
-            const toks = instantiateFunction(fn, [el]);
+            const toks = await instantiateFunction(fn, [el]);
             if (!toks) return null;
             if (method === 'map') {
               results.push(chainBinding(toks));
@@ -3323,10 +4292,10 @@
           const arrow = peekArrow(parenIdx + 1, stop);
           if (arrow && arrow.params.length === 2) {
             const body = readArrowBody(arrow.arrowNext, stop);
-            if (body) { reduceFn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock); reduceFnNext = body.next; }
+            if (body) { reduceFn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock); reduceFn.capturedScope = _snapshotClosureForCapture(); reduceFnNext = body.next; }
           }
           if (!reduceFn) {
-            var rfexpr = readFunctionExpr(parenIdx + 1, stop);
+            var rfexpr = await readFunctionExpr(parenIdx + 1, stop);
             if (rfexpr && rfexpr.binding.params && rfexpr.binding.params.length === 2) { reduceFn = rfexpr.binding; reduceFnNext = rfexpr.next; }
           }
           if (!reduceFn) {
@@ -3339,7 +4308,7 @@
           if (!reduceFn) return null;
           const sep = tks[reduceFnNext];
           if (!sep || sep.type !== 'sep' || sep.char !== ',') return null;
-          const init = readConcatExpr(reduceFnNext + 1, stop, { sep: [], close: [')'] });
+          const init = await readConcatExpr(reduceFnNext + 1, stop, { sep: [], close: [')'] });
           if (!init) return null;
           const rp = tks[init.next];
           if (!rp || rp.type !== 'close' || rp.char !== ')') return null;
@@ -3347,14 +4316,14 @@
           let accBind = chainBinding(init.toks);
           for (const el of bind.elems) {
             if (!el) return null;
-            const toks = instantiateFunction(fn, [accBind, el]);
+            const toks = await instantiateFunction(fn, [accBind, el]);
             if (!toks) return null;
             accBind = chainBinding(toks);
           }
           const acc = accBind.toks;
           return { bind: chainBinding(acc), next: init.next + 1 };
         }
-        const args = readConcatArgs(parenIdx, stop);
+        const args = await readConcatArgs(parenIdx, stop);
         if (!args) return null;
         const argVals = [];
         let allConcrete = true;
@@ -3406,12 +4375,13 @@
           const body = readArrowBody(arrow.arrowNext, stop);
           if (body) {
             fn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock);
+            fn.capturedScope = _snapshotClosureForCapture();
             fnEnd = body.next;
           }
         }
         // Try function expression: `.map(function(x) { ... })`
         if (!fn) {
-          var _fexpr = readFunctionExpr(parenIdx + 1, stop);
+          var _fexpr = await readFunctionExpr(parenIdx + 1, stop);
           if (_fexpr) {
             fn = _fexpr.binding;
             fnEnd = _fexpr.next;
@@ -3421,13 +4391,90 @@
         const rp = tks[fnEnd];
         if (!rp || rp.type !== 'close' || rp.char !== ')') return null;
         const paramBinds = fn.params.map((p) => chainBinding([exprRef(p.name)]));
-        const toks = instantiateFunction(fn, paramBinds);
+        const toks = await instantiateFunction(fn, paramBinds);
         if (!toks) return null;
         const iterExpr = bind ? chainAsExprText(bind) : null;
         return {
           bind: { kind: 'mapped', iterExpr: iterExpr || '/* iterable */', paramName: fn.params[0] ? fn.params[0].name : '_', perElemChain: toks },
           next: fnEnd + 1,
         };
+      }
+      // --- Promise tracking: .then / .catch / .finally on a chain ---
+      // The receiver is a Promise (typically opaque + tainted, e.g. the
+      // result of fetch()). The callback's first argument is the Promise's
+      // resolved value, which carries the receiver's taint. The callback's
+      // return value is the new Promise's resolved value, which inherits
+      // taint from both the callback body and the receiver.
+      if ((method === 'then' || method === 'catch' || method === 'finally') &&
+          bind && bind.kind === 'chain') {
+        const lp = tks[parenIdx];
+        if (!lp || lp.type !== 'open' || lp.char !== '(') return null;
+        // Parse the callback (arrow / function expression / identifier).
+        var pfn = null, pfnEnd = 0;
+        const parrow = peekArrow(parenIdx + 1, stop);
+        if (parrow) {
+          const pbody = readArrowBody(parrow.arrowNext, stop);
+          if (pbody) { pfn = functionBinding(parrow.params, pbody.bodyStart, pbody.bodyEnd, pbody.isBlock); pfnEnd = pbody.next; }
+        }
+        if (!pfn) {
+          var pfexpr = await readFunctionExpr(parenIdx + 1, stop);
+          if (pfexpr) { pfn = pfexpr.binding; pfnEnd = pfexpr.next; }
+        }
+        if (!pfn) {
+          var pcbTok = tks[parenIdx + 1];
+          if (pcbTok && pcbTok.type === 'other' && IDENT_RE.test(pcbTok.text)) {
+            var prefB = resolve(pcbTok.text);
+            if (prefB && prefB.kind === 'function') { pfn = prefB; pfnEnd = parenIdx + 2; }
+          }
+        }
+        if (!pfn) return null;
+        const prp = tks[pfnEnd];
+        if (!prp || prp.type !== 'close' || prp.char !== ')') return null;
+        // The first arg of the callback receives the Promise's resolved
+        // value — which is just the receiver chain itself, because the
+        // analyzer doesn't distinguish a Promise<T> from its T. Pass the
+        // receiver as the first arg so any taint flows through.
+        var receiverTaint = collectChainTaint(bind.toks);
+        var firstArgChain = chainBinding(bind.toks.slice());
+        if (receiverTaint && firstArgChain.toks.length) {
+          // Tag the first token with the receiver's taint so the inlined
+          // body sees a tainted parameter.
+          var pTok0 = Object.assign({}, firstArgChain.toks[0]);
+          if (!pTok0.taint) pTok0.taint = new Set();
+          for (var ptl of receiverTaint) pTok0.taint.add(ptl);
+          firstArgChain.toks[0] = pTok0;
+        }
+        var pParamBinds = pfn.params.map(function (p, idx) {
+          if (idx === 0) return firstArgChain;
+          return chainBinding([exprRef(p.name)]);
+        });
+        var pCallbackResult = await instantiateFunction(pfn, pParamBinds);
+        // Register the .then/.catch/.finally callback for the
+        // phase-2 fixpoint so it sees mutations made by other
+        // callbacks (e.g. another fetch's .then writing to a global).
+        if (_pendingCallbacks && taintEnabled) {
+          _pendingCallbacks.push({ fn: pfn, params: pParamBinds, isEventHandler: false });
+        }
+        // The callback's return value is the new Promise's resolved value.
+        // Wrap it as an opaque chain that inherits taint from both the
+        // receiver and the callback's return.
+        var pResultToks;
+        if (pCallbackResult && Array.isArray(pCallbackResult)) {
+          pResultToks = pCallbackResult;
+        } else if (pCallbackResult && pCallbackResult.kind === 'chain') {
+          pResultToks = pCallbackResult.toks;
+        } else {
+          pResultToks = [exprRef('promise.' + method + '()')];
+        }
+        // Propagate receiver taint into the result chain so chained
+        // .then(...).then(...) keeps flowing taint forward.
+        if (receiverTaint && pResultToks.length) {
+          var pRTok0 = Object.assign({}, pResultToks[0]);
+          if (!pRTok0.taint) pRTok0.taint = new Set();
+          for (var prtl of receiverTaint) pRTok0.taint.add(prtl);
+          pResultToks = [pRTok0].concat(pResultToks.slice(1));
+        }
+        return { bind: chainBinding(pResultToks), next: pfnEnd + 1 };
       }
       return null;
     };
@@ -3505,7 +4552,7 @@
     // Read a "base" value before any suffixes: literals, identifiers/paths
     // (with optional attached .concat/.join method), parenthesized
     // subexpressions, array literals, and object literals.
-    const readBase = (k, stop) => {
+    const readBase = async (k, stop) => {
       // Collect prefix operators iteratively instead of recursing.
       const prefixes = [];
       while (k < stop) {
@@ -3519,14 +4566,29 @@
         }
         break;
       }
-      var baseResult = _readBaseCore(k, stop);
+      var baseResult = await _readBaseCore(k, stop);
       if (!baseResult) return null;
       for (var _pi = prefixes.length - 1; _pi >= 0; _pi--) {
         var _pf = prefixes[_pi];
         if (_pf.kind === 'keyword') {
+          // `await` and `yield` are unwrapping operations on Promises /
+          // generators — for taint analysis they're transparent: the
+          // result has the same taint as the inner expression. Pass the
+          // binding through unchanged so taint flows from `await fetch(...)`
+          // into the awaited value.
+          if (_pf.text === 'await' || _pf.text === 'yield') {
+            // baseResult unchanged — keep the binding's taint.
+            continue;
+          }
           var _et = chainAsExprText(baseResult.bind);
           if (_et === null) return null;
-          baseResult = { bind: chainBinding([exprRef(_pf.text + ' ' + _et)]), next: baseResult.next };
+          // Preserve the inner binding's taint on the wrapped expression.
+          var _wrappedRef = exprRef(_pf.text + ' ' + _et);
+          if (baseResult.bind && baseResult.bind.kind === 'chain') {
+            var _innerTaint = collectChainTaint(baseResult.bind.toks);
+            if (_innerTaint) _wrappedRef.taint = _innerTaint;
+          }
+          baseResult = { bind: chainBinding([_wrappedRef]), next: baseResult.next };
         } else {
           var _applied = applyUnary(_pf.text, baseResult.bind);
           if (!_applied) return null;
@@ -3535,7 +4597,7 @@
       }
       return baseResult;
     };
-    const _readBaseCore = (k, stop) => {
+    const _readBaseCore = async (k, stop) => {
       const t = tks[k];
       if (!t) return null;
       // `new X(args)` / `new X.Y` / `new X` — absorb the constructor call
@@ -3546,21 +4608,86 @@
         if (_newName && _newName.type === 'other' && IDENT_RE.test(_newName.text)) {
           var _newBind = resolve(_newName.text);
           if (_newBind && _newBind.kind === 'object' && _newBind._isClass) {
-            // Class instantiation: create instance with class methods.
-            var _newJ = k + 2;
-            if (tks[_newJ] && tks[_newJ].type === 'open' && tks[_newJ].char === '(') {
-              var _nd = 1; _newJ++;
-              while (_newJ < stop && _nd > 0) { if (tks[_newJ].type === 'open' && tks[_newJ].char === '(') _nd++; if (tks[_newJ].type === 'close' && tks[_newJ].char === ')') _nd--; _newJ++; }
-            }
-            // Create instance object with copies of all class methods.
+            // Class instantiation: create instance with class methods,
+            // then run the constructor with `this` bound to the new
+            // instance so any `this.prop = arg` writes populate the
+            // instance object (and feed the may-be lattice).
             var _instProps = Object.create(null);
             for (var _ck in _newBind.props) _instProps[_ck] = _newBind.props[_ck];
             var _inst = objectBinding(_instProps);
+            var _newJ = k + 2;
+            var _ctorArgs = null;
+            if (tks[_newJ] && tks[_newJ].type === 'open' && tks[_newJ].char === '(') {
+              // Parse constructor args as concat chains so tainted
+              // arguments flow into `this.foo = arg` assignments.
+              _ctorArgs = await readCallArgBindings(_newJ, stop);
+              if (_ctorArgs) {
+                _newJ = _ctorArgs.next;
+              } else {
+                // Parse failed: skip balanced parens.
+                var _nd = 1; _newJ++;
+                while (_newJ < stop && _nd > 0) { if (tks[_newJ].type === 'open' && tks[_newJ].char === '(') _nd++; if (tks[_newJ].type === 'close' && tks[_newJ].char === ')') _nd--; _newJ++; }
+              }
+            }
+            var _ctorFn = _instProps['constructor'];
+            if (_ctorFn && _ctorFn.kind === 'function') {
+              var _ctorArgBinds = _ctorArgs ? _ctorArgs.bindings : [];
+              await instantiateFunction(_ctorFn, _ctorArgBinds, _inst);
+            }
             return { bind: _inst, next: _newJ };
+          }
+          // `new Map()` / `new Set()` / `new WeakMap()` / `new WeakSet()` —
+          // model as an empty object binding. The shared method-call path
+          // at applyMethod / applySuffixes then treats `.set(k, v)` as a
+          // key-indexed write and `.get(k)` as a read, so dispatchers
+          // and lookup tables propagate taint + flow through the same
+          // machinery plain objects use.
+          if (_newName.text === 'Map' || _newName.text === 'Set' ||
+              _newName.text === 'WeakMap' || _newName.text === 'WeakSet') {
+            var _mObj = objectBinding(Object.create(null));
+            _mObj._mapLike = _newName.text;
+            var _mJ = k + 2;
+            if (tks[_mJ] && tks[_mJ].type === 'open' && tks[_mJ].char === '(') {
+              // Skip balanced parens; initializer entries are ignored
+              // (rare in practice for dispatcher tables).
+              var _mnd = 1; _mJ++;
+              while (_mJ < stop && _mnd > 0) {
+                if (tks[_mJ].type === 'open' && tks[_mJ].char === '(') _mnd++;
+                else if (tks[_mJ].type === 'close' && tks[_mJ].char === ')') _mnd--;
+                _mJ++;
+              }
+            }
+            return { bind: _mObj, next: _mJ };
           }
         }
         let j = k + 1;
-        if (tks[j] && tks[j].type === 'other' && IDENT_OR_PATH_RE.test(tks[j].text)) j++;
+        var _newCtorTok = null;
+        if (tks[j] && tks[j].type === 'other' && IDENT_OR_PATH_RE.test(tks[j].text)) { _newCtorTok = tks[j]; j++; }
+        // `new Ctor(args)` — fire the universal call watchers so
+        // consumers (fetch-trace, dead-code detector, etc.) can
+        // observe constructor calls the same way they observe bare
+        // function calls. The walker otherwise treats new-calls as
+        // opaque refs with just argument taint propagation.
+        if (_callWatchers && _callWatchers.length > 0 && _newCtorTok &&
+            tks[j] && tks[j].type === 'open' && tks[j].char === '(') {
+          try {
+            var _nwArgs = await readCallArgBindings(j, stop);
+            if (_nwArgs) {
+              var _nwInfo = {
+                stage: 'new',
+                reached: true,
+                pathConditions: taintCondStack ? taintCondStack.slice() : [],
+                pathFormulas: pathConstraints ? pathConstraints.slice() : [],
+                mayBe: _varMayBe,
+                resolve: resolve,
+                resolvePath: resolvePath,
+              };
+              for (var _nwi = 0; _nwi < _callWatchers.length; _nwi++) {
+                try { _callWatchers[_nwi](_newCtorTok.text, _nwArgs.bindings, _newCtorTok, _nwInfo); } catch (_) {}
+              }
+            }
+          } catch (_) { /* fall through to opaque handling */ }
+        }
         if (tks[j] && tks[j].type === 'open' && tks[j].char === '(') {
           let d = 1; j++;
           while (j < stop && d > 0) {
@@ -3581,7 +4708,7 @@
       }
       if (t.type === 'str') return { bind: chainBinding([t]), next: k + 1 };
       if (t.type === 'tmpl') {
-        const rw = rewriteTemplate(t);
+        const rw = await rewriteTemplate(t);
         if (rw.type === '_chain') return { bind: chainBinding(rw.toks), next: k + 1 };
         return { bind: chainBinding([rw]), next: k + 1 };
       }
@@ -3590,7 +4717,7 @@
         // Handle comma operator: (expr1, expr2, ..., exprN) → value is exprN.
         var _lastToks = null, _parenNext = k + 1;
         while (_parenNext < stop) {
-          var _pr = readConcatExpr(_parenNext, stop, { sep: [','], close: [')'] });
+          var _pr = await readConcatExpr(_parenNext, stop, { sep: [','], close: [')'] });
           if (!_pr) break;
           _lastToks = _pr.toks;
           _parenNext = _pr.next;
@@ -3603,18 +4730,18 @@
         return { bind: chainBinding(_lastToks), next: _parenNext + 1 };
       }
       if (t.type === 'open' && t.char === '[') {
-        const a = readArrayLit(k, stop);
+        const a = await readArrayLit(k, stop);
         if (!a) return null;
         return { bind: a.binding, next: a.next };
       }
       if (t.type === 'open' && t.char === '{') {
-        const o = readObjectLit(k, stop);
+        const o = await readObjectLit(k, stop);
         if (!o) return null;
         return { bind: o.binding, next: o.next };
       }
       // Function expression in expression position.
       if (t.type === 'other' && t.text === 'function') {
-        var _fnExpr = readFunctionExpr(k, stop);
+        var _fnExpr = await readFunctionExpr(k, stop);
         if (_fnExpr) return { bind: _fnExpr.binding, next: _fnExpr.next };
       }
       if (t.type !== 'other') return null;
@@ -3627,20 +4754,20 @@
         const isCall = paren && paren.type === 'open' && paren.char === '(';
         // Tagged template: tag`...` — call the tag function with template parts.
         if (paren && paren.type === 'tmpl') {
-          var tagBind = resolvePath(t.text);
+          var tagBind = await resolvePath(t.text);
           if (tagBind && tagBind.kind === 'function') {
             // Build arguments: first arg is strings array, rest are expression values.
             var _tagArgs = [chainBinding([makeSynthStr('')])]; // strings placeholder
             if (paren.parts) {
               for (var _tp = 0; _tp < paren.parts.length; _tp++) {
                 if (paren.parts[_tp].kind === 'expr') {
-                  var _tagExpr = evalExprSrc(paren.parts[_tp].expr);
+                  var _tagExpr = await evalExprSrc(paren.parts[_tp].expr);
                   if (_tagExpr) _tagArgs.push(chainBinding(_tagExpr));
                   else _tagArgs.push(chainBinding([exprRef(paren.parts[_tp].expr)]));
                 }
               }
             }
-            var _tagResult = instantiateFunction(tagBind, _tagArgs);
+            var _tagResult = await instantiateFunction(tagBind, _tagArgs);
             if (_tagResult && _tagResult.kind) return { bind: _tagResult, next: k + 2 };
             if (_tagResult) return { bind: chainBinding(_tagResult), next: k + 2 };
           }
@@ -3651,7 +4778,7 @@
           if (paren.parts) {
             for (var _tp2 = 0; _tp2 < paren.parts.length; _tp2++) {
               if (paren.parts[_tp2].kind === 'expr') {
-                var _te = evalExprSrc(paren.parts[_tp2].expr);
+                var _te = await evalExprSrc(paren.parts[_tp2].expr);
                 var _tt = _te ? collectChainTaint(_te) : null;
                 if (_tt) { if (!_tagRef.taint) _tagRef.taint = new Set(); for (var _tl of _tt) _tagRef.taint.add(_tl); }
               }
@@ -3665,7 +4792,7 @@
         }
         // Known global builtin function call (numeric Math.*, parseInt...).
         if (isCall && BUILTINS[t.text]) {
-          const args = readConcatArgs(k + 1, stop);
+          const args = await readConcatArgs(k + 1, stop);
           if (args) {
             const nums = [];
             let allNum = true;
@@ -3683,7 +4810,7 @@
         }
         // Object.keys/values/entries on known object bindings.
         if (isCall && (t.text === 'Object.keys' || t.text === 'Object.values' || t.text === 'Object.entries')) {
-          const argRes = readCallArgBindings(k + 1, stop);
+          const argRes = await readCallArgBindings(k + 1, stop);
           if (argRes && argRes.bindings.length === 1) {
             const ob = argRes.bindings[0];
             if (ob && ob.kind === 'object') {
@@ -3705,7 +4832,7 @@
         }
         // Array.isArray / Array.from / Array.of on known bindings.
         if (isCall && t.text === 'Array.isArray') {
-          const argRes = readCallArgBindings(k + 1, stop);
+          const argRes = await readCallArgBindings(k + 1, stop);
           if (argRes && argRes.bindings.length === 1) {
             const ob = argRes.bindings[0];
             const v = ob && ob.kind === 'array' ? 'true' : (ob && (ob.kind === 'object' || ob.kind === 'chain') ? 'false' : null);
@@ -3713,11 +4840,11 @@
           }
         }
         if (isCall && t.text === 'Array.of') {
-          const argRes = readCallArgBindings(k + 1, stop);
+          const argRes = await readCallArgBindings(k + 1, stop);
           if (argRes) return { bind: arrayBinding(argRes.bindings.slice()), next: argRes.next };
         }
         if (isCall && t.text === 'Array.from') {
-          const argRes = readCallArgBindings(k + 1, stop);
+          const argRes = await readCallArgBindings(k + 1, stop);
           if (argRes && argRes.bindings.length >= 1) {
             const src = argRes.bindings[0];
             const mapFn = argRes.bindings[1] || null;
@@ -3728,7 +4855,7 @@
                 for (let idx = 0; idx < out.length; idx++) {
                   const el = out[idx];
                   if (!el) return null;
-                  const toks = instantiateFunction(mapFn, [el, chainBinding([makeSynthStr(String(idx))])]);
+                  const toks = await instantiateFunction(mapFn, [el, chainBinding([makeSynthStr(String(idx))])]);
                   if (!toks) return null;
                   mapped.push(chainBinding(toks));
                 }
@@ -3744,7 +4871,7 @@
                 const out = [];
                 for (let idx = 0; idx < lenN; idx++) {
                   if (mapFn && mapFn.kind === 'function') {
-                    const toks = instantiateFunction(mapFn, [
+                    const toks = await instantiateFunction(mapFn, [
                       chainBinding([exprRef('undefined')]),
                       chainBinding([makeSynthStr(String(idx))]),
                     ]);
@@ -3761,7 +4888,7 @@
         }
         // JSON.stringify on known scalar / object / array bindings.
         if (isCall && (t.text === 'JSON.stringify' || t.text === 'JSON.parse')) {
-          const argRes = readCallArgBindings(k + 1, stop);
+          const argRes = await readCallArgBindings(k + 1, stop);
           if (argRes && argRes.bindings.length >= 1) {
             // Check taint BEFORE concrete evaluation — if the argument
             // carries taint, the result should too regardless of concrete value.
@@ -3799,7 +4926,7 @@
         }
         // DOM factories return a tracked virtual element.
         if (isCall && DOM_FACTORIES[t.text]) {
-          const args = readConcatArgs(k + 1, stop);
+          const args = await readConcatArgs(k + 1, stop);
           if (args) {
             const r = DOM_FACTORIES[t.text](args.args, k, args.next, t);
             if (r) return r;
@@ -3807,7 +4934,7 @@
         }
         // `String(x)` coerces any literal to its string form.
         if (isCall && t.text === 'String') {
-          const args = readConcatArgs(k + 1, stop);
+          const args = await readConcatArgs(k + 1, stop);
           if (args && args.args.length === 1) {
             const ch = chainBinding(args.args[0]);
             if (ch.toks.length === 1 && ch.toks[0].type === 'str') {
@@ -3821,19 +4948,19 @@
             const method = t.text.slice(dot + 1);
             if (KNOWN_METHODS.has(method)) {
               const prefix = t.text.slice(0, dot);
-              const prefBind = resolvePath(prefix) || chainBinding([exprRef(prefix)]);
-              const r = applyMethod(prefBind, method, k + 1, stop);
+              const prefBind = await resolvePath(prefix) || chainBinding([exprRef(prefix)]);
+              const r = await applyMethod(prefBind, method, k + 1, stop);
               if (r) return { bind: r.bind, next: r.next };
             }
             // Fall through to the opaque-ident handling below for unknown
             // methods or unresolved prefixes.
           }
         }
-        const b = resolvePath(t.text);
+        const b = await resolvePath(t.text);
         // Taint: check call-based sinks even in expression position
         // (e.g. var x = eval(tainted)).
         if (taintEnabled && isCall && TAINT_CALL_SINKS[t.text] && !declaredNames.has(t.text.split('.')[0])) {
-          var _sinkCallArgs = readCallArgBindings(k + 1, stop);
+          var _sinkCallArgs = await readCallArgBindings(k + 1, stop);
           if (_sinkCallArgs) checkSinkCall(t.text, _sinkCallArgs.bindings, t);
         }
         if (!b) {
@@ -3845,6 +4972,13 @@
           while (end < stop) {
             const nx = tks[end];
             if (!nx) break;
+            // Stop before Promise continuation methods so applySuffixes
+            // can route them through applyMethod's .then/.catch/.finally
+            // handler. This is what makes \`fetch(...).then(d => sink(d))\`
+            // propagate taint into the callback.
+            if (nx.type === 'other' && /^\.(then|catch|finally)$/.test(nx.text)) {
+              break;
+            }
             if (nx.type === 'open' && (nx.char === '(' || nx.char === '[')) {
               const matchChar = nx.char === '(' ? ')' : ']';
               let depth = 1, j = end + 1;
@@ -3869,22 +5003,61 @@
           const last = tks[end - 1];
           var _opaqueText = first._src.slice(first.start, last.end);
           var _opaqueRef = exprRef(_opaqueText);
+          // Path-based taint sources (TAINT_SOURCES + member paths).
           var _opaqueTaint = checkTaintSource(_opaqueText);
+          // Call-based taint sources: extract everything before the first
+          // '(' and check it against TAINT_SOURCE_CALLS. Covers
+          // fetch("/api"), new XMLHttpRequest(), IndexedDB / Cache reads.
+          if (!_opaqueTaint) {
+            var _parenIdx = _opaqueText.indexOf('(');
+            if (_parenIdx > 0) {
+              var _callName = _opaqueText.slice(0, _parenIdx).replace(/^new\s+/, '');
+              var _callTaint = checkTaintSourceCall(_callName);
+              if (_callTaint) _opaqueTaint = _callTaint;
+            }
+          }
+          // Argument-taint propagation: parse the immediate `(...)` after
+          // the callee and collect taint from each arg. Promise.resolve(x),
+          // Promise.reject(x), wrapper functions like setTimeout(cb, ms),
+          // and any opaque call all preserve their arguments' taint
+          // through the opaque result. This is the same propagation the
+          // inlined-function path does at line ~3933.
+          var _firstParen = -1;
+          for (var _fp = k + 1; _fp < end; _fp++) {
+            if (tks[_fp] && tks[_fp].type === 'open' && tks[_fp].char === '(') { _firstParen = _fp; break; }
+          }
+          if (_firstParen >= 0 && taintEnabled && !isSanitizer(t.text)) {
+            var _opaqueArgs = await readConcatArgs(_firstParen, stop);
+            if (_opaqueArgs) {
+              var _opaqueArgTaint = null;
+              for (var _oai = 0; _oai < _opaqueArgs.args.length; _oai++) {
+                var _oat = collectChainTaint(_opaqueArgs.args[_oai]);
+                if (_oat) {
+                  if (!_opaqueArgTaint) _opaqueArgTaint = new Set();
+                  for (var _oal of _oat) _opaqueArgTaint.add(_oal);
+                }
+              }
+              if (_opaqueArgTaint) {
+                if (!_opaqueTaint) _opaqueTaint = _opaqueArgTaint;
+                else for (var _oalt of _opaqueArgTaint) _opaqueTaint.add(_oalt);
+              }
+            }
+          }
           if (_opaqueTaint) _opaqueRef.taint = _opaqueTaint;
           return { bind: chainBinding([_opaqueRef]), next: end };
         }
         if (b) {
           // Call syntax: `name(args)` where name resolves to a function binding.
           if (b.kind === 'function' && isCall) {
-            const args = readConcatArgs(k + 1, stop);
+            const args = await readConcatArgs(k + 1, stop);
             if (!args) return null;
             // For method calls (dotted path), bind 'this' to the receiver object.
             var _thisBind = null;
             var _dot = t.text.lastIndexOf('.');
             if (_dot > 0) {
-              _thisBind = resolvePath(t.text.slice(0, _dot));
+              _thisBind = await resolvePath(t.text.slice(0, _dot));
             }
-            var _fnResult = instantiateFunction(b, args.args.map((a) => chainBinding(a)), _thisBind);
+            var _fnResult = await instantiateFunction(b, args.args.map((a) => chainBinding(a)), _thisBind);
             // Non-chain return (object/array/function binding).
             if (_fnResult && _fnResult.kind && _fnResult.kind !== 'chain') {
               return { bind: _fnResult, next: args.next };
@@ -3923,7 +5096,42 @@
     // Invoke a function binding with a list of argument chains (token lists).
     // Pushes a temporary scope with param→arg bindings, parses the body
     // expression in the original token array, then pops the scope.
-    const instantiateFunction = (fn, argBindings, thisBinding) => {
+    // Recursion / depth guard for instantiateFunction. Each entry is
+    // the function body range `"<bodyStart>:<bodyEnd>"`. The analyser
+    // walks a function body symbolically once it sees the same body
+    // already live on the call stack and returns a conservative
+    // opaque chain so recursive calls (direct, indirect, or mutual)
+    // don't unbound the walker. An absolute depth cap catches
+    // non-recursive but pathologically deep call graphs.
+    const _callStack = [];
+    const _CALL_STACK_MAX = 64;
+    const instantiateFunction = async (fn, argBindings, thisBinding) => {
+      var _fnKey = (fn && fn.bodyStart != null) ? (fn.bodyStart + ':' + fn.bodyEnd) : null;
+      // Detect recursion: the same function body is already being
+      // walked. Return null so the caller falls back to its own
+      // opaque-call handling (which preserves the original source
+      // text and computes taint from the argument bindings). This
+      // prevents runaway recursive walks, mutual recursion, and
+      // pathological graphs from unbounding the analyser without
+      // polluting the output with synthetic tokens.
+      if (_fnKey && _callStack.indexOf(_fnKey) >= 0) return null;
+      if (_callStack.length >= _CALL_STACK_MAX) return null;
+      if (_fnKey) _callStack.push(_fnKey);
+      // Closure capture: push any captured-scope frames (by reference)
+      // that aren't already on the live stack, so reads of outer
+      // variables resolve through the closure. We push only
+      // previously-popped frames to avoid duplicates when a closure
+      // is called synchronously within its defining scope.
+      var _pushedCaptureFrames = [];
+      if (fn.capturedScope) {
+        for (var _ci = 0; _ci < fn.capturedScope.length; _ci++) {
+          var capFr = fn.capturedScope[_ci];
+          if (!capFr) continue;
+          if (stack.indexOf(capFr) >= 0) continue; // already live
+          stack.push(capFr);
+          _pushedCaptureFrames.push(capFr);
+        }
+      }
       stack.push({ bindings: Object.create(null), isFunction: true });
       const frame = stack[stack.length - 1];
       // Bind 'this' if provided (for method calls on objects).
@@ -3950,7 +5158,7 @@
         } else if (pi.defaultStart != null) {
           // Evaluate the parameter's default expression in the current
           // (call-site) scope so enclosing bindings can be referenced.
-          const r = readConcatExpr(pi.defaultStart, pi.defaultEnd, TERMS_NONE);
+          const r = await readConcatExpr(pi.defaultStart, pi.defaultEnd, TERMS_NONE);
           frame.bindings[pi.name] = (r && r.next === pi.defaultEnd) ? chainBinding(r.toks) : null;
         } else {
           frame.bindings[pi.name] = null;
@@ -4007,7 +5215,7 @@
         }
         buildVarDeclStart = -1; // reset so inner decls don't leak out
         const lvBefore = loopVars.length;
-        walkRange(bodyStart, bodyEnd);
+        await walkRange(bodyStart, bodyEnd);
         fnLoopVars = loopVars.splice(lvBefore);
         trackBuildVar = savedTrackBuildVar;
         trackBuildVarDepth = savedTrackDepth;
@@ -4018,12 +5226,12 @@
           const t = tks[ri];
           if (t && t.type === 'other' && t.text === 'return') {
             // Use readValue to preserve object/array/function bindings.
-            const rv = readValue(ri + 1, bodyEnd, TERMS_TOP);
+            const rv = await readValue(ri + 1, bodyEnd, TERMS_TOP);
             if (rv && rv.binding) {
               if (rv.binding.kind === 'chain') { result = rv.binding.toks; }
               else { fnReturnBinding = rv.binding; }
             } else {
-              const r = readConcatExpr(ri + 1, bodyEnd, TERMS_TOP);
+              const r = await readConcatExpr(ri + 1, bodyEnd, TERMS_TOP);
               if (r) result = r.toks;
             }
             break;
@@ -4040,12 +5248,29 @@
           ri++;
         }
       } else {
-        const r = readConcatExpr(fn.bodyStart, fn.bodyEnd, TERMS_NONE);
+        // Expression-body arrow: `v => expr`. We run the statement
+        // walker over [bodyStart, bodyEnd) too, so assignment-shaped
+        // expression bodies like `v => document.body.innerHTML = v`
+        // trigger sink detection (the statement walker's element /
+        // element-attribute sink handlers fire during walkRange).
+        // Then we also read the expression's value for the caller's
+        // return-value taint propagation.
+        if (taintEnabled) {
+          try { await walkRange(fn.bodyStart, fn.bodyEnd); } catch (_) {}
+        }
+        const r = await readConcatExpr(fn.bodyStart, fn.bodyEnd, TERMS_NONE);
         if (r && r.next === fn.bodyEnd) result = r.toks;
       }
       tks = savedTks;
       taintFnDepth = savedTaintFnDepth;
       stack.pop();
+      // Pop captured frames in reverse order of push.
+      for (var _pc = _pushedCaptureFrames.length - 1; _pc >= 0; _pc--) {
+        var _top = stack[stack.length - 1];
+        if (_top === _pushedCaptureFrames[_pc]) stack.pop();
+      }
+      // Pop recursion guard entry for this invocation.
+      if (_fnKey && _callStack[_callStack.length - 1] === _fnKey) _callStack.pop();
       // Expand any loopVars created during the function body walk.
       if (result && fnLoopVars && fnLoopVars.length > 0) {
         const lvByName = Object.create(null);
@@ -4086,8 +5311,8 @@
     // unresolved identifiers already emitted by the tokenizer). This dual
     // representation is the tool's fundamental model for string expressions:
     // known parts become string tokens, unknown parts become expression refs.
-    const readOperand = (k, stop, terms) => {
-      const parsed = parseArithExpr(k, stop);
+    const readOperand = async (k, stop, terms) => {
+      const parsed = await parseArithExpr(k, stop);
       if (parsed) {
         const boundary = skipOperand(parsed.next, stop, terms);
         if (boundary === parsed.next) {
@@ -4150,7 +5375,7 @@
     };
     // Iterative Pratt parser. Uses explicit stacks instead of recursive
     // calls so deeply nested expressions can't overflow the JS call stack.
-    const parseArithExpr = (k, stop, minPrec) => {
+    const parseArithExpr = async (k, stop, minPrec) => {
       minPrec = minPrec || 0;
       const opStack = [];
       const ternStack = [];
@@ -4161,7 +5386,7 @@
       var needOperand = true;
       for (;;) {
         if (needOperand) {
-          const base = readBase(pos, stop);
+          const base = await readBase(pos, stop);
           if (!base) {
             while (opStack.length > 0) {
               const top = opStack.pop();
@@ -4171,7 +5396,7 @@
             if (!cur) return null;
             break;
           }
-          const r = applySuffixes(base.bind, base.next, stop);
+          const r = await applySuffixes(base.bind, base.next, stop);
           cur = r.bind;
           next = r.next;
           needOperand = false;
@@ -4422,16 +5647,14 @@
     // Takes a token range (start, end) in the main tokens array.
     // Returns: true (always true), false (always false), null (both possible).
     // Uses concrete evaluation first, then SMT with path constraints.
-    const checkReachability = (start, end) => {
+    const checkReachability = async (start, end) => {
       if (start >= end) return null;
-      // Concrete evaluation via readValue.
-      var condVal = readValue(start, end, null);
+      var condVal = await readValue(start, end, null);
       var concrete = condVal ? evalTruthiness(condVal.binding) : null;
-      // SMT: build formula from raw tokens in range and check satisfiability.
       if (taintEnabled) {
         var condToks = [];
         for (var ci = start; ci < end; ci++) condToks.push(tokens[ci]);
-        var smtResult = smtCheckCondition(condToks, resolve, resolvePath, pathConstraints);
+        var smtResult = await smtCheckCondition(condToks, resolve, resolvePath, pathConstraints);
         if (smtResult) {
           if (smtResult.sat && smtResult.unsat) return null;
           if (smtResult.sat && !smtResult.unsat) return true;
@@ -4443,21 +5666,51 @@
     };
 
     const chainAsExprText = (chain) => {
-      if (chain.toks.length !== 1) return null;
-      const t = chain.toks[0];
-      if (t.type === 'str') {
-        // Quote literal strings; bare numbers flow as-is.
-        const n = Number(t.text);
-        if (!Number.isNaN(n) && String(n) === t.text) return t.text;
-        return JSON.stringify(t.text);
+      // Render a single-token chain.
+      const renderTok = (t) => {
+        if (t.type === 'str') {
+          const n = Number(t.text);
+          if (!Number.isNaN(n) && String(n) === t.text) return t.text;
+          return JSON.stringify(t.text);
+        }
+        if (t.type === 'other') return t.text;
+        if (t.type === 'cond') {
+          const tt = chainAsExprText(chainBinding(t.ifTrue));
+          const ft = chainAsExprText(chainBinding(t.ifFalse));
+          if (tt !== null && ft !== null) return '(' + t.condExpr + ' ? ' + tt + ' : ' + ft + ')';
+          return null;
+        }
+        if (t.type === 'trycatch') {
+          const tb = chainAsExprText(chainBinding(t.tryBody));
+          const cb = chainAsExprText(chainBinding(t.catchBody));
+          if (tb !== null && cb !== null) return '(try ' + tb + ' catch ' + cb + ')';
+          return null;
+        }
+        if ((t.type === 'switch' || t.type === 'switchjoin') && t.branches) {
+          var _brParts = [];
+          for (var _bi = 0; _bi < t.branches.length; _bi++) {
+            var _brT = chainAsExprText(chainBinding(t.branches[_bi].chain));
+            if (_brT === null) return null;
+            _brParts.push(_brT);
+          }
+          return '(switch ' + _brParts.join(' | ') + ')';
+        }
+        return null;
+      };
+      if (chain.toks.length === 1) return renderTok(chain.toks[0]);
+      // Multi-token concat chain: alternate operand / `plus` tokens. Render
+      // each operand and join with `+`. This lets the walker pass concat
+      // conditions like `"http://" + x === "http://abc"` to the SMT layer
+      // where smtArith translates `+` between String operands to (str.++).
+      var parts = [];
+      for (var ci = 0; ci < chain.toks.length; ci++) {
+        var tk = chain.toks[ci];
+        if (tk.type === 'plus') { parts.push('+'); continue; }
+        var rendered = renderTok(tk);
+        if (rendered === null) return null;
+        parts.push(rendered);
       }
-      if (t.type === 'other') return t.text;
-      if (t.type === 'cond') {
-        const tt = chainAsExprText(chainBinding(t.ifTrue));
-        const ft = chainAsExprText(chainBinding(t.ifFalse));
-        if (tt !== null && ft !== null) return '(' + t.condExpr + ' ? ' + tt + ' : ' + ft + ')';
-      }
-      return null;
+      return parts.join(' ');
     };
 
     // Parse `( chain, chain, ... )` starting at the `(` token index. Returns
@@ -4465,13 +5718,13 @@
     // Parse `( arg, arg, ... )` where each arg is a full value (binding),
     // returning { bindings: [binding|null, ...], next } or null. Used by
     // the DOM method call handler so element-typed arguments stay intact.
-    const readCallArgBindings = (k, stop) => {
+    const readCallArgBindings = async (k, stop) => {
       if (!tks[k] || tks[k].type !== 'open' || tks[k].char !== '(') return null;
       if (tks[k + 1] && tks[k + 1].type === 'close' && tks[k + 1].char === ')') return { bindings: [], next: k + 2 };
       _evalStack.push({ type: 'READ_CALL_ARG_BINDINGS', i: k + 1, stop, bindings: [] });
-      return _evalLoop();
+      return await _evalLoop();
     };
-    const _stepReadCallArgBindings = (frame) => {
+    const _stepReadCallArgBindings = async (frame) => {
       if (_resultSlot.has) {
         const v = _consumeResult();
         if (!v) { _completeFrame(null); return; }
@@ -4484,7 +5737,7 @@
         if (tks[frame.i] && tks[frame.i].type === 'close' && tks[frame.i].char === ')') break;
         if (tks[frame.i] && tks[frame.i].type === 'other' && tks[frame.i].text.startsWith('...')) {
           var _sn = tks[frame.i].text.slice(3);
-          var _sb = IDENT_RE.test(_sn) ? resolvePath(_sn) : null;
+          var _sb = IDENT_RE.test(_sn) ? await resolvePath(_sn) : null;
           if (_sb && _sb.kind === 'array') { for (var _si = 0; _si < _sb.elems.length; _si++) if (_sb.elems[_si]) frame.bindings.push(_sb.elems[_si]); }
           else frame.bindings.push(chainBinding([deriveExprRef(_sn, _sb && _sb.kind === 'chain' ? _sb.toks : null)]));
           frame.i++; if (tks[frame.i] && tks[frame.i].type === 'sep' && tks[frame.i].char === ',') { frame.i++; continue; } break;
@@ -4497,11 +5750,11 @@
       _completeFrame({ bindings: frame.bindings, next: frame.i + 1 });
     };
 
-    const readConcatArgs = (k, stop) => {
+    const readConcatArgs = async (k, stop) => {
       if (!tks[k] || tks[k].type !== 'open' || tks[k].char !== '(') return null;
       if (tks[k + 1] && tks[k + 1].type === 'close' && tks[k + 1].char === ')') return { args: [], next: k + 2 };
       _evalStack.push({ type: 'READ_CONCAT_ARGS', i: k + 1, stop, args: [] });
-      return _evalLoop();
+      return await _evalLoop();
     };
     const _stepReadConcatArgs = (frame) => {
       if (_resultSlot.has) {
@@ -4523,7 +5776,7 @@
     // Read a concat chain (operand [+ operand]*) starting at `k`, stopping at
     // the first top-level token matching any terminator in `terms`
     // (`{ sep: [...], close: [...] }`). Returns `{ toks, next }` or null.
-    const readConcatExpr = (k, stop, terms) => {
+    const readConcatExpr = async (k, stop, terms) => {
       const out = [];
       const endAt = (tk) => {
         if (!tk) return true;
@@ -4534,7 +5787,7 @@
       let i = k;
       // Read first operand.
       if (endAt(tks[i])) return null;
-      let op = readOperand(i, stop, terms);
+      let op = await readOperand(i, stop, terms);
       if (!op) return null;
       for (const t of op.toks) out.push(t);
       i = op.next;
@@ -4543,7 +5796,7 @@
         const plus = tks[i];
         if (!plus || plus.type !== 'plus') return null;
         i++;
-        op = readOperand(i, stop, terms);
+        op = await readOperand(i, stop, terms);
         if (!op) return null;
         out.push(plus);
         for (const t of op.toks) out.push(t);
@@ -4553,8 +5806,8 @@
     };
 
     // Top-level RHS reader: reads a concat chain up to `,`/`;`/stop.
-    const readInit = (k, stop) => {
-      const r = readConcatExpr(k, stop, TERMS_TOP);
+    const readInit = async (k, stop) => {
+      const r = await readConcatExpr(k, stop, TERMS_TOP);
       return r ? r.toks : null;
     };
 
@@ -4582,40 +5835,201 @@
           if (!(name in snap)) snap[name] = stack[si].bindings[name];
       return snap;
     };
-    // Work stack for iterative walkRange (LIFO).
+    // Restore a variable's binding from a snapshot without feeding the
+    // may-be lattice. Snapshots are purely structural rewinds — the
+    // lattice already recorded every prior value the variable held, so
+    // re-running _trackMayBeAssign on an opaque synthetic restoration
+    // chain (e.g. the post-loop deriveExprRef) would poison the slot
+    // and destroy refutation power for every branch that follows.
+    const _restoreBinding = (name, value) => {
+      for (let si = stack.length - 1; si >= 0; si--) {
+        if (name in stack[si].bindings) {
+          stack[si].bindings[name] = value;
+          return;
+        }
+      }
+      if (stack.length > 0) stack[0].bindings[name] = value;
+    };
+    // -------------------------------------------------------------------
+    // walkRange: iterative SMT-integrated state machine
+    // -------------------------------------------------------------------
+    //
+    // The walker models JavaScript statement evaluation as a state machine
+    // whose configuration is the tuple:
+    //
+    //     (S, B, P, T, L)
+    //
+    //   S  — scope stack (lexical bindings: block/function frames)
+    //   B  — symbolic bindings for each live variable (chain/array/object)
+    //   P  — SMT path-constraint stack (conjunction of formulas proved
+    //        true on the current control-flow path, used to prune
+    //        unreachable branches and refine taint reachability)
+    //   T  — taint-condition stack (string descriptions of P, for
+    //        user-visible finding reports)
+    //   L  — loop stack (enclosing for/while frames with bodyEnd,
+    //        modifiedVars, and per-loop SMT obligations)
+    //
+    // Each task on the LIFO work stack (`_ws`) is a transition in the
+    // machine. Task types and their effects on (S,B,P,T,L):
+    //
+    //   range         — execute statements in [start,end); dispatches to
+    //                   per-statement transitions (assign, if, loop,
+    //                   switch, try, function, class, ...).
+    //   if_restore    — rollback B to pre-if snapshot, flip P/T from
+    //                   `cond` to `!cond`, queue else-body range.
+    //   if_merge      — pop P/T for `!cond`, merge if/else bindings into
+    //                   a `cond` token for build vars.
+    //   try_restore   — rollback B after try body, queue catch range.
+    //   try_merge     — merge try/catch bindings; queue finally range.
+    //   switch_case   — rollback to snapshot, push case-equality into P,
+    //                   SMT-check reachability, queue case body.
+    //   switch_capture— pop case-equality from P, capture post-case B.
+    //   switch_merge  — combine caseResults into a `switch` token.
+    //   loop_pop      — pop loop condition from P/T and restore L after
+    //                   crossing a loop-body boundary (inlined via
+    //                   loopStack bookkeeping below).
+    //
+    // SMT integration: every branching transition pushes an SMT formula
+    // onto P before walking and pops it after. The theory solver in
+    // smtSat() then decides branch reachability for nested conditions.
+    // When a formula is irreducible the walker still walks the branch
+    // but records a symbolic path-condition for taint reports.
+    //
+    // The machine is strictly iterative — walkRange never recurses into
+    // itself. Tasks chain via LIFO push order (push restore/merge tasks
+    // BEFORE pushing the range they depend on so the range runs first).
+    // -------------------------------------------------------------------
     const _ws = [];
-    const walkRange = (startI, endI) => {
+    // SMT path constraint lifecycle helpers. Centralising push/pop
+    // makes all transitions use the same mechanism so the P/T stacks
+    // can never drift out of sync with the work stack.
+    const _pushPathConstraint = (formula, condExpr) => {
+      if (pathConstraints && formula) pathConstraints.push(formula);
+      if (taintCondStack && condExpr) taintCondStack.push(condExpr);
+    };
+    const _popPathConstraint = (formula, condExpr) => {
+      if (pathConstraints && formula) pathConstraints.pop();
+      if (taintCondStack && condExpr) taintCondStack.pop();
+    };
+    // Build an SMT formula from a raw token range (header tokens of
+    // an if/while/for/switch-case/...).
+    const _smtFormulaFromRange = async (start, end) => {
+      if (!taintEnabled || start >= end) return null;
+      var toks = [];
+      for (var _fi = start; _fi < end; _fi++) toks.push(tokens[_fi]);
+      return await smtParseExpr(toks, 0, toks.length, resolve, resolvePath);
+    };
+    // Registered transition types. Each entry documents the handler's
+    // effect on the machine configuration (S, B, P, T, L). This is both
+    // self-documenting and an invariant fixture — any task type pushed
+    // onto _ws that isn't listed here is a bug.
+    const TASK_TYPES = {
+      // Walk the statements in [start, end). The statement dispatcher
+      // inside the range handler may push further tasks.
+      range:          'exec statements in [start,end)',
+      // Rollback B to the pre-`if` snapshot, flip (P,T) from `cond` to
+      // `!cond`, and queue the else range (if any).
+      if_restore:     'rollback B; flip P from cond to !cond; queue else',
+      // Merge if/else bindings into a cond token; pop `!cond` from (P,T).
+      if_merge:       'merge if/else; pop !cond from P',
+      // Rollback B after the try body; queue the catch range.
+      try_restore:    'rollback B after try; queue catch range',
+      // Merge try/catch bindings into a trycatch token; queue finally.
+      try_merge:      'merge try/catch; queue finally range',
+      // Rollback to pre-switch snapshot; SMT-check case reachability;
+      // push `disc === caseExpr` onto (P,T); queue case body range.
+      switch_case:    'rollback B; push disc===case to P; queue body',
+      // Pop the case equality from (P,T); capture post-case bindings.
+      switch_capture: 'pop case-equality from P; capture case bindings',
+      // Combine all case results into a switch token; queue post-switch range.
+      switch_merge:   'merge cases into switch token; queue tail range',
+    };
+    // Statement-kind transitions fired from within the `range` task's
+    // dispatcher. This table doesn't directly drive dispatch (the
+    // dispatcher is still an if-chain for historical reasons) but it
+    // documents every statement kind the state machine recognises and
+    // names its effect on the configuration (S, B, P, T, L).
+    const STATEMENT_DISPATCH = {
+      // Scoping
+      'var':           'decl-function-scope(name); mutate B',
+      'let':           'decl-block-scope(name); mutate B',
+      'const':         'decl-block-scope(name); mutate B',
+      // Control flow — branching
+      'if':            'queue if_restore/if_merge; push cond to P; walk if-body',
+      'else':          'handled inline by preceding `if`',
+      'switch':        'queue switch_merge; fan out switch_case tasks',
+      'case':          'handled inside switch_case transition',
+      'default':       'handled inside switch_case transition',
+      // Control flow — iteration
+      'for':           'compute loop cond formula; push to P; walk body; pop on exit',
+      'while':         'compute loop cond formula; push to P; walk body; pop on exit',
+      'do':            'walk body then eval while-cond; push/pop cond on P',
+      'break':         'advance past innermost loopStack bodyEnd',
+      'continue':      'advance to next iteration (approx: run to bodyEnd)',
+      // Control flow — exceptions
+      'try':           'queue try_restore/try_merge; walk try-body',
+      'catch':         'handled inside try_restore transition',
+      'finally':       'handled inside try_merge transition',
+      'throw':         'mark rest of range dead (current scope)',
+      // Functions & classes
+      'function':      'bind function in outer frame; walk body in new frame',
+      'class':         'parse methods into classBinding; walk body',
+      'return':        'mark rest of range dead within function frame',
+      // Modules & misc
+      'import':        'skip statement',
+      'export':        'strip and walk decl',
+      'with':          'skip body (scope unpredictable)',
+      'debugger':      'skip',
+    };
+    // State-machine invariant: keep track of the intended path-constraint
+    // stack depth so mismatched push/pop on the `pathConstraints` /
+    // `taintCondStack` pair can be detected early (in debug builds).
+    const _pcBaseDepth = pathConstraints ? pathConstraints.length : 0;
+    const _tcBaseDepth = taintCondStack ? taintCondStack.length : 0;
+    const walkRange = async (startI, endI) => {
+    // Per-invocation work stack: recursive walkRange calls (e.g.
+    // from instantiateFunction walking a function body) get their
+    // own stack and never drain parent tasks.
+    const _ws = [];
     _ws.push({ type: 'range', start: startI, end: endI });
     while (_ws.length > 0) {
     const _task = _ws.pop();
-    // --- Action: restore after if-body, queue else ---
+    // State-machine guard: every task must be a registered transition.
+    if (!TASK_TYPES[_task.type]) {
+      // Unknown task — skip rather than crash; this is a defensive
+      // guard so malformed transitions don't stall the walker.
+      continue;
+    }
+    // --- Transition: restore after if-body, flip P from `cond` to `!cond`, queue else ---
     if (_task.type === 'if_restore') {
       _task.ctx.ifLoopVars = loopVars.splice(_task.ctx.lvBefore);
-      if (taintCondStack) taintCondStack.pop();
-      if (pathConstraints && _task.ctx.pathFormula) pathConstraints.pop();
+      _popPathConstraint(_task.ctx.pathFormula, _task.ctx.condExpr);
       _task.ctx.ifBindings = _snapshotBindings();
-      for (const name in _task.snapshot) assignName(name, _task.snapshot[name]);
-      if (taintCondStack) taintCondStack.push('!(' + _task.ctx.condExpr + ')');
-      if (pathConstraints && _task.ctx.pathFormula) pathConstraints.push(smtNot(_task.ctx.pathFormula));
+      for (const name in _task.snapshot) _restoreBinding(name, _task.snapshot[name]);
+      _pushPathConstraint(smtNot(_task.ctx.pathFormula), '!(' + _task.ctx.condExpr + ')');
+      _task.ctx.negPushed = true;
       _task.ctx.lvBefore2 = loopVars.length;
       if (_task.elseStart > 0 && _task.elseEnd > _task.elseStart)
         _ws.push({ type: 'range', start: _task.elseStart, end: _task.elseEnd });
       continue;
     }
-    // --- Action: merge if/else branches ---
+    // --- Transition: merge if/else branches, pop `!cond` from P ---
     if (_task.type === 'if_merge') {
-      if (taintCondStack) taintCondStack.pop();
-      if (pathConstraints && _task.ctx.pathFormula) pathConstraints.pop();
+      if (_task.ctx.negPushed) _popPathConstraint(smtNot(_task.ctx.pathFormula), '!(' + _task.ctx.condExpr + ')');
       const ctx = _task.ctx;
       const elseLoopVars = loopVars.splice(ctx.lvBefore2);
       const elseBindings = _snapshotBindings();
+      // Track which names were merged as cond tokens by the first
+      // loop so the second loop's opaque fallback doesn't overwrite
+      // them (and poison the may-be lattice with an exprRef).
+      const _mergedAsCond = new Set();
       for (const name in ctx.ifBindings) {
         const ifB = ctx.ifBindings[name];
         const elB = elseBindings[name] || _task.snapshot[name];
         if (!ifB || ifB.kind !== 'chain' || !elB || elB.kind !== 'chain') continue;
         const ifFull = _expandBindWithLVs(ifB, ctx.ifLoopVars);
         const elFull = _expandBindWithLVs(elB, elseLoopVars);
-        if (JSON.stringify(ifFull) === JSON.stringify(elFull)) continue;
+        if (JSON.stringify(ifFull) === JSON.stringify(elFull)) { _mergedAsCond.add(name); continue; }
         const snapB = _task.snapshot[name];
         if (snapB && snapB.kind === 'chain') {
           const snapFull = snapB.toks;
@@ -4630,10 +6044,12 @@
           if (currentLoopId !== null) condTok.loopId = currentLoopId;
           assignName(name, (!ifAppended || !elAppended) ? chainBinding([condTok]) : chainBinding([...snapB.toks, SYNTH_PLUS, condTok]));
           if (loopStack.length > 0) loopStack[loopStack.length - 1].modifiedVars.add(name);
+          _mergedAsCond.add(name);
         }
       }
       for (const name in ctx.ifBindings) {
         if (trackBuildVar && trackBuildVar.has(name)) continue;
+        if (_mergedAsCond.has(name)) continue;
         const ifB = ctx.ifBindings[name], elB = elseBindings[name] || _task.snapshot[name];
         if (ifB === elB || JSON.stringify(ifB) === JSON.stringify(elB)) continue;
         assignName(name, chainBinding([deriveExprRef(name, ifB && ifB.kind === 'chain' ? ifB.toks : null, elB && elB.kind === 'chain' ? elB.toks : null)]));
@@ -4644,10 +6060,27 @@
     if (_task.type === 'try_restore') {
       const tryLoopVars = loopVars.splice(_task.lvBefore);
       const tryBindings = _snapshotBindings();
-      for (const name in _task.snapshot) assignName(name, _task.snapshot[name]);
+      for (const name in _task.snapshot) _restoreBinding(name, _task.snapshot[name]);
       _task.ctx.tryBindings = tryBindings;
       _task.ctx.tryLoopVars = tryLoopVars;
       _task.ctx.lvBefore2 = loopVars.length;
+      // Bind the catch parameter to an opaque chain tagged with every
+      // taint source that could flow through a throw inside the try
+      // body (including throws inside any function called from it).
+      // Without this, `throw location.hash` → `catch (e) { sink(e) }`
+      // looks like a safe use of an unbound variable.
+      if (taintEnabled && _task.catchStart >= 0 && _task.ctx.catchParamName) {
+        var _tcCatchRef = exprRef(_task.ctx.catchParamName);
+        if (_task.ctx.throwTaint && _task.ctx.throwTaint.size) {
+          _tcCatchRef.taint = new Set(_task.ctx.throwTaint);
+        }
+        // Declare the catch parameter in the current block so the
+        // catch body can resolve it. The body's `{` will push a new
+        // block frame on top, but declBlock attaches to the current
+        // topBlock() which is the ambient frame — good enough for
+        // lookups since catch params shadow nothing else.
+        declBlock(_task.ctx.catchParamName, chainBinding([_tcCatchRef]));
+      }
       if (_task.catchStart >= 0)
         _ws.push({ type: 'range', start: _task.catchStart, end: _task.catchEnd });
       continue;
@@ -4665,9 +6098,12 @@
         const catchFull = _expandBindWithLVs(catchB, catchLoopVars);
         if (JSON.stringify(tryFull) === JSON.stringify(catchFull)) continue;
         const snapB = _task.snapshot[name];
-        if (!snapB || snapB.kind !== 'chain') {
-          assignName(name, chainBinding([deriveExprRef(name, tryB.toks, catchB.toks)]));
-        } else if (trackBuildVar && trackBuildVar.has(name)) {
+        // Always emit a `trycatch` join token so the may-be lattice
+        // can split it into both reachable branches. The build-var
+        // path still gets its full snapshot-appended form for
+        // serialization; non-build vars get the bare trycatch token
+        // which _trackMayBeAssign expands into tryBody / catchBody.
+        if (snapB && snapB.kind === 'chain' && trackBuildVar && trackBuildVar.has(name)) {
           const snapFull = snapB.toks;
           const tryAppended = chainStartsWith(tryFull, snapFull);
           const catchAppended = chainStartsWith(catchFull, snapFull);
@@ -4677,19 +6113,24 @@
           if (tryAppended && catchAppended) assignName(name, chainBinding([...snapB.toks, SYNTH_PLUS, tryCatchTok]));
           else assignName(name, chainBinding([tryCatchTok]));
         } else {
-          assignName(name, chainBinding([deriveExprRef(name, tryB.toks, catchB.toks)]));
+          var _tcFullTok = { type: 'trycatch', tryBody: tryFull, catchBody: catchFull, catchParam: _task.catchParam };
+          assignName(name, chainBinding([_tcFullTok]));
         }
       }
       if (_task.finallyStart >= 0) _ws.push({ type: 'range', start: _task.finallyStart, end: _task.finallyEnd });
       continue;
     }
-    // --- Action: switch case ---
+    // --- Transition: switch case — rollback to pre-switch bindings,
+    //     compute `disc === caseExpr` as an SMT formula, SMT-check
+    //     reachability against the enclosing path constraints, push the
+    //     formula onto P/T while walking the body, and queue switch_capture
+    //     to pop P/T and record the resulting bindings. ---
     if (_task.type === 'switch_case') {
-      for (const name in _task.snapshot) assignName(name, _task.snapshot[name]);
-      // SMT: check if this case is reachable before walking.
+      for (const name in _task.snapshot) _restoreBinding(name, _task.snapshot[name]);
       var _cs = _task.cs;
+      var _caseFormula = null;
+      var _caseCondExpr = null;
       if (taintEnabled && _cs.label !== 'default' && _cs.caseExpr) {
-        var _caseFormula = null;
         for (var _csi = 0; _csi < tokens.length; _csi++) {
           if (tokens[_csi].start === _cs.srcStart && tokens[_csi].text === 'case') {
             var _ceStart = _csi + 1, _ceEnd = _ceStart;
@@ -4701,12 +6142,13 @@
               for (var _ck = _ceStart; _ck < _ceEnd; _ck++) _ceToks.push(tokens[_ck]);
               var _discB = _task.discVal ? _task.discVal.binding : null;
               var _discIsTrueConst = _discB && _discB.kind === 'chain' && _discB.toks.length === 1 && _discB.toks[0].type === 'str' && _discB.toks[0].text === 'true';
-              if (_discIsTrueConst) _caseFormula = smtParseExpr(_ceToks, 0, _ceToks.length, resolve, resolvePath);
+              if (_discIsTrueConst) _caseFormula = await smtParseExpr(_ceToks, 0, _ceToks.length, resolve, resolvePath);
               else {
-                var _ceSmtExpr = smtParseAtom(_ceToks, 0, _ceToks.length, resolve, resolvePath);
-                var _discSmtExpr = _discB ? smtParseAtom([{ type: 'other', text: _task.discExpr || 'disc' }], 0, 1, resolve, resolvePath) : null;
+                var _ceSmtExpr = await smtParseAtom(_ceToks, 0, _ceToks.length, resolve, resolvePath);
+                var _discSmtExpr = _discB ? (await smtParseAtom([{ type: 'other', text: _task.discExpr || 'disc' }], 0, 1, resolve, resolvePath)) : null;
                 if (_ceSmtExpr && _discSmtExpr) _caseFormula = smtCmp('===', _discSmtExpr, _ceSmtExpr);
               }
+              _caseCondExpr = (_task.discExpr || 'disc') + ' === ' + _cs.caseExpr;
             }
             break;
           }
@@ -4714,17 +6156,22 @@
         if (_caseFormula) {
           var _fullCaseFormula = _caseFormula;
           if (pathConstraints && pathConstraints.length > 0) for (var _pi = 0; _pi < pathConstraints.length; _pi++) _fullCaseFormula = smtAnd(pathConstraints[_pi], _fullCaseFormula);
-          if (!smtSat(_fullCaseFormula)) {
+          if (!(await smtSat(_fullCaseFormula))) {
             _task.caseResults.push({ label: _cs.label, caseExpr: _cs.caseExpr, bindings: _task.snapshot });
             continue;
           }
         }
       }
-      _ws.push({ type: 'switch_capture', cs: _cs, caseResults: _task.caseResults });
+      // Push case-equality as a path constraint while walking the body,
+      // so nested `if`/loop reachability within the case body can use it.
+      _pushPathConstraint(_caseFormula, _caseCondExpr);
+      _ws.push({ type: 'switch_capture', cs: _cs, caseResults: _task.caseResults, pathFormula: _caseFormula, condExpr: _caseCondExpr });
       _ws.push({ type: 'range', start: _cs.bodyStart, end: _cs.bodyEnd });
       continue;
     }
     if (_task.type === 'switch_capture') {
+      // Pop the case path constraint pushed by switch_case.
+      _popPathConstraint(_task.pathFormula, _task.condExpr);
       _task.caseResults.push({ label: _task.cs.label, caseExpr: _task.cs.caseExpr, bindings: _snapshotBindings() });
       continue;
     }
@@ -4757,9 +6204,20 @@
         if (b && (!snap || JSON.stringify(b) !== JSON.stringify(snap))) switchChanged.add(name);
       }
       for (const name of switchChanged) {
-        var _swToks = [];
-        for (var _cr of caseResults) if (_cr.bindings[name] && _cr.bindings[name].kind === 'chain') _swToks.push(_cr.bindings[name].toks);
-        assignName(name, chainBinding([deriveExprRef.apply(null, [name].concat(_swToks))]));
+        // Emit a `switchjoin` token with one entry per case's chain
+        // so _trackMayBeAssign can split each branch into a separate
+        // may-be lattice entry. This lets post-switch refutations
+        // over values never assigned in any case fire properly.
+        var _swBranches = [];
+        for (var _cr of caseResults) {
+          if (_cr.bindings[name] && _cr.bindings[name].kind === 'chain') {
+            _swBranches.push({ label: _cr.label, caseExpr: _cr.caseExpr, chain: _cr.bindings[name].toks });
+          }
+        }
+        if (_swBranches.length) {
+          var _swTok = { type: 'switchjoin', discExpr: _task.discExpr || '/* switch */', branches: _swBranches };
+          assignName(name, chainBinding([_swTok]));
+        }
       }
       _ws.push({ type: 'range', start: _task.switchEnd, end: _task.resumeEnd });
       continue;
@@ -4774,6 +6232,22 @@
       // as a named variable rather than inlining the one-iteration chain.
       while (loopStack.length > 0 && i >= loopStack[loopStack.length - 1].bodyEnd) {
         const entry = loopStack.pop();
+        // Release the for-of loop var guard so subsequent lattice
+        // updates to unrelated vars aren't accidentally suppressed.
+        if (entry.forOfVarName) _activeForOfVars.delete(entry.forOfVarName);
+        // Pop enhanced constraints first (reverse order of push).
+        if (entry.extraFormulas && entry.extraFormulas.length) {
+          for (var _ef = entry.extraFormulas.length - 1; _ef >= 0; _ef--) {
+            _popPathConstraint(entry.extraFormulas[_ef], entry.extraExprs[_ef]);
+          }
+        }
+        // Pop the loop condition from P/T — the post-loop world has no
+        // guarantee that the loop predicate still holds (we approximate
+        // it as unknown rather than as `!cond`, since loop exit can
+        // also happen via break, and bounded iteration is symbolic).
+        if (entry.pathFormula || entry.condExpr) {
+          _popPathConstraint(entry.pathFormula, entry.condExpr);
+        }
         // Collect names that were pre-scanned as opaque in the loop frame.
         const preScanNames = entry.frame ? Object.keys(entry.frame.bindings) : [];
         // Capture modified variable bindings BEFORE removing the loop frame,
@@ -4797,7 +6271,20 @@
               loop: { id: entry.id, kind: entry.kind, headerSrc: entry.headerSrc },
               chain: b.toks,
             });
-            assignName(name, chainBinding([deriveExprRef(name, b.toks)]));
+            // Replace the binding in place without poisoning the may-be
+            // lattice. The per-iteration body assignments have already
+            // fed every reachable literal into the lattice; the opaque
+            // post-loop synthetic value is only needed so downstream
+            // references resolve to a stable name for extraction /
+            // serialization purposes. Calling assignName here would
+            // route through _trackMayBeAssign and poison the slot.
+            var _postLoopChain = chainBinding([deriveExprRef(name, b.toks)]);
+            for (let _sf = stack.length - 1; _sf >= 0; _sf--) {
+              if (name in stack[_sf].bindings) {
+                stack[_sf].bindings[name] = _postLoopChain;
+                break;
+              }
+            }
           }
         }
       }
@@ -4836,15 +6323,15 @@
           if (tokens[_ii].type === 'open' && tokens[_ii].char === '(') { _iifeDep--; if (_iifeDep === 0) { _iifeOpenIdx = _ii; break; } }
         }
         if (_iifeOpenIdx >= 0) {
-          var _iifeFnE = readFunctionExpr(_iifeOpenIdx + 1, i);
+          var _iifeFnE = await readFunctionExpr(_iifeOpenIdx + 1, i);
           var _iifeFn = _iifeFnE ? _iifeFnE.binding : null;
           if (!_iifeFn) {
             var _iifeArr = peekArrow(_iifeOpenIdx + 1, i);
             if (_iifeArr) { var _iifeB = readArrowBody(_iifeArr.arrowNext, i); if (_iifeB) _iifeFn = functionBinding(_iifeArr.params, _iifeB.bodyStart, _iifeB.bodyEnd, _iifeB.isBlock); }
           }
           if (_iifeFn) {
-            var _iifeA = readCallArgBindings(i + 1, stop);
-            if (_iifeA) { instantiateFunction(_iifeFn, _iifeA.bindings); i = _iifeA.next - 1; continue; }
+            var _iifeA = await readCallArgBindings(i + 1, stop);
+            if (_iifeA) { await instantiateFunction(_iifeFn, _iifeA.bindings); i = _iifeA.next - 1; continue; }
           }
         }
       }
@@ -4894,8 +6381,8 @@
           }
           if (j < stop) {
             // Evaluate the condition via unified reachability check.
-            const condVal = readValue(i + 2, j, null);
-            var concrete = taintEnabled ? checkReachability(i + 2, j) : (condVal ? evalTruthiness(condVal.binding) : null);
+            const condVal = await readValue(i + 2, j, null);
+            var concrete = taintEnabled ? (await checkReachability(i + 2, j)) : (condVal ? evalTruthiness(condVal.binding) : null);
             // Determine if-body range.
             const bodyTok = tokens[j + 1];
             let ifEnd;
@@ -5032,17 +6519,16 @@
               if (pathConstraints) {
                 var _condToks = [];
                 for (var _pi = i + 2; _pi < j; _pi++) _condToks.push(tokens[_pi]);
-                _pathFormula = smtParseExpr(_condToks, 0, _condToks.length, resolve, resolvePath);
+                _pathFormula = await smtParseExpr(_condToks, 0, _condToks.length, resolve, resolvePath);
               }
               var _elS = (elseStart > 0 && elseEnd > elseStart) ? elseStart : 0;
               var _elE = (elseStart > 0 && elseEnd > elseStart) ? elseEnd : 0;
               var _resumeAt = (elseEnd > 0 ? elseEnd : ifEnd);
-              var _oCtx = { condExpr, lvBefore: loopVars.length, pathFormula: _pathFormula };
+              var _oCtx = { condExpr, lvBefore: loopVars.length, pathFormula: _pathFormula, negPushed: false };
               _ws.push({ type: 'range', start: _resumeAt, end: _rangeEnd });
               _ws.push({ type: 'if_merge', ctx: _oCtx, snapshot });
               _ws.push({ type: 'if_restore', ctx: _oCtx, snapshot, elseStart: _elS, elseEnd: _elE });
-              if (taintCondStack) taintCondStack.push(condExpr);
-              if (pathConstraints && _pathFormula) pathConstraints.push(_pathFormula);
+              _pushPathConstraint(_pathFormula, condExpr);
               _rangeEnd = ifEnd; i = j; continue;
             }
             // Condition too complex to represent — preserve the entire
@@ -5127,6 +6613,62 @@
           // Use state machine for try/catch/finally.
           const snapshot = _snapshotBindings();
           var _tCtx = { lvBefore: loopVars.length };
+          // Scan the try body for `throw <expr>` statements and any
+          // functions called that might throw. Collect the union of
+          // every taint source reachable via a throw so the catch
+          // param gets bound to an opaque chain carrying that taint.
+          // This makes `try { throw location.hash } catch (e) { sink(e) }`
+          // a taint flow the analyser can see.
+          var _throwTaint = null;
+          if (taintEnabled) {
+            var _scanThrowsIn = function(scanStart, scanEnd, visited) {
+              visited = visited || Object.create(null);
+              for (var _ti = scanStart; _ti < scanEnd; _ti++) {
+                var _tk = tokens[_ti];
+                if (!_tk) continue;
+                if (_tk.type === 'other' && _tk.text === 'throw') {
+                  // Find the end of the throw expression.
+                  var _teEnd = _ti + 1, _td = 0;
+                  while (_teEnd < scanEnd) {
+                    var _tet = tokens[_teEnd];
+                    if (_tet.type === 'open') _td++;
+                    else if (_tet.type === 'close') _td--;
+                    else if (_td === 0 && _tet.type === 'sep' && _tet.char === ';') break;
+                    _teEnd++;
+                  }
+                  // Collect any taint source in the throw expression range.
+                  for (var _tej = _ti + 1; _tej < _teEnd; _tej++) {
+                    var _ttk = tokens[_tej];
+                    if (_ttk && _ttk.type === 'other') {
+                      var _tsrc = checkTaintSource(_ttk.text);
+                      if (_tsrc) {
+                        if (!_throwTaint) _throwTaint = new Set();
+                        for (var _tsl of _tsrc) _throwTaint.add(_tsl);
+                      }
+                    }
+                  }
+                  continue;
+                }
+                // Recurse into called functions (up to a fixed depth).
+                if (_tk.type === 'other' && IDENT_OR_PATH_RE.test(_tk.text)) {
+                  var _tnext = tokens[_ti + 1];
+                  if (_tnext && _tnext.type === 'open' && _tnext.char === '(') {
+                    var _tfb = resolve(_tk.text.split('.')[0]);
+                    if (_tfb && _tfb.kind === 'function') {
+                      var _tfKey = _tfb.bodyStart + ':' + _tfb.bodyEnd;
+                      if (!visited[_tfKey]) {
+                        visited[_tfKey] = true;
+                        _scanThrowsIn(_tfb.bodyStart, _tfb.bodyEnd, visited);
+                      }
+                    }
+                  }
+                }
+              }
+            };
+            _scanThrowsIn(i + 2, tryEnd - 1);
+          }
+          _tCtx.throwTaint = _throwTaint;
+          _tCtx.catchParamName = catchParam;
           if (catchStart < 0) {
             // No catch — try body state persists. Just walk try + finally.
             _ws.push({ type: 'range', start: k, end: _rangeEnd });
@@ -5149,7 +6691,7 @@
         if (lp && lp.type === 'open' && lp.char === '(') {
           const cp = findCloseParen(i + 1);
           // Read the discriminant expression.
-          const discVal = readValue(i + 2, cp - 1, null);
+          const discVal = await readValue(i + 2, cp - 1, null);
           const discExpr = discVal ? chainAsExprText(discVal.binding) : null;
           const bodyOpen = tokens[cp];
           if (bodyOpen && bodyOpen.type === 'open' && bodyOpen.char === '{') {
@@ -5167,10 +6709,10 @@
                 let colonIdx = j + 1;
                 while (colonIdx < switchEnd - 1 && !(tokens[colonIdx].type === 'other' && tokens[colonIdx].text === ':')) colonIdx++;
                 const label = tk.text === 'default' ? 'default' : null;
-                const caseExpr = tk.text === 'case' ? (function() {
-                  const v = readValue(j + 1, colonIdx, null);
+                const caseExpr = tk.text === 'case' ? (await (async function() {
+                  const v = await readValue(j + 1, colonIdx, null);
                   return v ? chainAsExprText(v.binding) : null;
-                })() : null;
+                })()) : null;
                 cases.push({ label, caseExpr, bodyStart: colonIdx + 1, bodyEnd: -1, srcStart: tk.start });
               }
             }
@@ -5297,7 +6839,13 @@
             }
             // for-in / for-of: resolve iterable and store taint info
             // so the loop frame binding can carry it (set after frame push below).
+            // When the iterable has concrete entries, also stash each
+            // entry so we can pre-populate the may-be lattice for any
+            // variable simply assigned from the loop variable inside
+            // the body (e.g. `var s; for (var v of ["a","b"]) { s = v; }`).
             var _forInOfTaint = null;
+            var _forInOfKnownValues = null;
+            var _forInOfLoopVarName = null;
             if (taintEnabled) {
               for (var _fi = i + 2; _fi < j; _fi++) {
                 if (tokens[_fi].type === 'other' && (tokens[_fi].text === 'in' || tokens[_fi].text === 'of')) {
@@ -5306,21 +6854,37 @@
                   if (tokens[_fiVarStart].type === 'other' && (tokens[_fiVarStart].text === 'var' || tokens[_fiVarStart].text === 'let' || tokens[_fiVarStart].text === 'const')) _fiVarStart++;
                   var _fiVarName = tokens[_fiVarStart] && IDENT_RE.test(tokens[_fiVarStart].text) ? tokens[_fiVarStart].text : null;
                   if (_fiVarName) {
-                    var _fiExprVal = readValue(_fi + 1, j, null);
+                    _forInOfLoopVarName = _fiVarName;
+                    var _fiExprVal = await readValue(_fi + 1, j, null);
                     var _fiIterBind = _fiExprVal ? _fiExprVal.binding : null;
                     var _fiTaintSources = [];
+                    var _fiKnownVals = [];
                     if (_fiIterBind && _fiIterBind.kind === 'array') {
                       for (var _fie = 0; _fie < _fiIterBind.elems.length; _fie++) {
-                        if (_fiIterBind.elems[_fie] && _fiIterBind.elems[_fie].kind === 'chain') _fiTaintSources.push(_fiIterBind.elems[_fie].toks);
+                        var _fiElem = _fiIterBind.elems[_fie];
+                        if (_fiElem && _fiElem.kind === 'chain') {
+                          _fiTaintSources.push(_fiElem.toks);
+                          _fiKnownVals.push(_fiElem);
+                        }
+                      }
+                    } else if (_fiIterBind && _fiIterBind.kind === 'object' && _forInOf === 'in') {
+                      // for-in over object literal: loop var takes each
+                      // property NAME in turn (not the value).
+                      for (var _fip in _fiIterBind.props) {
+                        _fiKnownVals.push(chainBinding([makeSynthStr(_fip)]));
                       }
                     } else if (_fiIterBind && _fiIterBind.kind === 'object' && _forInOf === 'of') {
-                      for (var _fip in _fiIterBind.props) {
-                        if (_fiIterBind.props[_fip] && _fiIterBind.props[_fip].kind === 'chain') _fiTaintSources.push(_fiIterBind.props[_fip].toks);
+                      for (var _fipv in _fiIterBind.props) {
+                        if (_fiIterBind.props[_fipv] && _fiIterBind.props[_fipv].kind === 'chain') {
+                          _fiTaintSources.push(_fiIterBind.props[_fipv].toks);
+                          _fiKnownVals.push(_fiIterBind.props[_fipv]);
+                        }
                       }
                     } else if (_fiIterBind && _fiIterBind.kind === 'chain') {
                       _fiTaintSources.push(_fiIterBind.toks);
                     }
                     if (_fiTaintSources.length) _forInOfTaint = { varName: _fiVarName, sources: _fiTaintSources };
+                    if (_fiKnownVals.length) _forInOfKnownValues = _fiKnownVals;
                   }
                   break;
                 }
@@ -5368,7 +6932,7 @@
                   headerParts.push(gap2 + ht._src.slice(ht.start, ht.end));
                   continue;
                 }
-                var resolved = resolvePath(ht.text);
+                var resolved = await resolvePath(ht.text);
                 if (resolved && resolved.kind === 'chain') {
                   var exprText = chainAsExprText(resolved);
                   if (exprText !== null && exprText !== ht.text) {
@@ -5431,7 +6995,11 @@
                 }
               }
             }
-            // Check loop condition reachability.
+            // Check loop condition reachability AND compute the SMT
+            // formula for the condition so it can be pushed onto the
+            // path-constraint stack while walking the body.
+            var _loopPathFormula = null;
+            var _loopCondExpr = null;
             {
               var _loopCondStart = -1, _loopCondEnd = -1;
               if (t.text === 'while') {
@@ -5446,8 +7014,20 @@
                 }
               }
               if (_loopCondStart >= 0 && _loopCondEnd > _loopCondStart) {
-                var _loopReach = checkReachability(_loopCondStart, _loopCondEnd);
+                var _loopReach = await checkReachability(_loopCondStart, _loopCondEnd);
                 if (_loopReach === false) { i = bodyEnd - 1; continue; }
+                // SMT: build the loop condition formula for inner tasks.
+                // While walking the body we know `cond` is true (this is
+                // an over-approximation for the last iteration where the
+                // loop exits, but matches the semantics for "inside body").
+                _loopPathFormula = await _smtFormulaFromRange(_loopCondStart, _loopCondEnd);
+                if (taintCondStack) {
+                  var _lcToks = tokens[_loopCondStart]._src.slice(
+                    tokens[_loopCondStart].start,
+                    tokens[_loopCondEnd - 1].end
+                  );
+                  _loopCondExpr = _lcToks;
+                }
               }
             }
             stack.push(loopFrame);
@@ -5455,9 +7035,203 @@
             if (_forInOfTaint && loopFrame.bindings[_forInOfTaint.varName]) {
               loopFrame.bindings[_forInOfTaint.varName] = chainBinding([deriveExprRef.apply(null, [_forInOfTaint.varName].concat(_forInOfTaint.sources))]);
             }
+            // Pre-populate the may-be lattice for variables assigned
+            // from the for-of/for-in loop variable. For a body like
+            // `s = v` where `v` is the loop variable and the iterable
+            // is a known array, feed every element's value into `s`'s
+            // slot so post-loop refutations over values the loop
+            // never produces fire correctly. Only handles simple
+            // `IDENT = loopVar` assignments — compound RHS (e.g.
+            // `s = v + "x"`) stays opaque on the slot.
+            if (taintEnabled && _forInOfKnownValues && _forInOfLoopVarName) {
+              for (var _asi = j + 1; _asi < bodyEnd; _asi++) {
+                var _ast = tokens[_asi];
+                if (_ast && _ast.type === 'other' && IDENT_RE.test(_ast.text) && _ast.text !== _forInOfLoopVarName) {
+                  var _aeq = tokens[_asi + 1];
+                  var _avar = tokens[_asi + 2];
+                  var _aend = tokens[_asi + 3];
+                  if (_aeq && _aeq.type === 'sep' && _aeq.char === '=' &&
+                      _avar && _avar.type === 'other' && _avar.text === _forInOfLoopVarName &&
+                      _aend && _aend.type === 'sep' && _aend.char === ';') {
+                    for (var _afv = 0; _afv < _forInOfKnownValues.length; _afv++) {
+                      _trackMayBeAssign(_ast.text, _forInOfKnownValues[_afv]);
+                    }
+                  }
+                }
+              }
+              // Also feed the loop variable's OWN may-be slot with every
+              // iterable element. When a nested condition tests the loop
+              // variable (e.g. `if (v === "trusted")`), smtParseAtom
+              // consults the lattice and emits a disjunction over the
+              // concrete element set, letting Z3 refute branches the
+              // iterable can never produce.
+              for (var _lfv = 0; _lfv < _forInOfKnownValues.length; _lfv++) {
+                _trackMayBeAssign(_forInOfLoopVarName, _forInOfKnownValues[_lfv]);
+              }
+              // Suppress the body walker's opaque `loopVar` assignments
+              // into the may-be lattice — the pre-population above has
+              // already fed every concrete value, and letting the body
+              // walk add `other:v` would poison the slot.
+              _activeForOfVars.add(_forInOfLoopVarName);
+            }
+            // ---------- Enhanced SMT path constraints for loops ----------
+            // (a) for-of / for-in: push `<iter>.length > 0` so nested
+            //     conditions inside the body can reason about iteration.
+            // (b) Counter loops `for (var i = INT; i OP INT; ...)`: push
+            //     bound constraints on `i` tight to the init value so
+            //     nested conditions testing `i` can fold.
+            var _extraLoopFormulas = [];
+            var _extraLoopExprs = [];
+            if (taintEnabled && t.text === 'for') {
+              // Detect for-of / for-in and push iter.length > 0.
+              for (var _foi = i + 2; _foi < j; _foi++) {
+                if (tokens[_foi].type === 'other' && (tokens[_foi].text === 'in' || tokens[_foi].text === 'of')) {
+                  var _iterStart = _foi + 1;
+                  var _iterEnd = j;
+                  if (_iterStart < _iterEnd) {
+                    var _iterSrc = tokens[_iterStart]._src.slice(
+                      tokens[_iterStart].start,
+                      tokens[_iterEnd - 1].end
+                    );
+                    // Construct a length>0 atom via a synthetic token.
+                    var _iterToks = [{ type: 'other', text: _iterSrc + '.length', _src: tokens[_iterStart]._src, start: tokens[_iterStart].start, end: tokens[_iterEnd - 1].end }];
+                    var _lenAtom = await smtParseAtom(_iterToks, 0, 1, resolve, resolvePath);
+                    if (_lenAtom) {
+                      var _lenFormula = smtCmp('>', _lenAtom, smtConst(0));
+                      _extraLoopFormulas.push(_lenFormula);
+                      _extraLoopExprs.push(_iterSrc + '.length > 0');
+                    }
+                  }
+                  break;
+                }
+              }
+              // Detect counter loop `for (var i = INT; i OP ...; i++/--)`.
+              // Only activate when ALL three pieces match (otherwise skip).
+              (function() {
+                var _ci = i + 2;
+                // Skip `var`/`let`/`const`.
+                if (tokens[_ci] && tokens[_ci].type === 'other' &&
+                    (tokens[_ci].text === 'var' || tokens[_ci].text === 'let' || tokens[_ci].text === 'const')) _ci++;
+                var _cName = tokens[_ci] && tokens[_ci].type === 'other' && IDENT_RE.test(tokens[_ci].text) ? tokens[_ci].text : null;
+                if (!_cName) return;
+                // `=` literal int.
+                var _eqTok = tokens[_ci + 1];
+                if (!_eqTok || !((_eqTok.type === 'sep' && _eqTok.char === '=') || (_eqTok.type === 'op' && _eqTok.text === '='))) return;
+                var _cInitTok = tokens[_ci + 2];
+                if (!_cInitTok || _cInitTok.type !== 'other' || !/^-?\d+$/.test(_cInitTok.text)) return;
+                var _cInit = parseInt(_cInitTok.text, 10);
+                // The update clause (third section) must contain `i++`/`i--`/`i+=N`/`i-=N`
+                // so we know direction. Find it via semicolons.
+                var _sc1 = -1, _sc2 = -1;
+                for (var _sk = i + 2; _sk < j; _sk++) {
+                  if (tokens[_sk].type === 'sep' && tokens[_sk].char === ';') {
+                    if (_sc1 < 0) _sc1 = _sk; else { _sc2 = _sk; break; }
+                  }
+                }
+                if (_sc1 < 0 || _sc2 < 0) return;
+                // Direction and step: `i++` / `i+=N` → ascending step N;
+                //                     `i--` / `i-=N` → descending step N.
+                var _ascending = null;
+                var _step = 1;
+                for (var _uk = _sc2 + 1; _uk < j; _uk++) {
+                  var _ut = tokens[_uk];
+                  if (_ut.type === 'other' && _ut.text === _cName) {
+                    var _un = tokens[_uk + 1];
+                    if (_un && _un.type === 'op' && _un.text === '++') { _ascending = true; _step = 1; break; }
+                    if (_un && _un.type === 'op' && _un.text === '--') { _ascending = false; _step = 1; break; }
+                    if (_un && _un.type === 'op' && (_un.text === '+=' || _un.text === '-=')) {
+                      var _sTok = tokens[_uk + 2];
+                      if (_sTok && _sTok.type === 'other' && /^\d+$/.test(_sTok.text)) {
+                        _ascending = _un.text === '+=';
+                        _step = parseInt(_sTok.text, 10);
+                        break;
+                      }
+                    }
+                  }
+                  if (_ut.type === 'op' && (_ut.text === '++' || _ut.text === '--')) {
+                    var _un2 = tokens[_uk + 1];
+                    if (_un2 && _un2.type === 'other' && _un2.text === _cName) {
+                      _ascending = _ut.text === '++'; _step = 1;
+                      break;
+                    }
+                  }
+                }
+                if (_ascending === null || _step <= 0) return;
+                var _cSym = smtSym(_cName);
+                // Push init-side bound: `i >= init` (ascending) or `i <= init` (descending).
+                var _cFormula = smtCmp(_ascending ? '>=' : '<=', _cSym, smtConst(_cInit));
+                _extraLoopFormulas.push(_cFormula);
+                _extraLoopExprs.push(_cName + ' ' + (_ascending ? '>=' : '<=') + ' ' + _cInit);
+                // BOUNDED UNROLLING as an SMT refinement: if the loop has
+                // a concrete upper bound AND the iteration count is ≤
+                // UNROLL_LIMIT, push a disjunction of concrete values
+                // `i === init || i === init±step || ...` so the theory
+                // solver can prove properties that depend on specific
+                // iteration values, not just the range [init, bound).
+                var UNROLL_LIMIT = 8;
+                var _boundTok = null;
+                var _boundOp = null;
+                // Condition parsed as `i OP LIT` or `LIT OP i`.
+                for (var _bk = _sc1 + 1; _bk < _sc2; _bk++) {
+                  var _bt = tokens[_bk];
+                  if (_bt.type === 'op' && /^(<|<=|>|>=)$/.test(_bt.text)) {
+                    var _lhs = tokens[_bk - 1], _rhs = tokens[_bk + 1];
+                    if (_lhs && _rhs && _lhs.type === 'other' && _rhs.type === 'other') {
+                      if (_lhs.text === _cName && /^-?\d+$/.test(_rhs.text)) {
+                        _boundTok = _rhs; _boundOp = _bt.text;
+                      } else if (_rhs.text === _cName && /^-?\d+$/.test(_lhs.text)) {
+                        _boundTok = _lhs;
+                        // Flip op when counter is on the right.
+                        _boundOp = { '<':'>', '>':'<', '<=':'>=', '>=':'<=' }[_bt.text];
+                      }
+                    }
+                    break;
+                  }
+                }
+                if (_boundTok) {
+                  var _bound = parseInt(_boundTok.text, 10);
+                  var _iterCount;
+                  if (_ascending) {
+                    if (_boundOp === '<') _iterCount = Math.max(0, Math.ceil((_bound - _cInit) / _step));
+                    else if (_boundOp === '<=') _iterCount = Math.max(0, Math.floor((_bound - _cInit) / _step) + 1);
+                    else return;
+                  } else {
+                    if (_boundOp === '>') _iterCount = Math.max(0, Math.ceil((_cInit - _bound) / _step));
+                    else if (_boundOp === '>=') _iterCount = Math.max(0, Math.floor((_cInit - _bound) / _step) + 1);
+                    else return;
+                  }
+                  if (_iterCount > 0 && _iterCount <= UNROLL_LIMIT) {
+                    // Build disjunction: i === v_0 OR i === v_1 OR ...
+                    var _disj = null;
+                    var _disjExprs = [];
+                    for (var _it = 0; _it < _iterCount; _it++) {
+                      var _val = _ascending ? (_cInit + _it * _step) : (_cInit - _it * _step);
+                      var _atom = smtCmp('===', _cSym, smtConst(_val));
+                      _disj = _disj ? smtOr(_disj, _atom) : _atom;
+                      _disjExprs.push(_cName + ' === ' + _val);
+                    }
+                    _extraLoopFormulas.push(_disj);
+                    _extraLoopExprs.push('unroll(' + _iterCount + '): ' + _disjExprs.join(' || '));
+                  }
+                }
+              })();
+            }
+            // Push the loop condition onto P/T — it holds inside the body.
+            _pushPathConstraint(_loopPathFormula, _loopCondExpr);
+            // Push the enhanced constraints (iterator length / counter bound).
+            for (var _elf = 0; _elf < _extraLoopFormulas.length; _elf++) {
+              _pushPathConstraint(_extraLoopFormulas[_elf], _extraLoopExprs[_elf]);
+            }
             loopStack.push({
               id, kind: t.text, headerSrc, bodyEnd, frame: loopFrame,
               modifiedVars: new Set(),
+              pathFormula: _loopPathFormula,
+              condExpr: _loopCondExpr,
+              extraFormulas: _extraLoopFormulas,
+              extraExprs: _extraLoopExprs,
+              // Carry for-of loop var name so the cleanup at loop
+              // exit can pop it out of _activeForOfVars.
+              forOfVarName: _forInOfKnownValues && _forInOfLoopVarName ? _forInOfLoopVarName : null,
             });
             // Skip past the loop header — the init/cond/update clauses
             // don't count as body mutations, so we resume at the body's
@@ -5606,8 +7380,12 @@
             declFunction(_clsName.text, _clsBinding);
           }
           // Don't skip body — let the walker continue through it
-          // so extraction and inner declarations are processed.
-          i = _clsIdx; // point to '{', the walker will push a scope frame
+          // so extraction and inner declarations are processed. The
+          // `for` loop's `i++` will land on `_clsIdx` (the `{`), where
+          // the frame-push handler runs and bumps taintFnDepth so
+          // method bodies walked raw don't emit findings without a
+          // calling context.
+          i = _clsIdx - 1;
           pendingFunctionBrace = true;
           continue;
         }
@@ -5673,9 +7451,9 @@
               j = skipExpr(pat.next, stop);
               break;
             }
-            const val = readValue(pat.next + 1, stop, TERMS_TOP);
+            const val = await readValue(pat.next + 1, stop, TERMS_TOP);
             const srcBinding = val ? val.binding : null;
-            applyPatternBindings(pat.pattern, srcBinding, declBind);
+            await applyPatternBindings(pat.pattern, srcBinding, declBind);
             j = val ? val.next : skipExpr(pat.next + 1, stop);
             if (tokens[j] && tokens[j].type === 'sep' && tokens[j].char === ',') { j++; continue; }
             break;
@@ -5690,7 +7468,7 @@
             hasInit = true;
             // readValue handles function expressions, arrows, and all
             // other value types through a single code path.
-            const r = readValue(j + 2, stop, TERMS_TOP);
+            const r = await readValue(j + 2, stop, TERMS_TOP);
             value = r ? r.binding : null;
             // For function bindings use the precise end; for chains use
             // skipExpr to ensure we consume the full statement.
@@ -5698,6 +7476,15 @@
           }
           if (hasInit) {
             declBind(nameTok.text, value);
+            // Object literal initializer: register every property's
+            // initial value in the may-be lattice keyed by the full
+            // path. This catches `var s = {v: "init"}` so that later
+            // `s.v = "X"` joins into the same lattice slot.
+            if (value && value.kind === 'object' && taintEnabled) {
+              for (var _olP in value.props) {
+                _trackMayBeAssign(nameTok.text + '.' + _olP, value.props[_olP]);
+              }
+            }
             if (trackBuildVar && trackBuildVar.has(nameTok.text)) {
               // Only set buildVarDeclStart at the outer scope level, not
               // inside inlined functions. When instantiateFunction enables
@@ -5752,7 +7539,7 @@
         const eqTok = tokens[i + 1];
         // Navigation sink: bare assignment to a navigation global (location = expr).
         if (taintEnabled && eqTok && eqTok.type === 'sep' && eqTok.char === '=' && isNavSink(t.text, declaredNames)) {
-          var _bNavR = readValue(i + 2, stop, TERMS_TOP);
+          var _bNavR = await readValue(i + 2, stop, TERMS_TOP);
           if (_bNavR && _bNavR.binding && _bNavR.binding.kind === 'chain') {
             var _bNavTaint = collectChainTaint(_bNavR.binding.toks);
             if (_bNavTaint && _bNavTaint.size) {
@@ -5775,7 +7562,7 @@
               _rhsStart += 2;
             } else break;
           }
-          const r = readValue(_rhsStart, stop, TERMS_TOP);
+          const r = await readValue(_rhsStart, stop, TERMS_TOP);
           // Detect prepend pattern: x = expr + x (builds string in reverse).
           // Treat as equivalent to x += expr but with the new content prepended.
           // For build variables assigned via = inside a loop (prepend
@@ -5809,7 +7596,7 @@
           continue;
         }
         if (eqTok && eqTok.type === 'sep' && eqTok.char === '+=') {
-          const r = readValue(i + 2, stop, TERMS_TOP);
+          const r = await readValue(i + 2, stop, TERMS_TOP);
           const rhs = r ? r.binding : null;
           const cur = resolve(t.text);
           let combined = null;
@@ -5879,7 +7666,7 @@
         }
         // Logical assignment: IDENT ||= expr, IDENT &&= expr, IDENT ??= expr
         if (eqTok && eqTok.type === 'sep' && (eqTok.char === '||=' || eqTok.char === '&&=' || eqTok.char === '??=')) {
-          var _laR = readValue(i + 2, stop, TERMS_TOP);
+          var _laR = await readValue(i + 2, stop, TERMS_TOP);
           var _laRhs = _laR ? _laR.binding : null;
           var _laCur = resolve(t.text);
           var _laOp = eqTok.char;
@@ -5924,27 +7711,164 @@
       if (t.type === 'other' && (t.text === 'setTimeout' || t.text === 'setInterval') && !declaredNames.has(t.text)) {
         var _timerParen = tokens[i + 1];
         if (_timerParen && _timerParen.type === 'open' && _timerParen.char === '(') {
-          var _timerArgs = readCallArgBindings(i + 1, stop);
+          var _timerArgs = await readCallArgBindings(i + 1, stop);
           if (_timerArgs && _timerArgs.bindings.length >= 1) {
             var _timerCb = _timerArgs.bindings[0];
             if (_timerCb && _timerCb.kind === 'function') {
-              instantiateFunction(_timerCb, []);
+              await instantiateFunction(_timerCb, []);
+              if (_pendingCallbacks && taintEnabled) {
+                _pendingCallbacks.push({ fn: _timerCb, params: [], isEventHandler: false });
+              }
             }
             i = _timerArgs.next - 1;
             continue;
           }
         }
       }
+      // Bare-method Promise continuation: `p.then(...)` / `p.catch(...)`
+      // / `p.finally(...)` as a statement, where p is a stored Promise
+      // (a chain produced by fetch / await / etc.). When p resolves to
+      // a chain (Promise-shaped value), route through readValue so
+      // applyMethod's then/catch/finally handler walks the callback
+      // with the receiver's taint. When p resolves to a real object
+      // with a .then function property (a "thenable"), let the existing
+      // bare-call handler dispatch through resolvePath instead — its
+      // path-walking is what makes inline thenables work.
+      if (taintEnabled && t.type === 'other' && /\.(then|catch|finally)$/.test(t.text)) {
+        var _bmParen = tokens[i + 1];
+        if (_bmParen && _bmParen.type === 'open' && _bmParen.char === '(') {
+          var _bmRoot = t.text.slice(0, t.text.lastIndexOf('.')).split('.')[0];
+          var _bmRootBind = resolve(_bmRoot);
+          if (_bmRootBind && _bmRootBind.kind === 'chain') {
+            var _bmResult = await readValue(i, stop, TERMS_TOP);
+            if (_bmResult) { i = _bmResult.next - 1; continue; }
+          }
+        }
+      }
+      // Bare `new ClassName(...)` as a statement, possibly with trailing
+      // method calls: `new C().go();`, `new C(x).a().b();`. The walker
+      // otherwise has no handler for statement-initial `new`, so the
+      // instantiation and every chained method would go unanalysed.
+      // Route the whole expression through readValue so readBaseCore's
+      // `new` handler returns the instance and applySuffixes walks the
+      // trailing `.method(args)` chain with the instance as `this`.
+      if (t.type === 'other' && t.text === 'new') {
+        var _newResult = await readValue(i, stop, TERMS_TOP);
+        if (_newResult) { i = _newResult.next - 1; continue; }
+      }
       // Bare function call as a statement: `render(input);` or `obj.method(args);`.
       // Resolve the callee; if it's a function binding, inline it for side effects.
       if (t.type === 'other' && IDENT_OR_PATH_RE.test(t.text)) {
         const callParen = tokens[i + 1];
         if (callParen && callParen.type === 'open' && callParen.char === '(') {
-          var calleeBind = resolvePath(t.text);
+          // Chained-call peek: `outer()()`, `factory()()`, `a()()()`.
+          // If what follows the first `)` is another `(`, route the
+          // whole chain through readValue so applySuffixes's bare-call
+          // handler walks each invocation and the returned closure's
+          // body is actually analysed (including captured taint).
+          if (taintEnabled) {
+            var _ccDepth = 1, _ccK = i + 2;
+            while (_ccK < stop && _ccDepth > 0) {
+              if (tokens[_ccK].type === 'open' && tokens[_ccK].char === '(') _ccDepth++;
+              else if (tokens[_ccK].type === 'close' && tokens[_ccK].char === ')') _ccDepth--;
+              if (_ccDepth === 0) break;
+              _ccK++;
+            }
+            if (_ccDepth === 0) {
+              var _ccAfter = tokens[_ccK + 1];
+              if (_ccAfter && _ccAfter.type === 'open' && _ccAfter.char === '(') {
+                var _ccResult = await readValue(i, stop, TERMS_TOP);
+                if (_ccResult) { i = _ccResult.next - 1; continue; }
+              }
+            }
+          }
+          // Promise continuation peek BEFORE the inline-call path:
+          // `load().then(d => sink(d))` should be routed through
+          // readValue so the .then callback flows through applyMethod
+          // with the receiver's taint. If we let the bare-call handler
+          // inline load() in isolation, the trailing .then is lost.
+          if (taintEnabled) {
+            var _bcDepth = 1, _bcK = i + 2;
+            while (_bcK < stop && _bcDepth > 0) {
+              if (tokens[_bcK].type === 'open' && tokens[_bcK].char === '(') _bcDepth++;
+              else if (tokens[_bcK].type === 'close' && tokens[_bcK].char === ')') _bcDepth--;
+              if (_bcDepth === 0) break;
+              _bcK++;
+            }
+            if (_bcDepth === 0) {
+              var _bcAfter = tokens[_bcK + 1];
+              if (_bcAfter && _bcAfter.type === 'other' && /^\.(then|catch|finally)$/.test(_bcAfter.text)) {
+                var _bcResult = await readValue(i, stop, TERMS_TOP);
+                if (_bcResult) { i = _bcResult.next - 1; continue; }
+              }
+            }
+          }
+          var calleeBind = await resolvePath(t.text);
+          // Universal call watcher: when a recorder is registered,
+          // fire it for every bare-statement call regardless of whether
+          // the callee is resolvable. This is how external analyses
+          // (fetch/XHR tracers, sink finders, dead-code reporters)
+          // observe call sites without having to duplicate the
+          // walker. The recorder sees fully resolved argument
+          // bindings — chain tokens, object literals, arrays — as
+          // they exist at this call site.
+          if (_callWatchers && _callWatchers.length > 0) {
+            var _cwArgs = await readCallArgBindings(i + 1, stop);
+            if (_cwArgs) {
+              // Snapshot the active path constraint stack so watchers
+              // can reason about *under what conditions* this call is
+              // reachable. taintCondStack is human-readable JS-ish; the
+              // parallel pathConstraints array holds SMT formula nodes.
+              var _cwInfo = {
+                stage: 'statement',
+                reached: true,
+                pathConditions: taintCondStack ? taintCondStack.slice() : [],
+                pathFormulas: pathConstraints ? pathConstraints.slice() : [],
+                mayBe: _varMayBe,
+                resolve: resolve,
+                resolvePath: resolvePath,
+              };
+              for (var _cwi = 0; _cwi < _callWatchers.length; _cwi++) {
+                try { _callWatchers[_cwi](t.text, _cwArgs.bindings, t, _cwInfo); } catch (_) {}
+              }
+            }
+          }
           if (calleeBind && calleeBind.kind === 'function') {
-            var callArgs = readCallArgBindings(i + 1, stop);
+            var callArgs = await readCallArgBindings(i + 1, stop);
             if (callArgs) {
-              instantiateFunction(calleeBind, callArgs.bindings);
+              // Method call on an object path: bind the receiver as
+              // `this` so the body can read/write `this.prop` against
+              // the instance. Without this, `c.setIt(v)` where setIt
+              // does `this.foo = v` loses the assignment because
+              // `this` resolves to null.
+              var _calleeThis = null;
+              var _calleeDot = t.text.lastIndexOf('.');
+              if (_calleeDot > 0) {
+                _calleeThis = await resolvePath(t.text.slice(0, _calleeDot));
+              }
+              await instantiateFunction(calleeBind, callArgs.bindings, _calleeThis);
+              // Indirect-call may-be: if the callee variable was also
+              // assigned OTHER function values (e.g. `var f = cond ? a : b`
+              // or sequential reassignment from different code paths),
+              // walk every alternative target. Without this, only the
+              // single binding the walker happens to see at this point
+              // gets analysed — anything assigned earlier is missed.
+              if (taintEnabled) {
+                var _altTargets = _funcMayBeFor(t.text);
+                if (_altTargets) {
+                  for (var _ati = 0; _ati < _altTargets.length; _ati++) {
+                    if (_altTargets[_ati] !== calleeBind) {
+                      await instantiateFunction(_altTargets[_ati], callArgs.bindings);
+                      // Register for the phase-2 fixpoint so the
+                      // alternative target's body sees mutations from
+                      // every other callback.
+                      if (_pendingCallbacks) {
+                        _pendingCallbacks.push({ fn: _altTargets[_ati], params: callArgs.bindings, isEventHandler: false });
+                      }
+                    }
+                  }
+                }
+              }
               i = callArgs.next - 1;
               if (taintEnabled && TAINT_CALL_SINKS[t.text] && !declaredNames.has(t.text.split('.')[0])) {
                 checkSinkCall(t.text, callArgs.bindings, t);
@@ -5952,13 +7876,57 @@
               continue;
             }
           }
+          // Indirect call: the variable resolves to something that
+          // isn't a known function binding (e.g. a chain produced by a
+          // ternary), but the may-be lattice tracked function targets
+          // assigned to it. Walk all of them.
+          if (taintEnabled && (!calleeBind || calleeBind.kind !== 'function')) {
+            var _icTargets = _funcMayBeFor(t.text);
+            if (_icTargets && _icTargets.length > 0) {
+              var _icArgs = await readCallArgBindings(i + 1, stop);
+              if (_icArgs) {
+                for (var _ici = 0; _ici < _icTargets.length; _ici++) {
+                  await instantiateFunction(_icTargets[_ici], _icArgs.bindings);
+                  if (_pendingCallbacks) {
+                    _pendingCallbacks.push({ fn: _icTargets[_ici], params: _icArgs.bindings, isEventHandler: false });
+                  }
+                }
+                i = _icArgs.next - 1;
+                continue;
+              }
+            }
+          }
           // Taint: even if callee isn't inlinable, check if it's a call-based sink.
           if (taintEnabled && TAINT_CALL_SINKS[t.text] && !declaredNames.has(t.text.split('.')[0])) {
-            var sinkArgs = readCallArgBindings(i + 1, stop);
+            var sinkArgs = await readCallArgBindings(i + 1, stop);
             if (sinkArgs) {
               checkSinkCall(t.text, sinkArgs.bindings, t);
               i = sinkArgs.next - 1;
               continue;
+            }
+          }
+          // Bare-call expression statement followed by a Promise
+          // continuation method (`.then` / `.catch` / `.finally`):
+          // run the whole expression through readValue so applySuffixes
+          // routes the .then(callback) to applyMethod, which walks the
+          // callback with the receiver's taint as the first arg. This
+          // lets fetch("/api").then(d => sink(d)) flow taint into the
+          // callback even though it's a bare expression statement.
+          if (taintEnabled) {
+            var _peekContEnd = -1;
+            var _peekDepth = 1, _peekJ = i + 2;
+            while (_peekJ < stop && _peekDepth > 0) {
+              if (tokens[_peekJ].type === 'open' && tokens[_peekJ].char === '(') _peekDepth++;
+              else if (tokens[_peekJ].type === 'close' && tokens[_peekJ].char === ')') _peekDepth--;
+              if (_peekDepth === 0) { _peekContEnd = _peekJ; break; }
+              _peekJ++;
+            }
+            if (_peekContEnd > 0) {
+              var _peekNext = tokens[_peekContEnd + 1];
+              if (_peekNext && _peekNext.type === 'other' && /^\.(then|catch|finally)$/.test(_peekNext.text)) {
+                var _exprResult = await readValue(i, stop, TERMS_TOP);
+                if (_exprResult) { i = _exprResult.next - 1; continue; }
+              }
             }
           }
         }
@@ -5970,7 +7938,7 @@
       if (t.type === 'other' && DOM_FACTORIES[t.text]) {
         const factoryParen = tokens[i + 1];
         if (factoryParen && factoryParen.type === 'open' && factoryParen.char === '(') {
-          const factoryArgs = readConcatArgs(i + 1, stop);
+          const factoryArgs = await readConcatArgs(i + 1, stop);
           if (factoryArgs) {
             const factoryResult = DOM_FACTORIES[t.text](factoryArgs.args, i, factoryArgs.next, t);
             if (factoryResult && factoryResult.bind) {
@@ -5982,7 +7950,7 @@
                 var trailEq = tokens[afterCall + 1];
                 if (trailEq && trailEq.type === 'sep' && (trailEq.char === '=' || trailEq.char === '+=')) {
                   // Property assignment on DOM factory result.
-                  var trailR = readValue(afterCall + 2, stop, TERMS_TOP);
+                  var trailR = await readValue(afterCall + 2, stop, TERMS_TOP);
                   var trailVal = trailR ? trailR.binding : null;
                   if (factoryResult.bind.kind === 'element') {
                     applyElementSet(factoryResult.bind, [trailProp], trailVal, trailTok);
@@ -5992,7 +7960,7 @@
                 } else if (trailEq && trailEq.type === 'open' && trailEq.char === '(') {
                   // Method call on DOM factory result.
                   if (factoryResult.bind.kind === 'element' && DOM_METHODS.has(trailProp)) {
-                    var methodArgs = readCallArgBindings(afterCall + 1, stop);
+                    var methodArgs = await readCallArgBindings(afterCall + 1, stop);
                     if (methodArgs) {
                       applyElementMethod(factoryResult.bind, trailProp, methodArgs.bindings);
                       i = methodArgs.next - 1;
@@ -6016,7 +7984,7 @@
         if (_navType) {
           var _navEq = tokens[i + 1];
           if (_navEq && _navEq.type === 'sep' && (_navEq.char === '=' || _navEq.char === '+=')) {
-            var _navR = readValue(i + 2, stop, TERMS_TOP);
+            var _navR = await readValue(i + 2, stop, TERMS_TOP);
             var _navVal = _navR ? _navR.binding : null;
             // Record as navigation sink finding.
             if (taintEnabled && _navVal && _navVal.kind === 'chain') {
@@ -6032,7 +8000,7 @@
           // Check for navigation method call: location.assign(expr), location.replace(expr)
           var _navParen = tokens[i + 1];
           if (_navParen && _navParen.type === 'open' && _navParen.char === '(') {
-            var _navCallArgs = readCallArgBindings(i + 1, stop);
+            var _navCallArgs = await readCallArgBindings(i + 1, stop);
             if (_navCallArgs && taintEnabled) {
               checkSinkCall(t.text, _navCallArgs.bindings, t);
             }
@@ -6051,7 +8019,7 @@
             if (_cwTag === 'iframe' || _cwTag === 'frame') {
               var _cwEq = tokens[i + 1];
               if (_cwEq && _cwEq.type === 'sep' && _cwEq.char === '=') {
-                var _cwR = readValue(i + 2, stop, TERMS_TOP);
+                var _cwR = await readValue(i + 2, stop, TERMS_TOP);
                 var _cwVal = _cwR ? _cwR.binding : null;
                 if (taintEnabled && _cwVal && _cwVal.kind === 'chain') {
                   var _cwTaint = collectChainTaint(_cwVal.toks);
@@ -6092,6 +8060,7 @@
                 ? chainBinding([makeSynthStr(String(n + delta))])
                 : chainBinding([deriveExprRef(t.text, cur ? cur.toks : null)]);
             }
+            _trackMayBeAssign(t.text, baseBind.props[parts[1]]);
           }
           i = i + 1;
           continue;
@@ -6100,26 +8069,45 @@
         if (eqTok && eqTok.type === 'sep' && (eqTok.char === '=' || eqTok.char === '+=')) {
           const parts = t.text.split('.');
           const baseBind = resolve(parts[0]);
-          // Object property assignment: obj.prop = value
-          if (baseBind && baseBind.kind === 'object' && parts.length === 2) {
-            const r = readValue(i + 2, stop, TERMS_TOP);
-            if (r && r.binding) {
-              if (eqTok.char === '+=') {
-                var prev = baseBind.props[parts[1]];
-                if (prev && prev.kind === 'chain' && r.binding.kind === 'chain') {
-                  baseBind.props[parts[1]] = chainBinding([...prev.toks, SYNTH_PLUS, ...r.binding.toks]);
-                } else {
-                  baseBind.props[parts[1]] = r.binding;
-                }
-              } else {
-                baseBind.props[parts[1]] = r.binding;
-              }
+          // Object property assignment: obj.prop = value, or
+          // multi-segment obj.a.b.c = value. Walk through the
+          // intermediate segments to find the deepest object,
+          // then set the final segment.
+          if (baseBind && baseBind.kind === 'object' && parts.length >= 2) {
+            // Walk to the leaf container.
+            var _container = baseBind;
+            var _walkOk = true;
+            for (var _pi = 1; _pi < parts.length - 1; _pi++) {
+              var _next = _container.props[parts[_pi]];
+              if (!_next || _next.kind !== 'object') { _walkOk = false; break; }
+              _container = _next;
             }
-            i = skipExpr(i + 2, stop) - 1;
-            continue;
+            if (_walkOk) {
+              const r = await readValue(i + 2, stop, TERMS_TOP);
+              if (r && r.binding) {
+                var _leaf = parts[parts.length - 1];
+                if (eqTok.char === '+=') {
+                  var prev = _container.props[_leaf];
+                  if (prev && prev.kind === 'chain' && r.binding.kind === 'chain') {
+                    _container.props[_leaf] = chainBinding([...prev.toks, SYNTH_PLUS, ...r.binding.toks]);
+                  } else {
+                    _container.props[_leaf] = r.binding;
+                  }
+                } else {
+                  _container.props[_leaf] = r.binding;
+                }
+                // May-be lattice: track the full path so smtSat can emit
+                // a (or (= |obj.prop| v1) (= |obj.prop| v2) ...) disjunction.
+                // _mayBeKey will canonicalise via __objId so any alias of
+                // the leaf container hits the same slot.
+                _trackMayBeAssign(t.text, _container.props[_leaf]);
+              }
+              i = skipExpr(i + 2, stop) - 1;
+              continue;
+            }
           }
           if (baseBind && baseBind.kind === 'element') {
-            const r = readValue(i + 2, stop, TERMS_TOP);
+            const r = await readValue(i + 2, stop, TERMS_TOP);
             const val = r ? r.binding : null;
             applyElementSet(baseBind, parts.slice(1), val, t);
             i = skipExpr(i + 2, stop) - 1;
@@ -6129,7 +8117,7 @@
           if (taintEnabled && parts.length >= 2) {
             const sinkProp = parts[parts.length - 1];
             if (TAINT_SINKS[sinkProp] || sinkProp === 'src' || sinkProp === 'href' || sinkProp === 'action' || sinkProp === 'srcdoc') {
-              const r = readValue(i + 2, stop, TERMS_TOP);
+              const r = await readValue(i + 2, stop, TERMS_TOP);
               const val = r ? r.binding : null;
               if (val && val.kind === 'chain') {
                 var _taint = collectChainTaint(val.toks);
@@ -6157,24 +8145,37 @@
             const method = t.text.slice(dot + 1);
             const baseBind = resolve(base);
             if (baseBind && baseBind.kind === 'element' && DOM_METHODS.has(method)) {
-              const argResult = readCallArgBindings(i + 1, stop);
+              const argResult = await readCallArgBindings(i + 1, stop);
               if (argResult) {
                 applyElementMethod(baseBind, method, argResult.bindings);
                 i = argResult.next - 1;
                 continue;
               }
             }
+            // Map / Set / WeakMap / WeakSet statements: `.set(k, v)`,
+            // `.add(v)`, `.delete(k)`, `.clear()` mutate the receiver
+            // in place. Route through applyMethod which handles the
+            // mapLike dispatch (see the Map/Set block at the top of
+            // applyMethod for semantics).
+            if (baseBind && baseBind.kind === 'object' && baseBind._mapLike &&
+                (method === 'set' || method === 'add' || method === 'delete' || method === 'clear' || method === 'has' || method === 'get')) {
+              var _mapStmtResult = await applyMethod(baseBind, method, i + 1, stop);
+              if (_mapStmtResult) {
+                i = _mapStmtResult.next - 1;
+                continue;
+              }
+            }
             // Array methods as statements: forEach, push, unshift.
             if (baseBind && baseBind.kind === 'array' && (method === 'forEach' || method === 'map' || method === 'filter')) {
               // Use applyMethod to handle the call — it walks forEach callbacks.
-              var arrMethodResult = applyMethod(baseBind, method, i + 1, stop);
+              var arrMethodResult = await applyMethod(baseBind, method, i + 1, stop);
               if (arrMethodResult) {
                 i = arrMethodResult.next - 1;
                 continue;
               }
             }
             if (baseBind && baseBind.kind === 'array' && (method === 'push' || method === 'unshift')) {
-              var arrArgs = readCallArgBindings(i + 1, stop);
+              var arrArgs = await readCallArgBindings(i + 1, stop);
               if (arrArgs) {
                 for (var _ai = 0; _ai < arrArgs.bindings.length; _ai++) {
                   if (arrArgs.bindings[_ai]) {
@@ -6190,7 +8191,7 @@
             // readCallArgBindings now handles function expressions and arrows
             // via readValue → readFunctionExpr, so no special parser needed.
             if (taintEnabled && method === 'addEventListener') {
-              var _evArgs = readCallArgBindings(i + 1, stop);
+              var _evArgs = await readCallArgBindings(i + 1, stop);
               if (_evArgs && _evArgs.bindings.length >= 2) {
                 var _evTypeStr = _evArgs.bindings[0] && _evArgs.bindings[0].kind === 'chain' ? chainAsKnownString(_evArgs.bindings[0]) : null;
                 var _evHandler = _evArgs.bindings[1];
@@ -6207,18 +8208,19 @@
                     // Unknown event type: param is opaque, no taint.
                     _evParamBindings.push(chainBinding([exprRef(_evHandler.params[0].name)]));
                   }
-                  // Walk the handler body twice: event handlers fire
-                  // multiple times. The first walk establishes mutations
-                  // (state transitions). The second walk sees accumulated
-                  // state and can reach branches guarded by it.
-                  // Suppress findings during the first walk.
+                  // Walk the handler body once. Convergence (re-walking
+                  // until state stabilises) is handled at the OUTER
+                  // level, in buildScopeState's whole-program callback
+                  // fixpoint loop, so that every callback sees the
+                  // effects of every other callback.
                   var _prevInEH = inEventHandler;
                   inEventHandler = true;
-                  var _savedFindings = taintFindings ? taintFindings.length : 0;
-                  instantiateFunction(_evHandler, _evParamBindings);
-                  if (taintFindings) taintFindings.length = _savedFindings; // discard first-walk findings
-                  instantiateFunction(_evHandler, _evParamBindings);
+                  await instantiateFunction(_evHandler, _evParamBindings);
                   inEventHandler = _prevInEH;
+                  // Register for the phase-2 fixpoint re-walk.
+                  if (_pendingCallbacks) {
+                    _pendingCallbacks.push({ fn: _evHandler, params: _evParamBindings, isEventHandler: true });
+                  }
                 }
                 i = _evArgs.next - 1;
                 continue;
@@ -6226,7 +8228,7 @@
             }
             // Taint: detect call-based sinks (eval, document.write, etc.).
             if (taintEnabled && TAINT_CALL_SINKS[t.text] && !declaredNames.has(t.text.split('.')[0])) {
-              const argResult = readCallArgBindings(i + 1, stop);
+              const argResult = await readCallArgBindings(i + 1, stop);
               if (argResult) {
                 checkSinkCall(t.text, argResult.bindings, t);
                 i = argResult.next - 1;
@@ -6280,10 +8282,10 @@
                 if (tokens[_ki].type === 'close' && tokens[_ki].char === ']') { _kd--; if (_kd === 0) { _keyEnd = _ki; break; } }
               }
               if (_keyEnd > _keyStart) {
-                var _keyVal = readValue(_keyStart, _keyEnd, null);
+                var _keyVal = await readValue(_keyStart, _keyEnd, null);
                 var _keyStr = _keyVal ? chainAsKnownString(_keyVal.binding) : null;
                 if (_keyStr !== null) {
-                  var _rhsVal = readValue(j + 1, stop, TERMS_TOP);
+                  var _rhsVal = await readValue(j + 1, stop, TERMS_TOP);
                   if (_rhsVal && _rhsVal.binding) {
                     if (_baseBind.kind === 'object') _baseBind.props[_keyStr] = _rhsVal.binding;
                     if (_baseBind.kind === 'array' && /^\d+$/.test(_keyStr)) _baseBind.elems[parseInt(_keyStr, 10)] = _rhsVal.binding;
@@ -6311,6 +8313,69 @@
             }
             i = stmtEndIdx - 1;
             continue;
+          }
+          // Indirect dispatcher call: `dispatch[expr]()` or `dispatch[expr](args)`.
+          // The bracket key is opaque (e.g. e.data) so we can't pick a
+          // single property — instead, walk EVERY function-typed
+          // property of the dispatcher object so any callback that
+          // could fire at runtime sees its body analysed.
+          if (taintEnabled) {
+            // Detect: ident [ ... ] ( ... )  with no further suffixes.
+            // j currently points at the first non-bracket-non-dot token
+            // after the chain we already walked. Look back to see if
+            // the chain ended with a `(`...`)` group right after a `]`.
+            var _dpBase = resolve(t.text);
+            if (_dpBase && _dpBase.kind === 'object') {
+              // Find the last `[` … `]` and the `(` that follows it.
+              var _bkOpen = i + 1;
+              var _bkClose = -1;
+              var _bkD = 1, _bkK = i + 2;
+              while (_bkK < _rangeEnd && _bkD > 0) {
+                if (tokens[_bkK].type === 'open' && tokens[_bkK].char === '[') _bkD++;
+                if (tokens[_bkK].type === 'close' && tokens[_bkK].char === ']') { _bkD--; if (_bkD === 0) { _bkClose = _bkK; break; } }
+                _bkK++;
+              }
+              if (_bkClose > 0) {
+                var _argOpen = _bkClose + 1;
+                if (tokens[_argOpen] && tokens[_argOpen].type === 'open' && tokens[_argOpen].char === '(') {
+                  // The bracket key isn't a known string → walk every
+                  // function property. Otherwise the existing handlers
+                  // resolve the specific target.
+                  var _bkVal = await readValue(_bkOpen + 1, _bkClose, null);
+                  var _bkStr = _bkVal && _bkVal.binding ? chainAsKnownString(_bkVal.binding) : null;
+                  if (_bkStr === null) {
+                    var _dispatchArgs = await readCallArgBindings(_argOpen, stop);
+                    if (_dispatchArgs) {
+                      for (var _dpName in _dpBase.props) {
+                        var _dpProp = _dpBase.props[_dpName];
+                        if (_dpProp && _dpProp.kind === 'function') {
+                          await instantiateFunction(_dpProp, _dispatchArgs.bindings);
+                          if (_pendingCallbacks) {
+                            _pendingCallbacks.push({ fn: _dpProp, params: _dispatchArgs.bindings, isEventHandler: false });
+                          }
+                        }
+                      }
+                      i = _dispatchArgs.next - 1;
+                      continue;
+                    }
+                  } else {
+                    // Known-key bracket call: dispatch["arm"]()
+                    var _knownProp = _dpBase.props[_bkStr];
+                    if (_knownProp && _knownProp.kind === 'function') {
+                      var _knArgs = await readCallArgBindings(_argOpen, stop);
+                      if (_knArgs) {
+                        await instantiateFunction(_knownProp, _knArgs.bindings);
+                        if (_pendingCallbacks) {
+                          _pendingCallbacks.push({ fn: _knownProp, params: _knArgs.bindings, isEventHandler: false });
+                        }
+                        i = _knArgs.next - 1;
+                        continue;
+                      }
+                    }
+                  }
+                }
+              }
+            }
           }
           // Bracket-access followed by ; or end — expression statement
           // (e.g. items[i].doSomething()). Skip to statement boundary.
@@ -6345,23 +8410,164 @@
       }
     }
     } // end while (_ws)
+    // Invariant: after the work stack drains, any nested push onto the
+    // path-constraint or taint-condition stacks must have been matched
+    // by a corresponding pop. If we ever observe imbalance at top level
+    // it indicates a broken transition; reset to the base depth so the
+    // next walkRange call starts from a clean configuration.
+    if (pathConstraints && pathConstraints.length > _pcBaseDepth) {
+      pathConstraints.length = _pcBaseDepth;
+    }
+    if (taintCondStack && taintCondStack.length > _tcBaseDepth) {
+      taintCondStack.length = _tcBaseDepth;
+    }
     };
-    walkRange(0, stop);
+    // ----------------------------------------------------------------
+    // Top-level walk + whole-program callback fixpoint (taint mode)
+    // ----------------------------------------------------------------
+    // The walker uses a two-phase strategy when taint-enabled:
+    //
+    //   Phase 1 — top-level walk. walkRange runs once over the program
+    //     in source order. var/let/const declarations execute, function
+    //     bodies are inlined at call sites, addEventListener registers
+    //     and walks the handler body once. Phase 1 produces an initial
+    //     binding state and an initial set of findings.
+    //
+    //   Phase 2 — callback fixpoint. Every callback registered during
+    //     phase 1 (event handlers, setTimeout/setInterval, .then/.catch,
+    //     etc.) gets a re-walk request added to _pendingCallbacks. After
+    //     phase 1 returns, the analyser repeatedly re-walks every
+    //     pending callback in turn, observing the bindings + findings
+    //     produced by every other callback. This continues until the
+    //     program's observable state stops changing.
+    //
+    // Why the split? Re-running phase 1 would re-execute var
+    // declarations (`var state = "idle"`) and undo any mutations
+    // earlier callbacks made — the fixpoint would never advance. By
+    // freezing top-level state after phase 1 and only iterating the
+    // callback set, mutations from one callback persist into the next
+    // iteration of every other callback. This is what lets a finding
+    // gated on `state === "ready"` (set in callback A) fire from
+    // callback B even when neither callback alone reaches it.
+    //
+    // Findings are de-duplicated by source location so a callback
+    // emitting the same finding twice doesn't break convergence.
+
+    const _findingKey = function (f) {
+      return (f.type || '') + '|' + (f.sink ? (f.sink.prop || '') + ':' + (f.sink.elementTag || '') : '') +
+             '|' + (f.location ? (f.location.line || 0) + ':' + (f.location.pos || 0) + ':' + (f.location.expr || '') : '') +
+             '|' + (f.sources ? f.sources.slice().sort().join(',') : '');
+    };
+    const _dedupeFindings = function () {
+      if (!taintFindings) return;
+      var seen = Object.create(null);
+      var kept = [];
+      for (var _fi = 0; _fi < taintFindings.length; _fi++) {
+        var k = _findingKey(taintFindings[_fi]);
+        if (seen[k]) continue;
+        seen[k] = true;
+        kept.push(taintFindings[_fi]);
+      }
+      taintFindings.length = 0;
+      for (var _kj = 0; _kj < kept.length; _kj++) taintFindings.push(kept[_kj]);
+    };
+
+    // Activate the per-walk may-be lattice. smtSat reads
+    // _currentVarMayBe at SAT-check time so the same _varMayBe map
+    // we populate during walks is what feeds the disjunction extras.
+    // _currentMayBeKey lets the IIFE-level smtSat / smtParseAtom
+    // resolve textual paths to identity-keyed canonical form
+    // (alias-aware lookups).
+    var _savedCurrentVarMayBe = _currentVarMayBe;
+    var _savedCurrentMayBeKey = _currentMayBeKey;
+    if (taintEnabled) {
+      _currentVarMayBe = _varMayBe;
+      _currentMayBeKey = _mayBeKey;
+    }
+    try {
+
+    // Phase 1: single forward walk.
+    await walkRange(0, stop);
+    // Dedupe after phase 1 so duplicate findings emitted from the
+    // same source location (e.g. a class-method body walked both at
+    // class-definition time and at `new C().go()` call-site time)
+    // collapse before either the user sees them or the phase-2
+    // convergence signature is computed.
+    if (taintEnabled) _dedupeFindings();
+
+    // Phase 2: callback fixpoint. Iterate all callbacks registered
+    // during phase 1 until findings + bindings + may-be lattices
+    // stabilise. The may-be lattice is monotone (values only join
+    // in, never leave) so adding it to the convergence signature
+    // doesn't break termination.
+    if (taintEnabled && _pendingCallbacks && _pendingCallbacks.length > 0) {
+      const _snapshotBindingsJson = function () {
+        var snap = Object.create(null);
+        for (var _si = stack.length - 1; _si >= 0; _si--) {
+          for (var _bn in stack[_si].bindings) {
+            if (!(_bn in snap)) {
+              try { snap[_bn] = JSON.stringify(stack[_si].bindings[_bn]); }
+              catch (e) { snap[_bn] = '<cyclic>'; }
+            }
+          }
+        }
+        var keys = Object.keys(snap).sort();
+        var out = '';
+        for (var _ki = 0; _ki < keys.length; _ki++) out += keys[_ki] + '=' + snap[keys[_ki]] + ';';
+        return out;
+      };
+      const _snapshotMayBe = function () {
+        var keys = Object.keys(_varMayBe).sort();
+        var out = '';
+        for (var _mki = 0; _mki < keys.length; _mki++) {
+          var slot = _varMayBe[keys[_mki]];
+          out += keys[_mki] + '=' + (slot.complete ? '*' : '#');
+          if (slot.complete && slot.vals) {
+            for (var _mvi = 0; _mvi < slot.vals.length; _mvi++) {
+              out += '|' + slot.vals[_mvi].sort + ':' + slot.vals[_mvi].lit;
+            }
+          }
+          out += ';';
+        }
+        return out;
+      };
+      const FIXPOINT_MAX_ITERS = 16;
+      var _prevSig = '';
+      for (var _fpIter = 0; _fpIter < FIXPOINT_MAX_ITERS; _fpIter++) {
+        for (var _cbi = 0; _cbi < _pendingCallbacks.length; _cbi++) {
+          var _cb = _pendingCallbacks[_cbi];
+          var _prevInEH = inEventHandler;
+          if (_cb.isEventHandler) inEventHandler = true;
+          try { await instantiateFunction(_cb.fn, _cb.params); }
+          finally { inEventHandler = _prevInEH; }
+        }
+        _dedupeFindings();
+        var _sig = _snapshotBindingsJson() + '||MB:' + _snapshotMayBe() + '||' +
+                   (taintFindings ? taintFindings.length + ':' + taintFindings.map(_findingKey).sort().join('|') : '');
+        if (_sig === _prevSig) break;
+        _prevSig = _sig;
+      }
+    }
+
+    } finally {
+      _currentVarMayBe = _savedCurrentVarMayBe;
+      _currentMayBeKey = _savedCurrentMayBeKey;
+    }
 
     // Advance the scope walker to a new stop position, processing all
     // tokens between the current stop and the new one. This allows
     // the caller to incrementally build scope state for each statement
     // in a build region.
-    const advanceTo = (newStop) => {
+    const advanceTo = async (newStop) => {
       const ns = Math.min(newStop, tokens.length);
-      if (ns > stop) { walkRange(stop, ns); stop = ns; }
+      if (ns > stop) { await walkRange(stop, ns); stop = ns; }
     };
 
     // Parse tokens[start, end) as a concat chain, expanding identifier
     // references, member paths, `[...].join(sep)`, and `.concat(...)` calls.
     // Returns the flat chain tokens (alternating operand / plus) or null.
-    const parseRange = (start, end) => {
-      const r = readConcatExpr(start, end, TERMS_NONE);
+    const parseRange = async (start, end) => {
+      const r = await readConcatExpr(start, end, TERMS_NONE);
       if (!r || r.next !== end) return null;
       return r.toks;
     };
@@ -6385,16 +8591,16 @@
   // paths, `.join(sep)`, `.concat(...)`, and template interpolation); if that
   // fails, falls back to per-identifier substitution so downstream chain
   // detection can still find partial matches.
-  function resolveIdentifiers(tokens, startIdx, endIdx, buildVarOrVars) {
+  async function resolveIdentifiers(tokens, startIdx, endIdx, buildVarOrVars) {
     const externallyMutable = scanMutations(tokens);
-    const state = buildScopeState(tokens, startIdx, externallyMutable, buildVarOrVars);
-    const full = state.parseRange(startIdx, endIdx);
+    const state = await buildScopeState(tokens, startIdx, externallyMutable, buildVarOrVars);
+    const full = await state.parseRange(startIdx, endIdx);
     if (full) return { tokens: full, parsed: true, loopInfo: state.loopInfo, loopVars: state.loopVars, buildVarDeclStart: state.getBuildVarDeclStart(), inScope: state.inScope, resolve: state.resolve };
     const out = [];
     for (let i = startIdx; i < endIdx; i++) {
       const t = tokens[i];
       if (t.type === 'tmpl') {
-        const rw = state.rewriteTemplate(t);
+        const rw = await state.rewriteTemplate(t);
         if (rw.type === '_chain') { for (const ct of rw.toks) out.push(ct); }
         else out.push(rw);
         continue;
@@ -6403,7 +8609,7 @@
         const next = tokens[i + 1];
         const isLhs = next && next.type === 'sep' && next.char === '=';
         if (!isLhs) {
-          const b = state.resolvePath(t.text);
+          const b = await state.resolvePath(t.text);
           if (b && b.kind === 'chain') { for (const vt of b.toks) out.push(vt); continue; }
         }
       }
@@ -6735,314 +8941,23 @@
   // This avoids multi-level inlining which flattens scopes.
   // Uses the JS tokenizer for proper function detection and brace
   // matching (handles strings, comments, regex containing braces).
-  function convertHtmlBuilderFunctions(source) {
-    const result = { source: source, converted: new Set() };
-    const toks = tokenize(source);
-    const replacements = []; // { start, end, replacement }
-
-    for (let i = 0; i < toks.length; i++) {
-      // Look for: function NAME ( params ) {
-      if (toks[i].type !== 'other' || toks[i].text !== 'function') continue;
-      const funcStart = toks[i].start;
-
-      // Skip to name.
-      let j = i + 1;
-      while (j < toks.length && toks[j].type === 'sep' && toks[j].char === ';') j++;
-      if (j >= toks.length || toks[j].type !== 'other') continue;
-      const funcName = toks[j].text;
-      j++;
-
-      // Skip to (.
-      if (j >= toks.length || toks[j].type !== 'open' || toks[j].char !== '(') continue;
-      const paramsStart = toks[j].end;
-      j++;
-
-      // Find matching ).
-      let parenDepth = 1;
-      while (j < toks.length && parenDepth > 0) {
-        if (toks[j].type === 'open' && toks[j].char === '(') parenDepth++;
-        else if (toks[j].type === 'close' && toks[j].char === ')') parenDepth--;
-        if (parenDepth > 0) j++;
-      }
-      if (parenDepth !== 0 || j >= toks.length) continue;
-      const params = source.slice(paramsStart, toks[j].start);
-      j++;
-
-      // Skip to {.
-      if (j >= toks.length || toks[j].type !== 'open' || toks[j].char !== '{') continue;
-      const bodyStartPos = toks[j].end;
-      j++;
-
-      // Find matching } using the tokenizer's brace tracking.
-      let braceDepth = 1;
-      while (j < toks.length && braceDepth > 0) {
-        if (toks[j].type === 'open' && toks[j].char === '{') braceDepth++;
-        else if (toks[j].type === 'close' && toks[j].char === '}') braceDepth--;
-        if (braceDepth > 0) j++;
-      }
-      if (braceDepth !== 0 || j >= toks.length) continue;
-      const bodyEndPos = toks[j].start;
-      const funcEnd = toks[j].end;
-      const body = source.slice(bodyStartPos, bodyEndPos);
-
-      // Check the build-and-return pattern using the tokenizer to
-      // avoid matching inside strings or comments.
-      let hasInnerHTML = false;
-      // Tokenize the body to check for the build-and-return pattern.
-      // Find any variable that: (1) is declared with var/let X = ...,
-      // (2) has X += ..., and (3) has return X. The variable can have
-      // any name, not just "html".
-      const bodyToks = tokenize(body);
-      const declaredVars = new Set();
-      const concatVars = new Set();
-      const returnedVars = new Set();
-      for (let bi = 0; bi < bodyToks.length; bi++) {
-        const bt = bodyToks[bi];
-        if (bt.type === 'other' && /\.innerHTML$/.test(bt.text)) hasInnerHTML = true;
-        if (bt.type === 'other' && (bt.text === 'var' || bt.text === 'let') &&
-            bi + 1 < bodyToks.length && bodyToks[bi + 1].type === 'other' && IDENT_RE.test(bodyToks[bi + 1].text) &&
-            bi + 2 < bodyToks.length && bodyToks[bi + 2].type === 'sep' && bodyToks[bi + 2].char === '=') {
-          declaredVars.add(bodyToks[bi + 1].text);
-        }
-        if (bt.type === 'other' && IDENT_RE.test(bt.text) &&
-            bi + 1 < bodyToks.length && bodyToks[bi + 1].type === 'sep' && bodyToks[bi + 1].char === '+=') {
-          concatVars.add(bt.text);
-        }
-        if (bt.type === 'other' && bt.text === 'return' &&
-            bi + 1 < bodyToks.length && bodyToks[bi + 1].type === 'other' && IDENT_RE.test(bodyToks[bi + 1].text)) {
-          returnedVars.add(bodyToks[bi + 1].text);
-        }
-      }
-      // Find the build variable: declared, concatenated, and returned.
-      let buildVarName = null;
-      for (const v of declaredVars) {
-        if (concatVars.has(v) && returnedVars.has(v)) { buildVarName = v; break; }
-      }
-      if (hasInnerHTML || !buildVarName) continue;
-
-      // Convert: replace `return html` with a synthetic innerHTML
-      // assignment, run through the converter, wrap in fragment.
-      // Find the return html token position in body to do the replacement.
-      let syntheticBody = body;
-      for (let bi = 0; bi < bodyToks.length; bi++) {
-        if (bodyToks[bi].type === 'other' && bodyToks[bi].text === 'return' &&
-            bi + 1 < bodyToks.length && bodyToks[bi + 1].type === 'other' && bodyToks[bi + 1].text === buildVarName) {
-          const retStart = bodyToks[bi].start;
-          let retEnd = bodyToks[bi + 1].end;
-          if (bi + 2 < bodyToks.length && bodyToks[bi + 2].type === 'sep' && bodyToks[bi + 2].char === ';') {
-            retEnd = bodyToks[bi + 2].end;
-          }
-          syntheticBody = body.slice(0, retStart) + '__frag.innerHTML = ' + buildVarName + ';' + body.slice(retEnd);
-          break;
-        }
-      }
-
-      const extractions = extractAllHTML(syntheticBody);
-      if (extractions.length > 0) {
-        const ex = extractions[0];
-        const used = new Set();
-        const domBlock = convertOne(syntheticBody, ex, false, false, used, '__frag', result.converted);
-        if (domBlock) {
-          let converted = domBlock
-            .replace('__frag.replaceChildren();\n', '')
-            .replace(/__frag/g, '__f');
-          const indented = converted.split('\n').map(function(l) { return '  ' + l; }).join('\n');
-          const newBody = '  var __f = document.createDocumentFragment();\n' + indented + '\n  return __f;\n';
-          replacements.push({
-            start: funcStart,
-            end: funcEnd,
-            replacement: 'function ' + funcName + '(' + params + ') {\n' + newBody + '}'
-          });
-          result.converted.add(funcName);
-        }
-      }
-    }
-    // Apply replacements in reverse order.
-    if (replacements.length) {
-      let s = source;
-      replacements.sort(function(a, b) { return b.start - a.start; });
-      for (const r of replacements) {
-        s = s.slice(0, r.start) + r.replacement + s.slice(r.end);
-      }
-      result.source = s;
-    }
-    return result;
-  }
+  // convertHtmlBuilderFunctions: moved to htmldom-convert.js
 
   // Core conversion: takes a raw input string, returns the converted output.
   // sourceName: optional filename for naming output files (e.g. 'index.html').
-  function convertRaw(raw, sourceName, externalDomFunctions) {
-    // Derive the handlers filename from the source.
-    const baseName = sourceName ? sourceName.replace(/\.[^.]+$/, '') : 'index';
-    const handlersFile = baseName + '.handlers.js';
-    try {
-      // If input starts with HTML, use the HTML tokenizer to split into
-      // HTML portions and <script> blocks. Convert inline scripts for
-      // innerHTML replacements, extract unsafe attributes (events, styles,
-      // javascript: URLs) into a separate JS file.
-      if (/^\s*</.test(raw)) {
-        const markup = convertHtmlMarkup(raw, sourceName || 'index.html');
-        // Combine inline script blocks and process innerHTML assignments.
-        const jsFileLines = [];
-        const sharedUsed = new Set();
-        if (markup.extractedScripts.length > 0) {
-          const separator = '\n/*__BLOCK_SEP__*/\n';
-          let combinedJs = markup.extractedScripts.map(function(s) { return s.content; }).join(separator);
-          const prepass = convertHtmlBuilderFunctions(combinedJs);
-          combinedJs = prepass.source;
-          const extractions = extractAllHTML(combinedJs);
-          if (extractions.length === 0) {
-            for (const s of markup.extractedScripts) jsFileLines.push(s.content.trim());
-          } else {
-            const trimmed = combinedJs.trim();
-            let scriptOutput = '';
-            let cursor = 0;
-            for (const ex of extractions) {
-              if (ex.srcStart === undefined) continue;
-              const domBlock = convertOne(combinedJs, ex, false, false, sharedUsed, null, prepass.converted);
-              let srcStart = ex.srcStart;
-              let srcEnd = ex.srcEnd;
-              if (ex.buildVarDeclStart >= 0) {
-                srcStart = ex.buildVarDeclStart;
-              }
-              let pre = trimmed.slice(cursor, srcStart);
-              pre = pre.replace(/\n\s*$/, '\n');
-              scriptOutput += pre;
-              if (domBlock) {
-                let lineStart = srcStart;
-                while (lineStart > 0 && trimmed[lineStart - 1] !== '\n') lineStart--;
-                const indent = trimmed.slice(lineStart, srcStart).match(/^(\s*)/)[1];
-                const indented = domBlock.split('\n').map(function(line) { return indent + line; }).join('\n');
-                scriptOutput += indented;
-                if (!indented.endsWith('\n')) scriptOutput += '\n';
-              }
-              cursor = srcEnd;
-              while (cursor < trimmed.length && (trimmed[cursor] === ';' || trimmed[cursor] === ' ' || trimmed[cursor] === '\n')) cursor++;
-            }
-            scriptOutput += trimmed.slice(cursor);
-            scriptOutput = scriptOutput.replace(/\n\/\*__BLOCK_SEP__\*\/\n/g, '\n');
-            jsFileLines.push(scriptOutput.trim());
-          }
-        }
-        // Build output: cleaned HTML + handlers JS + extracted script JS.
-        const handlersContent = markup.handlers ? markup.handlers.content : '';
-        const allJs = [handlersContent].concat(jsFileLines).filter(Boolean);
-        const jsFile = allJs.length ? '// Generated by HTML to DOM API Converter\n// Extracted inline handlers, styles, and innerHTML conversions.\n\n' + allJs.join('\n\n') + '\n' : '';
-        if (jsFile) {
-          return ('// === ' + (sourceName || 'index.html') + ' ===\n' + markup.html + '\n\n// === ' + handlersFile + ' ===\n' + jsFile);
-        } else {
-          return (markup.html);
-        }
-      }
-
-      // Pure JS input (no leading <).
-      // The scope walker handles function inlining (including complex
-      // builder functions with loops). External DOM function names
-      // from cross-file pre-pass are passed via externalDomFunctions.
-      const processedRaw = raw;
-      const allDomFunctions = new Set();
-      if (externalDomFunctions) {
-        for (const fn of externalDomFunctions) allDomFunctions.add(fn);
-      }
-      const extractions = extractAllHTML(processedRaw);
-      if (extractions.length === 0) {
-        const summary = summarizeDomConstruction(processedRaw);
-        if (summary) { return summary; }
-        return (convertOne(processedRaw, extractHTML(processedRaw), false, false) || '');
-        return;
-      }
-      // Inline rewriting: preserve original code, replace innerHTML sites.
-      const trimmed = processedRaw.trim();
-      let output = '';
-      let cursor = 0;
-      const sharedUsed = new Set();
-      // Reserve all identifiers from the source code so generated
-      // variable names don't collide with user variables.
-      const srcToks = extractions[0] && extractions[0]._tokens ? extractions[0]._tokens : tokenize(trimmed);
-      for (const st of srcToks) {
-        if (st.type === 'other' && IDENT_RE.test(st.text)) sharedUsed.add(st.text);
-      }
-      // Also reserve target identifier roots.
-      for (const ex of extractions) {
-        if (ex.target) {
-          const root = ex.target.match(/^[A-Za-z_$][A-Za-z0-9_$]*/);
-          if (root) sharedUsed.add(root[0]);
-        }
-      }
-      for (const ex of extractions) {
-        if (ex.srcStart === undefined) continue;
-        const target = ex.target || 'document.body';
-        const assignOp = ex.assignOp || '=';
-
-        const domBlock = convertOne(processedRaw, ex, false, false, sharedUsed, null, allDomFunctions);
-        let srcStart = ex.srcStart;
-        let srcEnd = ex.srcEnd;
-        // When the chain carries preserve tokens, the region starts at
-        // the build var declaration. No findBuildRegion needed.
-        if (ex.buildVarDeclStart >= 0) {
-          srcStart = ex.buildVarDeclStart;
-        }
-        let pre = trimmed.slice(cursor, srcStart);
-        pre = pre.replace(/\n\s*$/, '\n');
-        output += pre;
-        if (domBlock) {
-          let lineStart = srcStart;
-          while (lineStart > 0 && trimmed[lineStart - 1] !== '\n') lineStart--;
-          const indent = trimmed.slice(lineStart, srcStart).match(/^(\s*)/)[1];
-          output += domBlock.split('\n').map((line) => indent + line).join('\n');
-          if (!output.endsWith('\n')) output += '\n';
-        }
-        cursor = srcEnd;
-        while (cursor < trimmed.length && (trimmed[cursor] === ';' || trimmed[cursor] === ' ' || trimmed[cursor] === '\n')) cursor++;
-      }
-      output += trimmed.slice(cursor);
-      return output;
-    } catch (err) {
-      return ('// Error: ' + err.message);
-    }
-  }
+  // convertRaw: moved to htmldom-convert.js
 
   // UI wrapper: reads from editor, converts, writes to output.
-  function convert() {
-    const raw = (typeof window !== 'undefined' && window._monacoIn) ? window._monacoIn.getValue() : ($('in') ? $('in').value : '');
-    setOutput(convertRaw(raw) || '');
-  }
+  // convert: UI glue moved to monaco-init.js
 
   let lastOutput = '';
-  function setOutput(text) {
-    lastOutput = text;
-    if (typeof window !== 'undefined' && window._monacoOut) {
-      window._monacoOut.setValue(text);
-    } else if ($('out')) {
-      $('out').value = text;
-    }
-  }
+  // setOutput: UI glue moved to monaco-init.js
 
   // Summarize the DOM tree the script constructs via createElement /
   // appendChild / setAttribute as HTML comments. The script's own code
   // is already safe (no innerHTML), so there's nothing to rewrite; the
   // summary shows what the user ends up building.
-  function summarizeDomConstruction(raw) {
-    const dom = extractAllDOM(raw);
-    if (!dom || !dom.roots || !dom.roots.length) return '';
-    const hasCreate = dom.ops && dom.ops.some((o) => o.op === 'create' || o.op === 'createTextNode');
-    if (!hasCreate) return '';
-    const lines = ['// === DOM construction (already safe; summary only) ==='];
-    for (const root of dom.roots) {
-      if (root.kind === 'textNode') continue;
-      if (!root.origin || root.origin.kind !== 'create') continue;
-      lines.push('//   ' + (dom.html[root.id] || '').replace(/\n/g, ' '));
-    }
-    // Show what the attached children of looked-up elements become.
-    for (const el of dom.elements) {
-      if (el.kind !== 'element') continue;
-      if (!el.origin || el.origin.kind !== 'lookup') continue;
-      if (!el.children.length) continue;
-      const where = '#' + el.origin.value + (el.origin.by === 'selector' ? ' (query)' : '');
-      lines.push('//   ' + where + ' receives: ' + (dom.html[el.id] || '').replace(/\n/g, ' '));
-    }
-    return lines.length > 1 ? lines.join('\n') : '';
-  }
+  // summarizeDomConstruction: moved to htmldom-convert.js
 
   // ---------------------------------------------------------------------------
   // Direct chain-to-DOM converter: bypass DOMParser, work from chain tokens.
@@ -7060,1092 +8975,32 @@
   //
   // For runtime-dependent structure (state machines with unbalanced
   // tags), falls back to a runtime parent pointer only where needed.
-  function convertOne(raw, result, multi, emitTitle, sharedUsed, parentOverride, domFunctions) {
-    const { target, assignProp, assignOp } = result;
-
-    let parent = parentOverride || 'document.body';
-    let parentFromAssignment = false;
-    if (target) {
-      parent = assignProp === 'outerHTML' ? target + '.parentNode' : target;
-      parentFromAssignment = true;
-    }
-
-    const domFuncs = domFunctions || new Set();
-    const lines = [];
-    const used = sharedUsed || new Set();
-
-    const parentRoot = parent.match(/^[A-Za-z_$][A-Za-z0-9_$]*/);
-    if (parentRoot) used.add(parentRoot[0]);
-    const SVG_NS_STR = "'http://www.w3.org/2000/svg'";
-    const MATHML_NS_STR = "'http://www.w3.org/1998/Math/MathML'";
-
-    if (parentFromAssignment && assignOp === '=' && assignProp === 'innerHTML') {
-      lines.push(target + '.replaceChildren();');
-    }
-
-    const chainTokens = result.chainTokens || [];
-    if (chainTokens.length === 0 || (chainTokens.length === 1 && chainTokens[0].type === 'str' && chainTokens[0].text === '')) {
-      return lines.length ? lines.join('\n') : '// (no nodes parsed)';
-    }
-
-    // Compile-time parent stack: tracks which variable is the current
-    // parent at each nesting level. No runtime parent pointer needed.
-    var parentStack = [parent]; // stack of variable names
-    var runtimeParentVars = new Set(); // variables that are runtime parent pointers
-    var inUnbalancedLoop = false; // true when inside a loop with unbalanced tags
-    function curParent() { return parentStack[parentStack.length - 1]; }
-    function isRuntimeVar(name) { return runtimeParentVars.has(name); }
-
-    // Stateful HTML parser that persists across chain tokens.
-    // States: TEXT, TAG_OPEN, ATTRS, ATTR_NAME, ATTR_EQ,
-    //         ATTR_VAL_DQ, ATTR_VAL_SQ, ATTR_VAL_UQ, TAG_CLOSE, COMMENT
-    const S_TEXT = 0, S_TAG_OPEN = 1, S_ATTRS = 2, S_ATTR_NAME = 3;
-    const S_ATTR_EQ = 4, S_ATTR_VAL_DQ = 5, S_ATTR_VAL_SQ = 6;
-    const S_ATTR_VAL_UQ = 7, S_TAG_CLOSE = 8, S_COMMENT = 9;
-    let hState = S_TEXT;
-    let hTag = '';
-    let hAttrName = '';
-    let hAttrVal = '';
-    let hAttrExprs = []; // dynamic expressions embedded in attribute value
-    let hAttrs = [];     // { name, value, dynamic:bool, exprs:[] }
-    let hTagVar = '';     // variable name for current element being built
-    let hCommentBuf = '';
-    let hTextBuf = '';
-    let hParentTags = []; // track parent tag names for auto-tbody
-    let hTbodyVar = null; // variable for auto-inserted tbody
-
-    // Infer the target element's tag from the chain content. If the
-    // first HTML tag is <tr>, the target must be a table-like element.
-    // Initialize hParentTags so auto-tbody works correctly.
-    for (var ci = 0; ci < chainTokens.length; ci++) {
-      if (chainTokens[ci].type === 'str' && chainTokens[ci].text.trim()) {
-        var firstTag = chainTokens[ci].text.match(/<([a-zA-Z][a-zA-Z0-9]*)/);
-        if (firstTag && firstTag[1].toLowerCase() === 'tr') {
-          hParentTags = ['table'];
-        }
-        break;
-      }
-    }
-
-    function hFlushText() {
-      if (hTextBuf) {
-        const decoded = decodeHtmlEntities(hTextBuf);
-        lines.push(curParent() + '.appendChild(document.createTextNode(' + jsStr(decoded).code + '));');
-        hTextBuf = '';
-      }
-    }
-
-    function hFinishAttr() {
-      if (hAttrName) {
-        hAttrs.push({
-          name: hAttrName.toLowerCase(),
-          value: decodeHtmlEntities(hAttrVal),
-          dynamic: hAttrExprs.length > 0,
-          exprs: hAttrExprs.slice(),
-        });
-      }
-      hAttrName = '';
-      hAttrVal = '';
-      hAttrExprs = [];
-    }
-
-    function hCommitTag(selfClose) {
-      const tagLower = hTag.toLowerCase();
-      if (VOID_ELEMENTS.has(tagLower)) selfClose = true;
-
-      let nsExpr = null;
-      if (tagLower === 'svg') nsExpr = SVG_NS_STR;
-      else if (tagLower === 'math') nsExpr = MATHML_NS_STR;
-      else if (SVG_TAGS.has(tagLower)) nsExpr = SVG_NS_STR;
-
-      const v = makeVar(hTag, used);
-      hTagVar = v;
-      if (nsExpr) {
-        lines.push('const ' + v + ' = document.createElementNS(' + nsExpr + ', ' + jsStr(tagLower).code + ');');
-      } else {
-        lines.push('const ' + v + ' = document.createElement(' + jsStr(tagLower).code + ');');
-      }
-
-      const eventAttrs = [];
-      for (const attr of hAttrs) {
-        // Compile-time conditional attribute: if (cond) el.setAttribute(...)
-        if (attr.kind === 'cond_attr') {
-          if (BOOLEAN_ATTRS.has(attr.name)) {
-            lines.push('if (' + attr.condExpr + ') ' + v + '.' + attr.name + ' = true;');
-          } else {
-            lines.push('if (' + attr.condExpr + ') ' + v + '.setAttribute(' + jsStr(attr.name).code + ', ' + jsStr(attr.value).code + ');');
-          }
-          continue;
-        }
-        // All attribute expressions are resolved at compile time —
-        // no dynamic_name kind exists. The scope walker resolves
-        // opaque bracket access and property chains to symbolic
-        // expressions, and ternaries are parsed by the JS tokenizer.
-        const name = attr.name;
-        // Extract inline event handlers and javascript: URLs.
-        if (name.length > 2 && name.slice(0, 2) === 'on' && !attr.dynamic) {
-          eventAttrs.push({ event: name.slice(2), handler: attr.value });
-          continue;
-        }
-        if (name === 'href' && !attr.dynamic && attr.value.slice(0, 11).toLowerCase() === 'javascript:') {
-          eventAttrs.push({ event: 'click', handler: attr.value.slice(11), preventDefault: true });
-          continue;
-        }
-        if (attr.dynamic) {
-          // Build expression from static parts + dynamic expressions.
-          const parts = [];
-          let cursor = 0;
-          const sorted = attr.exprs.slice().sort(function(a, b) { return a.pos - b.pos; });
-          for (const e of sorted) {
-            if (e.pos > cursor) parts.push(jsStr(decodeHtmlEntities(attr.value.slice(cursor, e.pos))).code);
-            parts.push(e.expr);
-            cursor = e.pos;
-          }
-          if (cursor < attr.value.length) parts.push(jsStr(decodeHtmlEntities(attr.value.slice(cursor))).code);
-          const valExpr = parts.length === 1 ? parts[0] : parts.join(' + ');
-
-          if (name === 'style') {
-            lines.push(v + '.setAttribute(' + jsStr(name).code + ', ' + valExpr + ');');
-          } else if (name === 'class') {
-            lines.push(v + '.className = ' + valExpr + ';');
-          } else if (!nsExpr && isIdlProp(name)) {
-            lines.push(v + '.' + (ATTR_TO_PROP[name] || name) + ' = ' + valExpr + ';');
-          } else {
-            lines.push(v + '.setAttribute(' + jsStr(name).code + ', ' + valExpr + ');');
-          }
-        } else {
-          const val = attr.value;
-          if (name === 'style') {
-            const decls = parseStyleDecls(val);
-            for (const d of decls) {
-              lines.push(v + '.style.setProperty(' + jsStr(d.prop).code + ', ' + jsStr(d.value).code + (d.important ? ", 'important'" : '') + ');');
-            }
-          } else if (name === 'class') {
-            const classes = val.split(/\s+/).filter(Boolean);
-            if (classes.length === 1) lines.push(v + '.className = ' + jsStr(val).code + ';');
-            else if (classes.length > 1) lines.push(v + '.classList.add(' + classes.map(function(c) { return jsStr(c).code; }).join(', ') + ');');
-          } else if (!nsExpr && BOOLEAN_ATTRS.has(name) && (val === '' || val === name)) {
-            lines.push(v + '.' + (ATTR_TO_PROP[name] || name) + ' = true;');
-          } else if (!nsExpr && isIdlProp(name)) {
-            lines.push(v + '.' + (ATTR_TO_PROP[name] || name) + ' = ' + jsStr(val).code + ';');
-          } else {
-            lines.push(v + '.setAttribute(' + jsStr(name).code + ', ' + jsStr(val).code + ');');
-          }
-        }
-      }
-
-      // Auto-insert <tbody> when <tr> is a direct child of <table>.
-      // Skip if tbody was already pre-created by the loop pre-scan.
-      if (tagLower === 'tr' && hParentTags.length > 0 && hParentTags[hParentTags.length - 1] === 'table') {
-        if (!hTbodyVar) {
-          hTbodyVar = makeVar('tbody', used);
-          lines.push('const ' + hTbodyVar + ' = document.createElement(\'tbody\');');
-          lines.push(curParent() + '.appendChild(' + hTbodyVar + ');');
-        }
-        parentStack.push(hTbodyVar);
-        hParentTags.push('tbody');
-      }
-      // Auto-close implicit <tbody> when table section elements appear.
-      if ((tagLower === 'tfoot' || tagLower === 'thead' || tagLower === 'caption') &&
-          hParentTags.length > 0 && hParentTags[hParentTags.length - 1] === 'tbody') {
-        parentStack.pop();
-        hParentTags.pop();
-      }
-
-      // Emit event listeners for extracted on* attributes.
-      for (const ev of eventAttrs) {
-        if (ev.preventDefault) {
-          lines.push(v + '.addEventListener(' + jsStr(ev.event).code + ', function(event) {');
-          lines.push('  event.preventDefault();');
-          lines.push('  ' + ev.handler);
-          lines.push('});');
-        } else {
-          lines.push(v + '.addEventListener(' + jsStr(ev.event).code + ', function(event) { ' + ev.handler + ' });');
-        }
-      }
-
-      var parentExpr = curParent();
-      lines.push(parentExpr + '.appendChild(' + v + ');');
-      if (!selfClose) {
-        // In unbalanced loops, update the runtime parent variable
-        // so the next iteration appends to the new element.
-        if (inUnbalancedLoop && isRuntimeVar(parentExpr)) {
-          lines.push(parentExpr + ' = ' + v + ';');
-        }
-        parentStack.push(v);
-        hParentTags.push(tagLower);
-      }
-      hTag = '';
-      hAttrs = [];
-      hTagVar = '';
-    }
-
-    // Feed a character from a string literal through the HTML state machine.
-    function hFeedStr(text) {
-      for (let i = 0; i < text.length; i++) {
-        const c = text[i];
-        switch (hState) {
-          case S_TEXT:
-            if (c === '<') {
-              hFlushText();
-              if (text[i+1] === '/' && i+1 < text.length) { hState = S_TAG_CLOSE; hTag = ''; i++; }
-              else if (text[i+1] === '!' && text[i+2] === '-' && text[i+3] === '-') { hState = S_COMMENT; hCommentBuf = ''; i += 3; }
-              else { hState = S_TAG_OPEN; hTag = ''; }
-            } else {
-              hTextBuf += c;
-            }
-            break;
-          case S_TAG_OPEN:
-            if (c === ' ' || c === '\t' || c === '\n') { if (hTag) { hState = S_ATTRS; hAttrs = []; } }
-            else if (c === '>') { hCommitTag(false); hState = S_TEXT; }
-            else if (c === '/' && text[i+1] === '>') { hCommitTag(true); hState = S_TEXT; i++; }
-            else hTag += c;
-            break;
-          case S_TAG_CLOSE:
-            if (c === '>') {
-              const closingTagLower = hTag.toLowerCase();
-              // Auto-close implicit <tbody> when closing <table>.
-              if (closingTagLower === 'table' && hParentTags.length > 0 && hParentTags[hParentTags.length - 1] === 'tbody') {
-                parentStack.pop();
-                hParentTags.pop();
-              }
-              // Pop the parent stack and, if the new current parent is a
-              // runtime variable, emit a parentNode walk so it tracks correctly.
-              parentStack.pop();
-              if (parentStack.length > 0 && isRuntimeVar(curParent())) {
-                lines.push(curParent() + ' = ' + curParent() + '.parentNode;');
-              }
-              if (hParentTags.length > 0) hParentTags.pop();
-              hTag = '';
-              hState = S_TEXT;
-            } else {
-              hTag += c;
-            }
-            break;
-          case S_ATTRS:
-            if (c === '>') { hFinishAttr(); hCommitTag(false); hState = S_TEXT; }
-            else if (c === '/' && text[i+1] === '>') { hFinishAttr(); hCommitTag(true); hState = S_TEXT; i++; }
-            else if (c !== ' ' && c !== '\t' && c !== '\n') { hAttrName = c; hAttrVal = ''; hAttrExprs = []; hState = S_ATTR_NAME; }
-            break;
-          case S_ATTR_NAME:
-            if (c === '=') { hState = S_ATTR_EQ; }
-            else if (c === ' ' || c === '\t') { hFinishAttr(); hState = S_ATTRS; }
-            else if (c === '>') { hFinishAttr(); hCommitTag(false); hState = S_TEXT; }
-            else if (c === '/' && text[i+1] === '>') { hFinishAttr(); hCommitTag(true); hState = S_TEXT; i++; }
-            else hAttrName += c;
-            break;
-          case S_ATTR_EQ:
-            if (c === '"') hState = S_ATTR_VAL_DQ;
-            else if (c === "'") hState = S_ATTR_VAL_SQ;
-            else if (c !== ' ' && c !== '\t') { hAttrVal = c; hState = S_ATTR_VAL_UQ; }
-            break;
-          case S_ATTR_VAL_DQ:
-            if (c === '"') { hFinishAttr(); hState = S_ATTRS; }
-            else hAttrVal += c;
-            break;
-          case S_ATTR_VAL_SQ:
-            if (c === "'") { hFinishAttr(); hState = S_ATTRS; }
-            else hAttrVal += c;
-            break;
-          case S_ATTR_VAL_UQ:
-            if (c === ' ' || c === '\t') { hFinishAttr(); hState = S_ATTRS; }
-            else if (c === '>') { hFinishAttr(); hCommitTag(false); hState = S_TEXT; }
-            else hAttrVal += c;
-            break;
-          case S_COMMENT:
-            if (c === '-' && text[i+1] === '-' && text[i+2] === '>') {
-              lines.push(curParent() + '.appendChild(document.createComment(' + jsStr(hCommentBuf).code + '));');
-              hState = S_TEXT; i += 2;
-            } else hCommentBuf += c;
-            break;
-        }
-      }
-    }
-
-    // Feed an expression token. If we're inside an attribute value,
-    // the expression becomes a dynamic part of that attribute.
-    // If we're in text context, it becomes a text node.
-    function hFeedExpr(expr) {
-      if (hState === S_ATTR_VAL_DQ || hState === S_ATTR_VAL_SQ || hState === S_ATTR_VAL_UQ) {
-        // Dynamic expression in attribute value.
-        hAttrExprs.push({ pos: hAttrVal.length, expr: expr });
-      } else if (hState === S_ATTRS || hState === S_TAG_OPEN) {
-        // Expression inside a tag (between attributes).
-        // Parse the expression at compile time to extract attribute
-        // name/value. Use the JS tokenizer to detect ternary patterns.
-        hFinishAttr();
-        var parsed = false;
-        // Detect ternary: cond ? " attr" : "" or cond ? "" : " attr"
-        var toks = tokenize(expr);
-        var qIdx = -1;
-        for (var ti = 0; ti < toks.length; ti++) {
-          if (toks[ti].type === 'other' && toks[ti].text === '?') { qIdx = ti; break; }
-        }
-        if (qIdx > 0) {
-          // Find the : separator (at depth 0)
-          var colonIdx = -1;
-          var depth = 0;
-          for (var ti = qIdx + 1; ti < toks.length; ti++) {
-            if (toks[ti].type === 'open') depth++;
-            else if (toks[ti].type === 'close') depth--;
-            else if (depth === 0 && toks[ti].type === 'other' && toks[ti].text === ':') { colonIdx = ti; break; }
-          }
-          if (colonIdx > 0) {
-            // Extract condition, ifTrue, ifFalse as source text
-            var condEnd = toks[qIdx].start;
-            var trueStart = toks[qIdx].end;
-            var trueEnd = toks[colonIdx].start;
-            var falseStart = toks[colonIdx].end;
-            var condExpr = expr.slice(0, condEnd).trim();
-            var trueExpr = expr.slice(trueStart, trueEnd).trim();
-            var falseExpr = expr.slice(falseStart).trim();
-            // Check if one branch is a string and the other is empty
-            var trueStr = null, falseStr = null;
-            if (trueExpr.length >= 2 && (trueExpr[0] === '"' || trueExpr[0] === "'")) {
-              trueStr = trueExpr.slice(1, -1).trim();
-            }
-            if (falseExpr.length >= 2 && (falseExpr[0] === '"' || falseExpr[0] === "'")) {
-              falseStr = falseExpr.slice(1, -1).trim();
-            }
-            if (trueStr !== null && (falseStr === '' || falseExpr === '""' || falseExpr === "''")) {
-              // cond ? " attr" : "" — conditional attribute
-              var eqPos = trueStr.indexOf('=');
-              if (eqPos >= 0) {
-                hAttrs.push({ kind: 'cond_attr', condExpr: condExpr, name: trueStr.slice(0, eqPos), value: trueStr.slice(eqPos + 1).replace(/^['"]/, '').replace(/['"]$/, '') });
-              } else if (trueStr) {
-                hAttrs.push({ kind: 'cond_attr', condExpr: condExpr, name: trueStr, value: '' });
-              }
-              parsed = true;
-            } else if (falseStr !== null && (trueStr === '' || trueExpr === '""' || trueExpr === "''")) {
-              // cond ? "" : " attr" — inverted conditional
-              var eqPos2 = falseStr.indexOf('=');
-              if (eqPos2 >= 0) {
-                hAttrs.push({ kind: 'cond_attr', condExpr: '!(' + condExpr + ')', name: falseStr.slice(0, eqPos2), value: falseStr.slice(eqPos2 + 1).replace(/^['"]/, '').replace(/['"]$/, '') });
-              } else if (falseStr) {
-                hAttrs.push({ kind: 'cond_attr', condExpr: '!(' + condExpr + ')', name: falseStr, value: '' });
-              }
-              parsed = true;
-            }
-          }
-        }
-        // If the expression wasn't parsed as a ternary, let it flow
-        // through — the next string token will close the tag normally.
-        // The expression was already processed by the scope walker;
-        // if it resolved to a concrete string, it would be a str token
-        // parsed by hFeedStr, not an other token reaching here.
-      } else {
-        // Text context — emit as text node or DOM call.
-        hFlushText();
-        const isDomCall = domFuncs.size > 0 &&
-          [...domFuncs].some(function(fn) { return new RegExp('^' + fn.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*\\(').test(expr); });
-        if (isDomCall) {
-          lines.push(curParent() + '.appendChild(' + expr + ');');
-        } else {
-          lines.push(curParent() + '.appendChild(document.createTextNode(' + expr + '));');
-        }
-      }
-    }
-
-    // Recursively process chain tokens.
-    function emitChain(tokens) {
-      for (let ti = 0; ti < tokens.length; ti++) {
-        const t = tokens[ti];
-        if (t.type === 'plus') continue;
-        // Multi-target: switch the active __p to a different target element.
-        if (t.type === '_targetPush') {
-          hFlushText();
-          parentStack.push(t.target);
-          continue;
-        }
-        if (t.type === '_targetPop') {
-          hFlushText();
-          parentStack.pop();
-          continue;
-        }
-        if (t.type === 'str') hFeedStr(t.text);
-        else if (t.type === 'tmpl') {
-          // Template literal: process each part — text portions through
-          // the HTML parser, expression portions as dynamic values.
-          for (const p of t.parts) {
-            if (p.kind === 'text') {
-              hFeedStr(decodeJsString(p.raw, '`'));
-            } else if (p.kind === 'expr') {
-              hFeedExpr(p.expr.trim());
-            }
-          }
-        }
-        else if (t.type === 'other') hFeedExpr(t.text);
-        else if (t.type === 'preserve') { hFlushText(); lines.push(t.text); }
-        else if (t.type === 'cond') {
-          function condToExpr(ct) {
-            if (ct.length === 1 && ct[0].type === 'str') return JSON.stringify(ct[0].text);
-            if (ct.length === 1 && ct[0].type === 'other') return ct[0].text;
-            return ct.filter(function(x){return x.type!=='plus';}).map(function(x) {
-              return x.type === 'str' ? JSON.stringify(x.text) : x.text;
-            }).join(' + ');
-          }
-          if (hState === S_ATTR_VAL_DQ || hState === S_ATTR_VAL_SQ || hState === S_ATTR_VAL_UQ) {
-            // Inside an attribute value: emit as ternary expression.
-            var ternaryExpr = '(' + t.condExpr + ' ? ' + condToExpr(t.ifTrue) + ' : ' + condToExpr(t.ifFalse) + ')';
-            hAttrExprs.push({ pos: hAttrVal.length, expr: ternaryExpr });
-          } else if (hState === S_ATTRS || hState === S_TAG_OPEN) {
-            // Between tag attributes: conditional attribute addition.
-            // Parse the branches at compile time to extract attribute
-            // name/value and emit a static if/setAttribute.
-            hFinishAttr();
-            var trueStr = t.ifTrue.length === 1 && t.ifTrue[0].type === 'str' ? t.ifTrue[0].text.trim() : null;
-            var falseStr = t.ifFalse.length === 1 && t.ifFalse[0].type === 'str' ? t.ifFalse[0].text.trim() : null;
-            if (trueStr && !falseStr) {
-              // Pattern: cond ? " selected" : "" — conditional boolean attr.
-              var eqPos = trueStr.indexOf('=');
-              if (eqPos >= 0) {
-                var aName = trueStr.slice(0, eqPos);
-                var aVal = trueStr.slice(eqPos + 1).replace(/^['"]/, '').replace(/['"]$/, '');
-                hAttrs.push({ kind: 'cond_attr', condExpr: t.condExpr, name: aName, value: aVal });
-              } else {
-                hAttrs.push({ kind: 'cond_attr', condExpr: t.condExpr, name: trueStr, value: '' });
-              }
-            } else if (falseStr && !trueStr) {
-              // Pattern: cond ? "" : " disabled" — inverted conditional.
-              var eqPos2 = falseStr.indexOf('=');
-              if (eqPos2 >= 0) {
-                hAttrs.push({ kind: 'cond_attr', condExpr: '!(' + t.condExpr + ')', name: falseStr.slice(0, eqPos2), value: falseStr.slice(eqPos2 + 1).replace(/^['"]/, '').replace(/['"]$/, '') });
-              } else {
-                hAttrs.push({ kind: 'cond_attr', condExpr: '!(' + t.condExpr + ')', name: falseStr, value: '' });
-              }
-            } else if (trueStr !== null && falseStr !== null) {
-              // Both branches produce attributes. Emit both as conditionals.
-              var trueEq = trueStr.indexOf('=');
-              var falseEq = falseStr.indexOf('=');
-              if (trueStr) hAttrs.push({ kind: 'cond_attr', condExpr: t.condExpr, name: trueEq >= 0 ? trueStr.slice(0, trueEq) : trueStr, value: trueEq >= 0 ? trueStr.slice(trueEq + 1).replace(/^['"]/, '').replace(/['"]$/, '') : '' });
-              if (falseStr) hAttrs.push({ kind: 'cond_attr', condExpr: '!(' + t.condExpr + ')', name: falseEq >= 0 ? falseStr.slice(0, falseEq) : falseStr, value: falseEq >= 0 ? falseStr.slice(falseEq + 1).replace(/^['"]/, '').replace(/['"]$/, '') : '' });
-            }
-          } else {
-            // Text context: check for unbalanced tags in branches.
-            // An unbalanced open tag (like <b> without </b>) means the
-            // parent depends on runtime state after the cond.
-            hFlushText();
-            var savedStack = parentStack.slice();
-            var savedHTags = hParentTags.slice();
-            var savedHState = hState;
-
-            // Process ifTrue branch, track stack changes.
-            lines.push('if (' + t.condExpr + ') {');
-            emitChain(t.ifTrue);
-            hFlushText();
-            var trueStack = parentStack.slice();
-            var trueHTags = hParentTags.slice();
-
-            // Restore and process ifFalse branch.
-            parentStack.length = 0;
-            for (var si = 0; si < savedStack.length; si++) parentStack.push(savedStack[si]);
-            hParentTags = savedHTags.slice();
-            hState = savedHState;
-            lines.push('} else {');
-            emitChain(t.ifFalse);
-            hFlushText();
-            var falseStack = parentStack.slice();
-            lines.push('}');
-
-            // If both branches end with the same parent stack, use it.
-            if (JSON.stringify(trueStack) === JSON.stringify(falseStack)) {
-              // Balanced: both branches end at the same nesting level.
-              parentStack.length = 0;
-              for (var si2 = 0; si2 < trueStack.length; si2++) parentStack.push(trueStack[si2]);
-            } else {
-              // Unbalanced: branches end at different nesting levels.
-              // Introduce a runtime parent variable for subsequent code.
-              // The variable is set in each branch to wherever that branch
-              // left the parent.
-              // Reuse existing runtime parent if the current parent is
-              // already a runtime variable (from a previous cond).
-              var existingRuntime = isRuntimeVar(curParent());
-              var condParent = existingRuntime ? curParent() : makeVar('current', used);
-              if (!existingRuntime) runtimeParentVars.add(condParent);
-              // Insert assignment in branches that CHANGED the parent.
-              // Branches that didn't change the stack (empty content)
-              // should NOT set current — it preserves its previous value
-              // (important for state machines where bold_on persists).
-              function insertBeforeFlowControl(startIdx, endIdx, assignment) {
-                var insertAt = endIdx;
-                for (var li = endIdx - 1; li >= startIdx; li--) {
-                  if (lines[li] === 'continue;' || lines[li] === 'break;') {
-                    insertAt = li;
-                  } else break;
-                }
-                lines.splice(insertAt, 0, assignment);
-              }
-              var trueChanged = JSON.stringify(trueStack) !== JSON.stringify(savedStack);
-              var falseChanged = JSON.stringify(falseStack) !== JSON.stringify(savedStack);
-              var elseIdx = lines.lastIndexOf('} else {');
-              if (trueChanged && elseIdx >= 0) {
-                insertBeforeFlowControl(0, elseIdx, condParent + ' = ' + trueStack[trueStack.length - 1] + ';');
-              }
-              if (falseChanged) {
-                var closeIdx = lines.lastIndexOf('}');
-                var elseIdx2 = lines.lastIndexOf('} else {');
-                if (closeIdx >= 0 && elseIdx2 >= 0) {
-                  insertBeforeFlowControl(elseIdx2 + 1, closeIdx, condParent + ' = ' + falseStack[falseStack.length - 1] + ';');
-                }
-              }
-              // If only one branch changes, remove the empty else.
-              if (!falseChanged) {
-                var eIdx = lines.lastIndexOf('} else {');
-                var cIdx = lines.lastIndexOf('}');
-                if (eIdx >= 0 && cIdx > eIdx) {
-                  // Check if else block is empty.
-                  var elseContent = lines.slice(eIdx + 1, cIdx).filter(function(l) { return l.trim(); });
-                  if (elseContent.length === 0) {
-                    lines.splice(eIdx, cIdx - eIdx + 1, '}');
-                  }
-                }
-              }
-              // Add var declaration BEFORE any enclosing loop (so it
-              // persists across iterations) or before the if if not in a loop.
-              var ifIdx = -1;
-              for (var li = lines.length - 1; li >= 0; li--) {
-                if (lines[li] === 'if (' + t.condExpr + ') {') { ifIdx = li; break; }
-              }
-              // Look for an enclosing loop header before the if.
-              var loopIdx = -1;
-              if (ifIdx >= 0) {
-                for (var li2 = ifIdx - 1; li2 >= 0; li2--) {
-                  if (/^(for|while|do)\b/.test(lines[li2])) { loopIdx = li2; break; }
-                  // Stop at function boundaries or other blocks.
-                  if (lines[li2] === '}') break;
-                }
-              }
-              if (!existingRuntime) {
-                var insertIdx = loopIdx >= 0 ? loopIdx : ifIdx;
-                if (insertIdx >= 0) {
-                  lines.splice(insertIdx, 0, 'var ' + condParent + ' = ' + savedStack[savedStack.length - 1] + ';');
-                }
-              }
-              // Replace parent stack with the runtime variable.
-              parentStack.length = 0;
-              var minLen = Math.min(trueStack.length, falseStack.length);
-              for (var si3 = 0; si3 < minLen; si3++) parentStack.push(savedStack[si3] || condParent);
-              parentStack.push(condParent);
-            }
-          }
-        } else if (t.type === 'trycatch') {
-          hFlushText();
-          var savedState1 = hState, savedParents1 = hParentTags.slice();
-          // Use a DocumentFragment for the try branch so partial DOM
-          // from a failed try doesn't pollute the main tree.
-          var tryFrag = makeVar('frag', used);
-          lines.push('var ' + tryFrag + ' = document.createDocumentFragment();');
-          var savedParent = curParent();
-          parentStack.push(tryFrag);
-          lines.push('try {');
-          emitChain(t.tryBody);
-          hFlushText();
-          // Success: append fragment to parent.
-          parentStack.pop();
-          lines.push(savedParent + '.appendChild(' + tryFrag + ');');
-          hState = savedState1; hParentTags = savedParents1.slice();
-          lines.push('} catch(' + (t.catchParam || 'e') + ') {');
-          // Failure: discard fragment, build catch content on parent directly.
-          emitChain(t.catchBody);
-          hFlushText();
-          lines.push('}');
-        } else if (t.type === 'switch') {
-          hFlushText();
-          lines.push('switch (' + t.discExpr + ') {');
-          for (const br of t.branches) {
-            if (br.label === 'default') lines.push('  default: {');
-            else lines.push('  case ' + br.caseExpr + ': {');
-            emitChain(br.chain);
-            lines.push('    break;');
-            lines.push('  }');
-          }
-          lines.push('}');
-        } else if (t.type === 'iter') {
-          hFlushText();
-          lines.push(t.iterExpr + '.forEach(function(' + t.paramName + ') {');
-          emitChain(t.perElemChain);
-          lines.push('});');
-        }
-      }
-    }
-
-    // Emit chain tokens with proper nested loop wrappers.
-    // Tokens carry loopId tags. When the loopId changes (increases),
-    // we've entered an inner loop. When it reverts to a previous id
-    // or null, we've exited. This handles arbitrary nesting depth.
-    function emitWithLoops(tokens, loopInfoMap) {
-      const toks = tokens.filter(function(t) { return t.type !== 'plus'; });
-      const openLoops = []; // stack of { id, runtimeParent, preStack }
-
-
-      function emitLoopHeader(id, upcomingTokens) {
-        // Pre-scan: if the loop body has <tr> that needs auto-tbody,
-        // create the tbody BEFORE the loop so it's not inside the loop.
-        if (upcomingTokens && !hTbodyVar && hParentTags.length > 0 && hParentTags[hParentTags.length - 1] === 'table') {
-          for (var ui = 0; ui < upcomingTokens.length; ui++) {
-            if (upcomingTokens[ui].type === 'str' && /<tr[\s>]/i.test(upcomingTokens[ui].text)) {
-              hTbodyVar = makeVar('tbody', used);
-              lines.push('const ' + hTbodyVar + ' = document.createElement(\'tbody\');');
-              lines.push(curParent() + '.appendChild(' + hTbodyVar + ');');
-              parentStack.push(hTbodyVar);
-              hParentTags.push('tbody');
-              break;
-            }
-          }
-        }
-        const info = loopInfoMap ? loopInfoMap[id] : null;
-        if (info) {
-          if (info.kind === 'do') lines.push('do {');
-          else lines.push((info.kind === 'while' ? 'while' : 'for') + ' (' + info.headerSrc + ') {');
-        } else {
-          lines.push('/* loop */ {');
-        }
-        openLoops.push({ id: id, runtimeParent: null, preStack: null });
-      }
-
-      function emitLoopFooter() {
-        const entry = openLoops.pop();
-        if (entry.runtimeParent) inUnbalancedLoop = false;
-        if (entry.runtimeParent && entry.preStack) {
-          parentStack.length = 0;
-          for (var ri = 0; ri < entry.preStack.length; ri++) parentStack.push(entry.preStack[ri]);
-          parentStack.push(entry.runtimeParent);
-        }
-        const id = entry.id;
-        const info = loopInfoMap ? loopInfoMap[id] : null;
-        if (info && info.kind === 'do') {
-          lines.push('} while (' + info.headerSrc + ');');
-        } else {
-          lines.push('}');
-        }
-      }
-
-      for (let i = 0; i < toks.length; i++) {
-        const t = toks[i];
-        // plus tokens don't carry loopId — inherit from surrounding context.
-        if (t.type === 'plus') { emitChain([t]); continue; }
-        const loopId = t.loopId != null ? t.loopId : null;
-        const currentLoop = openLoops.length > 0 ? openLoops[openLoops.length - 1].id : null;
-
-        if (loopId === currentLoop) {
-          // Same loop (or both null) — just emit.
-          emitChain([t]);
-        } else if (loopId !== null && currentLoop === null) {
-          // Entering a loop from non-loop context.
-          var upcoming = toks.slice(i);
-          var preLoopStack = parentStack.slice();
-          emitLoopHeader(loopId, upcoming);
-          // Check if loop body has unbalanced tags by pre-scanning
-          // for open/close tag counts.
-          var loopOpenTags = 0, loopCloseTags = 0;
-          for (var si = i; si < toks.length; si++) {
-            if (toks[si].type === 'plus') continue; // plus tokens don't carry loopId
-            if (toks[si].loopId !== loopId) break;
-            if (toks[si].type === 'str') {
-              var s = toks[si].text;
-              for (var ci = 0; ci < s.length; ci++) {
-                if (s[ci] === '<' && s[ci+1] !== '/' && s[ci+1] !== '!') loopOpenTags++;
-                if (s[ci] === '<' && s[ci+1] === '/') loopCloseTags++;
-              }
-            }
-          }
-          if (loopOpenTags !== loopCloseTags) {
-            // Unbalanced loop body — use runtime parent variable.
-            var loopParent = makeVar('current', used);
-            var existingRT = isRuntimeVar(curParent());
-            if (existingRT) {
-              loopParent = curParent();
-            } else {
-              runtimeParentVars.add(loopParent);
-              lines.splice(lines.length - 1, 0, 'var ' + loopParent + ' = ' + curParent() + ';');
-              parentStack.push(loopParent);
-            }
-            // Record on the loop entry so emitLoopFooter can restore.
-            openLoops[openLoops.length - 1].runtimeParent = loopParent;
-            openLoops[openLoops.length - 1].preStack = preLoopStack;
-            inUnbalancedLoop = true;
-          }
-          emitChain([t]);
-        } else if (loopId === null && currentLoop !== null) {
-          // Exiting all loops.
-          while (openLoops.length > 0) emitLoopFooter();
-          emitChain([t]);
-        } else if (loopId !== null && currentLoop !== null && loopId !== currentLoop) {
-          if (openLoops.some(function(e) { return e.id === loopId; })) {
-            // Returning to an outer loop — close inner loops.
-            while (openLoops.length > 0 && openLoops[openLoops.length - 1].id !== loopId) {
-              emitLoopFooter();
-            }
-          } else {
-            // Entering a deeper/sibling loop — open new loop (keep outer open).
-            emitLoopHeader(loopId, toks.slice(i));
-          }
-          emitChain([t]);
-        }
-      }
-
-      // Close any remaining open loops.
-      while (openLoops.length > 0) emitLoopFooter();
-
-      hFlushText();
-    }
-
-    // Emit all chain tokens.
-    const loopInfoMap = result.loopInfoMap || null;
-    emitWithLoops(chainTokens, loopInfoMap);
-
-    let block = lines.join('\n');
-    if (emitTitle) {
-      block = '// === ' + target + '.' + assignProp + ' ' + assignOp + ' ... ===\n' + block;
-    }
-    return block;
-  }
+  // convertOne: moved to htmldom-convert.js
 
   // Copy is handled by monaco-init.js in the full UI.
   // Only attach here for standalone/test usage.
-  if ($('copy') && !(typeof window !== 'undefined' && window._monacoIn)) {
-    $('copy').addEventListener('click', async () => {
-      try {
-        await navigator.clipboard.writeText(lastOutput);
-        $('copy').textContent = 'Copied!';
-        setTimeout(() => { $('copy').textContent = 'Copy output'; }, 1200);
-      } catch (_) {}
-    });
-  }
+  // copy button handler: moved to monaco-init.js
 
   // Monaco editors are initialized by index.html before this script loads.
   if (typeof window !== 'undefined' && window._monacoIn) {
-    window._monacoIn.onDidChangeModelContent(convert);
+  // event listener for convert(): moved to monaco-init.js
   } else if ($('in')) {
-    $('in').addEventListener('input', convert);
+  // event listener for convert(): moved to monaco-init.js
   }
 
-  convert();
+  // await convert(): moved to monaco-init.js
 
   // --- Project-level API ---
 
-  function resolveRelativePath(src, htmlPath) {
-    const dir = htmlPath.indexOf('/') >= 0 ? htmlPath.slice(0, htmlPath.lastIndexOf('/') + 1) : '';
-    const parts = (dir + src).split('/');
-    const norm = [];
-    for (let i = 0; i < parts.length; i++) {
-      if (parts[i] === '..') norm.pop();
-      else if (parts[i] !== '.') norm.push(parts[i]);
-    }
-    return norm.join('/');
-  }
+  // resolveRelativePath: moved to htmldom-convert.js
 
-  function findPageScripts(htmlContent, htmlPath) {
-    const scripts = [];
-    const tokens = tokenizeHtml(htmlContent);
-    for (const tok of tokens) {
-      if (tok.type !== 'openTag' || tok.tag !== 'script') continue;
-      for (const attr of tok.attrs) {
-        if (attr.name === 'src' && attr.value) {
-          scripts.push(resolveRelativePath(attr.value, htmlPath));
-        }
-      }
-    }
-    return scripts;
-  }
+  // findPageScripts: moved to htmldom-convert.js
 
   // Scan JS source for navigation sinks and wrap them with protocol filtering.
   // Returns the modified source, or null if no changes.
-  function filterUnsafeSinks(jsContent) {
-    var tokens = tokenize(jsContent);
-    if (!tokens.length) return null;
-    // Build scope to resolve variable types and taint.
-    var scope = buildScopeState(tokens, tokens.length, null, null, { enabled: true });
-    var replacements = []; // { start, end, replacement }
-    for (var i = 0; i < tokens.length; i++) {
-      var t = tokens[i];
-      if (t.type !== 'other') continue;
+  // filterUnsafeSinks: moved to htmldom-convert.js
 
-      // --- Code execution sinks: eval, Function, setTimeout/setInterval ---
-      // Helper: resolve an argument's source text to a known string if possible.
-      // Checks literal strings, template literals, concat of literals, and
-      // variables that resolve to literal strings through scope.
-      var _resolveArgText = function(argStart, argEnd) {
-        if (argStart >= argEnd) return null;
-        // Single string token.
-        if (argEnd === argStart + 1 && tokens[argStart].type === 'str') return tokens[argStart].text;
-        // Single template literal with no expressions.
-        if (argEnd === argStart + 1 && tokens[argStart].type === 'tmpl') {
-          var parts = tokens[argStart].parts;
-          if (parts && parts.every(function(p) { return p.kind === 'text'; })) {
-            return parts.map(function(p) { return p.raw; }).join('');
-          }
-          return null;
-        }
-        // Single identifier: resolve through scope.
-        if (argEnd === argStart + 1 && tokens[argStart].type === 'other' && IDENT_RE.test(tokens[argStart].text)) {
-          var b = scope.resolve(tokens[argStart].text);
-          if (b && b.kind === 'chain' && b.toks.length === 1 && b.toks[0].type === 'str') return b.toks[0].text;
-          return null;
-        }
-        // Multi-token: try concat of string literals (e.g. "a" + "b").
-        var result = '';
-        for (var ai = argStart; ai < argEnd; ai++) {
-          var at = tokens[ai];
-          if (at.type === 'str') { result += at.text; continue; }
-          if (at.type === 'plus') continue;
-          if (at.type === 'other' && IDENT_RE.test(at.text)) {
-            var ab = scope.resolve(at.text);
-            if (ab && ab.kind === 'chain' && ab.toks.length === 1 && ab.toks[0].type === 'str') { result += ab.toks[0].text; continue; }
-          }
-          return null; // non-literal part
-        }
-        return result;
-      };
-      // Helper: split call args by commas at depth 0. Returns array of {start, end}.
-      var _splitCallArgs = function(openIdx) {
-        var args = [], argStart = openIdx + 1, d = 0;
-        for (var ai = openIdx + 1; ai < tokens.length; ai++) {
-          if (tokens[ai].type === 'open') d++;
-          if (tokens[ai].type === 'close') { if (d === 0) { if (ai > argStart) args.push({ start: argStart, end: ai }); return { args: args, callEnd: ai + 1 }; } d--; }
-          if (d === 0 && tokens[ai].type === 'sep' && tokens[ai].char === ',') { args.push({ start: argStart, end: ai }); argStart = ai + 1; }
-        }
-        return { args: args, callEnd: tokens.length };
-      };
-
-      // eval(expr) / Function(expr) — only real globals, not shadowed locals.
-      if ((t.text === 'eval' || t.text === 'Function') && !scope.declaredNames.has(t.text)) {
-        var paren = tokens[i + 1];
-        if (paren && paren.type === 'open' && paren.char === '(') {
-          var parsed = _splitCallArgs(i + 1);
-          var fullEnd = tokens[parsed.callEnd - 1] ? tokens[parsed.callEnd - 1].end : t.end;
-          if (parsed.args.length === 0) {
-            // eval() with no args — leave as is (returns undefined).
-            i = parsed.callEnd;
-            continue;
-          }
-          if (t.text === 'eval') {
-            // eval only uses first argument.
-            var code = _resolveArgText(parsed.args[0].start, parsed.args[0].end);
-            if (code !== null) {
-              replacements.push({ start: t.start, end: fullEnd, replacement: code });
-            } else {
-              replacements.push({ start: t.start, end: fullEnd, replacement: '/* [blocked: eval with dynamic argument] */ void 0' });
-            }
-          } else {
-            // Function(body) or Function(param1, param2, ..., body)
-            var lastArg = parsed.args[parsed.args.length - 1];
-            var bodyCode = _resolveArgText(lastArg.start, lastArg.end);
-            if (bodyCode !== null) {
-              var paramParts = [];
-              for (var pi = 0; pi < parsed.args.length - 1; pi++) {
-                var pText = _resolveArgText(parsed.args[pi].start, parsed.args[pi].end);
-                if (pText !== null) paramParts.push(pText);
-                else { bodyCode = null; break; }
-              }
-              if (bodyCode !== null) {
-                replacements.push({ start: t.start, end: fullEnd, replacement: '(function(' + paramParts.join(', ') + ') { ' + bodyCode + ' })' });
-              } else {
-                replacements.push({ start: t.start, end: fullEnd, replacement: '/* [blocked: Function with dynamic argument] */ void 0' });
-              }
-            } else {
-              replacements.push({ start: t.start, end: fullEnd, replacement: '/* [blocked: Function with dynamic argument] */ void 0' });
-            }
-          }
-          i = parsed.callEnd;
-          continue;
-        }
-      }
-      // new Function(...)
-      if (t.text === 'new' && tokens[i + 1] && tokens[i + 1].type === 'other' && tokens[i + 1].text === 'Function' && !scope.declaredNames.has('Function')) {
-        var paren2 = tokens[i + 2];
-        if (paren2 && paren2.type === 'open' && paren2.char === '(') {
-          var parsed2 = _splitCallArgs(i + 2);
-          var fullEnd2 = tokens[parsed2.callEnd - 1] ? tokens[parsed2.callEnd - 1].end : 0;
-          if (parsed2.args.length === 0) {
-            replacements.push({ start: t.start, end: fullEnd2, replacement: '(function() {})' });
-          } else {
-            var lastArg2 = parsed2.args[parsed2.args.length - 1];
-            var bodyCode2 = _resolveArgText(lastArg2.start, lastArg2.end);
-            if (bodyCode2 !== null) {
-              var paramParts2 = [];
-              for (var pi2 = 0; pi2 < parsed2.args.length - 1; pi2++) {
-                var pText2 = _resolveArgText(parsed2.args[pi2].start, parsed2.args[pi2].end);
-                if (pText2 !== null) paramParts2.push(pText2);
-                else { bodyCode2 = null; break; }
-              }
-              if (bodyCode2 !== null) {
-                replacements.push({ start: t.start, end: fullEnd2, replacement: '(function(' + paramParts2.join(', ') + ') { ' + bodyCode2 + ' })' });
-              } else {
-                replacements.push({ start: t.start, end: fullEnd2, replacement: '/* [blocked: new Function with dynamic argument] */ void 0' });
-              }
-            } else {
-              replacements.push({ start: t.start, end: fullEnd2, replacement: '/* [blocked: new Function with dynamic argument] */ void 0' });
-            }
-          }
-          i = parsed2.callEnd;
-          continue;
-        }
-      }
-      // setTimeout("code", delay) / setInterval("code", delay) — convert string to function
-      if ((t.text === 'setTimeout' || t.text === 'setInterval') && !scope.declaredNames.has(t.text)) {
-        var paren3 = tokens[i + 1];
-        if (paren3 && paren3.type === 'open' && paren3.char === '(') {
-          var firstArg = tokens[i + 2];
-          if (firstArg) {
-            var comma = null, commaIdx = -1;
-            // Find the comma separating first arg from the rest.
-            var d3 = 0;
-            for (var ci = i + 2; ci < tokens.length; ci++) {
-              if (tokens[ci].type === 'open') d3++;
-              if (tokens[ci].type === 'close') d3--;
-              if (d3 < 0) break;
-              if (d3 === 0 && tokens[ci].type === 'sep' && tokens[ci].char === ',') { commaIdx = ci; break; }
-            }
-            if (firstArg.type === 'str' && commaIdx > 0) {
-              // setTimeout("alert(1)", 100) → setTimeout(function() { alert(1) }, 100)
-              replacements.push({ start: firstArg.start, end: tokens[commaIdx - 1].end, replacement: 'function() { ' + firstArg.text + ' }' });
-              i = commaIdx;
-              continue;
-            }
-            // Check if first arg is tainted/dynamic (not a function keyword or arrow).
-            var resolved3 = firstArg.type === 'other' && IDENT_RE.test(firstArg.text) ? scope.resolve(firstArg.text) : null;
-            var isFn = firstArg.text === 'function' || (resolved3 && resolved3.kind === 'function');
-            var isArrow = false;
-            // Check for arrow: look for => before comma
-            if (!isFn && commaIdx > 0) {
-              for (var ai = i + 2; ai < commaIdx; ai++) {
-                if (tokens[ai].type === 'other' && tokens[ai].text === '=>') { isArrow = true; break; }
-              }
-            }
-            if (!isFn && !isArrow && commaIdx > 0 && firstArg.type !== 'str') {
-              // Dynamic string passed to setTimeout — check for taint.
-              var hasTaint = false;
-              if (resolved3 && resolved3.kind === 'chain') hasTaint = !!collectChainTaint(resolved3.toks);
-              if (hasTaint || firstArg.type === 'other') {
-                // Block it.
-                var timerEnd = commaIdx;
-                replacements.push({ start: firstArg.start, end: tokens[commaIdx - 1].end, replacement: '/* [blocked: ' + t.text + ' with dynamic string] */ function() {}' });
-                i = commaIdx;
-                continue;
-              }
-            }
-          }
-        }
-      }
-
-      // --- Navigation sinks ---
-      if (PATH_RE.test(t.text) || IDENT_RE.test(t.text)) {
-        var navType = isNavSink(t.text, scope.declaredNames);
-        if (navType) {
-          var eq = tokens[i + 1];
-          // location.href = expr / location = expr
-          if (eq && eq.type === 'sep' && eq.char === '=') {
-            var stmtEnd = i + 2;
-            while (stmtEnd < tokens.length && !(tokens[stmtEnd].type === 'sep' && tokens[stmtEnd].char === ';')) stmtEnd++;
-            var rhsStart = tokens[i + 2].start;
-            var rhsEnd = tokens[stmtEnd - 1].end;
-            var rhsSrc = t._src.slice(rhsStart, rhsEnd);
-            var fullStart = t.start;
-            var fullEnd = tokens[stmtEnd] ? tokens[stmtEnd].end : rhsEnd;
-            // Only wrap if the RHS isn't a plain string literal (string literals are safe).
-            if (tokens[i + 2].type !== 'str' || stmtEnd > i + 3) {
-              var safeExpr = '(function(){var __u=__safeNav(' + rhsSrc + ');if(__u!==undefined)' + t.text + '=__u}())';
-              replacements.push({ start: fullStart, end: fullEnd, replacement: safeExpr });
-            }
-            i = stmtEnd;
-            continue;
-          }
-          // location.assign(expr) / location.replace(expr) / navigation.navigate(expr)
-          if (eq && eq.type === 'open' && eq.char === '(') {
-            var callEnd = i + 2;
-            var depth = 1;
-            while (callEnd < tokens.length && depth > 0) {
-              if (tokens[callEnd].type === 'open' && tokens[callEnd].char === '(') depth++;
-              if (tokens[callEnd].type === 'close' && tokens[callEnd].char === ')') depth--;
-              callEnd++;
-            }
-            // Extract the first argument.
-            var argStart = tokens[i + 2] ? tokens[i + 2].start : null;
-            var argEnd = tokens[callEnd - 2] ? tokens[callEnd - 2].end : null;
-            if (argStart !== null && argEnd !== null) {
-              var argSrc = t._src.slice(argStart, argEnd);
-              if (tokens[i + 2].type !== 'str') {
-                var safeCall = '(function(){var __u=__safeNav(' + argSrc + ');if(__u!==undefined)' + t.text + '(__u)}())';
-                var cFullEnd = tokens[callEnd - 1] ? tokens[callEnd - 1].end : argEnd;
-                replacements.push({ start: t.start, end: cFullEnd, replacement: safeCall });
-              }
-            }
-            i = callEnd;
-            continue;
-          }
-        }
-        // frame.src = expr where frame is an iframe/frame element
-        if (PATH_RE.test(t.text)) {
-          var parts = t.text.split('.');
-          var lastProp = parts[parts.length - 1];
-          if (lastProp === 'src') {
-            var baseBind = scope.resolve(parts[0]);
-            var tag = getElementTag(baseBind);
-            if (tag === 'iframe' || tag === 'frame') {
-              var eq2 = tokens[i + 1];
-              if (eq2 && eq2.type === 'sep' && eq2.char === '=') {
-                var stmtEnd2 = i + 2;
-                while (stmtEnd2 < tokens.length && !(tokens[stmtEnd2].type === 'sep' && tokens[stmtEnd2].char === ';')) stmtEnd2++;
-                var rhsStart2 = tokens[i + 2].start;
-                var rhsEnd2 = tokens[stmtEnd2 - 1].end;
-                var rhsSrc2 = t._src.slice(rhsStart2, rhsEnd2);
-                if (tokens[i + 2].type !== 'str' || stmtEnd2 > i + 3) {
-                  var safeSrc = '(function(){var __u=__safeNav(' + rhsSrc2 + ');if(__u!==undefined)' + t.text + '=__u}())';
-                  var fFullEnd = tokens[stmtEnd2] ? tokens[stmtEnd2].end : rhsEnd2;
-                  replacements.push({ start: t.start, end: fFullEnd, replacement: safeSrc });
-                }
-                i = stmtEnd2;
-                continue;
-              }
-            }
-          }
-        }
-      }
-    }
-    if (!replacements.length) return null;
-    // Apply replacements in reverse order to preserve positions.
-    var result = jsContent;
-    for (var ri = replacements.length - 1; ri >= 0; ri--) {
-      var rep = replacements[ri];
-      result = result.slice(0, rep.start) + rep.replacement + result.slice(rep.end);
-    }
-    // Prepend the safe navigation helper if not already present.
-    if (result.indexOf('__safeNav') >= 0 && result.indexOf('function __safeNav') < 0) {
-      result = NAV_SAFE_FILTER + '\n' + result;
-    }
-    return result;
-  }
-
-  function convertJsFile(jsContent, precedingCode, knownDomFunctions) {
-    // Use extractAllHTML to detect actual innerHTML/outerHTML assignments.
-    // This uses the tokenizer (skipping comments/strings) AND verifies
-    // the target is not a known non-element via scope resolution.
-    const combined = precedingCode
-      ? precedingCode + '\n/*__FILE_BOUNDARY__*/\n' + jsContent
-      : jsContent;
-    const extractions = extractAllHTML(combined);
-    // Also filter navigation sinks in the current file.
-    var navFiltered = filterUnsafeSinks(jsContent);
-    if (extractions.length === 0 && !navFiltered) return navFiltered;
-    var sourceToConvert = navFiltered || jsContent;
-    var combinedSrc = precedingCode
-      ? precedingCode + '\n/*__FILE_BOUNDARY__*/\n' + sourceToConvert
-      : sourceToConvert;
-    if (extractions.length === 0) return navFiltered;
-    const converted = convertRaw(combinedSrc, undefined, knownDomFunctions);
-    if (!converted || converted === '// (no nodes parsed)') return navFiltered;
-    if (precedingCode) {
-      const idx = converted.indexOf('/*__FILE_BOUNDARY__*/');
-      if (idx >= 0) {
-        const result = converted.slice(idx + '/*__FILE_BOUNDARY__*/'.length).trim();
-        if (result && result !== jsContent.trim()) return result;
-        return navFiltered;
-      }
-    }
-    if (converted.trim() === jsContent.trim()) return navFiltered;
-    return converted;
-  }
+  // convertJsFile: moved to htmldom-convert.js
 
   // HTML tokenizer: produces a flat token stream from HTML source.
   // Token types:
@@ -8333,246 +9188,7 @@
     return out;
   }
 
-  function convertHtmlMarkup(htmlContent, htmlPath, reservedIdents) {
-    // Derive filenames from source path.
-    let baseName = htmlPath;
-    const slashIdx = baseName.lastIndexOf('/');
-    if (slashIdx >= 0) baseName = baseName.slice(slashIdx + 1);
-    const dotIdx = baseName.lastIndexOf('.');
-    if (dotIdx >= 0) baseName = baseName.slice(0, dotIdx);
-    const handlersFile = baseName + '.handlers.js';
-
-    const htmlTokens = tokenizeHtml(htmlContent);
-    let elemCounter = 0;
-    const jsLines = [];
-    const extractedScripts = [];
-    const extractedStyles = [];
-    let scriptIdx = 0;
-    let styleIdx = 0;
-    // Collect reserved identifiers from all inline scripts so generated
-    // handler variable names don't collide with user code.
-    const used = new Set(reservedIdents || []);
-    for (let si = 0; si < htmlTokens.length; si++) {
-      if (htmlTokens[si].type === 'openTag' && htmlTokens[si].tag === 'script') {
-        const hasSrc = htmlTokens[si].attrs.some(function(a) { return a.name === 'src'; });
-        if (!hasSrc) {
-          let body = '';
-          for (let sj = si + 1; sj < htmlTokens.length; sj++) {
-            if (htmlTokens[sj].type === 'closeTag' && htmlTokens[sj].tag === 'script') break;
-            if (htmlTokens[sj].type === 'text') body += htmlTokens[sj].text;
-          }
-          const toks = tokenize(body.trim());
-          for (const t of toks) {
-            if (t.type === 'other' && IDENT_RE.test(t.text)) used.add(t.text);
-          }
-        }
-      }
-    }
-
-    // Walk tokens and process each opening tag.
-    for (let ti = 0; ti < htmlTokens.length; ti++) {
-      const tok = htmlTokens[ti];
-      if (tok.type !== 'openTag') continue;
-
-      // Handle <script> without src — extract to external file.
-      if (tok.tag === 'script') {
-        const hasSrc = tok.attrs.some(function(a) { return a.name === 'src'; });
-        if (!hasSrc) {
-          // Find the closing </script> and extract the body.
-          let body = '';
-          let closeIdx = ti + 1;
-          while (closeIdx < htmlTokens.length) {
-            if (htmlTokens[closeIdx].type === 'closeTag' && htmlTokens[closeIdx].tag === 'script') break;
-            if (htmlTokens[closeIdx].type === 'text') body += htmlTokens[closeIdx].text;
-            closeIdx++;
-          }
-          body = body.trim();
-          if (body) {
-            const name = scriptIdx === 0 ? baseName + '.js' : baseName + '.' + scriptIdx + '.js';
-            scriptIdx++;
-            extractedScripts.push({ name: name, content: body });
-            // Add src attribute and remove text content.
-            tok.attrs.push({ name: 'src', value: name, nameRaw: 'src', start: 0, end: 0 });
-            for (let ri = ti + 1; ri < closeIdx; ri++) {
-              htmlTokens[ri] = { type: 'text', text: '', start: 0, end: 0 };
-            }
-          }
-        }
-        continue;
-      }
-
-      // Handle <style> — extract to external CSS file.
-      if (tok.tag === 'style') {
-        let body = '';
-        let closeIdx = ti + 1;
-        while (closeIdx < htmlTokens.length) {
-          if (htmlTokens[closeIdx].type === 'closeTag' && htmlTokens[closeIdx].tag === 'style') break;
-          if (htmlTokens[closeIdx].type === 'text') body += htmlTokens[closeIdx].text;
-          closeIdx++;
-        }
-        body = body.trim();
-        if (body) {
-          const name = styleIdx === 0 ? baseName + '.css' : baseName + '.' + styleIdx + '.css';
-          styleIdx++;
-          extractedStyles.push({ name: name, content: body });
-          // Replace <style>content</style> with <link rel="stylesheet" href="name">
-          htmlTokens[ti] = { type: 'openTag', tag: 'link', tagRaw: 'link', attrs: [
-            { name: 'rel', value: 'stylesheet', nameRaw: 'rel', start: 0, end: 0 },
-            { name: 'href', value: name, nameRaw: 'href', start: 0, end: 0 }
-          ], selfClose: false, start: tok.start, end: tok.end };
-          for (let ri = ti + 1; ri <= closeIdx && ri < htmlTokens.length; ri++) {
-            htmlTokens[ri] = { type: 'text', text: '', start: 0, end: 0 };
-          }
-        }
-        continue;
-      }
-
-      // Process all elements regardless of whether body will be replaced.
-      // Elements exist during initial render and their handlers are active
-      // until the script replaces body content.
-
-      // Extract unsafe attributes from this element.
-      const events = [];
-      let styleVal = null;
-      let jsHref = null;
-      let existingId = null;
-      const keepAttrs = [];
-
-      for (const attr of tok.attrs) {
-        if (attr.name.length > 2 && attr.name.slice(0, 2) === 'on') {
-          events.push({ event: attr.name.slice(2), handler: decodeHtmlEntities(attr.value) });
-          continue;
-        }
-        if (attr.name === 'href' && attr.value.slice(0, 11).toLowerCase() === 'javascript:') {
-          jsHref = decodeHtmlEntities(attr.value.slice(11));
-          continue;
-        }
-        if (attr.name === 'style') {
-          styleVal = decodeHtmlEntities(attr.value);
-          continue;
-        }
-        if (attr.name === 'id') existingId = attr.value;
-        keepAttrs.push(attr);
-      }
-
-      if (events.length === 0 && !jsHref && !styleVal) continue;
-
-      // Build selector.
-      let sel;
-      if (existingId) {
-        sel = 'document.getElementById(\'' + existingId + '\')';
-      } else {
-        // Add a data-handler attribute to identify this element.
-        // data-* attributes are standard HTML for machine-generated
-        // metadata and won't collide with the id namespace.
-        let handlerId;
-        do {
-          handlerId = String(elemCounter++);
-        } while (htmlTokens.some(function(ht) {
-          return ht.type === 'openTag' && ht.attrs && ht.attrs.some(function(a) { return a.name === 'data-handler' && a.value === handlerId; });
-        }));
-        sel = 'document.querySelector(\'[data-handler="' + handlerId + '"]\')';
-        keepAttrs.push({ name: 'data-handler', value: handlerId, nameRaw: 'data-handler', start: 0, end: 0 });
-      }
-
-      // Count operations for grouping.
-      let opCount = events.length + (jsHref ? 1 : 0);
-      if (styleVal) {
-        opCount += parseStyleDecls(styleVal).length;
-      }
-      const useVar = opCount > 1;
-      // Variable is scoped inside an IIFE so no collision possible.
-      const varName = useVar ? 'el' : null;
-      const ref = useVar ? varName : sel;
-
-      if (useVar) {
-        jsLines.push('(function() {');
-        jsLines.push('var ' + varName + ' = ' + sel + ';');
-      }
-
-      // Emit event listeners.
-      for (const ev of events) {
-        const body = ev.handler.trim();
-        let hasReturn = false;
-        const returnToks = tokenize(body);
-        for (const rt of returnToks) {
-          if (rt.type === 'other' && rt.text === 'return') { hasReturn = true; break; }
-        }
-        if (hasReturn) {
-          jsLines.push(ref + '.addEventListener(\'' + ev.event + '\', function(event) {');
-          jsLines.push('  var __r = (function() { ' + body + ' }).call(this);');
-          jsLines.push('  if (__r === false) event.preventDefault();');
-          jsLines.push('});');
-        } else {
-          jsLines.push(ref + '.addEventListener(\'' + ev.event + '\', function(event) { ' + body + ' });');
-        }
-      }
-
-      if (jsHref) {
-        jsLines.push(ref + '.addEventListener(\'click\', function(event) {');
-        jsLines.push('  event.preventDefault();');
-        jsLines.push('  ' + jsHref);
-        jsLines.push('});');
-      }
-
-      if (styleVal) {
-        const decls = parseStyleDecls(styleVal);
-        for (const d of decls) {
-          const escapedVal = d.value.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-          jsLines.push(ref + '.style.setProperty(\'' + d.prop + '\', \'' + escapedVal + '\'' + (d.important ? ', \'important\'' : '') + ');');
-        }
-      }
-
-      if (useVar) {
-        jsLines.push('})();');
-      }
-
-      // Update the token's attributes to only keep safe ones.
-      tok.attrs = keepAttrs;
-    }
-
-    // Insert handlers script reference. Place before </body> if it
-    // exists, otherwise before the first <script> tag so handlers
-    // run before any scripts that might modify the DOM.
-    if (jsLines.length) {
-      var handlerScriptTokens = [
-        { type: 'openTag', tag: 'script', tagRaw: 'script',
-          attrs: [{ name: 'src', value: handlersFile, nameRaw: 'src', start: 0, end: 0 }],
-          selfClose: false, start: 0, end: 0 },
-        { type: 'closeTag', tag: 'script', start: 0, end: 0 },
-        { type: 'text', text: '\n', start: 0, end: 0 }
-      ];
-      var inserted = false;
-      for (let ti = htmlTokens.length - 1; ti >= 0; ti--) {
-        if (htmlTokens[ti].type === 'closeTag' && htmlTokens[ti].tag === 'body') {
-          htmlTokens.splice(ti, 0, ...handlerScriptTokens);
-          inserted = true;
-          break;
-        }
-      }
-      if (!inserted) {
-        // No </body> — insert before the first <script> tag.
-        for (let ti = 0; ti < htmlTokens.length; ti++) {
-          if (htmlTokens[ti].type === 'openTag' && htmlTokens[ti].tag === 'script') {
-            htmlTokens.splice(ti, 0, ...handlerScriptTokens);
-            inserted = true;
-            break;
-          }
-        }
-      }
-      if (!inserted) {
-        // No </body> and no <script> — append at the end.
-        htmlTokens.push(...handlerScriptTokens);
-      }
-    }
-
-    return {
-      html: serializeHtmlTokens(htmlTokens),
-      handlers: jsLines.length ? { name: handlersFile, content: jsLines.join('\n') } : null,
-      extractedScripts: extractedScripts,
-      extractedStyles: extractedStyles,
-    };
-  }
+  // convertHtmlMarkup: moved to htmldom-convert.js
 
   // -----------------------------------------------------------------------
   // Taint Analysis API
@@ -8580,12 +9196,12 @@
 
   // Analyze a single JS source for taint flows. Returns an array of findings.
   // All detection happens inside the scope walker — no post-hoc regex scanning.
-  function traceTaintInJs(jsContent, precedingCode) {
+  async function traceTaintInJs(jsContent, precedingCode) {
     var src = (precedingCode ? precedingCode + '\n' : '') + jsContent;
     var tokens = tokenize(src.trim());
     if (!tokens.length) return [];
     // Run scope walker with taint enabled — it detects all sinks internally.
-    var scope = buildScopeState(tokens, tokens.length, null, null, { enabled: true });
+    var scope = await buildScopeState(tokens, tokens.length, null, null, { enabled: true });
     return scope.taintFindings || [];
   }
 
@@ -8601,7 +9217,7 @@
 
   // Analyze a multi-file project for taint flows.
   // Returns { findings: [...], summary: { ... } }.
-  function traceTaint(files) {
+  async function traceTaint(files) {
     var allFindings = [];
     // Find HTML pages and their referenced scripts.
     var htmlPages = Object.keys(files).filter(function(p) { return /\.html?$/i.test(p); });
@@ -8634,7 +9250,7 @@
             if (scriptToken && scriptToken.start !== undefined) {
               scriptLineOffset = countLines(content, scriptToken.start);
             }
-            var inlineFindings = traceTaintInJs(scriptContent);
+            var inlineFindings = await traceTaintInJs(scriptContent);
             for (var f of inlineFindings) {
               f.file = page;
               f.inline = true;
@@ -8661,7 +9277,7 @@
       var precedingCode = '';
       for (var sr of scriptRefs) {
         if (files[sr]) {
-          var extFindings = traceTaintInJs(files[sr], precedingCode);
+          var extFindings = await traceTaintInJs(files[sr], precedingCode);
           for (var f2 of extFindings) {
             f2.file = sr;
             allFindings.push(f2);
@@ -8684,7 +9300,7 @@
     }
     var standaloneJs = Object.keys(files).filter(function(p) { return /\.js$/i.test(p) && !referencedJs.has(p); });
     for (var sj of standaloneJs) {
-      var sjFindings = traceTaintInJs(files[sj]);
+      var sjFindings = await traceTaintInJs(files[sj]);
       for (var f3 of sjFindings) {
         f3.file = sj;
         allFindings.push(f3);
@@ -8703,105 +9319,7 @@
     };
   }
 
-  function convertProject(files) {
-    const output = {};
-    const htmlPages = Object.keys(files).filter(function(p) { return /\.html?$/i.test(p); }).sort();
-    const referencedJs = new Set();
-    const pageScriptMap = {};
-    for (const page of htmlPages) {
-      const scripts = findPageScripts(files[page], page);
-      pageScriptMap[page] = scripts;
-      for (const s of scripts) referencedJs.add(s);
-    }
-    for (const page of htmlPages) {
-      // Collect identifiers from ALL scripts on this page so generated
-      // variable names in handlers don't collide with user code.
-      const pageIdents = new Set();
-      const pageScripts = pageScriptMap[page] || [];
-      for (const sp of pageScripts) {
-        if (!files[sp]) continue;
-        const toks = tokenize(files[sp].trim());
-        for (const t of toks) {
-          if (t.type === 'other' && IDENT_RE.test(t.text)) pageIdents.add(t.text);
-        }
-      }
-      const markup = convertHtmlMarkup(files[page], page, pageIdents);
-      const dir = page.indexOf('/') >= 0 ? page.slice(0, page.lastIndexOf('/') + 1) : '';
-      // Only output HTML if it actually changed.
-      if (markup.html !== files[page]) output[page] = markup.html;
-      if (markup.handlers) {
-        output[dir + markup.handlers.name] = markup.handlers.content;
-      }
-      // Output extracted CSS files.
-      for (const style of markup.extractedStyles) {
-        output[dir + style.name] = style.content;
-      }
-      // Convert external JS files referenced by this page.
-      // Pass 1: convert builder functions across all files. A builder
-      // function in an earlier file (e.g. util.js) needs to be converted
-      // to return a DocumentFragment so later files can use it.
-      const scripts = pageScriptMap[page] || [];
-      const workingFiles = {};
-      for (const sp of scripts) workingFiles[sp] = files[sp] || '';
-      for (const script of markup.extractedScripts) workingFiles[dir + script.name] = script.content;
-      // Pass 1: convert builder functions in PRECEDING files only.
-      // Same-file functions are inlined by the scope walker and should
-      // NOT be pre-converted (that would make them return DocumentFragment,
-      // breaking string concatenation at call sites the walker can inline).
-      // For each file, run the pre-pass on ONLY that file. Collect
-      // converted function names. Output the converted file.
-      // The scope walker inlines same-file builder functions properly
-      // (including those with loops). For cross-file builders (function
-      // defined in an earlier file), the pre-pass converts the function
-      // to return a DocumentFragment and marks it as a DOM function so
-      // call sites use appendChild instead of createTextNode.
-      // Only pre-convert files that DON'T have innerHTML (pure utility files).
-      const allConvertedFns = new Set();
-      for (const sp of scripts) {
-        if (!workingFiles[sp]) continue;
-        // Check: does this file have innerHTML/outerHTML assignments?
-        const fileToks = tokenize(workingFiles[sp].trim());
-        let fileHasInnerHTML = false;
-        for (let ti = 1; ti < fileToks.length; ti++) {
-          if (fileToks[ti].type === 'sep' && (fileToks[ti].char === '=' || fileToks[ti].char === '+=') &&
-              fileToks[ti-1].type === 'other' && /\.(innerHTML|outerHTML)$/.test(fileToks[ti-1].text)) {
-            fileHasInnerHTML = true; break;
-          }
-        }
-        // Skip pre-pass for files with innerHTML — scope walker handles them.
-        if (fileHasInnerHTML) continue;
-        const prepass = convertHtmlBuilderFunctions(workingFiles[sp]);
-        for (const fn of prepass.converted) allConvertedFns.add(fn);
-        if (prepass.converted.size > 0 && prepass.source !== workingFiles[sp]) {
-          workingFiles[sp] = prepass.source;
-          output[sp] = prepass.source;
-        }
-      }
-      // Pass 2: convert innerHTML/outerHTML/document.write/insertAdjacentHTML.
-      // allConvertedFns collects builder function names from pass 1.
-      let precedingCode = '';
-      for (const sp of scripts) {
-        if (!workingFiles[sp]) continue;
-        const converted = convertJsFile(workingFiles[sp], precedingCode, allConvertedFns);
-        if (converted) output[sp] = converted;
-        precedingCode += (precedingCode ? '\n' : '') + workingFiles[sp];
-      }
-      // Convert extracted inline scripts (now external files).
-      for (const script of markup.extractedScripts) {
-        const key = dir + script.name;
-        const content = workingFiles[key] || script.content;
-        const converted = convertJsFile(content, precedingCode, allConvertedFns);
-        output[key] = converted || content;
-        precedingCode += (precedingCode ? '\n' : '') + content;
-      }
-    }
-    const standaloneJs = Object.keys(files).filter(function(p) { return /\.js$/i.test(p) && !referencedJs.has(p); }).sort();
-    for (const jp of standaloneJs) {
-      const converted = convertJsFile(files[jp], '');
-      if (converted) output[jp] = converted;
-    }
-    return output;
-  }
+  // convertProject: moved to htmldom-convert.js
 
   // -----------------------------------------------------------------------
   // Public API
@@ -8810,10 +9328,27 @@
     // Core analysis
     tokenize: tokenize,
     tokenizeHtml: tokenizeHtml,
-    // Conversion
-    convertProject: convertProject,
-    convertJsFile: convertJsFile,
-    convertHtmlMarkup: convertHtmlMarkup,
+    // Conversion entry points: Stage 4b.2 removed these from
+    // jsanalyze.js. Consumers should use the HtmldomConvert facade
+    // (globalThis.HtmldomConvert or require('./htmldom-convert.js')).
+    // The keys are kept here as getter shims so legacy code that
+    // reaches into jsanalyze.js's api.convertJsFile continues to
+    // resolve after HtmldomConvert has loaded. The shims return
+    // undefined until HtmldomConvert.js executes.
+    get convertProject() {
+      return (typeof globalThis !== 'undefined' && globalThis.HtmldomConvert) ? globalThis.HtmldomConvert.convertProject : undefined;
+    },
+    get convertJsFile() {
+      return (typeof globalThis !== 'undefined' && globalThis.HtmldomConvert) ? globalThis.HtmldomConvert.convertJsFile : undefined;
+    },
+    get convertHtmlMarkup() {
+      return (typeof globalThis !== 'undefined' && globalThis.HtmldomConvert) ? globalThis.HtmldomConvert.convertHtmlMarkup : undefined;
+    },
+    // Diagnostics / extraction still live in jsanalyze.js (they're
+    // walker-level extractors, not converter-specific).
+    extractHTML: extractHTML,
+    extractAllHTML: extractAllHTML,
+    extractAllDOM: extractAllDOM,
     // Taint analysis
     traceTaint: traceTaint,
     traceTaintInJs: traceTaintInJs,
@@ -8829,14 +9364,71 @@
     ELEMENT_SINK_TYPES: ELEMENT_SINK_TYPES,
     TAINT_SANITIZERS: TAINT_SANITIZERS,
     EVENT_TAINT_SOURCES: EVENT_TAINT_SOURCES,
+    // jsanalyze public surface (stage 1 — seam only, stable shape)
+    jsanalyze: {
+      bindingToValue: bindingToValue,
+      // Allow tests + consumers to reach the walker for now.
+      // Stage 2 will expose a proper `analyze()` entry point.
+      buildScopeState: buildScopeState,
+      scanMutations: scanMutations,
+      tokenize: tokenize,
+    },
+    // Walker internals exposed for htmldom-convert.js's factory
+    // (Stage 4b). Consumers OTHER than htmldom-convert should use
+    // the jsanalyze query layer — these are walker-private and
+    // will migrate to jsanalyze.js in Stage 5.
+    _walkerInternals: {
+      // Tokenizers & parsers
+      tokenize: tokenize,
+      tokenizeHtml: tokenizeHtml,
+      decodeHtmlEntities: decodeHtmlEntities,
+      decodeJsString: decodeJsString,
+      serializeHtmlTokens: serializeHtmlTokens,
+      parseStyleDecls: parseStyleDecls,
+      scanMutations: scanMutations,
+      // Walker
+      buildScopeState: buildScopeState,
+      extractHTML: extractHTML,
+      extractAllHTML: extractAllHTML,
+      extractAllDOM: extractAllDOM,
+      traceTaint: traceTaint,
+      traceTaintInJs: traceTaintInJs,
+      bindingToValue: bindingToValue,
+      // Binding primitives
+      collectChainTaint: collectChainTaint,
+      getElementTag: getElementTag,
+      isSanitizer: isSanitizer,
+      isNavSink: isNavSink,
+      isIdlProp: isIdlProp,
+      classifySink: classifySink,
+      countLines: countLines,
+      makeVar: makeVar,
+      jsStr: jsStr,
+      // Regex & classification tables
+      IDENT_RE: IDENT_RE,
+      PATH_RE: PATH_RE,
+      ATTR_TO_PROP: ATTR_TO_PROP,
+      BOOLEAN_ATTRS: BOOLEAN_ATTRS,
+      VOID_ELEMENTS: VOID_ELEMENTS,
+      SVG_TAGS: SVG_TAGS,
+      NAV_SAFE_FILTER: NAV_SAFE_FILTER,
+      TAINT_SOURCES: TAINT_SOURCES,
+      TAINT_SINKS: TAINT_SINKS,
+      TAINT_CALL_SINKS: TAINT_CALL_SINKS,
+      TAINT_SANITIZERS: TAINT_SANITIZERS,
+      ELEMENT_SINK_TYPES: ELEMENT_SINK_TYPES,
+      EVENT_TAINT_SOURCES: EVENT_TAINT_SOURCES,
+    },
   };
 
   if (typeof globalThis !== 'undefined') {
-    globalThis.__convertProject = convertProject;
-    globalThis.__convertHtmlMarkup = convertHtmlMarkup;
-    globalThis.__convertJsFile = convertJsFile;
+    // Converter globals removed in Stage 4b.2 — use HtmldomConvert
+    // (loaded from htmldom-convert.js) instead. The test harness
+    // wires up __convertProject / __convertJsFile / __convertHtmlMarkup
+    // / __convertRaw from HtmldomConvert for back-compat.
     globalThis.__traceTaint = traceTaint;
     globalThis.__htmldomApi = api;
+    globalThis.__bindingToValue = bindingToValue;
   }
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = api;
