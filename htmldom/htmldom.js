@@ -155,13 +155,16 @@
   };
   // Global call sinks (not property-based).
   const TAINT_CALL_SINKS = {
-    'eval':                   { type: 'code', severity: 'critical' },
-    'Function':               { type: 'code', severity: 'critical' },
-    'setTimeout':             { type: 'code', severity: 'high' },    // when first arg is string
+    'eval':                   { type: 'code', severity: 'high' },
+    'Function':               { type: 'code', severity: 'high' },
+    'setTimeout':             { type: 'code', severity: 'high' },
     'setInterval':            { type: 'code', severity: 'high' },
     'document.write':         { type: 'html', severity: 'high' },
     'document.writeln':       { type: 'html', severity: 'high' },
-    'window.open':            { type: 'url',  severity: 'medium' },
+    'window.open':            { type: 'navigation', severity: 'medium' },
+    'location.assign':        { type: 'navigation', severity: 'high' },
+    'location.replace':       { type: 'navigation', severity: 'high' },
+    'navigation.navigate':    { type: 'navigation', severity: 'high' },
   };
   // setAttribute sinks: attr name → classification.
   const ATTR_SINKS = {
@@ -210,39 +213,67 @@
   ]);
 
   // Collect taint from a chain token array. Returns a Set of source labels
-  // or null if no taint.
+  // or null if no taint. Recurses into structured tokens (cond, trycatch,
+  // switch, tmpl) so taint inside branches is never missed.
   function collectChainTaint(toks) {
     if (!toks) return null;
     var result = null;
+    var merge = function(set) {
+      if (!set) return;
+      if (!result) result = new Set();
+      for (var label of set) result.add(label);
+    };
     for (var i = 0; i < toks.length; i++) {
-      if (toks[i].taint) {
-        if (!result) result = new Set();
-        for (var label of toks[i].taint) result.add(label);
+      var t = toks[i];
+      if (t.taint) merge(t.taint);
+      if (t.type === 'cond') {
+        merge(collectChainTaint(t.ifTrue));
+        merge(collectChainTaint(t.ifFalse));
+      } else if (t.type === 'trycatch') {
+        merge(collectChainTaint(t.tryBody));
+        merge(collectChainTaint(t.catchBody));
+      } else if (t.type === 'switch' && t.branches) {
+        for (var bi = 0; bi < t.branches.length; bi++) {
+          merge(collectChainTaint(t.branches[bi].chain));
+        }
+      } else if (t.type === 'tmpl' && t.parts) {
+        for (var pi = 0; pi < t.parts.length; pi++) {
+          if (t.parts[pi].kind === 'expr' && t.parts[pi].toks) {
+            merge(collectChainTaint(t.parts[pi].toks));
+          }
+        }
       }
     }
     return result;
   }
 
-  // Propagate taint to a chain token array: apply labels to all non-plus tokens.
-  function applyTaint(toks, labels) {
-    if (!labels || !labels.size) return toks;
-    return toks.map(function (t) {
-      if (t.type === 'plus') return t;
-      if (t.taint) {
-        var merged = new Set(t.taint);
-        for (var l of labels) merged.add(l);
-        return Object.assign({}, t, { taint: merged });
+  // Create an exprRef that inherits taint from any number of source token
+  // arrays. Every place that creates a derived opaque expression from
+  // existing bindings should use this instead of bare exprRef().
+  function deriveExprRef(text) {
+    var ref = exprRef(text);
+    for (var i = 1; i < arguments.length; i++) {
+      var t = collectChainTaint(arguments[i]);
+      if (t) {
+        if (!ref.taint) ref.taint = new Set();
+        for (var l of t) ref.taint.add(l);
       }
-      return Object.assign({}, t, { taint: new Set(labels) });
-    });
+    }
+    return ref;
   }
 
   // Check if an expression text matches a known taint source. Returns label or null.
+  // Matches exact, suffix (window.location.search), and prefix with method calls
+  // (location.hash.slice(1) starts with taint source location.hash).
   function getTaintSource(expr) {
     if (TAINT_SOURCES[expr]) return TAINT_SOURCES[expr];
-    // Check partial matches: e.g. "window.location.search" matches "location.search"
     for (var src in TAINT_SOURCES) {
+      // Suffix match: "window.location.search" contains "location.search"
       if (expr.endsWith(src) && (expr.length === src.length || expr[expr.length - src.length - 1] === '.')) {
+        return TAINT_SOURCES[src];
+      }
+      // Prefix match: "location.hash.slice(1)" starts with "location.hash"
+      if (expr.startsWith(src) && expr.length > src.length && (expr[src.length] === '.' || expr[src.length] === '(')) {
         return TAINT_SOURCES[src];
       }
     }
@@ -293,6 +324,644 @@
       if (binding.origin.kind === 'create') return binding.origin.tag;
     }
     return null;
+  }
+
+  // -----------------------------------------------------------------------
+  // Navigation Sink Infrastructure
+  // -----------------------------------------------------------------------
+
+
+  // Navigation sink patterns: property assignments or method calls that
+  // cause navigation and are vulnerable to javascript: protocol XSS.
+  // Each entry: { kind: 'assign'|'call', severity, check }.
+  const NAV_SINKS = {
+    // Direct location assignments
+    'location.href':     { kind: 'assign', severity: 'high' },
+    'location':          { kind: 'assign', severity: 'high' },  // location = url
+    // Location methods
+    'location.assign':   { kind: 'call', severity: 'high' },
+    'location.replace':  { kind: 'call', severity: 'high' },
+    // window.open
+    'window.open':       { kind: 'call', severity: 'medium' },
+    'open':              { kind: 'call', severity: 'medium' },
+    // Navigation API
+    'navigation.navigate': { kind: 'call', severity: 'high' },
+  };
+
+  // Properties on frame/iframe elements that are navigation sinks.
+  const FRAME_NAV_PROPS = new Set(['src']);
+  // Properties on opener/parent/top.location that are navigation sinks.
+  const LOCATION_NAV_PROPS = new Set(['href', '']);  // '' = direct assignment
+
+  // Check if an expression is a known global navigation object.
+  // Returns the nav type or null. Only matches when the name isn't
+  // shadowed by a local binding in the provided resolve function.
+  // Check if an expression refers to a global navigation object.
+  // Only returns a match when the root identifier is NOT declared
+  // locally (var/let/const/function). Bare assignments to globals
+  // (location = x) don't count as declarations.
+  // declaredSet: a Set of names declared with var/let/const.
+  // Navigation sink expressions: these are the ONLY patterns that cause
+  // navigation and are vulnerable to javascript: protocol. Any other
+  // property on location (location.hash, location.search) is a SOURCE
+  // not a sink.
+  const NAV_SINK_EXPRS = new Set([
+    'location', 'location.href', 'location.assign', 'location.replace',
+    'window.location', 'window.location.href', 'window.location.assign', 'window.location.replace',
+    'document.location', 'document.location.href', 'document.location.assign', 'document.location.replace',
+    'self.location', 'self.location.href',
+    'opener', 'opener.location', 'opener.location.href',
+    'window.opener', 'window.opener.location', 'window.opener.location.href',
+    'parent', 'parent.location', 'parent.location.href',
+    'window.parent', 'window.parent.location', 'window.parent.location.href',
+    'top', 'top.location', 'top.location.href',
+    'window.top', 'window.top.location', 'window.top.location.href',
+    'navigation.navigate', 'window.navigation.navigate',
+  ]);
+
+  // Check if an expression is a navigation sink. Only matches actual
+  // sink patterns, not reads like location.hash or location.search.
+  function isNavSink(expr, declaredSet) {
+    if (!NAV_SINK_EXPRS.has(expr)) return false;
+    var root = expr.split('.')[0];
+    if (root === 'window' || root === 'self' || root === 'globalThis' || root === 'document') return true;
+    if (declaredSet && declaredSet.has(root)) return false;
+    return true;
+  }
+
+  // Protocol filter code for safe navigation: validates URL is http(s).
+  var NAV_SAFE_FILTER = 'function __safeNav(url){try{var u=new URL(url,location.href);if(u.protocol===\"https:\"||u.protocol===\"http:\")return url}catch(e){}return undefined}';
+  var NAV_SAFE_FILTER_USED = false;
+
+  // -----------------------------------------------------------------------
+  // SMT Constraint Solver
+  // -----------------------------------------------------------------------
+  //
+  // Determines satisfiability of conditions at compile time using
+  // constraint formulas, theory solvers, and path constraint propagation.
+  //
+  // Architecture:
+  //   1. Formula AST — typed expression tree (Sym, Const, Not, And, Or, Cmp)
+  //   2. Theory solvers — evaluate formulas over specific domains:
+  //      - Boolean theory: AND, OR, NOT simplification
+  //      - Linear arithmetic: integer/float comparisons and bounds
+  //      - Equality theory: =, !=, ===, !== with unification
+  //   3. Satisfiability checker — determines if a formula has a model
+  //      (assignment of symbolic variables that makes it true)
+  //   4. Condition parser — builds formulas from raw JS condition tokens
+  //   5. Integration — scope walker queries the solver for branch reachability
+  //
+  // A symbolic variable represents a value the attacker controls:
+  //   - Taint sources (location.search, postMessage data)
+  //   - Event handler invocation counts (handler fires N times)
+  //   - Any value derived from the above through operations
+
+  // --- Formula AST ---
+  // Each node: { type, ... } where type is one of:
+  //   sym    — symbolic variable: { id, name }
+  //   const  — concrete value: { value }
+  //   not    — negation: { arg }
+  //   and    — conjunction: { args: [...] }  (flattened)
+  //   or     — disjunction: { args: [...] }  (flattened)
+  //   cmp    — comparison: { op, left, right }
+  //   arith  — arithmetic: { op, left, right }
+
+  var _nextSymId = 0;
+  var _symNameMap = Object.create(null);
+
+  function smtSym(name) {
+    if (name in _symNameMap) return { type: 'sym', id: _symNameMap[name], name: name };
+    var id = _nextSymId++;
+    _symNameMap[name] = id;
+    return { type: 'sym', id: id, name: name };
+  }
+  function smtConst(value) { return { type: 'const', value: value }; }
+  function smtNot(e) { return !e ? null : e.type === 'not' ? e.arg : e.type === 'const' ? smtConst(!e.value) : { type: 'not', arg: e }; }
+  function smtAnd(a, b) { return !a ? b : !b ? a : a.type === 'const' ? (a.value ? b : a) : b.type === 'const' ? (b.value ? a : b) : { type: 'and', left: a, right: b }; }
+  function smtOr(a, b) { return !a ? b : !b ? a : a.type === 'const' ? (a.value ? a : b) : b.type === 'const' ? (b.value ? b : a) : { type: 'or', left: a, right: b }; }
+  function smtCmp(op, l, r) { return { type: 'cmp', op: op, left: l, right: r }; }
+  function smtArith(op, l, r) { return { type: 'arith', op: op, left: l, right: r }; }
+  // String theory constraints:
+  //   strProp: { symId, prop, value } — e.g. x.startsWith("http"), x.length === 0
+  function smtStrProp(symId, prop, value) { return { type: 'strProp', symId: symId, prop: prop, value: value }; }
+
+  function smtHasSym(e) {
+    if (!e) return false;
+    if (e.type === 'sym' || e.type === 'strProp') return true;
+    if (e.type === 'const') return false;
+    return (e.left && smtHasSym(e.left)) || (e.right && smtHasSym(e.right)) || (e.arg && smtHasSym(e.arg));
+  }
+
+  // --- Normalize: push NOT inward (NNF), flatten AND/OR ---
+  var _flipCmp = { '<':'>=', '>':'<=', '<=':'>', '>=':'<', '==':'!=', '===':'!==', '!=':'==', '!==':'===' };
+  var _swapCmp = { '>':'<', '<':'>', '>=':'<=', '<=':'>=', '==':'==', '===':'===', '!=':'!=', '!==':'!==' };
+  function smtNNF(f) {
+    if (!f) return f;
+    if (f.type === 'const' || f.type === 'sym') return f;
+    if (f.type === 'and') return smtAnd(smtNNF(f.left), smtNNF(f.right));
+    if (f.type === 'or') return smtOr(smtNNF(f.left), smtNNF(f.right));
+    if (f.type === 'cmp' || f.type === 'arith') return f;
+    if (f.type === 'not') {
+      var a = f.arg;
+      if (a.type === 'const') return smtConst(!a.value);
+      if (a.type === 'sym') return f; // NOT(sym) stays
+      if (a.type === 'not') return smtNNF(a.arg);
+      if (a.type === 'and') return smtOr(smtNNF(smtNot(a.left)), smtNNF(smtNot(a.right)));
+      if (a.type === 'or') return smtAnd(smtNNF(smtNot(a.left)), smtNNF(smtNot(a.right)));
+      if (a.type === 'cmp') return smtCmp(_flipCmp[a.op] || a.op, a.left, a.right);
+      return f;
+    }
+    return f;
+  }
+
+  // --- Collect all atomic constraints from a conjunction (NNF form) ---
+  // Returns array of cmp/not nodes. Returns null if formula contains OR (non-conjunctive).
+  function smtCollectAtoms(f) {
+    if (!f) return [];
+    if (f.type === 'const') return f.value ? [] : null; // false = unsat
+    if (f.type === 'and') {
+      var l = smtCollectAtoms(f.left), r = smtCollectAtoms(f.right);
+      if (!l || !r) return null;
+      return l.concat(r);
+    }
+    if (f.type === 'cmp' || f.type === 'not' || f.type === 'strProp') return [f];
+    if (f.type === 'or') return null; // can't flatten disjunction
+    if (f.type === 'sym') return []; // symbolic = satisfiable, no constraint
+    return [];
+  }
+
+  // --- Theory solver: arithmetic bounds + relational + equality ---
+  // Checks if a set of atomic constraints is jointly satisfiable.
+  // Handles: sym OP const, sym OP sym, arith(sym,const) OP const/sym.
+  function smtTheorySat(atoms) {
+    if (!atoms) return false; // null = had a const(false)
+    // Evaluate any fully-concrete atoms first.
+    for (var ci = 0; ci < atoms.length; ci++) {
+      var ca = atoms[ci];
+      if (ca.type === 'cmp' && ca.left.type === 'const' && ca.right.type === 'const') {
+        var lv = ca.left.value, rv = ca.right.value;
+        var ok;
+        switch (ca.op) {
+          case '<': ok = lv < rv; break; case '>': ok = lv > rv; break;
+          case '<=': ok = lv <= rv; break; case '>=': ok = lv >= rv; break;
+          case '==': case '===': ok = lv === rv; break;
+          case '!=': case '!==': ok = lv !== rv; break;
+          default: ok = true;
+        }
+        if (!ok) return false; // concrete comparison fails → unsat
+      }
+    }
+    // Per-symbol bounds: { symId → { lo, hi, loStrict, hiStrict, eqs:[], neqs:[] } }
+    var bounds = Object.create(null);
+    // Relational pairs: [{leftId, rightId, op}] for sym OP sym constraints
+    var relations = [];
+    var getBounds = function(id) {
+      if (!bounds[id]) bounds[id] = { lo: -Infinity, hi: Infinity, loStrict: false, hiStrict: false, eqs: [], neqs: [] };
+      return bounds[id];
+    };
+    var addBound = function(id, op, val) {
+      var b = getBounds(id);
+      if (typeof val === 'number') {
+        switch (op) {
+          case '>': if (val >= b.lo) { b.lo = val; b.loStrict = true; } break;
+          case '>=': if (val > b.lo || (val === b.lo && !b.loStrict)) { b.lo = val; b.loStrict = false; } break;
+          case '<': if (val <= b.hi) { b.hi = val; b.hiStrict = true; } break;
+          case '<=': if (val < b.hi || (val === b.hi && !b.hiStrict)) { b.hi = val; b.hiStrict = false; } break;
+          case '===': case '==': b.eqs.push(val); break;
+          case '!==': case '!=': b.neqs.push(val); break;
+        }
+      } else {
+        if (op === '===' || op === '==') b.eqs.push(val);
+        else if (op === '!==' || op === '!=') b.neqs.push(val);
+      }
+    };
+    // Extract constraints from atoms.
+    for (var i = 0; i < atoms.length; i++) {
+      var a = atoms[i];
+      if (a.type === 'cmp') {
+        var L = a.left, R = a.right, op = a.op;
+        if (L.type === 'sym' && R.type === 'const') { addBound(L.id, op, R.value); }
+        else if (R.type === 'sym' && L.type === 'const') { addBound(R.id, _swapCmp[op] || op, L.value); }
+        else if (L.type === 'sym' && R.type === 'sym') { relations.push({ leftId: L.id, rightId: R.id, op: op }); }
+        // arith(sym, const) OP const: e.g. (x + 1) > 5 → x > 4
+        else if (L.type === 'arith' && R.type === 'const') {
+          if (L.left.type === 'sym' && L.right.type === 'const') {
+            var adjusted = null;
+            if (L.op === '+') adjusted = R.value - L.right.value;
+            else if (L.op === '-') adjusted = R.value + L.right.value;
+            if (adjusted !== null) addBound(L.left.id, op, adjusted);
+          }
+          // Any arith expression with a sym operand: create synthetic variable.
+          // Handles arith(sym, sym), arith('length', sym, _), arith('indexOf', sym, _), etc.
+          if (L.left.type === 'sym') {
+            var exprKey = 'expr:' + L.left.id + ':' + L.op + ':' + (L.right.type === 'sym' ? L.right.id : L.right.type === 'const' ? L.right.value : '_');
+            var exprId = smtSym(exprKey).id;
+            addBound(exprId, op, R.value);
+          }
+        }
+        else if (R.type === 'arith' && L.type === 'const') {
+          if (R.left.type === 'sym' && R.right.type === 'const') {
+            var adjusted2 = null;
+            if (R.op === '+') adjusted2 = L.value - R.right.value;
+            else if (R.op === '-') adjusted2 = L.value + R.right.value;
+            if (adjusted2 !== null) addBound(R.left.id, _swapCmp[op] || op, adjusted2);
+          }
+          if (R.left.type === 'sym') {
+            var exprKey2 = 'expr:' + R.left.id + ':' + R.op + ':' + (R.right.type === 'sym' ? R.right.id : R.right.type === 'const' ? R.right.value : '_');
+            var exprId2 = smtSym(exprKey2).id;
+            addBound(exprId2, _swapCmp[op] || op, L.value);
+          }
+        }
+      }
+      // NOT(sym) is like sym == false — no arithmetic bound.
+    }
+    // Check per-variable bound contradictions.
+    for (var sid in bounds) {
+      var b = bounds[sid];
+      if (b.loStrict || b.hiStrict) { if (b.lo >= b.hi) return false; }
+      else { if (b.lo > b.hi) return false; }
+      if (b.eqs.length >= 2) { for (var j = 1; j < b.eqs.length; j++) if (b.eqs[j] !== b.eqs[0]) return false; }
+      if (b.eqs.length >= 1) {
+        for (var k = 0; k < b.neqs.length; k++) if (b.neqs[k] === b.eqs[0]) return false;
+        var ev = b.eqs[0];
+        if (typeof ev === 'number') {
+          if (b.loStrict ? ev <= b.lo : ev < b.lo) return false;
+          if (b.hiStrict ? ev >= b.hi : ev > b.hi) return false;
+        }
+      }
+    }
+    // Check relational constraints via transitive closure.
+    // Build a directed graph: edge from A to B with weight means A + weight <= B (or <).
+    // Use Floyd-Warshall to detect negative cycles (contradiction).
+    // --- String theory: check string property constraints ---
+    // Collect strProp atoms per symbolic variable.
+    var strConstraints = Object.create(null); // symId → [{prop, value}]
+    // Also collect length constraints for string-length correlation.
+    var lengthBounds = Object.create(null); // symId → bounds
+    for (var si = 0; si < atoms.length; si++) {
+      var sa = atoms[si];
+      if (sa.type === 'strProp') {
+        if (!strConstraints[sa.symId]) strConstraints[sa.symId] = [];
+        strConstraints[sa.symId].push({ prop: sa.prop, value: sa.value });
+      }
+      // cmp where left is arith('length', sym, _) and right is const
+      // e.g. x.length === 0
+      if (sa.type === 'cmp' && sa.left && sa.left.type === 'arith' && sa.left.op === 'length' && sa.left.left.type === 'sym' && sa.right.type === 'const') {
+        var _lsId = sa.left.left.id;
+        if (!lengthBounds[_lsId]) lengthBounds[_lsId] = { eqs: [], lo: -Infinity, hi: Infinity };
+        var _lv = sa.right.value;
+        if (typeof _lv === 'number') {
+          switch (sa.op) {
+            case '===': case '==': lengthBounds[_lsId].eqs.push(_lv); break;
+            case '>': lengthBounds[_lsId].lo = Math.max(lengthBounds[_lsId].lo, _lv + 1); break;
+            case '>=': lengthBounds[_lsId].lo = Math.max(lengthBounds[_lsId].lo, _lv); break;
+            case '<': lengthBounds[_lsId].hi = Math.min(lengthBounds[_lsId].hi, _lv - 1); break;
+            case '<=': lengthBounds[_lsId].hi = Math.min(lengthBounds[_lsId].hi, _lv); break;
+          }
+        }
+      }
+      // cmp where left is arith('indexOf', sym, const) and right is const
+      // e.g. x.indexOf("a") >= 0
+      if (sa.type === 'cmp' && sa.left && sa.left.type === 'arith' && sa.left.op === 'indexOf' && sa.left.left.type === 'sym' && sa.left.right.type === 'const' && sa.right.type === 'const') {
+        var _isId = sa.left.left.id;
+        var _idxStr = sa.left.right.value;
+        // indexOf >= 0 means string contains the substring → like includes.
+        if ((sa.op === '>=' && sa.right.value === 0) || (sa.op === '>' && sa.right.value === -1)) {
+          if (!strConstraints[_isId]) strConstraints[_isId] = [];
+          strConstraints[_isId].push({ prop: 'includes', value: _idxStr });
+        }
+      }
+    }
+    // Check string contradictions.
+    for (var scId in strConstraints) {
+      var sc = strConstraints[scId];
+      // startsWith contradictions: two different prefixes where neither is a prefix of the other.
+      var starts = sc.filter(function(c) { return c.prop === 'startsWith'; });
+      for (var s1 = 0; s1 < starts.length; s1++) {
+        for (var s2 = s1 + 1; s2 < starts.length; s2++) {
+          var p1 = starts[s1].value, p2 = starts[s2].value;
+          if (!p1.startsWith(p2) && !p2.startsWith(p1)) return false;
+        }
+      }
+      // endsWith contradictions.
+      var ends = sc.filter(function(c) { return c.prop === 'endsWith'; });
+      for (var e1 = 0; e1 < ends.length; e1++) {
+        for (var e2 = e1 + 1; e2 < ends.length; e2++) {
+          var s1e = ends[e1].value, s2e = ends[e2].value;
+          if (!s1e.endsWith(s2e) && !s2e.endsWith(s1e)) return false;
+        }
+      }
+      // length === 0 contradicts includes/startsWith/endsWith with non-empty string.
+      var lb = lengthBounds[scId];
+      if (lb && lb.eqs.indexOf(0) >= 0) {
+        for (var sci = 0; sci < sc.length; sci++) {
+          if (sc[sci].value && sc[sci].value.length > 0) return false;
+        }
+      }
+      if (lb && lb.hi === 0) {
+        for (var sci2 = 0; sci2 < sc.length; sci2++) {
+          if (sc[sci2].value && sc[sci2].value.length > 0) return false;
+        }
+      }
+    }
+
+    var allIds = Object.keys(bounds).map(Number);
+    for (var ri = 0; ri < relations.length; ri++) {
+      var rel = relations[ri];
+      if (allIds.indexOf(rel.leftId) < 0) allIds.push(rel.leftId);
+      if (allIds.indexOf(rel.rightId) < 0) allIds.push(rel.rightId);
+    }
+    if (relations.length > 0 && allIds.length <= 20) {
+      // Build difference constraints: x OP y → difference bounds.
+      // x > y means x - y > 0, i.e. y - x < 0.
+      // We track: dist[i][j] = max proven lower bound on (var_i - var_j).
+      var n = allIds.length;
+      var idxOf = Object.create(null);
+      for (var ii = 0; ii < n; ii++) idxOf[allIds[ii]] = ii;
+      // dist[i][j] = upper bound on (j - i), i.e. j <= i + dist[i][j].
+      var dist = [];
+      for (var di = 0; di < n; di++) {
+        dist[di] = [];
+        for (var dj = 0; dj < n; dj++) dist[di][dj] = di === dj ? 0 : Infinity;
+      }
+      // Add relational edges.
+      for (var re = 0; re < relations.length; re++) {
+        var r = relations[re];
+        var li = idxOf[r.leftId], ri2 = idxOf[r.rightId];
+        if (li === undefined || ri2 === undefined) continue;
+        // x > y → y - x < 0 → dist[x][y] = min(dist[x][y], -1) (strict)
+        // x >= y → y - x <= 0 → dist[x][y] = min(dist[x][y], 0)
+        // x < y → x - y < 0 → dist[y][x] = min(dist[y][x], -1)
+        // x <= y → x - y <= 0 → dist[y][x] = min(dist[y][x], 0)
+        // x == y → both directions = 0
+        switch (r.op) {
+          case '>': dist[li][ri2] = Math.min(dist[li][ri2], -1); break;
+          case '>=': dist[li][ri2] = Math.min(dist[li][ri2], 0); break;
+          case '<': dist[ri2][li] = Math.min(dist[ri2][li], -1); break;
+          case '<=': dist[ri2][li] = Math.min(dist[ri2][li], 0); break;
+          case '===': case '==':
+            dist[li][ri2] = Math.min(dist[li][ri2], 0);
+            dist[ri2][li] = Math.min(dist[ri2][li], 0);
+            break;
+        }
+      }
+      // Also add const bounds as edges to a virtual "zero" node — not needed for
+      // pure relational contradictions but helps with mixed constraints.
+      // Floyd-Warshall: find shortest paths (min weights).
+      for (var fk = 0; fk < n; fk++) {
+        for (var fi = 0; fi < n; fi++) {
+          for (var fj = 0; fj < n; fj++) {
+            if (dist[fi][fk] + dist[fk][fj] < dist[fi][fj]) {
+              dist[fi][fj] = dist[fi][fk] + dist[fk][fj];
+            }
+          }
+        }
+      }
+      // Negative cycle on diagonal = contradiction.
+      for (var ci = 0; ci < n; ci++) {
+        if (dist[ci][ci] < 0) return false;
+      }
+    }
+    return true;
+  }
+
+  // --- Main satisfiability checker ---
+  function smtSat(formula) {
+    if (!formula) return true;
+    var nnf = smtNNF(formula);
+    if (!nnf) return true;
+    if (nnf.type === 'const') return !!nnf.value;
+    if (nnf.type === 'sym') return true;
+    // Try to collect atoms from pure conjunction.
+    var atoms = smtCollectAtoms(nnf);
+    if (atoms !== null) return smtTheorySat(atoms);
+    // Disjunction: at least one branch must be satisfiable.
+    if (nnf.type === 'or') return smtSat(nnf.left) || smtSat(nnf.right);
+    // Conjunction with nested OR: distribute AND over OR (DNF conversion).
+    // A ∧ (B ∨ C) = (A ∧ B) ∨ (A ∧ C). Check each conjunct.
+    if (nnf.type === 'and') {
+      var orChild = null, otherChild = null;
+      if (nnf.left.type === 'or') { orChild = nnf.left; otherChild = nnf.right; }
+      else if (nnf.right.type === 'or') { orChild = nnf.right; otherChild = nnf.left; }
+      if (orChild) {
+        return smtSat(smtAnd(otherChild, orChild.left)) || smtSat(smtAnd(otherChild, orChild.right));
+      }
+      // Nested AND with deeper OR: flatten and retry.
+      // Collect all conjuncts, find the first OR, distribute.
+      var conjuncts = [];
+      var _flatAnd = function(f) { if (f.type === 'and') { _flatAnd(f.left); _flatAnd(f.right); } else conjuncts.push(f); };
+      _flatAnd(nnf);
+      for (var ci = 0; ci < conjuncts.length; ci++) {
+        if (conjuncts[ci].type === 'or') {
+          var rest = null;
+          for (var cj = 0; cj < conjuncts.length; cj++) {
+            if (cj !== ci) rest = rest ? smtAnd(rest, conjuncts[cj]) : conjuncts[cj];
+          }
+          return smtSat(smtAnd(rest, conjuncts[ci].left)) || smtSat(smtAnd(rest, conjuncts[ci].right));
+        }
+      }
+    }
+    // Comparison with concrete operands.
+    if (nnf.type === 'cmp' && nnf.left.type === 'const' && nnf.right.type === 'const') {
+      var l = nnf.left.value, r = nnf.right.value;
+      switch (nnf.op) {
+        case '<': return l < r; case '>': return l > r;
+        case '<=': return l <= r; case '>=': return l >= r;
+        case '==': case '===': return l === r;
+        case '!=': case '!==': return l !== r;
+      }
+    }
+    return true;
+  }
+
+  // --- Condition parser: raw JS tokens → SMT formula ---
+  // Operator precedence: || < && < comparisons < atoms
+  var _cmpOps = { '<':1, '>':1, '<=':1, '>=':1, '==':1, '!=':1, '===':1, '!==':1 };
+
+  function smtParseExpr(toks, start, end, resolveFunc, resolvePathFunc) {
+    if (start >= end) return null;
+    // Find lowest-precedence binary operator at depth 0.
+    // Precedence (low→high): || < && < comparisons < +/- < */% < atoms
+    var d = 0, lastOr = -1, lastAnd = -1, lastCmp = -1, lastCmpOp = null;
+    var lastAdd = -1, lastAddOp = null, lastMul = -1, lastMulOp = null;
+    for (var i = start; i < end; i++) {
+      if (toks[i].type === 'open') d++;
+      if (toks[i].type === 'close') d--;
+      if (d !== 0) continue;
+      var tt = toks[i].text;
+      if (toks[i].type === 'op' && tt === '||') lastOr = i;
+      else if (toks[i].type === 'op' && tt === '&&') lastAnd = i;
+      else if (toks[i].type === 'op' && _cmpOps[tt]) { lastCmp = i; lastCmpOp = tt; }
+      else if ((toks[i].type === 'op' && (tt === '-')) || (toks[i].type === 'plus')) { lastAdd = i; lastAddOp = tt === '-' ? '-' : '+'; }
+      else if (toks[i].type === 'op' && (tt === '*' || tt === '/' || tt === '%')) { lastMul = i; lastMulOp = tt; }
+    }
+    if (lastOr >= 0) return smtOr(smtParseExpr(toks, start, lastOr, resolveFunc, resolvePathFunc), smtParseExpr(toks, lastOr + 1, end, resolveFunc, resolvePathFunc));
+    if (lastAnd >= 0) return smtAnd(smtParseExpr(toks, start, lastAnd, resolveFunc, resolvePathFunc), smtParseExpr(toks, lastAnd + 1, end, resolveFunc, resolvePathFunc));
+    if (lastCmp >= 0) {
+      var cl = smtParseExpr(toks, start, lastCmp, resolveFunc, resolvePathFunc);
+      var cr = smtParseExpr(toks, lastCmp + 1, end, resolveFunc, resolvePathFunc);
+      return (cl && cr) ? smtCmp(lastCmpOp, cl, cr) : null;
+    }
+    if (lastAdd >= 0) {
+      var al = smtParseExpr(toks, start, lastAdd, resolveFunc, resolvePathFunc);
+      var ar = smtParseExpr(toks, lastAdd + 1, end, resolveFunc, resolvePathFunc);
+      if (al && ar) {
+        // Fold const + const.
+        if (al.type === 'const' && ar.type === 'const' && typeof al.value === 'number' && typeof ar.value === 'number') {
+          return smtConst(lastAddOp === '+' ? al.value + ar.value : al.value - ar.value);
+        }
+        return smtArith(lastAddOp, al, ar);
+      }
+    }
+    if (lastMul >= 0) {
+      var ml = smtParseExpr(toks, start, lastMul, resolveFunc, resolvePathFunc);
+      var mr = smtParseExpr(toks, lastMul + 1, end, resolveFunc, resolvePathFunc);
+      if (ml && mr) {
+        if (ml.type === 'const' && mr.type === 'const' && typeof ml.value === 'number' && typeof mr.value === 'number') {
+          if (lastMulOp === '*') return smtConst(ml.value * mr.value);
+          if (lastMulOp === '/' && mr.value !== 0) return smtConst(ml.value / mr.value);
+          if (lastMulOp === '%' && mr.value !== 0) return smtConst(ml.value % mr.value);
+        }
+        return smtArith(lastMulOp, ml, mr);
+      }
+    }
+    return smtParseAtom(toks, start, end, resolveFunc, resolvePathFunc);
+  }
+
+  function smtParseAtom(toks, start, end, resolveFunc, resolvePathFunc) {
+    if (start >= end) return null;
+    // NOT prefix.
+    if (toks[start].type === 'op' && toks[start].text === '!') {
+      var inner = smtParseAtom(toks, start + 1, end, resolveFunc, resolvePathFunc);
+      return inner ? smtNot(inner) : null;
+    }
+    // Parenthesized.
+    if (toks[start].type === 'open' && toks[start].char === '(') {
+      var d2 = 1, j2 = start + 1;
+      while (j2 < end && d2 > 0) { if (toks[j2].type === 'open') d2++; if (toks[j2].type === 'close') d2--; j2++; }
+      return smtParseExpr(toks, start + 1, j2 - 1, resolveFunc, resolvePathFunc);
+    }
+    // Single token.
+    if (end === start + 1) {
+      var t = toks[start];
+      // String literal.
+      if (t.type === 'str') return smtConst(t.text);
+      if (t.type === 'other') {
+        // JS constants.
+        if (t.text === 'true') return smtConst(true);
+        if (t.text === 'false') return smtConst(false);
+        if (t.text === 'null' || t.text === 'undefined') return smtConst(false);
+        if (/^\d+(\.\d+)?$/.test(t.text)) return smtConst(Number(t.text));
+        // Identifier: check if symbolic (tainted / event-modified).
+        var root = t.text.split('.')[0];
+        if (IDENT_RE.test(root)) {
+          var rb = resolveFunc(root);
+          if (rb) {
+            // Check root binding for taint (recursive into arrays/objects).
+            var _hasTaint = function(b) {
+              if (!b) return false;
+              if (b.kind === 'chain') return !!collectChainTaint(b.toks);
+              if (b.kind === 'array') { for (var e = 0; e < b.elems.length; e++) if (_hasTaint(b.elems[e])) return true; }
+              if (b.kind === 'object') { for (var k in b.props) if (_hasTaint(b.props[k])) return true; }
+              return false;
+            };
+            if (_hasTaint(rb)) {
+              // Resolve aliases: if the binding is a single opaque ref to
+              // another expression, use that expression as the symbolic name.
+              // This unifies x and y when y = x.
+              var _symName = t.text;
+              if (rb.kind === 'chain' && rb.toks.length === 1 && rb.toks[0].type === 'other') {
+                _symName = rb.toks[0].text;
+              }
+              if (_symName.endsWith('.length') || t.text.endsWith('.length')) return smtArith('length', smtSym(_symName.replace(/\.length$/, '')), smtConst(0));
+              return smtSym(_symName);
+            }
+          }
+          // Resolve full path to concrete value.
+          var fb = resolvePathFunc(t.text);
+          if (fb && fb.kind === 'chain' && fb.toks.length === 1 && fb.toks[0].type === 'str') {
+            var fv = fb.toks[0].text;
+            if (fv === 'true') return smtConst(true);
+            if (fv === 'false' || fv === 'null' || fv === 'undefined' || fv === '') return smtConst(false);
+            var nv = Number(fv);
+            if (!Number.isNaN(nv)) return smtConst(nv);
+            return smtConst(fv);
+          }
+        }
+        return smtSym(t.text);
+      }
+    }
+    // Multi-token: detect method calls like x.startsWith("str"), x.indexOf("str").
+    // Pattern: IDENT_PATH ( ARG )
+    if (end >= start + 3 && toks[start].type === 'other' && toks[start + 1].type === 'open' && toks[start + 1].char === '(') {
+      var _mPath = toks[start].text;
+      var _mDot = _mPath.lastIndexOf('.');
+      if (_mDot > 0) {
+        var _mBase = _mPath.slice(0, _mDot);
+        var _mMethod = _mPath.slice(_mDot + 1);
+        // Resolve the base to check if it's symbolic.
+        var _mRoot = _mBase.split('.')[0];
+        var _mRb = resolveFunc(_mRoot);
+        var _mIsSym = false;
+        if (_mRb) {
+          var _ht = function(b) { if (!b) return false; if (b.kind==='chain') return !!collectChainTaint(b.toks); if (b.kind==='array') { for (var e=0;e<b.elems.length;e++) if (_ht(b.elems[e])) return true; } if (b.kind==='object') { for (var k in b.props) if (_ht(b.props[k])) return true; } return false; };
+          _mIsSym = _ht(_mRb);
+        }
+        if (_mIsSym) {
+          // Find the argument (single string literal).
+          var _mArgTok = toks[start + 2];
+          var _mArgVal = null;
+          if (_mArgTok && _mArgTok.type === 'str' && toks[start + 3] && toks[start + 3].type === 'close') {
+            _mArgVal = _mArgTok.text;
+          }
+          // Resolve aliases for consistent symbolic ID.
+          var _mResolvedBase = _mBase;
+          if (_mRb && _mRb.kind === 'chain' && _mRb.toks.length === 1 && _mRb.toks[0].type === 'other') _mResolvedBase = _mRb.toks[0].text;
+          var _mSymId = smtSym(_mResolvedBase).id;
+          if (_mMethod === 'startsWith' && _mArgVal !== null) return smtStrProp(_mSymId, 'startsWith', _mArgVal);
+          if (_mMethod === 'endsWith' && _mArgVal !== null) return smtStrProp(_mSymId, 'endsWith', _mArgVal);
+          if (_mMethod === 'includes' && _mArgVal !== null) return smtStrProp(_mSymId, 'includes', _mArgVal);
+          if (_mMethod === 'indexOf' && _mArgVal !== null) return smtArith('indexOf', smtSym(_mResolvedBase), smtConst(_mArgVal));
+          // .length is a property, not a method call.
+        }
+      }
+    }
+    // Pattern: IDENT.length — property access without call.
+    if (end === start + 1 && toks[start].type === 'other' && toks[start].text.endsWith('.length')) {
+      var _lBase = toks[start].text.slice(0, -7);
+      var _lRoot = _lBase.split('.')[0];
+      var _lRb = resolveFunc(_lRoot);
+      if (_lRb) {
+        var _lt = function(b) { if (!b) return false; if (b.kind==='chain') return !!collectChainTaint(b.toks); if (b.kind==='array') { for (var e=0;e<b.elems.length;e++) if (_lt(b.elems[e])) return true; } if (b.kind==='object') { for (var k in b.props) if (_lt(b.props[k])) return true; } return false; };
+        if (_lt(_lRb)) return smtArith('length', smtSym(_lBase), smtConst(0));
+      }
+    }
+    return smtSym('_expr');
+  }
+
+  // --- Integration: check condition satisfiability ---
+  // condTokens: raw JS tokens of the condition expression
+  // pathConstraintStack: array of SMT formulas from enclosing branches
+  // Returns { sat, unsat } or null if purely concrete.
+  function smtCheckCondition(condTokens, resolveFunc, resolvePathFunc, pathConstraintStack) {
+    var formula = smtParseExpr(condTokens, 0, condTokens.length, resolveFunc, resolvePathFunc);
+    if (!formula) return null;
+    // Combine with path constraints: the full context is
+    // pathConstraint[0] ∧ pathConstraint[1] ∧ ... ∧ formula
+    var context = formula;
+    var negContext = smtNot(formula);
+    if (pathConstraintStack && pathConstraintStack.length > 0) {
+      // Build conjunction of all path constraints.
+      var pathConj = pathConstraintStack[0];
+      for (var i = 1; i < pathConstraintStack.length; i++) {
+        pathConj = smtAnd(pathConj, pathConstraintStack[i]);
+      }
+      // The true branch is reachable iff pathConj ∧ formula is satisfiable.
+      // The false branch is reachable iff pathConj ∧ ¬formula is satisfiable.
+      context = smtAnd(pathConj, formula);
+      negContext = smtAnd(pathConj, smtNot(formula));
+    }
+    return { sat: smtSat(context), unsat: smtSat(negContext) };
   }
 
   // -----------------------------------------------------------------------
@@ -1124,7 +1793,12 @@
   // `next` is the index after the param (points at `,` or `)`).
   function parseParamWithDefault(tokens, k, stop) {
     const nm = tokens[k];
-    if (!nm || nm.type !== 'other' || !IDENT_RE.test(nm.text)) return null;
+    if (!nm || nm.type !== 'other') return null;
+    // Rest parameter: ...args
+    if (nm.text.startsWith('...') && IDENT_RE.test(nm.text.slice(3))) {
+      return { param: { name: nm.text.slice(3), rest: true }, next: k + 1 };
+    }
+    if (!IDENT_RE.test(nm.text)) return null;
     let j = k + 1;
     const sep = tokens[j];
     if (sep && sep.type === 'sep' && sep.char === '=') {
@@ -1240,8 +1914,20 @@
     // Taint tracking state (active when taintConfig is provided).
     const taintEnabled = !!taintConfig;
     const taintFindings = taintEnabled ? [] : null;
-    // Path conditions accumulated through if/else branches.
+    // SMT path constraint: conjunction of conditions along the current
+    // execution path. Pushed when entering a branch, popped when leaving.
+    // Each entry is an SMT formula. The full path constraint is AND of all.
+    const pathConstraints = taintEnabled ? [] : null;
+    // String conditions for display in findings.
     const taintCondStack = taintEnabled ? [] : null;
+    // Track whether we're inside an event handler walk. Mutations to
+    // outer-scope variables inside handlers produce values that depend
+    // on the number of handler invocations (attacker-controlled).
+    var inEventHandler = false;
+    // Track function scope depth for taint. Findings inside function
+    // bodies walked at definition time (not via instantiateFunction)
+    // should be suppressed because there's no calling context.
+    var taintFnDepth = 0;
     // Loop detection stack: each entry is `{ id, kind, headerSrc, bodyEnd,
     // frame, modifiedVars }` recording an enclosing `for`/`while`. Operands
     // added to a binding's chain while a loop is active carry a `loopId` tag
@@ -1251,10 +1937,6 @@
     // Variables whose final value was built inside a loop, captured on
     // loop exit. Each entry: { name, loop: {id,kind,headerSrc}, chain }.
     const loopVars = [];
-    // Call stack for interprocedural analysis. Tracks functions currently
-    // being walked so recursive calls can be detected and handled at the
-    // fixed point (the first walk already captures all taint effects).
-    const fnCallStack = new Set();
     // When set, non-build statements inject 'preserve' tokens into this
     // variable's chain so the emitter outputs them at the right position.
     // trackBuildVar can be a string (single build var) or a Set (multiple).
@@ -1299,18 +1981,26 @@
     // Taint checking helpers (no-ops when taintEnabled is false).
     const checkTaintSource = (exprText) => {
       if (!taintEnabled) return null;
+      // Don't flag as taint source if the root is a declared local variable.
+      var root = exprText.split('.')[0];
+      if (root !== 'window' && root !== 'self' && root !== 'globalThis' && declaredNames.has(root)) return null;
       var label = getTaintSource(exprText);
       if (label) return new Set([label]);
       return null;
     };
     const checkTaintSourceCall = (callExpr) => {
       if (!taintEnabled) return null;
+      var root = callExpr.split('.')[0];
+      if (root !== 'window' && root !== 'self' && root !== 'globalThis' && declaredNames.has(root)) return null;
       var label = getTaintSourceCall(callExpr);
       if (label) return new Set([label]);
       return null;
     };
     const recordTaintFinding = (sinkType, severity, prop, elementTag, taintLabels, pathConditions, location) => {
       if (!taintFindings) return;
+      // Suppress findings inside function bodies walked at definition time.
+      // These are re-walked via instantiateFunction with proper context.
+      if (taintFnDepth > 0) return;
       taintFindings.push({
         type: sinkType,
         severity: severity,
@@ -1320,7 +2010,7 @@
         location: location || null,
       });
     };
-    const checkSinkAssignment = (el, propName, valBinding) => {
+    const checkSinkAssignment = (el, propName, valBinding, tok) => {
       if (!taintEnabled || !valBinding) return;
       var toks = valBinding.kind === 'chain' ? valBinding.toks : null;
       var taint = toks ? collectChainTaint(toks) : null;
@@ -1328,7 +2018,8 @@
       var tag = getElementTag(el);
       var sinkInfo = classifySink(propName, tag);
       if (sinkInfo && sinkInfo.severity !== 'safe') {
-        recordTaintFinding(sinkInfo.type, sinkInfo.severity, propName, tag, taint, taintCondStack);
+        var loc = tok && tok._src ? { expr: tok.text || propName, line: countLines(tok._src, tok.start) } : null;
+        recordTaintFinding(sinkInfo.type, sinkInfo.severity, propName, tag, taint, taintCondStack, loc);
       }
     };
     const checkSinkSetAttribute = (el, attrName, valBinding) => {
@@ -1350,7 +2041,7 @@
         }
       }
     };
-    const checkSinkCall = (callExpr, argBindings) => {
+    const checkSinkCall = (callExpr, argBindings, tok) => {
       if (!taintEnabled || !argBindings) return;
       var sinkInfo = TAINT_CALL_SINKS[callExpr];
       if (!sinkInfo) return;
@@ -1360,7 +2051,8 @@
         var toks = ab.kind === 'chain' ? ab.toks : null;
         var taint = toks ? collectChainTaint(toks) : null;
         if (taint && taint.size) {
-          recordTaintFinding(sinkInfo.type, sinkInfo.severity, callExpr, null, taint, taintCondStack);
+          var loc = tok && tok._src ? { expr: callExpr, line: countLines(tok._src, tok.start) } : null;
+          recordTaintFinding(sinkInfo.type, sinkInfo.severity, callExpr, null, taint, taintCondStack, loc);
           break;
         }
       }
@@ -1376,10 +2068,10 @@
     const elementBinding = domFactory.element;
     const textNodeBinding = domFactory.textNode;
     // Apply a mutation to an element binding's property path.
-    const applyElementSet = (el, path, val) => {
+    const applyElementSet = (el, path, val, tok) => {
       if (!el || el.kind !== 'element') return;
       // Taint: check if assigning a tainted value to a sink property.
-      if (path.length === 1) checkSinkAssignment(el, path[0], val);
+      if (path.length === 1) checkSinkAssignment(el, path[0], val, tok);
       const seg = path[0];
       if (path.length === 1) {
         if (seg === 'innerHTML' || seg === 'outerHTML') { el.html = val; }
@@ -1497,8 +2189,12 @@
       }
       return value;
     };
-    const declBlock = (name, value) => { topBlock().bindings[name] = asRef(name, value); };
+    // Track names explicitly declared with var/let/const/function.
+    // Used to distinguish `var location = x` (local) from `location = x` (global write).
+    const declaredNames = new Set();
+    const declBlock = (name, value) => { declaredNames.add(name); topBlock().bindings[name] = asRef(name, value); };
     const declFunction = (name, value) => {
+      declaredNames.add(name);
       for (let i = stack.length - 1; i >= 0; i--) {
         if (stack[i].isFunction) { stack[i].bindings[name] = asRef(name, value); return; }
       }
@@ -1524,14 +2220,20 @@
       for (let i = 1; i < parts.length && b; i++) {
         const p = parts[i];
         if (b.kind === 'object') {
+          // Check for getter: __getter_prop is a function that returns the value.
+          var _getter = b.props['__getter_' + p];
+          if (_getter && _getter.kind === 'function') {
+            var _getResult = instantiateFunction(_getter, []);
+            if (_getResult && _getResult.kind) b = _getResult;
+            else if (_getResult) b = chainBinding(_getResult);
+            else b = null;
+            continue;
+          }
           b = b.props[p] || null;
         } else if (b.kind === 'chain' && b.toks.length === 1 && b.toks[0].type === 'other') {
           // Opaque chain (e.g. parameter bound to exprRef) — extend the
           // path so `column.title` becomes `store.columns[i].title`.
-          var _extRef = exprRef(b.toks[0].text + '.' + parts.slice(i).join('.'));
-          // Propagate taint from the base token (e.g. tainted event param).
-          if (b.toks[0].taint) _extRef.taint = new Set(b.toks[0].taint);
-          b = chainBinding([_extRef]);
+          b = chainBinding([deriveExprRef(b.toks[0].text + '.' + parts.slice(i).join('.'), b.toks)]);
           break;
         } else if (p === 'length' && b.kind === 'array') {
           b = chainBinding([makeSynthStr(String(b.elems.length))]);
@@ -1630,12 +2332,14 @@
       for (const p of tok.parts) {
         if (p.kind === 'text') { parts.push({ kind: 'text', raw: p.raw }); continue; }
         let resolvedText = null;
+        var _tmplChain = null;
         if (TEMPLATE_EXPR_PATH_RE.test(p.expr)) {
           const path = p.expr.replace(/\s+/g, '');
           const b = resolvePath(path);
-          if (b) resolvedText = bindingToText(b);
+          if (b) { resolvedText = bindingToText(b); if (b.kind === 'chain') _tmplChain = b.toks; }
         } else {
           const chain = evalExprSrc(p.expr);
+          _tmplChain = chain;
           if (chain) {
             // Check if the chain contains structured tokens (cond, trycatch, switch).
             const hasStructured = chain.some(t => t.type === 'cond' || t.type === 'trycatch' || t.type === 'switch' || t.type === 'iter');
@@ -1665,12 +2369,25 @@
           }
         }
         if (resolvedText !== null) {
+          // Taint: if the resolved chain carries taint, don't inline as
+          // text — keep as expr so collectChainTaint can find it.
+          if (taintEnabled && _tmplChain && collectChainTaint(_tmplChain)) {
+            parts.push({ kind: 'expr', expr: p.expr, toks: _tmplChain });
+            changed = true;
+            continue;
+          }
           const raw = resolvedText.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$\{/g, '\\${');
           parts.push({ kind: 'text', raw });
           changed = true;
           continue;
         }
-        parts.push({ kind: 'expr', expr: p.expr });
+        // Attach resolved chain toks to expr parts so collectChainTaint can find them.
+        var _exprPart = { kind: 'expr', expr: p.expr };
+        if (taintEnabled && _tmplChain && collectChainTaint(_tmplChain)) {
+          _exprPart.toks = _tmplChain;
+          changed = true;
+        }
+        parts.push(_exprPart);
       }
       if (!changed) return tok;
       // Coalesce adjacent text parts.
@@ -1753,6 +2470,17 @@
               if (sep && sep.type === 'other' && sep.text === ':') {
                 i++;
                 const alias = tks[i];
+                // Nested destructuring: { key: { ... } } or { key: [ ... ] }
+                if (alias && alias.type === 'open' && (alias.char === '{' || alias.char === '[')) {
+                  var nested = readDestructurePattern(i, stop);
+                  if (nested) {
+                    entries.push({ key, nested: nested.pattern });
+                    i = nested.next;
+                    if (tks[i] && tks[i].type === 'sep' && tks[i].char === ',') i++;
+                    continue;
+                  }
+                  return null;
+                }
                 if (!alias || alias.type !== 'other' || !IDENT_RE.test(alias.text)) return null;
                 name = alias.text;
                 i++;
@@ -1845,11 +2573,16 @@
       if (pattern.kind === 'obj-pattern') {
         const props = source && source.kind === 'object' ? source.props : null;
         const seen = Object.create(null);
-        for (const { key, name, dflt } of pattern.entries) {
-          seen[key] = true;
-          let val = props ? (props[key] || null) : null;
-          if (val === null && dflt) val = resolveDefault(dflt);
-          bind(name, val);
+        for (const entry of pattern.entries) {
+          seen[entry.key] = true;
+          let val = props ? (props[entry.key] || null) : null;
+          if (val === null && entry.dflt) val = resolveDefault(entry.dflt);
+          if (entry.nested) {
+            // Nested destructuring: recursively apply pattern.
+            applyPatternBindings(entry.nested, val, bind);
+          } else {
+            bind(entry.name, val);
+          }
         }
         if (pattern.rest) {
           if (props) {
@@ -1937,9 +2670,32 @@
             if ((tk.text === 'get' || tk.text === 'set' || tk.text === 'async') &&
                 tks[i + 1] && tks[i + 1].type === 'other' && IDENT_RE.test(tks[i + 1].text) &&
                 tks[i + 2] && tks[i + 2].type === 'open' && tks[i + 2].char === '(') {
+              var _gsPrefix = tk.text;
               i++; // skip prefix
               keyName = tks[i].text;
               i++;
+              // Parse params and body directly (no 'function' keyword).
+              var _gsParams = [], _gsJ = i; // i points to '('
+              if (tks[_gsJ] && tks[_gsJ].type === 'open' && tks[_gsJ].char === '(') {
+                _gsJ++;
+                while (_gsJ < stop) {
+                  if (tks[_gsJ].type === 'close' && tks[_gsJ].char === ')') { _gsJ++; break; }
+                  var _gsp = parseParamWithDefault(tks, _gsJ, stop);
+                  if (_gsp) { _gsParams.push(_gsp.param); _gsJ = _gsp.next; }
+                  else _gsJ++;
+                  if (tks[_gsJ] && tks[_gsJ].type === 'sep' && tks[_gsJ].char === ',') _gsJ++;
+                }
+              }
+              if (tks[_gsJ] && tks[_gsJ].type === 'open' && tks[_gsJ].char === '{') {
+                var _gsBD = 1, _gsBE = _gsJ + 1;
+                while (_gsBE < stop && _gsBD > 0) { if (tks[_gsBE].type === 'open' && tks[_gsBE].char === '{') _gsBD++; if (tks[_gsBE].type === 'close' && tks[_gsBE].char === '}') _gsBD--; _gsBE++; }
+                var _gsFnBind = functionBinding(_gsParams, _gsJ, _gsBE, true);
+                if (_gsPrefix === 'get') props['__getter_' + keyName] = _gsFnBind;
+                else props[keyName] = _gsFnBind;
+                i = _gsBE;
+                if (tks[i] && tks[i].type === 'sep' && tks[i].char === ',') i++;
+                continue;
+              }
             } else {
               keyName = tk.text;
               i++;
@@ -2131,9 +2887,69 @@
     // Read any value at index `k`: arrow function, chain, object literal, or
     // array literal. `terms` defines the expression terminators for chain
     // parsing. Returns { binding, next } or null.
+    // Parse a function expression: function [name](params) { body }.
+    // Returns { binding: functionBinding, next } or null.
+    const readFunctionExpr = (k, stop) => {
+      var ft = tks[k];
+      if (!ft || ft.type !== 'other' || ft.text !== 'function') return null;
+      var fk = k + 1;
+      // Optional function name.
+      if (tks[fk] && tks[fk].type === 'other' && IDENT_RE.test(tks[fk].text) && tks[fk].text !== 'function') fk++;
+      // Parameter list.
+      if (!tks[fk] || tks[fk].type !== 'open' || tks[fk].char !== '(') return null;
+      var params = [];
+      var fj = fk + 1;
+      while (fj < stop) {
+        var pt = tks[fj];
+        if (pt && pt.type === 'close' && pt.char === ')') { fj++; break; }
+        // Rest parameter: ...args (single token "...args" or two tokens "..." + "args")
+        if (pt && pt.type === 'other' && pt.text.startsWith('...')) {
+          var _restName = pt.text.slice(3);
+          if (IDENT_RE.test(_restName)) {
+            params.push({ name: _restName, rest: true });
+            fj++;
+            if (tks[fj] && tks[fj].type === 'sep' && tks[fj].char === ',') fj++;
+            continue;
+          }
+        }
+        if (pt && pt.type === 'other' && IDENT_RE.test(pt.text)) {
+          var paramObj = { name: pt.text };
+          // Check for default value: param = defaultExpr.
+          if (tks[fj + 1] && tks[fj + 1].type === 'sep' && tks[fj + 1].char === '=') {
+            paramObj.defaultStart = fj + 2;
+            var dd = fj + 2;
+            while (dd < stop && !(tks[dd].type === 'sep' && tks[dd].char === ',') && !(tks[dd].type === 'close' && tks[dd].char === ')')) {
+              if (tks[dd].type === 'open') { var dep = 1; dd++; while (dd < stop && dep > 0) { if (tks[dd].type === 'open') dep++; if (tks[dd].type === 'close') dep--; dd++; } continue; }
+              dd++;
+            }
+            paramObj.defaultEnd = dd;
+            fj = dd;
+          } else {
+            fj++;
+          }
+          params.push(paramObj);
+        } else {
+          fj++;
+        }
+        if (tks[fj] && tks[fj].type === 'sep' && tks[fj].char === ',') fj++;
+      }
+      // Body: { ... }
+      if (!tks[fj] || tks[fj].type !== 'open' || tks[fj].char !== '{') return null;
+      var depth = 1, bodyEnd = fj + 1;
+      while (bodyEnd < stop && depth > 0) {
+        if (tks[bodyEnd].type === 'open' && tks[bodyEnd].char === '{') depth++;
+        else if (tks[bodyEnd].type === 'close' && tks[bodyEnd].char === '}') depth--;
+        bodyEnd++;
+      }
+      return { binding: functionBinding(params, fj, bodyEnd, true), next: bodyEnd };
+    };
+
     const readValue = (k, stop, terms) => {
       const t = tks[k];
       if (!t) return null;
+      // Function expression: function(params) { body }
+      var fnExpr = readFunctionExpr(k, stop);
+      if (fnExpr) return fnExpr;
       // Arrow function (it can start with `(` or with an ident).
       const arrow = peekArrow(k, stop);
       if (arrow) {
@@ -2252,12 +3068,26 @@
             // Opaque index: produce a symbolic chain so downstream
             // property access (.v) and operators (===, ?) can form
             // valid expressions instead of returning null.
+            // For taint: collect taint from ALL array elements since
+            // any element could be accessed at runtime.
+            var _elemTaintSources = [];
+            if (taintEnabled && bind) {
+              if (bind.kind === 'array') {
+                for (var _ei = 0; _ei < bind.elems.length; _ei++) {
+                  if (bind.elems[_ei] && bind.elems[_ei].kind === 'chain') _elemTaintSources.push(bind.elems[_ei].toks);
+                }
+              } else if (bind.kind === 'object') {
+                for (var _ok in bind.props) {
+                  if (bind.props[_ok] && bind.props[_ok].kind === 'chain') _elemTaintSources.push(bind.props[_ok].toks);
+                }
+              }
+            }
             const baseText = bind.kind === 'chain' && bind.toks.length === 1 && bind.toks[0].type === 'other'
               ? bind.toks[0].text
               : (tks[next - 1] && tks[next - 1]._src ? tks[next - 1]._src.slice(tks[next - 1].start, tks[next - 1].end) : null);
             if (baseText) {
               const idxText = tks[next + 1] && tks[next + 1]._src ? tks[next + 1]._src.slice(tks[next + 1].start, tks[j - 1].end) : 'i';
-              bind = chainBinding([exprRef(baseText + '[' + idxText + ']')]);
+              bind = chainBinding([deriveExprRef.apply(null, [baseText + '[' + idxText + ']', bind ? bind.toks : null].concat(_elemTaintSources))]);
             } else {
               bind = null;
             }
@@ -2305,7 +3135,7 @@
               cur = ok ? chainBinding([makeSynthStr(String(n))]) : null;
             } else if (cur.kind === 'chain' && cur.toks.length === 1 && cur.toks[0].type === 'other') {
               // Opaque chain: extend the expression text with the property.
-              cur = chainBinding([exprRef(cur.toks[0].text + '.' + p)]);
+              cur = chainBinding([deriveExprRef(cur.toks[0].text + '.' + p, cur.toks)]);
             } else {
               cur = null;
               break;
@@ -2317,6 +3147,26 @@
             bind = r.bind;
             next = r.next;
             continue;
+          }
+          // Object method call: cur is a function binding accessed via .prop,
+          // followed by (args). Inline the function.
+          if (isCall && cur && cur.kind === 'function') {
+            var _omArgs = readCallArgBindings(next + 1, stop);
+            if (_omArgs) {
+              // Pass the receiver object as 'this' for method calls.
+              var _omResult = instantiateFunction(cur, _omArgs.bindings, bind);
+              if (_omResult && _omResult.kind) { bind = _omResult; next = _omArgs.next; continue; }
+              if (_omResult) { bind = chainBinding(_omResult); next = _omArgs.next; continue; }
+            }
+          }
+          // Getter on object: auto-invoke.
+          if (!isCall && cur && cur.kind === 'object' && cur.props['__getter_' + lastSeg]) {
+            var _gtrFn = cur.props['__getter_' + lastSeg];
+            if (_gtrFn.kind === 'function') {
+              var _gtrResult = instantiateFunction(_gtrFn, []);
+              if (_gtrResult && _gtrResult.kind) { cur = _gtrResult; }
+              else if (_gtrResult) { cur = chainBinding(_gtrResult); }
+            }
           }
           bind = cur;
           next = next + 1;
@@ -2330,6 +3180,20 @@
     // Apply a method call: .concat on chain, or .join on array.
     const applyMethod = (bind, method, parenIdx, stop) => {
       if (method === 'concat') {
+        // Array concat: [].concat(arr) → merge elements.
+        if (bind && bind.kind === 'array') {
+          var _cArgs = readCallArgBindings(parenIdx, stop);
+          if (_cArgs) {
+            var _cElems = bind.elems.slice();
+            for (var _ci = 0; _ci < _cArgs.bindings.length; _ci++) {
+              var _ca = _cArgs.bindings[_ci];
+              if (_ca && _ca.kind === 'array') { for (var _cj = 0; _cj < _ca.elems.length; _cj++) _cElems.push(_ca.elems[_cj]); }
+              else if (_ca) _cElems.push(_ca);
+            }
+            return { bind: arrayBinding(_cElems), next: _cArgs.next };
+          }
+        }
+        // String concat.
         if (!bind || bind.kind !== 'chain') return null;
         const args = readConcatArgs(parenIdx, stop);
         if (!args) return null;
@@ -2432,15 +3296,35 @@
         if (method === 'map' || method === 'filter' || method === 'forEach') {
           const lp = tks[parenIdx];
           if (!lp || lp.type !== 'open' || lp.char !== '(') return null;
+          // Try arrow function, then function expression, then identifier.
+          var fn = null, fnNext = 0;
           const arrow = peekArrow(parenIdx + 1, stop);
-          if (!arrow) return null;
-          const body = readArrowBody(arrow.arrowNext, stop);
-          if (!body) return null;
-          const rp = tks[body.next];
+          if (arrow) {
+            const body = readArrowBody(arrow.arrowNext, stop);
+            if (body) { fn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock); fnNext = body.next; }
+          }
+          if (!fn) {
+            var fexpr = readFunctionExpr(parenIdx + 1, stop);
+            if (fexpr) { fn = fexpr.binding; fnNext = fexpr.next; }
+          }
+          if (!fn) {
+            // Try identifier reference to a function.
+            var cbTok = tks[parenIdx + 1];
+            if (cbTok && cbTok.type === 'other' && IDENT_RE.test(cbTok.text)) {
+              var refB = resolve(cbTok.text);
+              if (refB && refB.kind === 'function') { fn = refB; fnNext = parenIdx + 2; }
+            }
+          }
+          if (!fn) return null;
+          const rp = tks[fnNext];
           if (!rp || rp.type !== 'close' || rp.char !== ')') return null;
-          const fn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock);
           if (method === 'forEach') {
-            return { bind: chainBinding([makeSynthStr('undefined')]), next: body.next + 1 };
+            // Walk callback for each element to detect side effects
+            // (e.g. el.innerHTML = item inside the callback).
+            for (const el of bind.elems) {
+              if (el) instantiateFunction(fn, [el]);
+            }
+            return { bind: chainBinding([makeSynthStr('undefined')]), next: fnNext + 1 };
           }
           const results = [];
           for (const el of bind.elems) {
@@ -2459,9 +3343,19 @@
             const truthy = (n !== null && n !== 0) || (s !== null && s !== '' && s !== 'false' && s !== 'null' && s !== 'undefined' && s !== '0' && s !== 'NaN');
             const falsy = n === 0 || s === '' || s === 'false' || s === 'null' || s === 'undefined' || s === '0' || s === 'NaN';
             if (truthy) results.push(el);
-            else if (!falsy) return null;
+            else if (falsy) { /* skip */ }
+            else {
+              // Can't determine at compile time: result could contain any
+              // element. Return opaque binding with taint from all elements.
+              var _allElToks = [];
+              for (var _fe = 0; _fe < bind.elems.length; _fe++) {
+                if (bind.elems[_fe] && bind.elems[_fe].kind === 'chain') _allElToks.push(bind.elems[_fe].toks);
+              }
+              var _filterRef = deriveExprRef.apply(null, [chainAsExprText(chainBinding([exprRef('filtered')]))||'filtered'].concat(_allElToks));
+              return { bind: chainBinding([_filterRef]), next: fnNext + 1 };
+            }
           }
-          return { bind: arrayBinding(results), next: body.next + 1 };
+          return { bind: arrayBinding(results), next: fnNext + 1 };
         }
         // `.reduce(fn, init)` — two-arg reducer: invoke the callback
         // per element with (accumulator, element) and thread the
@@ -2469,17 +3363,32 @@
         if (method === 'reduce') {
           const lp = tks[parenIdx];
           if (!lp || lp.type !== 'open' || lp.char !== '(') return null;
+          // Try arrow, function expression, or identifier.
+          var reduceFn = null, reduceFnNext = 0;
           const arrow = peekArrow(parenIdx + 1, stop);
-          if (!arrow || arrow.params.length !== 2) return null;
-          const body = readArrowBody(arrow.arrowNext, stop);
-          if (!body) return null;
-          const sep = tks[body.next];
+          if (arrow && arrow.params.length === 2) {
+            const body = readArrowBody(arrow.arrowNext, stop);
+            if (body) { reduceFn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock); reduceFnNext = body.next; }
+          }
+          if (!reduceFn) {
+            var rfexpr = readFunctionExpr(parenIdx + 1, stop);
+            if (rfexpr && rfexpr.binding.params && rfexpr.binding.params.length === 2) { reduceFn = rfexpr.binding; reduceFnNext = rfexpr.next; }
+          }
+          if (!reduceFn) {
+            var rcbTok = tks[parenIdx + 1];
+            if (rcbTok && rcbTok.type === 'other' && IDENT_RE.test(rcbTok.text)) {
+              var rrefB = resolve(rcbTok.text);
+              if (rrefB && rrefB.kind === 'function' && rrefB.params && rrefB.params.length === 2) { reduceFn = rrefB; reduceFnNext = parenIdx + 2; }
+            }
+          }
+          if (!reduceFn) return null;
+          const sep = tks[reduceFnNext];
           if (!sep || sep.type !== 'sep' || sep.char !== ',') return null;
-          const init = readConcatExpr(body.next + 1, stop, { sep: [], close: [')'] });
+          const init = readConcatExpr(reduceFnNext + 1, stop, { sep: [], close: [')'] });
           if (!init) return null;
           const rp = tks[init.next];
           if (!rp || rp.type !== 'close' || rp.char !== ')') return null;
-          const fn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock);
+          const fn = reduceFn;
           let accBind = chainBinding(init.toks);
           for (const el of bind.elems) {
             if (!el) return null;
@@ -2547,32 +3456,10 @@
         }
         // Try function expression: `.map(function(x) { ... })`
         if (!fn) {
-          let k = parenIdx + 1;
-          if (tks[k] && tks[k].type === 'other' && tks[k].text === 'function') {
-            k++;
-            // optional name
-            if (tks[k] && tks[k].type === 'other' && IDENT_RE.test(tks[k].text) && tks[k].text !== 'function') k++;
-            if (tks[k] && tks[k].type === 'open' && tks[k].char === '(') {
-              const params = [];
-              let j = k + 1;
-              while (j < stop) {
-                const pt = tks[j];
-                if (pt && pt.type === 'close' && pt.char === ')') { j++; break; }
-                if (pt && pt.type === 'other' && IDENT_RE.test(pt.text)) params.push({ name: pt.text });
-                j++;
-              }
-              // Expect `{`
-              if (tks[j] && tks[j].type === 'open' && tks[j].char === '{') {
-                let depth = 1, bodyEnd = j + 1;
-                while (bodyEnd < stop && depth > 0) {
-                  if (tks[bodyEnd].type === 'open' && tks[bodyEnd].char === '{') depth++;
-                  else if (tks[bodyEnd].type === 'close' && tks[bodyEnd].char === '}') depth--;
-                  if (depth > 0) bodyEnd++;
-                }
-                fn = functionBinding(params, j, bodyEnd + 1, true);
-                fnEnd = bodyEnd + 1;
-              }
-            }
+          var _fexpr = readFunctionExpr(parenIdx + 1, stop);
+          if (_fexpr) {
+            fn = _fexpr.binding;
+            fnEnd = _fexpr.next;
           }
         }
         if (!fn) return null;
@@ -2664,50 +3551,29 @@
     // (with optional attached .concat/.join method), parenthesized
     // subexpressions, array literals, and object literals.
     const readBase = (k, stop) => {
-      // Collect prefix operators iteratively instead of recursing.
-      // Two kinds: keyword prefixes (await/yield/typeof/void/delete) and
-      // operator prefixes (-/+/!/~). Collected in order, then applied in
-      // reverse after the base operand is read.
-      const prefixes = [];
-      while (k < stop) {
-        const pt = tks[k];
-        if (!pt) return null;
-        if (pt.type === 'other' && (pt.text === 'await' || pt.text === 'yield' || pt.text === 'typeof' || pt.text === 'void' || pt.text === 'delete')) {
-          prefixes.push({ kind: 'keyword', text: pt.text });
-          k++;
-          continue;
-        }
-        if (pt.type === 'op' && (pt.text === '-' || pt.text === '+' || pt.text === '!' || pt.text === '~')) {
-          prefixes.push({ kind: 'unary', text: pt.text });
-          k++;
-          continue;
-        }
-        break;
-      }
-      // Parse the base operand (everything after prefixes).
-      var baseResult = _readBaseCore(k, stop);
-      // Apply collected prefix operators in reverse order.
-      if (!baseResult) return null;
-      for (var _pi = prefixes.length - 1; _pi >= 0; _pi--) {
-        var _pf = prefixes[_pi];
-        if (_pf.kind === 'keyword') {
-          var _et = chainAsExprText(baseResult.bind);
-          if (_et === null) return null;
-          baseResult = { bind: chainBinding([exprRef(_pf.text + ' ' + _et)]), next: baseResult.next };
-        } else {
-          var _applied = applyUnary(_pf.text, baseResult.bind);
-          if (!_applied) return null;
-          baseResult = { bind: _applied, next: baseResult.next };
-        }
-      }
-      return baseResult;
-    };
-    const _readBaseCore = (k, stop) => {
       const t = tks[k];
       if (!t) return null;
       // `new X(args)` / `new X.Y` / `new X` — absorb the constructor call
       // and its arguments as a single opaque expression reference.
       if (t.type === 'other' && t.text === 'new') {
+        // Check if the constructor is a known class.
+        var _newName = tks[k + 1];
+        if (_newName && _newName.type === 'other' && IDENT_RE.test(_newName.text)) {
+          var _newBind = resolve(_newName.text);
+          if (_newBind && _newBind.kind === 'object' && _newBind._isClass) {
+            // Class instantiation: create instance with class methods.
+            var _newJ = k + 2;
+            if (tks[_newJ] && tks[_newJ].type === 'open' && tks[_newJ].char === '(') {
+              var _nd = 1; _newJ++;
+              while (_newJ < stop && _nd > 0) { if (tks[_newJ].type === 'open' && tks[_newJ].char === '(') _nd++; if (tks[_newJ].type === 'close' && tks[_newJ].char === ')') _nd--; _newJ++; }
+            }
+            // Create instance object with copies of all class methods.
+            var _instProps = Object.create(null);
+            for (var _ck in _newBind.props) _instProps[_ck] = _newBind.props[_ck];
+            var _inst = objectBinding(_instProps);
+            return { bind: _inst, next: _newJ };
+          }
+        }
         let j = k + 1;
         if (tks[j] && tks[j].type === 'other' && IDENT_OR_PATH_RE.test(tks[j].text)) j++;
         if (tks[j] && tks[j].type === 'open' && tks[j].char === '(') {
@@ -2728,6 +3594,24 @@
         if (_newTaint) _newRef.taint = _newTaint;
         return { bind: chainBinding([_newRef]), next: j };
       }
+      // `await expr` / `yield expr` / `void expr` / `typeof expr` / `delete expr`:
+      // evaluate the expression and surface a canonical symbolic form.
+      if (t.type === 'other' && (t.text === 'await' || t.text === 'yield' || t.text === 'typeof' || t.text === 'void' || t.text === 'delete')) {
+        const inner = readBase(k + 1, stop);
+        if (!inner) return null;
+        const et = chainAsExprText(inner.bind);
+        if (et === null) return null;
+        const text = t.text + ' ' + et;
+        return { bind: chainBinding([exprRef(text)]), next: inner.next };
+      }
+      // Unary operators: `-`, `+`, `!`, `~`.
+      if (t.type === 'op' && (t.text === '-' || t.text === '+' || t.text === '!' || t.text === '~')) {
+        const inner = readBase(k + 1, stop);
+        if (!inner) return null;
+        const applied = applyUnary(t.text, inner.bind);
+        if (!applied) return null;
+        return { bind: applied, next: inner.next };
+      }
       if (t.type === 'str') return { bind: chainBinding([t]), next: k + 1 };
       if (t.type === 'tmpl') {
         const rw = rewriteTemplate(t);
@@ -2736,11 +3620,20 @@
       }
       if (t.type === 'regex') return { bind: chainBinding([exprRef(t.text)]), next: k + 1 };
       if (t.type === 'open' && t.char === '(') {
-        const r = readConcatExpr(k + 1, stop, { sep: [], close: [')'] });
-        if (!r) return null;
-        const rp = tks[r.next];
+        // Handle comma operator: (expr1, expr2, ..., exprN) → value is exprN.
+        var _lastToks = null, _parenNext = k + 1;
+        while (_parenNext < stop) {
+          var _pr = readConcatExpr(_parenNext, stop, { sep: [','], close: [')'] });
+          if (!_pr) break;
+          _lastToks = _pr.toks;
+          _parenNext = _pr.next;
+          if (tks[_parenNext] && tks[_parenNext].type === 'sep' && tks[_parenNext].char === ',') { _parenNext++; continue; }
+          break;
+        }
+        if (!_lastToks) return null;
+        const rp = tks[_parenNext];
         if (!rp || rp.type !== 'close' || rp.char !== ')') return null;
-        return { bind: chainBinding(r.toks), next: r.next + 1 };
+        return { bind: chainBinding(_lastToks), next: _parenNext + 1 };
       }
       if (t.type === 'open' && t.char === '[') {
         const a = readArrayLit(k, stop);
@@ -2752,43 +3645,10 @@
         if (!o) return null;
         return { bind: o.binding, next: o.next };
       }
-      // Function expression: `function(params) { body }` or `function name(params) { body }`.
+      // Function expression in expression position.
       if (t.type === 'other' && t.text === 'function') {
-        let j = k + 1;
-        // Optional function name.
-        if (tks[j] && tks[j].type === 'other' && IDENT_RE.test(tks[j].text)) j++;
-        if (tks[j] && tks[j].type === 'open' && tks[j].char === '(') {
-          const params = [];
-          j++;
-          if (tks[j] && tks[j].type === 'close' && tks[j].char === ')') { j++; }
-          else {
-            let ok = true;
-            while (j < stop) {
-              const pt = parseParamWithDefault(tks, j, stop);
-              if (!pt) { ok = false; break; }
-              params.push(pt.param);
-              j = pt.next;
-              const sep = tks[j];
-              if (sep && sep.type === 'close' && sep.char === ')') { j++; break; }
-              if (sep && sep.type === 'sep' && sep.char === ',') { j++; continue; }
-              ok = false; break;
-            }
-            if (!ok) return null;
-          }
-          if (tks[j] && tks[j].type === 'open' && tks[j].char === '{') {
-            let depth = 1;
-            let bk = j + 1;
-            while (bk < stop && depth > 0) {
-              if (tks[bk].type === 'open' && tks[bk].char === '{') depth++;
-              else if (tks[bk].type === 'close' && tks[bk].char === '}') depth--;
-              bk++;
-            }
-            if (depth === 0) {
-              return { bind: functionBinding(params, j + 1, bk - 1, true), next: bk };
-            }
-          }
-        }
-        return null;
+        var _fnExpr = readFunctionExpr(k, stop);
+        if (_fnExpr) return { bind: _fnExpr.binding, next: _fnExpr.next };
       }
       if (t.type !== 'other') return null;
       // Primitive literal.
@@ -2798,6 +3658,40 @@
       if (IDENT_OR_PATH_RE.test(t.text)) {
         const paren = tks[k + 1];
         const isCall = paren && paren.type === 'open' && paren.char === '(';
+        // Tagged template: tag`...` — call the tag function with template parts.
+        if (paren && paren.type === 'tmpl') {
+          var tagBind = resolvePath(t.text);
+          if (tagBind && tagBind.kind === 'function') {
+            // Build arguments: first arg is strings array, rest are expression values.
+            var _tagArgs = [chainBinding([makeSynthStr('')])]; // strings placeholder
+            if (paren.parts) {
+              for (var _tp = 0; _tp < paren.parts.length; _tp++) {
+                if (paren.parts[_tp].kind === 'expr') {
+                  var _tagExpr = evalExprSrc(paren.parts[_tp].expr);
+                  if (_tagExpr) _tagArgs.push(chainBinding(_tagExpr));
+                  else _tagArgs.push(chainBinding([exprRef(paren.parts[_tp].expr)]));
+                }
+              }
+            }
+            var _tagResult = instantiateFunction(tagBind, _tagArgs);
+            if (_tagResult && _tagResult.kind) return { bind: _tagResult, next: k + 2 };
+            if (_tagResult) return { bind: chainBinding(_tagResult), next: k + 2 };
+          }
+          // Unknown tag: result is opaque (tag function transforms the template).
+          // Propagate taint from any expression parts.
+          var _tagSrc = t._src ? t._src.slice(t.start, paren.end) : t.text + '`...`';
+          var _tagRef = exprRef(_tagSrc);
+          if (paren.parts) {
+            for (var _tp2 = 0; _tp2 < paren.parts.length; _tp2++) {
+              if (paren.parts[_tp2].kind === 'expr') {
+                var _te = evalExprSrc(paren.parts[_tp2].expr);
+                var _tt = _te ? collectChainTaint(_te) : null;
+                if (_tt) { if (!_tagRef.taint) _tagRef.taint = new Set(); for (var _tl of _tt) _tagRef.taint.add(_tl); }
+              }
+            }
+          }
+          return { bind: chainBinding([_tagRef]), next: k + 2 };
+        }
         // Known math/numeric constants like `Math.PI`.
         if (!isCall && MATH_CONSTANTS[t.text] !== undefined) {
           return { bind: chainBinding([makeSynthStr(String(MATH_CONSTANTS[t.text]))]), next: k + 1 };
@@ -2902,17 +3796,36 @@
         if (isCall && (t.text === 'JSON.stringify' || t.text === 'JSON.parse')) {
           const argRes = readCallArgBindings(k + 1, stop);
           if (argRes && argRes.bindings.length >= 1) {
-            const val = bindingToJson(argRes.bindings[0]);
+            // Check taint BEFORE concrete evaluation — if the argument
+            // carries taint, the result should too regardless of concrete value.
+            var _argBind = argRes.bindings[0];
+            var _jTaint = null;
+            if (_argBind) {
+              if (_argBind.kind === 'chain') _jTaint = collectChainTaint(_argBind.toks);
+              else if (_argBind.kind === 'object') { for (var _jk in _argBind.props) { var _jpt = _argBind.props[_jk]; if (_jpt && _jpt.kind === 'chain' && collectChainTaint(_jpt.toks)) { _jTaint = collectChainTaint(_jpt.toks); break; } } }
+              else if (_argBind.kind === 'array') { for (var _ji = 0; _ji < _argBind.elems.length; _ji++) { var _jet = _argBind.elems[_ji]; if (_jet && _jet.kind === 'chain' && collectChainTaint(_jet.toks)) { _jTaint = collectChainTaint(_jet.toks); break; } } }
+            }
+            if (_jTaint) {
+              return { bind: chainBinding([deriveExprRef(t.text + '(...)', _argBind.kind === 'chain' ? _argBind.toks : [exprRef(t.text)])]), next: argRes.next };
+            }
+            const val = bindingToJson(_argBind);
             if (val !== undefined) {
               if (t.text === 'JSON.stringify') {
                 return { bind: chainBinding([makeSynthStr(JSON.stringify(val))]), next: argRes.next };
               }
-              // parse: value is a string, parse it and reconstruct a binding.
               if (typeof val === 'string') {
                 try {
                   const parsed = JSON.parse(val);
                   return { bind: jsonToBinding(parsed), next: argRes.next };
                 } catch (_) { /* fall through */ }
+              }
+            }
+            // Tainted/opaque argument: result carries the same taint.
+            var _argBind = argRes.bindings[0];
+            if (_argBind && _argBind.kind === 'chain') {
+              var _jTaint = collectChainTaint(_argBind.toks);
+              if (_jTaint) {
+                return { bind: chainBinding([deriveExprRef(t.text + '(...)', _argBind.toks)]), next: argRes.next };
               }
             }
           }
@@ -2950,6 +3863,12 @@
           }
         }
         const b = resolvePath(t.text);
+        // Taint: check call-based sinks even in expression position
+        // (e.g. var x = eval(tainted)).
+        if (taintEnabled && isCall && TAINT_CALL_SINKS[t.text] && !declaredNames.has(t.text.split('.')[0])) {
+          var _sinkCallArgs = readCallArgBindings(k + 1, stop);
+          if (_sinkCallArgs) checkSinkCall(t.text, _sinkCallArgs.bindings, t);
+        }
         if (!b) {
           // Unresolved identifier: return it as an opaque chain carrying
           // its source text. If followed by a balanced `(...)` (call) or
@@ -2992,7 +3911,19 @@
           if (b.kind === 'function' && isCall) {
             const args = readConcatArgs(k + 1, stop);
             if (!args) return null;
-            const toks = instantiateFunction(b, args.args.map((a) => chainBinding(a)));
+            // For method calls (dotted path), bind 'this' to the receiver object.
+            var _thisBind = null;
+            var _dot = t.text.lastIndexOf('.');
+            if (_dot > 0) {
+              _thisBind = resolvePath(t.text.slice(0, _dot));
+            }
+            var _fnResult = instantiateFunction(b, args.args.map((a) => chainBinding(a)), _thisBind);
+            // Non-chain return (object/array/function binding).
+            if (_fnResult && _fnResult.kind && _fnResult.kind !== 'chain') {
+              return { bind: _fnResult, next: args.next };
+            }
+            var toks = (typeof _fnResult === 'object' && _fnResult && !_fnResult.kind) ? _fnResult : _fnResult;
+            if (!toks || (Array.isArray(toks) && toks.length === 0)) toks = null;
             if (!toks) {
               // Function couldn't be inlined (e.g. pre-pass converted).
               // Produce an opaque call expression.
@@ -3025,34 +3956,29 @@
     // Invoke a function binding with a list of argument chains (token lists).
     // Pushes a temporary scope with param→arg bindings, parses the body
     // expression in the original token array, then pops the scope.
-    const instantiateFunction = (fn, argBindings) => {
-      // Recursion: if we're already walking this function's body, we've
-      // reached a fixed point — the first walk already captured all side
-      // effects (taint propagation, shared variable mutations). Re-walking
-      // with the same parameter taint won't discover new flows.
-      if (fnCallStack.has(fn)) {
-        // Still propagate taint from arguments to shared state: if an arg
-        // is tainted and the function writes params to outer variables,
-        // those writes were already processed in the first walk.
-        return null;
-      }
-      fnCallStack.add(fn);
+    const instantiateFunction = (fn, argBindings, thisBinding) => {
       stack.push({ bindings: Object.create(null), isFunction: true });
       const frame = stack[stack.length - 1];
-      // Body indices are into the original `tokens` array; swap `tks` if we
-      // happen to be evaluating a re-tokenized expression right now.
+      // Bind 'this' if provided (for method calls on objects).
+      if (thisBinding) frame.bindings['this'] = thisBinding;
+      // instantiateFunction walks the body with calling context —
+      // taint findings are valid here (unlike definition-time walks).
+      var savedTaintFnDepth = taintFnDepth;
+      // Only enable findings (taintFnDepth=0) when called from the main
+      // walk. Inside definition-time body walks (taintFnDepth > 0),
+      // nested instantiateFunction calls stay suppressed.
+      if (savedTaintFnDepth === 0) taintFnDepth = 0;
       const savedTks = tks;
       tks = tokens;
       for (let p = 0; p < fn.params.length; p++) {
         const pi = fn.params[p];
-        var a = argBindings[p];
+        if (pi.rest) {
+          // Rest parameter: collect remaining args into an array.
+          frame.bindings[pi.name] = arrayBinding(argBindings.slice(p));
+          break;
+        }
+        const a = argBindings[p];
         if (a) {
-          // If the argument is a chain with a single identifier, resolve it
-          // to the underlying binding so function-as-argument works properly.
-          if (a.kind === 'chain' && a.toks && a.toks.length === 1 && a.toks[0].type === 'other' && IDENT_RE.test(a.toks[0].text)) {
-            var _resolved = resolve(a.toks[0].text);
-            if (_resolved && _resolved.kind === 'function') a = _resolved;
-          }
           frame.bindings[pi.name] = a;
         } else if (pi.defaultStart != null) {
           // Evaluate the parameter's default expression in the current
@@ -3064,6 +3990,7 @@
         }
       }
       let result = null;
+      var fnReturnBinding = null; // non-chain return (object/array/function)
       var fnLoopVars = null;
       if (fn.isBlock) {
         // Skip functions already converted by the pre-pass to return
@@ -3073,7 +4000,6 @@
           if (/var __f\s*=\s*document\.createDocumentFragment/.test(peekSrc)) {
             tks = savedTks;
             stack.pop();
-            fnCallStack.delete(fn);
             return null;
           }
         }
@@ -3124,8 +4050,15 @@
         while (ri < bodyEnd) {
           const t = tks[ri];
           if (t && t.type === 'other' && t.text === 'return') {
-            const r = readConcatExpr(ri + 1, bodyEnd, TERMS_TOP);
-            if (r) result = r.toks;
+            // Use readValue to preserve object/array/function bindings.
+            const rv = readValue(ri + 1, bodyEnd, TERMS_TOP);
+            if (rv && rv.binding) {
+              if (rv.binding.kind === 'chain') { result = rv.binding.toks; }
+              else { fnReturnBinding = rv.binding; }
+            } else {
+              const r = readConcatExpr(ri + 1, bodyEnd, TERMS_TOP);
+              if (r) result = r.toks;
+            }
             break;
           }
           if (t && t.type === 'open' && t.char === '{') {
@@ -3144,8 +4077,8 @@
         if (r && r.next === fn.bodyEnd) result = r.toks;
       }
       tks = savedTks;
+      taintFnDepth = savedTaintFnDepth;
       stack.pop();
-      fnCallStack.delete(fn);
       // Expand any loopVars created during the function body walk.
       if (result && fnLoopVars && fnLoopVars.length > 0) {
         const lvByName = Object.create(null);
@@ -3155,6 +4088,8 @@
         }
         result = expandLoopVars(result, lvByName);
       }
+      // Return non-chain binding directly (object/array from return statement).
+      if (!result && fnReturnBinding) return fnReturnBinding;
       return result;
     };
 
@@ -3188,14 +4123,33 @@
       const parsed = parseArithExpr(k, stop);
       if (parsed) {
         const boundary = skipOperand(parsed.next, stop, terms);
-        if (boundary === parsed.next) return { toks: parsed.bind.toks.slice(), next: parsed.next };
+        if (boundary === parsed.next) {
+          if (parsed.bind.kind === 'chain') return { toks: parsed.bind.toks.slice(), next: parsed.next };
+          // Non-chain binding (function/array/object): return opaque ref
+          // so concat chains can include it without crashing.
+          return { toks: [exprRef(tks[k]._src.slice(tks[k].start, tks[parsed.next - 1].end))], next: parsed.next };
+        }
       }
       const end = skipOperand(k, stop, terms);
       if (end === k) return null;
       const first = tks[k];
       const last = tks[end - 1];
+      // Collect taint from any tokens in the captured range.
+      var _rangeRef = exprRef(first._src.slice(first.start, last.end));
+      if (taintEnabled) {
+        for (var _ri = k; _ri < end; _ri++) {
+          var _rt = tks[_ri];
+          if (_rt.type === 'other' && IDENT_RE.test(_rt.text)) {
+            var _rb = resolve(_rt.text);
+            if (_rb && _rb.kind === 'chain') {
+              var _rTaint = collectChainTaint(_rb.toks);
+              if (_rTaint) { if (!_rangeRef.taint) _rangeRef.taint = new Set(); for (var _rl of _rTaint) _rangeRef.taint.add(_rl); }
+            }
+          }
+        }
+      }
       return {
-        toks: [exprRef(first._src.slice(first.start, last.end))],
+        toks: [_rangeRef],
         next: end,
       };
     };
@@ -3217,126 +4171,54 @@
     // expressions. Reads an atom then greedily consumes operator-operand
     // pairs while their precedence is at least `minPrec`. Concrete operands
     // fold to literals; unknown subparts yield canonical symbolic text.
-    // Classify a token as a binary operator and return its precedence.
-    const _getOpPrec = (tok) => {
-      if (!tok) return null;
-      if (tok.type === 'op' && BINOP_PREC[tok.text] !== undefined)
-        return { text: tok.text, prec: BINOP_PREC[tok.text] };
-      if (tok.type === 'plus') return { text: '+', prec: 12 };
-      if (tok.type === 'other' && (tok.text === 'in' || tok.text === 'instanceof'))
-        return { text: tok.text, prec: 10 };
-      return null;
-    };
-    // Iterative Pratt parser. Uses explicit stacks instead of recursive
-    // calls so deeply nested expressions can't overflow the JS call stack.
     const parseArithExpr = (k, stop, minPrec) => {
       minPrec = minPrec || 0;
-      // Operator stack for binary precedence climbing.
-      const opStack = [];
-      // Ternary stack for nested `cond ? a : b` expressions.
-      const ternStack = [];
-      var pos = k;
-      var curMinPrec = minPrec;
-      // Main loop with two phases: 'read' reads the next operand,
-      // 'process' handles operators and ternary. No recursive calls.
-      var cur = null;
-      var next = pos;
-      var needOperand = true;
-      for (;;) {
-        // --- Phase 1: Read operand (when needed) ---
-        if (needOperand) {
-          const base = readBase(pos, stop);
-          if (!base) {
-            // No operand — unwind stack and restore.
-            while (opStack.length > 0) {
-              const top = opStack.pop();
-              if (cur) {
-                const c = combineArith(top.left, top.op, cur);
-                if (c) { cur = c; curMinPrec = top.minPrec; continue; }
-              }
-              cur = top.left; next = top.nextPos; curMinPrec = top.minPrec;
-            }
-            if (!cur) return null;
-            break;
-          }
-          const r = applySuffixes(base.bind, base.next, stop);
-          cur = r.bind;
-          next = r.next;
-          needOperand = false;
-        }
-        // --- Phase 2: Process operators and ternary ---
-        // Check for binary operator.
-        const opInfo = _getOpPrec(tks[next]);
-        if (opInfo && opInfo.prec >= curMinPrec && next < stop) {
-          // Push current state and read right operand.
-          opStack.push({ left: cur, op: opInfo.text, minPrec: curMinPrec, nextPos: next });
-          curMinPrec = opInfo.text === '**' ? opInfo.prec : opInfo.prec + 1;
-          pos = next + 1;
-          needOperand = true;
-          continue;
-        }
-        // No operator at current precedence. Pop stack and combine.
-        if (opStack.length > 0) {
-          const top = opStack[opStack.length - 1];
-          const c = combineArith(top.left, top.op, cur);
-          if (!c) {
-            // Combine failed. Restore to before the failed operator.
-            opStack.pop();
-            cur = top.left;
-            next = top.nextPos;
-            curMinPrec = top.minPrec;
-            // Unwind remaining stack.
-            while (opStack.length > 0) {
-              const t2 = opStack.pop();
-              const c2 = combineArith(t2.left, t2.op, cur);
-              if (c2) { cur = c2; curMinPrec = t2.minPrec; }
-              else { cur = t2.left; next = t2.nextPos; curMinPrec = t2.minPrec; }
-            }
-            break;
-          }
-          opStack.pop();
-          cur = c;
-          curMinPrec = top.minPrec;
-          continue; // re-check for operators at restored precedence
-        }
-        // Stack empty, no more binary ops. Handle ternary.
-        if (!cur || cur.kind !== 'chain') break;
-        const q = tks[next];
-        if (q && q.type === 'other' && q.text === '?') {
-          ternStack.push({ cond: cur, ifTrue: null });
-          pos = next + 1;
-          curMinPrec = 0;
-          needOperand = true;
-          continue;
-        }
-        // Check if completing a ternary branch.
-        if (ternStack.length > 0) {
-          const top = ternStack[ternStack.length - 1];
-          if (top.ifTrue === null) {
-            const colon = tks[next];
-            if (colon && colon.type === 'other' && colon.text === ':') {
-              top.ifTrue = cur;
-              pos = next + 1;
-              curMinPrec = 0;
-              needOperand = true;
-              continue;
-            }
-            // No colon — incomplete ternary.
-            ternStack.pop();
-            cur = top.cond;
-          } else {
-            // False-branch done. Combine.
-            ternStack.pop();
-            cur = combineTernary(top.cond, top.ifTrue, cur);
-            if (!cur) return null;
-            // Don't set needOperand — cur is already set from combine.
-            // Loop back to check for more ternary pops or operators.
-            continue;
-          }
-        }
-        break;
+      const base = readBase(k, stop);
+      if (!base) return null;
+      const r = applySuffixes(base.bind, base.next, stop);
+      let cur = r.bind;
+      let next = r.next;
+      while (next < stop) {
+        const opTok = tks[next];
+        let opText, prec;
+        if (opTok && opTok.type === 'op' && BINOP_PREC[opTok.text] !== undefined) {
+          opText = opTok.text; prec = BINOP_PREC[opText];
+        } else if (opTok && opTok.type === 'plus') {
+          // Treat `+` at precedence 12: numeric add when both operands are
+          // number literals, otherwise leave it to the concat-chain parser.
+          opText = '+'; prec = 12;
+        } else if (opTok && opTok.type === 'other' && (opTok.text === 'in' || opTok.text === 'instanceof')) {
+          // `in` / `instanceof` share relational precedence (10) and are
+          // always runtime-opaque — they fold to `(lhs in rhs)` / similar.
+          opText = opTok.text; prec = 10;
+        } else break;
+        if (prec < minPrec) break;
+        const nextMinPrec = opText === '**' ? prec : prec + 1;
+        const right = parseArithExpr(next + 1, stop, nextMinPrec);
+        if (!right) break;
+        const combined = combineArith(cur, opText, right.bind);
+        if (!combined) break;
+        cur = combined;
+        next = right.next;
       }
-      if (!cur || cur.kind !== 'chain') return null;
+      if (!cur) return null;
+      // Non-chain bindings (function, array, object) pass through as-is
+      // when no operators were applied. This lets call arguments like
+      // apply(sink, val) where sink is a function binding flow correctly.
+      if (cur.kind !== 'chain') return { bind: cur, next };
+      // Ternary at the lowest precedence: `cond ? a : b`.
+      const q = tks[next];
+      if (minPrec === 0 && q && q.type === 'other' && q.text === '?') {
+        const t = parseArithExpr(next + 1, stop, 0);
+        if (!t) return { bind: cur, next };
+        const colon = tks[t.next];
+        if (!colon || colon.type !== 'other' || colon.text !== ':') return { bind: cur, next };
+        const f = parseArithExpr(t.next + 1, stop, 0);
+        if (!f) return { bind: cur, next };
+        cur = combineTernary(cur, t.bind, f.bind);
+        if (!cur) return null;
+        next = f.next;
+      }
       return { bind: cur, next };
     };
 
@@ -3371,25 +4253,13 @@
     // sub-results.
     const combineArith = (left, op, right) => {
       if (!left || left.kind !== 'chain' || !right || right.kind !== 'chain') return null;
-      // Merge taint from both operands onto the result token.
-      const _mergeTaint = (ref, a, b) => {
-        if (!taintEnabled) return ref;
-        var t1 = collectChainTaint(a.toks);
-        var t2 = collectChainTaint(b.toks);
-        if (!t1 && !t2) return ref;
-        var merged = new Set();
-        if (t1) for (var l of t1) merged.add(l);
-        if (t2) for (var l of t2) merged.add(l);
-        if (merged.size) ref.taint = merged;
-        return ref;
-      };
       // `in` / `instanceof` are always symbolic — they depend on runtime
       // prototype/object state we don't model. Skip straight to symbolic.
       if (op === 'in' || op === 'instanceof') {
         const lt = chainAsExprText(left);
         const rt = chainAsExprText(right);
         if (lt === null || rt === null) return null;
-        return chainBinding([_mergeTaint(exprRef('(' + lt + ' ' + op + ' ' + rt + ')'), left, right)]);
+        return chainBinding([deriveExprRef('(' + lt + ' ' + op + ' ' + rt + ')', left.toks, right.toks)]);
       }
       const lNum = chainAsNumber(left);
       const rNum = chainAsNumber(right);
@@ -3466,7 +4336,7 @@
           const lt = chainAsExprText(left);
           const rt = chainAsExprText(right);
           if (lt !== null && rt !== null) {
-            return chainBinding([_mergeTaint(exprRef('(' + lt + ' + ' + rt + ')'), left, right)]);
+            return chainBinding([deriveExprRef('(' + lt + ' + ' + rt + ')', left.toks, right.toks)]);
           }
         }
         return null;
@@ -3485,7 +4355,7 @@
       const rt = chainAsExprText(right);
       if (lt === null || rt === null) return null;
       const text = '(' + lt + ' ' + op + ' ' + rt + ')';
-      return chainBinding([_mergeTaint(exprRef(text), left, right)]);
+      return chainBinding([deriveExprRef(text, left.toks, right.toks)]);
     };
 
     // Apply a unary prefix operator to a chain binding. Folds to a literal
@@ -3508,7 +4378,7 @@
       const et = chainAsExprText(operand);
       if (et === null) return null;
       const text = op + et;
-      return chainBinding([exprRef(text)]);
+      return chainBinding([deriveExprRef(text, operand.toks)]);
     };
 
     const chainAsNumber = (chain) => {
@@ -3524,8 +4394,6 @@
     // Evaluate truthiness of a chain binding. Returns true, false, or null (unknown).
     const evalTruthiness = (bind) => {
       if (!bind || bind.kind !== 'chain') return null;
-      // Check boolean/null/undefined keywords first — these are synthetic
-      // tokens from combineArith, not user string literals.
       if (bind.toks.length === 1 && bind.toks[0].type === 'str') {
         const text = bind.toks[0].text;
         if (text === 'true') return true;
@@ -3536,6 +4404,30 @@
       const s = chainAsKnownString(bind);
       if (s !== null) return s !== '';
       return null;
+    };
+
+    // Unified reachability check for ALL branch decisions.
+    // Takes a token range (start, end) in the main tokens array.
+    // Returns: true (always true), false (always false), null (both possible).
+    // Uses concrete evaluation first, then SMT with path constraints.
+    const checkReachability = (start, end) => {
+      if (start >= end) return null;
+      // Concrete evaluation via readValue.
+      var condVal = readValue(start, end, null);
+      var concrete = condVal ? evalTruthiness(condVal.binding) : null;
+      // SMT: build formula from raw tokens in range and check satisfiability.
+      if (taintEnabled) {
+        var condToks = [];
+        for (var ci = start; ci < end; ci++) condToks.push(tokens[ci]);
+        var smtResult = smtCheckCondition(condToks, resolve, resolvePath, pathConstraints);
+        if (smtResult) {
+          if (smtResult.sat && smtResult.unsat) return null;
+          if (smtResult.sat && !smtResult.unsat) return true;
+          if (!smtResult.sat && smtResult.unsat) return false;
+          if (!smtResult.sat && !smtResult.unsat) return false; // neither = dead
+        }
+      }
+      return concrete;
     };
 
     const chainAsExprText = (chain) => {
@@ -3569,6 +4461,22 @@
       const maybeRp = tks[i];
       if (maybeRp && maybeRp.type === 'close' && maybeRp.char === ')') return { bindings, next: i + 1 };
       while (i < stop) {
+        // Spread: ...expr — unpack array elements into individual args.
+        if (tks[i] && tks[i].type === 'other' && tks[i].text.startsWith('...')) {
+          var _spreadName = tks[i].text.slice(3);
+          var _spreadBind = IDENT_RE.test(_spreadName) ? resolvePath(_spreadName) : null;
+          if (_spreadBind && _spreadBind.kind === 'array') {
+            for (var _si = 0; _si < _spreadBind.elems.length; _si++) {
+              if (_spreadBind.elems[_si]) bindings.push(_spreadBind.elems[_si]);
+            }
+          } else {
+            // Opaque spread: propagate taint from the expression.
+            bindings.push(chainBinding([deriveExprRef(_spreadName, _spreadBind && _spreadBind.kind === 'chain' ? _spreadBind.toks : null)]));
+          }
+          i++;
+          if (tks[i] && tks[i].type === 'sep' && tks[i].char === ',') { i++; continue; }
+          break; // likely at ')' — exit the while loop
+        }
         const v = readValue(i, stop, TERMS_ARG);
         if (!v) return null;
         bindings.push(v.binding);
@@ -3642,227 +4550,8 @@
     };
 
     let stop = Math.min(stopAt, tokens.length);
-    // Iterative scope walker. Uses an explicit work stack instead of
-    // recursive walkRange calls so deeply nested control flow can't
-    // overflow the JS call stack. Each entry is a typed task:
-    //   range           — walk token range [start, end)
-    //   if_restore      — after if-body: capture bindings, restore, start else
-    //   if_merge        — after else-body: merge if/else bindings
-    //   try_restore     — after try-body: capture, restore, start catch
-    //   try_merge       — after catch-body: merge, queue finally
-    //   switch_case     — after previous case: restore, walk next case
-    //   switch_merge    — after all cases: merge results
-    const _ws = []; // work stack (LIFO)
-    const _walkPush = (subStart, subEnd, resumeStart, resumeEnd) => {
-      _ws.push({ type: 'range', start: resumeStart, end: resumeEnd });
-      _ws.push({ type: 'range', start: subStart, end: subEnd });
-    };
-    // Shared helper: expand loopVars in a binding's chain tokens.
-    const _expandBindWithLVs = (bind, branchLVs) => {
-      if (!bind || bind.kind !== 'chain') return bind ? bind.toks : [];
-      const lvMap = Object.create(null);
-      for (const lv of branchLVs) {
-        if (!lvMap[lv.name]) lvMap[lv.name] = [];
-        lvMap[lv.name].push(lv);
-      }
-      const expand = (toks) => {
-        const out = [];
-        for (const t of toks) {
-          if (t.type === 'other' && IDENT_RE.test(t.text) && lvMap[t.text] && lvMap[t.text].length) {
-            const lv = lvMap[t.text].pop();
-            for (const vt of expand(lv.chain)) out.push(vt);
-            lvMap[t.text].push(lv);
-          } else out.push(t);
-        }
-        return out;
-      };
-      return expand(bind.toks);
-    };
-    // Shared helper: snapshot all current bindings.
-    const _snapshotBindings = () => {
-      const snap = Object.create(null);
-      for (let si = stack.length - 1; si >= 0; si--)
-        for (const name in stack[si].bindings)
-          if (!(name in snap)) snap[name] = stack[si].bindings[name];
-      return snap;
-    };
     const walkRange = (startI, endI) => {
-    _ws.push({ type: 'range', start: startI, end: endI });
-    while (_ws.length > 0) {
-    const _task = _ws.pop();
-    // --- Action: restore bindings after if-body, then walk else ---
-    if (_task.type === 'if_restore') {
-      _task.ctx.ifLoopVars = loopVars.splice(_task.ctx.lvBefore);
-      if (taintCondStack) taintCondStack.pop();
-      const ifBindings = Object.create(null);
-      for (let si = stack.length - 1; si >= 0; si--)
-        for (const name in stack[si].bindings)
-          if (!(name in ifBindings)) ifBindings[name] = stack[si].bindings[name];
-      _task.ctx.ifBindings = ifBindings;
-      for (const name in _task.snapshot) assignName(name, _task.snapshot[name]);
-      if (taintCondStack) taintCondStack.push('!(' + _task.ctx.condExpr + ')');
-      _task.ctx.lvBefore2 = loopVars.length;
-      if (_task.elseStart > 0 && _task.elseEnd > _task.elseStart)
-        _ws.push({ type: 'range', start: _task.elseStart, end: _task.elseEnd });
-      continue;
-    }
-    // --- Action: merge if/else branch bindings ---
-    if (_task.type === 'if_merge') {
-      if (taintCondStack) taintCondStack.pop();
-      const ctx = _task.ctx;
-      const elseLoopVars = loopVars.splice(ctx.lvBefore2);
-      const elseBindings = Object.create(null);
-      for (let si = stack.length - 1; si >= 0; si--)
-        for (const name in stack[si].bindings)
-          if (!(name in elseBindings)) elseBindings[name] = stack[si].bindings[name];
-      const expandWithLVs = _expandBindWithLVs;
-      for (const name in ctx.ifBindings) {
-        const ifB = ctx.ifBindings[name];
-        const elB = elseBindings[name] || _task.snapshot[name];
-        if (!ifB || ifB.kind !== 'chain') continue;
-        if (!elB || elB.kind !== 'chain') continue;
-        const ifFull = expandWithLVs(ifB, ctx.ifLoopVars);
-        const elFull = expandWithLVs(elB, elseLoopVars);
-        if (JSON.stringify(ifFull) === JSON.stringify(elFull)) continue;
-        const snapB = _task.snapshot[name];
-        if (snapB && snapB.kind === 'chain') {
-          const snapFull = snapB.toks;
-          const ifAppended = chainStartsWith(ifFull, snapFull);
-          const elAppended = chainStartsWith(elFull, snapFull);
-          const ifExtra = ifAppended ? stripLeadingPlus(ifFull.slice(snapFull.length)) : ifFull;
-          const elExtra = elAppended ? stripLeadingPlus(elFull.slice(snapFull.length)) : elFull;
-          const currentLoopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
-          if (!ifAppended || !elAppended) {
-            const condTok = { type: 'cond', condExpr: ctx.condExpr, ifTrue: ifFull, ifFalse: elFull };
-            if (currentLoopId !== null) condTok.loopId = currentLoopId;
-            assignName(name, chainBinding([condTok]));
-          } else {
-            const condTok = { type: 'cond', condExpr: ctx.condExpr, ifTrue: ifExtra, ifFalse: elExtra };
-            if (currentLoopId !== null) condTok.loopId = currentLoopId;
-            assignName(name, chainBinding([...snapB.toks, SYNTH_PLUS, condTok]));
-          }
-          if (loopStack.length > 0) loopStack[loopStack.length - 1].modifiedVars.add(name);
-        }
-      }
-      for (const name in ctx.ifBindings) {
-        if (trackBuildVar && trackBuildVar.has(name)) continue;
-        const ifB = ctx.ifBindings[name];
-        const elB = elseBindings[name] || _task.snapshot[name];
-        if (ifB === elB) continue;
-        if (JSON.stringify(ifB) === JSON.stringify(elB)) continue;
-        assignName(name, chainBinding([exprRef(name)]));
-      }
-      continue;
-    }
-    // --- Action: restore after try-body, walk catch ---
-    if (_task.type === 'try_restore') {
-      const tryLoopVars = loopVars.splice(_task.lvBefore);
-      const tryBindings = Object.create(null);
-      for (let si = stack.length - 1; si >= 0; si--)
-        for (const name in stack[si].bindings)
-          if (!(name in tryBindings)) tryBindings[name] = stack[si].bindings[name];
-      for (const name in _task.snapshot) assignName(name, _task.snapshot[name]);
-      _task.ctx.tryBindings = tryBindings;
-      _task.ctx.tryLoopVars = tryLoopVars;
-      _task.ctx.lvBefore2 = loopVars.length;
-      if (_task.catchStart >= 0)
-        _ws.push({ type: 'range', start: _task.catchStart, end: _task.catchEnd });
-      continue;
-    }
-    // --- Action: merge try/catch, then queue finally ---
-    if (_task.type === 'try_merge') {
-      const ctx = _task.ctx;
-      const catchLoopVars = loopVars.splice(ctx.lvBefore2);
-      const catchBindings = Object.create(null);
-      for (let si = stack.length - 1; si >= 0; si--)
-        for (const name in stack[si].bindings)
-          if (!(name in catchBindings)) catchBindings[name] = stack[si].bindings[name];
-      const expandWithLVs = _expandBindWithLVs;
-      for (const name in ctx.tryBindings) {
-        if (!ctx.tryBindings[name] || ctx.tryBindings[name].kind !== 'chain') continue;
-        const tryB = ctx.tryBindings[name];
-        const catchB = catchBindings[name] || _task.snapshot[name];
-        if (!catchB || catchB.kind !== 'chain') continue;
-        const tryFull = expandWithLVs(tryB, ctx.tryLoopVars);
-        const catchFull = expandWithLVs(catchB, catchLoopVars);
-        if (JSON.stringify(tryFull) === JSON.stringify(catchFull)) continue;
-        const snapB = _task.snapshot[name];
-        if (snapB && snapB.kind === 'chain') {
-          if (trackBuildVar && trackBuildVar.has(name)) {
-            const snapFull = snapB.toks;
-            const tryAppended = chainStartsWith(tryFull, snapFull);
-            const catchAppended = chainStartsWith(catchFull, snapFull);
-            const tryExtra = tryAppended ? stripLeadingPlus(tryFull.slice(snapFull.length)) : tryFull;
-            const catchExtra = catchAppended ? stripLeadingPlus(catchFull.slice(snapFull.length)) : catchFull;
-            const tryCatchTok = { type: 'trycatch', tryBody: tryExtra, catchBody: catchExtra, catchParam: _task.catchParam };
-            if (tryAppended && catchAppended) assignName(name, chainBinding([...snapB.toks, SYNTH_PLUS, tryCatchTok]));
-            else assignName(name, chainBinding([tryCatchTok]));
-          } else {
-            assignName(name, chainBinding([exprRef(name)]));
-          }
-        }
-      }
-      if (_task.finallyStart >= 0)
-        _ws.push({ type: 'range', start: _task.finallyStart, end: _task.finallyEnd });
-      continue;
-    }
-    // --- Action: restore snapshot, walk one switch case body ---
-    if (_task.type === 'switch_case') {
-      for (const name in _task.snapshot) assignName(name, _task.snapshot[name]);
-      _ws.push({ type: 'switch_capture', cs: _task.cs, caseResults: _task.caseResults });
-      _ws.push({ type: 'range', start: _task.cs.bodyStart, end: _task.cs.bodyEnd });
-      continue;
-    }
-    // --- Action: capture bindings after a switch case body ---
-    if (_task.type === 'switch_capture') {
-      const bindings = _snapshotBindings();
-      _task.caseResults.push({ label: _task.cs.label, caseExpr: _task.cs.caseExpr, bindings });
-      continue;
-    }
-    // --- Action: merge all switch case results ---
-    if (_task.type === 'switch_merge') {
-      const caseResults = _task.caseResults;
-      const snapshot = _task.snapshot;
-      if (trackBuildVar) {
-        for (const bv of trackBuildVar) {
-          const snapB = snapshot[bv];
-          if (!snapB || snapB.kind !== 'chain') continue;
-          const snapFull = snapB.toks;
-          const branches = [];
-          let allAppended = true;
-          for (const cr of caseResults) {
-            const b = cr.bindings[bv];
-            if (b && b.kind === 'chain') {
-              const full = b.toks;
-              const appended = chainStartsWith(full, snapFull);
-              if (!appended) allAppended = false;
-              const extra = appended ? stripLeadingPlus(full.slice(snapFull.length)) : full;
-              branches.push({ label: cr.label, caseExpr: cr.caseExpr, chain: extra });
-            }
-          }
-          if (branches.length) {
-            const switchTok = { type: 'switch', discExpr: _task.discExpr || '/* switch */', branches };
-            if (allAppended) assignName(bv, chainBinding([...snapB.toks, SYNTH_PLUS, switchTok]));
-            else assignName(bv, chainBinding([switchTok]));
-          }
-        }
-      }
-      const switchChanged = new Set();
-      for (const cr2 of caseResults) {
-        for (const name in cr2.bindings) {
-          if (trackBuildVar && trackBuildVar.has(name)) continue;
-          const b = cr2.bindings[name];
-          const snap = snapshot[name];
-          if (b && (!snap || JSON.stringify(b) !== JSON.stringify(snap))) switchChanged.add(name);
-        }
-      }
-      for (const name of switchChanged) assignName(name, chainBinding([exprRef(name)]));
-      _ws.push({ type: 'range', start: _task.switchEnd, end: _task.resumeEnd });
-      continue;
-    }
-    // --- Process a token range ---
-    var _rangeEnd = _task.end;
-    for (let i = _task.start; i < _rangeEnd; i++) {
+    for (let i = startI; i < endI; i++) {
       // Pop any loops whose body we've walked past (and their shadow frames).
       // For each variable modified during the loop, capture its final chain
       // as a loopVar entry AND replace its binding with a single reference
@@ -3872,14 +4561,18 @@
         const entry = loopStack.pop();
         // Collect names that were pre-scanned as opaque in the loop frame.
         const preScanNames = entry.frame ? Object.keys(entry.frame.bindings) : [];
-        const topIdx = stack.indexOf(entry.frame);
-        if (topIdx >= 0) stack.splice(topIdx, 1);
-        // Merge pre-scanned and modified variables: all need to be
-        // opaque in the outer scope after the loop exits.
+        // Capture modified variable bindings BEFORE removing the loop frame,
+        // since resolve() would return the pre-loop outer value after removal.
         const allModified = new Set(entry.modifiedVars);
         for (const n of preScanNames) allModified.add(n);
+        var _loopBindings = {};
         for (const name of allModified) {
-          const b = resolve(name);
+          _loopBindings[name] = resolve(name);
+        }
+        const topIdx = stack.indexOf(entry.frame);
+        if (topIdx >= 0) stack.splice(topIdx, 1);
+        for (const name of allModified) {
+          const b = _loopBindings[name];
           if (b && b.kind === 'chain') {
             // Store the chain UNSTRIPPED; strip the outer loop's tags only
             // at display time via loopVarHtml. The unstripped chain is
@@ -3889,7 +4582,7 @@
               loop: { id: entry.id, kind: entry.kind, headerSrc: entry.headerSrc },
               chain: b.toks,
             });
-            assignName(name, chainBinding([exprRef(name)]));
+            assignName(name, chainBinding([deriveExprRef(name, b.toks)]));
           }
         }
       }
@@ -3897,6 +4590,7 @@
 
       if (t.type === 'open' && t.char === '{') {
         const frame = { bindings: Object.create(null), isFunction: pendingFunctionBrace };
+        if (taintEnabled && pendingFunctionBrace) taintFnDepth++;
         if (pendingFunctionBrace && pendingFunctionParams) {
           // Bind function parameters as references to their own names so
           // uses within the body surface when the body is
@@ -3912,8 +4606,32 @@
         continue;
       }
       if (t.type === 'close' && t.char === '}') {
-        if (stack.length > 1) stack.pop();
+        if (stack.length > 1) {
+          var _popped = stack.pop();
+          if (taintEnabled && _popped.isFunction) taintFnDepth--;
+        }
         continue;
+      }
+
+      // IIFE: ')(' pattern — (function(){...})() or (()=>{...})()
+      if (t.type === 'close' && t.char === ')' && tokens[i + 1] && tokens[i + 1].type === 'open' && tokens[i + 1].char === '(') {
+        var _iifeOpenIdx = -1, _iifeDep = 1;
+        for (var _ii = i - 1; _ii >= 0; _ii--) {
+          if (tokens[_ii].type === 'close' && tokens[_ii].char === ')') _iifeDep++;
+          if (tokens[_ii].type === 'open' && tokens[_ii].char === '(') { _iifeDep--; if (_iifeDep === 0) { _iifeOpenIdx = _ii; break; } }
+        }
+        if (_iifeOpenIdx >= 0) {
+          var _iifeFnE = readFunctionExpr(_iifeOpenIdx + 1, i);
+          var _iifeFn = _iifeFnE ? _iifeFnE.binding : null;
+          if (!_iifeFn) {
+            var _iifeArr = peekArrow(_iifeOpenIdx + 1, i);
+            if (_iifeArr) { var _iifeB = readArrowBody(_iifeArr.arrowNext, i); if (_iifeB) _iifeFn = functionBinding(_iifeArr.params, _iifeB.bodyStart, _iifeB.bodyEnd, _iifeB.isBlock); }
+          }
+          if (_iifeFn) {
+            var _iifeA = readCallArgBindings(i + 1, stop);
+            if (_iifeA) { instantiateFunction(_iifeFn, _iifeA.bindings); i = _iifeA.next - 1; continue; }
+          }
+        }
       }
 
       if (t.type !== 'other') continue;
@@ -3924,8 +4642,8 @@
         if (trackBuildVar && loopStack.length > 0 && (trackBuildVarDepth < 0 || funcDepth() === trackBuildVarDepth)) {
           // Include optional label and semicolon.
           let stmtEnd = i + 1;
-          if (stmtEnd < _rangeEnd && tokens[stmtEnd].type === 'other' && IDENT_RE.test(tokens[stmtEnd].text)) stmtEnd++;
-          if (stmtEnd < _rangeEnd && tokens[stmtEnd].type === 'sep' && tokens[stmtEnd].char === ';') stmtEnd++;
+          if (stmtEnd < endI && tokens[stmtEnd].type === 'other' && IDENT_RE.test(tokens[stmtEnd].text)) stmtEnd++;
+          if (stmtEnd < endI && tokens[stmtEnd].type === 'sep' && tokens[stmtEnd].char === ';') stmtEnd++;
           const first = tokens[i];
           const last = tokens[stmtEnd - 1];
           const stmtSrc = first._src.slice(first.start, last.end);
@@ -3960,9 +4678,9 @@
             j++;
           }
           if (j < stop) {
-            // Evaluate the condition.
+            // Evaluate the condition via unified reachability check.
             const condVal = readValue(i + 2, j, null);
-            const concrete = condVal ? evalTruthiness(condVal.binding) : null;
+            var concrete = taintEnabled ? checkReachability(i + 2, j) : (condVal ? evalTruthiness(condVal.binding) : null);
             // Determine if-body range.
             const bodyTok = tokens[j + 1];
             let ifEnd;
@@ -4081,17 +4799,15 @@
             }
             if (concrete === true) {
               // Walk only if-body; skip else chain.
-              var _resume = (elseEnd > 0 ? elseEnd : ifEnd);
-              _ws.push({ type: 'range', start: _resume, end: _rangeEnd });
-              _rangeEnd = ifEnd; i = j; continue;
+              walkRange(j + 1, ifEnd);
+              i = (elseEnd > 0 ? elseEnd : ifEnd) - 1;
+              continue;
             } else if (concrete === false) {
               // Skip if-body; walk else-body (if present).
-              var _resume = (elseEnd > 0 ? elseEnd : ifEnd);
               if (elseStart > 0) {
-                _ws.push({ type: 'range', start: _resume, end: _rangeEnd });
-                _rangeEnd = elseEnd; i = elseStart - 1; continue;
+                walkRange(elseStart, elseEnd);
               }
-              i = _resume - 1;
+              i = (elseEnd > 0 ? elseEnd : ifEnd) - 1;
               continue;
             }
             // Opaque condition: snapshot bindings, walk both branches,
@@ -4099,21 +4815,133 @@
             // tokens if the branches differ.
             const condExpr = condVal ? chainAsExprText(condVal.binding) : null;
             if (condExpr) {
-              // Opaque condition: use state machine to snapshot, walk
-              // if-body, restore, walk else-body, then merge — all via
-              // the work stack so no recursive walkRange calls are needed.
-              const snapshot = _snapshotBindings();
-              var _elS = (elseStart > 0 && elseEnd > elseStart) ? elseStart : 0;
-              var _elE = (elseStart > 0 && elseEnd > elseStart) ? elseEnd : 0;
-              var _resumeAt = (elseEnd > 0 ? elseEnd : ifEnd);
-              var _oCtx = { condExpr, lvBefore: loopVars.length };
-              // LIFO: push resume, merge, restore (which queues else), then if-body runs next.
-              _ws.push({ type: 'range', start: _resumeAt, end: _rangeEnd });
-              _ws.push({ type: 'if_merge', ctx: _oCtx, snapshot });
-              _ws.push({ type: 'if_restore', ctx: _oCtx, snapshot, elseStart: _elS, elseEnd: _elE });
-              // Walk if-body next (push taint condition first).
+              // Snapshot current bindings.
+              const snapshot = Object.create(null);
+              for (let si = stack.length - 1; si >= 0; si--) {
+                for (const name in stack[si].bindings) {
+                  if (!(name in snapshot)) snapshot[name] = stack[si].bindings[name];
+                }
+              }
+              // Build SMT formula for path constraint propagation.
+              var _pathFormula = null;
+              if (pathConstraints) {
+                var _condToks = [];
+                for (var _pi = i + 2; _pi < j; _pi++) _condToks.push(tokens[_pi]);
+                _pathFormula = smtParseExpr(_condToks, 0, _condToks.length, resolve, resolvePath);
+              }
+              // Walk if-body: push path constraint (condition is true in this branch).
               if (taintCondStack) taintCondStack.push(condExpr);
-              _rangeEnd = ifEnd; i = j; continue;
+              if (pathConstraints && _pathFormula) pathConstraints.push(_pathFormula);
+              const lvBefore = loopVars.length;
+              walkRange(j + 1, ifEnd);
+              const ifLoopVars = loopVars.splice(lvBefore);
+              if (taintCondStack) taintCondStack.pop();
+              if (pathConstraints && _pathFormula) pathConstraints.pop();
+              // Capture if-branch bindings.
+              const ifBindings = Object.create(null);
+              for (let si = stack.length - 1; si >= 0; si--) {
+                for (const name in stack[si].bindings) {
+                  if (!(name in ifBindings)) ifBindings[name] = stack[si].bindings[name];
+                }
+              }
+              // Walk else-body: push negated path constraint.
+              for (const name in snapshot) {
+                assignName(name, snapshot[name]);
+              }
+              if (taintCondStack) taintCondStack.push('!(' + condExpr + ')');
+              if (pathConstraints && _pathFormula) pathConstraints.push(smtNot(_pathFormula));
+              const lvBefore2 = loopVars.length;
+              if (elseStart > 0 && elseEnd > elseStart) {
+                walkRange(elseStart, elseEnd);
+              }
+              if (taintCondStack) taintCondStack.pop();
+              if (pathConstraints && _pathFormula) pathConstraints.pop();
+              const elseLoopVars = loopVars.splice(lvBefore2);
+              // Merge: for any binding that differs between branches,
+              // produce a cond token.
+              const elseBindings = Object.create(null);
+              for (let si = stack.length - 1; si >= 0; si--) {
+                for (const name in stack[si].bindings) {
+                  if (!(name in elseBindings)) elseBindings[name] = stack[si].bindings[name];
+                }
+              }
+              // Helper: expand loopVars into a binding's chain to get
+              // the full content including loop iterations.
+              const expandWithLVs = (bind, branchLVs) => {
+                if (!bind || bind.kind !== 'chain') return bind ? bind.toks : [];
+                const lvMap = Object.create(null);
+                for (const lv of branchLVs) {
+                  if (!lvMap[lv.name]) lvMap[lv.name] = [];
+                  lvMap[lv.name].push(lv);
+                }
+                const expand = (toks) => {
+                  const out = [];
+                  for (const t of toks) {
+                    if (t.type === 'other' && IDENT_RE.test(t.text) && lvMap[t.text] && lvMap[t.text].length) {
+                      const lv = lvMap[t.text].pop();
+                      for (const vt of expand(lv.chain)) out.push(vt);
+                      lvMap[t.text].push(lv);
+                    } else {
+                      out.push(t);
+                    }
+                  }
+                  return out;
+                };
+                return expand(bind.toks);
+              };
+              for (const name in ifBindings) {
+                const ifB = ifBindings[name];
+                const elB = elseBindings[name] || snapshot[name];
+                if (!ifB || ifB.kind !== 'chain') continue;
+                if (!elB || elB.kind !== 'chain') continue;
+                // Expand loopVars in each branch to get full content.
+                const ifFull = expandWithLVs(ifB, ifLoopVars);
+                const elFull = expandWithLVs(elB, elseLoopVars);
+                if (JSON.stringify(ifFull) === JSON.stringify(elFull)) continue;
+                const snapB = snapshot[name];
+                if (snapB && snapB.kind === 'chain') {
+                  const snapFull = snapB.toks;
+                  const ifAppended = chainStartsWith(ifFull, snapFull);
+                  const elAppended = chainStartsWith(elFull, snapFull);
+                  const ifExtra = ifAppended ? stripLeadingPlus(ifFull.slice(snapFull.length)) : ifFull;
+                  const elExtra = elAppended ? stripLeadingPlus(elFull.slice(snapFull.length)) : elFull;
+                  const currentLoopId = loopStack.length > 0 ? loopStack[loopStack.length - 1].id : null;
+                  if (!ifAppended || !elAppended) {
+                    // At least one branch did `html = ...` (full replacement).
+                    // Emit as a ternary: the whole value depends on the condition.
+                    const condTok = {
+                      type: 'cond', condExpr,
+                      ifTrue: ifFull,
+                      ifFalse: elFull,
+                    };
+                    if (currentLoopId !== null) condTok.loopId = currentLoopId;
+                    // The chain IS the cond — no snapshot prefix.
+                    assignName(name, chainBinding([condTok]));
+                  } else {
+                    const condTok = {
+                      type: 'cond', condExpr,
+                      ifTrue: ifExtra,
+                      ifFalse: elExtra,
+                    };
+                    if (currentLoopId !== null) condTok.loopId = currentLoopId;
+                    assignName(name, chainBinding([...snapB.toks, SYNTH_PLUS, condTok]));
+                  }
+                  if (loopStack.length > 0) loopStack[loopStack.length - 1].modifiedVars.add(name);
+                }
+              }
+              // Non-build vars that differ between branches become opaque
+              // so subsequent code doesn't use a stale concrete value.
+              for (const name in ifBindings) {
+                if (trackBuildVar && trackBuildVar.has(name)) continue;
+                const ifB = ifBindings[name];
+                const elB = elseBindings[name] || snapshot[name];
+                if (ifB === elB) continue;
+                if (JSON.stringify(ifB) === JSON.stringify(elB)) continue;
+                // Preserve taint from both branches.
+                assignName(name, chainBinding([deriveExprRef(name, ifB && ifB.kind === 'chain' ? ifB.toks : null, elB && elB.kind === 'chain' ? elB.toks : null)]));
+              }
+              i = (elseEnd > 0 ? elseEnd : ifEnd) - 1;
+              continue;
             }
             // Condition too complex to represent — preserve the entire
             // if/else as raw source so no code is silently dropped.
@@ -4194,15 +5022,93 @@
               k = finallyEnd;
             }
           }
-          // Use state machine for try/catch/finally.
-          const snapshot = _snapshotBindings();
-          var _tCtx = { lvBefore: loopVars.length };
-          // LIFO: push resume, finally, merge, catch-range, restore, then try-body runs next.
-          _ws.push({ type: 'range', start: k, end: _rangeEnd });
-          _ws.push({ type: 'try_merge', ctx: _tCtx, snapshot, catchParam, finallyStart, finallyEnd });
-          _ws.push({ type: 'try_restore', ctx: _tCtx, snapshot, catchStart, catchEnd, lvBefore: loopVars.length });
-          // Walk try-body next.
-          _rangeEnd = tryEnd; continue;
+          // Snapshot, walk try body.
+          const snapshot = Object.create(null);
+          for (let si = stack.length - 1; si >= 0; si--) {
+            for (const name in stack[si].bindings) {
+              if (!(name in snapshot)) snapshot[name] = stack[si].bindings[name];
+            }
+          }
+          const lvBefore = loopVars.length;
+          walkRange(i + 1, tryEnd);
+          const tryLoopVars = loopVars.splice(lvBefore);
+          const tryBindings = Object.create(null);
+          for (let si = stack.length - 1; si >= 0; si--) {
+            for (const name in stack[si].bindings) {
+              if (!(name in tryBindings)) tryBindings[name] = stack[si].bindings[name];
+            }
+          }
+          // If no catch block, try body state persists — skip restore/merge.
+          if (catchStart < 0) {
+            if (finallyStart >= 0) walkRange(finallyStart, finallyEnd);
+            i = k - 1;
+            continue;
+          }
+          // Restore and walk catch body.
+          for (const name in snapshot) assignName(name, snapshot[name]);
+          const lvBefore2 = loopVars.length;
+          walkRange(catchStart, catchEnd);
+          const catchLoopVars = loopVars.splice(lvBefore2);
+          const catchBindings = Object.create(null);
+          for (let si = stack.length - 1; si >= 0; si--) {
+            for (const name in stack[si].bindings) {
+              if (!(name in catchBindings)) catchBindings[name] = stack[si].bindings[name];
+            }
+          }
+          // Merge build var: try = one branch, catch = other.
+          const expandWithLVs = (bind, branchLVs) => {
+            if (!bind || bind.kind !== 'chain') return bind ? bind.toks : [];
+            const lvMap = Object.create(null);
+            for (const lv of branchLVs) {
+              if (!lvMap[lv.name]) lvMap[lv.name] = [];
+              lvMap[lv.name].push(lv);
+            }
+            const expand = (toks) => {
+              const out = [];
+              for (const ct of toks) {
+                if (ct.type === 'other' && IDENT_RE.test(ct.text) && lvMap[ct.text] && lvMap[ct.text].length) {
+                  const lv = lvMap[ct.text].pop();
+                  for (const vt of expand(lv.chain)) out.push(vt);
+                  lvMap[ct.text].push(lv);
+                } else out.push(ct);
+              }
+              return out;
+            };
+            return expand(bind.toks);
+          };
+          for (const name in tryBindings) {
+            if (!tryBindings[name] || tryBindings[name].kind !== 'chain') continue;
+            const tryB = tryBindings[name];
+            const catchB = catchBindings[name] || snapshot[name];
+            if (!catchB || catchB.kind !== 'chain') continue;
+            const tryFull = expandWithLVs(tryB, tryLoopVars);
+            const catchFull = expandWithLVs(catchB, catchLoopVars);
+            if (JSON.stringify(tryFull) === JSON.stringify(catchFull)) continue;
+            const snapB = snapshot[name];
+            if (!snapB || snapB.kind !== 'chain') {
+              // Variable was uninitialized before try/catch — merge with taint.
+              assignName(name, chainBinding([deriveExprRef(name, tryB.toks, catchB.toks)]));
+            } else if (trackBuildVar && trackBuildVar.has(name)) {
+              const snapFull = snapB.toks;
+              const tryAppended = chainStartsWith(tryFull, snapFull);
+              const catchAppended = chainStartsWith(catchFull, snapFull);
+              const tryExtra = tryAppended ? stripLeadingPlus(tryFull.slice(snapFull.length)) : tryFull;
+              const catchExtra = catchAppended ? stripLeadingPlus(catchFull.slice(snapFull.length)) : catchFull;
+              const tryCatchTok = { type: 'trycatch', tryBody: tryExtra, catchBody: catchExtra, catchParam };
+              if (tryAppended && catchAppended) {
+                assignName(name, chainBinding([...snapB.toks, SYNTH_PLUS, tryCatchTok]));
+              } else {
+                assignName(name, chainBinding([tryCatchTok]));
+              }
+            } else {
+              // Preserve taint from both branches on the merged reference.
+              assignName(name, chainBinding([deriveExprRef(name, tryB.toks, catchB.toks)]));
+            }
+          }
+          // Walk finally body unconditionally (it always runs).
+          if (finallyStart >= 0) walkRange(finallyStart, finallyEnd);
+          i = k - 1;
+          continue;
         }
       }
 
@@ -4257,15 +5163,114 @@
               }
             }
             const caseResults = [];
-            // Use state machine to walk each case body iteratively.
-            _ws.push({ type: 'switch_merge', snapshot, cases, caseResults, discExpr, switchEnd, resumeEnd: _rangeEnd });
-            // Push case bodies in reverse so first case is processed first (LIFO).
-            for (var _ci = cases.length - 1; _ci >= 0; _ci--) {
-              _ws.push({ type: 'switch_case', snapshot, cs: cases[_ci], caseResults });
+            for (const cs of cases) {
+              // Restore snapshot.
+              for (const name in snapshot) assignName(name, snapshot[name]);
+              // Check if this case is reachable via SMT.
+              // For switch(true), the case expression is the condition itself.
+              // For switch(disc), the condition is disc === caseExpr.
+              // Build an SMT formula and check satisfiability.
+              if (taintEnabled && cs.label !== 'default' && cs.caseExpr) {
+                var _discB = discVal ? discVal.binding : null;
+                var _discIsTrueConst = _discB && _discB.kind === 'chain' && _discB.toks.length === 1 && _discB.toks[0].type === 'str' && _discB.toks[0].text === 'true';
+                // Build the case expression as an SMT formula.
+                var _caseFormula = null;
+                // Find the case expression token range.
+                for (var _csi = 0; _csi < tokens.length; _csi++) {
+                  if (tokens[_csi].start === cs.srcStart && tokens[_csi].text === 'case') {
+                    var _ceStart = _csi + 1, _ceEnd = _ceStart;
+                    for (var _csj = _ceStart; _csj < tokens.length; _csj++) {
+                      if (tokens[_csj].type === 'other' && tokens[_csj].text === ':') { _ceEnd = _csj; break; }
+                    }
+                    if (_ceEnd > _ceStart) {
+                      var _ceToks = [];
+                      for (var _ck = _ceStart; _ck < _ceEnd; _ck++) _ceToks.push(tokens[_ck]);
+                      if (_discIsTrueConst) {
+                        // switch(true): case expr is the condition itself.
+                        _caseFormula = smtParseExpr(_ceToks, 0, _ceToks.length, resolve, resolvePath);
+                      } else {
+                        // switch(disc): condition is disc === caseExpr.
+                        var _ceSmtExpr = smtParseAtom(_ceToks, 0, _ceToks.length, resolve, resolvePath);
+                        var _discSmtExpr = _discB ? smtParseAtom([{ type: 'other', text: discExpr || 'disc' }], 0, 1, resolve, resolvePath) : null;
+                        if (_ceSmtExpr && _discSmtExpr) _caseFormula = smtCmp('===', _discSmtExpr, _ceSmtExpr);
+                      }
+                    }
+                    break;
+                  }
+                }
+                if (_caseFormula) {
+                  // Check with path constraints.
+                  var _fullCaseFormula = _caseFormula;
+                  if (pathConstraints && pathConstraints.length > 0) {
+                    for (var _pi = 0; _pi < pathConstraints.length; _pi++) _fullCaseFormula = smtAnd(pathConstraints[_pi], _fullCaseFormula);
+                  }
+                  if (!smtSat(_fullCaseFormula)) {
+                    caseResults.push({ label: cs.label, caseExpr: cs.caseExpr, bindings: snapshot });
+                    continue;
+                  }
+                }
+              }
+              walkRange(cs.bodyStart, cs.bodyEnd);
+              const bindings = Object.create(null);
+              for (let si = stack.length - 1; si >= 0; si--) {
+                for (const name in stack[si].bindings) {
+                  if (!(name in bindings)) bindings[name] = stack[si].bindings[name];
+                }
+              }
+              caseResults.push({ label: cs.label, caseExpr: cs.caseExpr, bindings });
             }
-            // Don't process any more tokens in this range — let the stack handle it.
-            _rangeEnd = i; continue;
-            // (merge logic moved to switch_merge action handler)
+            // Merge: produce a switchcase token for the build var.
+            if (trackBuildVar) {
+              for (const bv of trackBuildVar) {
+                const snapB = snapshot[bv];
+                if (!snapB || snapB.kind !== 'chain') continue;
+                const snapFull = snapB.toks;
+                const branches = [];
+                let allAppended = true;
+                for (const cr of caseResults) {
+                  const b = cr.bindings[bv];
+                  if (b && b.kind === 'chain') {
+                    const full = b.toks;
+                    const appended = chainStartsWith(full, snapFull);
+                    if (!appended) allAppended = false;
+                    const extra = appended ? stripLeadingPlus(full.slice(snapFull.length)) : full;
+                    branches.push({ label: cr.label, caseExpr: cr.caseExpr, chain: extra });
+                  }
+                }
+                if (branches.length) {
+                  const switchTok = { type: 'switch', discExpr: discExpr || '/* switch */', branches };
+                  if (allAppended) {
+                    assignName(bv, chainBinding([...snapB.toks, SYNTH_PLUS, switchTok]));
+                  } else {
+                    assignName(bv, chainBinding([switchTok]));
+                  }
+                }
+              }
+            }
+            // Non-build vars that differ across cases: make opaque so
+            // the resolver doesn't statically pick the last case's value.
+            // Collect all names assigned in any case.
+            const switchChanged = new Set();
+            for (const cr2 of caseResults) {
+              for (const name in cr2.bindings) {
+                if (trackBuildVar && trackBuildVar.has(name)) continue;
+                const b = cr2.bindings[name];
+                const snap = snapshot[name];
+                // Changed if: exists in case but not snapshot, or differs.
+                if (b && (!snap || JSON.stringify(b) !== JSON.stringify(snap))) {
+                  switchChanged.add(name);
+                }
+              }
+            }
+            for (const name of switchChanged) {
+              // Preserve taint from all case branches.
+              var _swToks = [];
+              for (var _cr of caseResults) {
+                if (_cr.bindings[name] && _cr.bindings[name].kind === 'chain') _swToks.push(_cr.bindings[name].toks);
+              }
+              assignName(name, chainBinding([deriveExprRef.apply(null, [name].concat(_swToks))]));
+            }
+            i = switchEnd - 1;
             continue;
           }
         }
@@ -4316,8 +5321,9 @@
                 id, kind: 'do', headerSrc, bodyEnd: doEnd, frame: loopFrame,
                 modifiedVars: new Set(),
               });
-              _ws.push({ type: 'range', start: doEnd, end: _rangeEnd });
-              _rangeEnd = bodyEnd; continue;
+              walkRange(i + 1, bodyEnd);
+              i = doEnd - 1;
+              continue;
             }
           }
         }
@@ -4361,6 +5367,37 @@
                 k++;
               }
               bodyEnd = k;
+            }
+            // for-in / for-of: resolve iterable and store taint info
+            // so the loop frame binding can carry it (set after frame push below).
+            var _forInOfTaint = null;
+            if (taintEnabled) {
+              for (var _fi = i + 2; _fi < j; _fi++) {
+                if (tokens[_fi].type === 'other' && (tokens[_fi].text === 'in' || tokens[_fi].text === 'of')) {
+                  var _forInOf = tokens[_fi].text;
+                  var _fiVarStart = i + 2;
+                  if (tokens[_fiVarStart].type === 'other' && (tokens[_fiVarStart].text === 'var' || tokens[_fiVarStart].text === 'let' || tokens[_fiVarStart].text === 'const')) _fiVarStart++;
+                  var _fiVarName = tokens[_fiVarStart] && IDENT_RE.test(tokens[_fiVarStart].text) ? tokens[_fiVarStart].text : null;
+                  if (_fiVarName) {
+                    var _fiExprVal = readValue(_fi + 1, j, null);
+                    var _fiIterBind = _fiExprVal ? _fiExprVal.binding : null;
+                    var _fiTaintSources = [];
+                    if (_fiIterBind && _fiIterBind.kind === 'array') {
+                      for (var _fie = 0; _fie < _fiIterBind.elems.length; _fie++) {
+                        if (_fiIterBind.elems[_fie] && _fiIterBind.elems[_fie].kind === 'chain') _fiTaintSources.push(_fiIterBind.elems[_fie].toks);
+                      }
+                    } else if (_fiIterBind && _fiIterBind.kind === 'object' && _forInOf === 'of') {
+                      for (var _fip in _fiIterBind.props) {
+                        if (_fiIterBind.props[_fip] && _fiIterBind.props[_fip].kind === 'chain') _fiTaintSources.push(_fiIterBind.props[_fip].toks);
+                      }
+                    } else if (_fiIterBind && _fiIterBind.kind === 'chain') {
+                      _fiTaintSources.push(_fiIterBind.toks);
+                    }
+                    if (_fiTaintSources.length) _forInOfTaint = { varName: _fiVarName, sources: _fiTaintSources };
+                  }
+                  break;
+                }
+              }
             }
             // Collect variables mutated in the loop body (=, +=, ++, --)
             // so we don't resolve them in the header to their initial value.
@@ -4467,7 +5504,30 @@
                 }
               }
             }
+            // Check loop condition reachability.
+            {
+              var _loopCondStart = -1, _loopCondEnd = -1;
+              if (t.text === 'while') {
+                _loopCondStart = i + 2; _loopCondEnd = j;
+              } else {
+                // for: condition is between 1st and 2nd semicolons.
+                for (var _lsi = i + 2; _lsi < j; _lsi++) {
+                  if (tokens[_lsi].type === 'sep' && tokens[_lsi].char === ';') {
+                    if (_loopCondStart < 0) _loopCondStart = _lsi + 1;
+                    else { _loopCondEnd = _lsi; break; }
+                  }
+                }
+              }
+              if (_loopCondStart >= 0 && _loopCondEnd > _loopCondStart) {
+                var _loopReach = checkReachability(_loopCondStart, _loopCondEnd);
+                if (_loopReach === false) { i = bodyEnd - 1; continue; }
+              }
+            }
             stack.push(loopFrame);
+            // Apply for-in/for-of taint to the loop frame binding.
+            if (_forInOfTaint && loopFrame.bindings[_forInOfTaint.varName]) {
+              loopFrame.bindings[_forInOfTaint.varName] = chainBinding([deriveExprRef.apply(null, [_forInOfTaint.varName].concat(_forInOfTaint.sources))]);
+            }
             loopStack.push({
               id, kind: t.text, headerSrc, bodyEnd, frame: loopFrame,
               modifiedVars: new Set(),
@@ -4531,6 +5591,99 @@
         }
         pendingFunctionBrace = true;
         continue;
+      }
+      // Class declaration: class Name { method(params) { body } ... }
+      if (t.text === 'class') {
+        var _clsName = tokens[i + 1];
+        var _clsOpen = null;
+        var _clsIdx = i + 1;
+        // Optional name.
+        if (_clsName && _clsName.type === 'other' && IDENT_RE.test(_clsName.text)) _clsIdx++;
+        else _clsName = null;
+        // Optional extends.
+        if (tokens[_clsIdx] && tokens[_clsIdx].type === 'other' && tokens[_clsIdx].text === 'extends') {
+          _clsIdx++; // skip extends
+          if (tokens[_clsIdx] && tokens[_clsIdx].type === 'other') _clsIdx++; // skip parent class name
+        }
+        _clsOpen = tokens[_clsIdx];
+        if (_clsOpen && _clsOpen.type === 'open' && _clsOpen.char === '{') {
+          // Find the matching }.
+          var _clsEnd = _clsIdx + 1, _clsD = 1;
+          while (_clsEnd < stop && _clsD > 0) {
+            if (tokens[_clsEnd].type === 'open' && tokens[_clsEnd].char === '{') _clsD++;
+            if (tokens[_clsEnd].type === 'close' && tokens[_clsEnd].char === '}') _clsD--;
+            _clsEnd++;
+          }
+          // Parse methods inside the class body.
+          var _clsProps = Object.create(null);
+          var _clsJ = _clsIdx + 1;
+          while (_clsJ < _clsEnd - 1) {
+            var _mTok = tokens[_clsJ];
+            if (!_mTok) break;
+            // Skip static, async, get, set keywords for now — just find method name + parens.
+            var _isGetter = false, _isSetter = false;
+            if (_mTok.type === 'other' && _mTok.text === 'static') { _clsJ++; _mTok = tokens[_clsJ]; }
+            if (_mTok && _mTok.type === 'other' && _mTok.text === 'async') { _clsJ++; _mTok = tokens[_clsJ]; }
+            if (_mTok && _mTok.type === 'other' && _mTok.text === 'get') {
+              var _gnext = tokens[_clsJ + 1];
+              if (_gnext && _gnext.type === 'open' && _gnext.char === '(') { /* method named 'get' */ }
+              else { _isGetter = true; _clsJ++; _mTok = tokens[_clsJ]; }
+            }
+            if (_mTok && _mTok.type === 'other' && _mTok.text === 'set') {
+              var _snext = tokens[_clsJ + 1];
+              if (_snext && _snext.type === 'open' && _snext.char === '(') { /* method named 'set' */ }
+              else { _isSetter = true; _clsJ++; _mTok = tokens[_clsJ]; }
+            }
+            if (_mTok && _mTok.type === 'other' && IDENT_RE.test(_mTok.text)) {
+              var _mName = _mTok.text;
+              var _mParen = tokens[_clsJ + 1];
+              if (_mParen && _mParen.type === 'open' && _mParen.char === '(') {
+                // Parse params.
+                var _mParams = [], _mJ = _clsJ + 2;
+                while (_mJ < _clsEnd) {
+                  var _mp = parseParamWithDefault(tokens, _mJ, _clsEnd);
+                  if (!_mp) break;
+                  _mParams.push(_mp.param);
+                  _mJ = _mp.next;
+                  if (tokens[_mJ] && tokens[_mJ].type === 'close' && tokens[_mJ].char === ')') { _mJ++; break; }
+                  if (tokens[_mJ] && tokens[_mJ].type === 'sep' && tokens[_mJ].char === ',') { _mJ++; continue; }
+                  break;
+                }
+                if (tokens[_mJ - 1] && tokens[_mJ - 1].type === 'close' && tokens[_mJ - 1].char === ')') { /* ok */ }
+                else if (tokens[_mJ] && tokens[_mJ].type === 'close' && tokens[_mJ].char === ')') _mJ++;
+                // Parse body.
+                if (tokens[_mJ] && tokens[_mJ].type === 'open' && tokens[_mJ].char === '{') {
+                  var _mBD = 1, _mBE = _mJ + 1;
+                  while (_mBE < _clsEnd && _mBD > 0) {
+                    if (tokens[_mBE].type === 'open' && tokens[_mBE].char === '{') _mBD++;
+                    if (tokens[_mBE].type === 'close' && tokens[_mBE].char === '}') _mBD--;
+                    _mBE++;
+                  }
+                  if (_isGetter) {
+                    // Getter: store as a function, resolve when property is accessed.
+                    _clsProps['__getter_' + _mName] = functionBinding(_mParams, _mJ, _mBE, true);
+                  } else {
+                    _clsProps[_mName] = functionBinding(_mParams, _mJ, _mBE, true);
+                  }
+                  _clsJ = _mBE;
+                  continue;
+                }
+              }
+            }
+            _clsJ++;
+          }
+          // Store class as an object binding with method properties.
+          if (_clsName) {
+            var _clsBinding = objectBinding(_clsProps);
+            _clsBinding._isClass = true;
+            declFunction(_clsName.text, _clsBinding);
+          }
+          // Don't skip body — let the walker continue through it
+          // so extraction and inner declarations are processed.
+          i = _clsIdx; // point to '{', the walker will push a scope frame
+          pendingFunctionBrace = true;
+          continue;
+        }
       }
       if (t.text === '=>') {
         // Only arrow bodies of the form `=> { ... }` open a function scope;
@@ -4608,9 +5761,13 @@
           let k = j + 1;
           if (eqTok && eqTok.type === 'sep' && eqTok.char === '=') {
             hasInit = true;
+            // readValue handles function expressions, arrows, and all
+            // other value types through a single code path.
             const r = readValue(j + 2, stop, TERMS_TOP);
             value = r ? r.binding : null;
-            k = skipExpr(j + 2, stop);
+            // For function bindings use the precise end; for chains use
+            // skipExpr to ensure we consume the full statement.
+            k = (r && r.binding && r.binding.kind === 'function') ? r.next : skipExpr(j + 2, stop);
           }
           if (hasInit) {
             declBind(nameTok.text, value);
@@ -4666,9 +5823,32 @@
       // (which translates to `IDENT = IDENT + <value>`).
       if (IDENT_RE.test(t.text)) {
         const eqTok = tokens[i + 1];
+        // Navigation sink: bare assignment to a navigation global (location = expr).
+        if (taintEnabled && eqTok && eqTok.type === 'sep' && eqTok.char === '=' && isNavSink(t.text, declaredNames)) {
+          var _bNavR = readValue(i + 2, stop, TERMS_TOP);
+          if (_bNavR && _bNavR.binding && _bNavR.binding.kind === 'chain') {
+            var _bNavTaint = collectChainTaint(_bNavR.binding.toks);
+            if (_bNavTaint && _bNavTaint.size) {
+              recordTaintFinding('navigation', 'high', t.text, null, _bNavTaint, taintCondStack,
+                { expr: t.text, line: countLines(t._src, t.start) });
+            }
+          }
+        }
         if (eqTok && eqTok.type === 'sep' && eqTok.char === '=') {
           const stmtEndIdx = skipExpr(i + 2, stop);
-          const r = readValue(i + 2, stop, TERMS_TOP);
+          // Handle chained assignment: a = b = c = expr.
+          // Collect all targets, then assign the final value to all.
+          var _chainTargets = [t.text];
+          var _rhsStart = i + 2;
+          while (_rhsStart + 1 < stmtEndIdx) {
+            var _ct = tokens[_rhsStart];
+            var _ce = tokens[_rhsStart + 1];
+            if (_ct && _ct.type === 'other' && IDENT_RE.test(_ct.text) && _ce && _ce.type === 'sep' && _ce.char === '=') {
+              _chainTargets.push(_ct.text);
+              _rhsStart += 2;
+            } else break;
+          }
+          const r = readValue(_rhsStart, stop, TERMS_TOP);
           // Detect prepend pattern: x = expr + x (builds string in reverse).
           // Treat as equivalent to x += expr but with the new content prepended.
           // For build variables assigned via = inside a loop (prepend
@@ -4679,7 +5859,8 @@
             const tagged = tagWithLoop(r.binding.toks, loopId);
             assignName(t.text, chainBinding(tagged));
           } else {
-            assignName(t.text, r ? r.binding : null);
+            var _assignVal = r ? r.binding : null;
+            for (var _ci = 0; _ci < _chainTargets.length; _ci++) assignName(_chainTargets[_ci], _assignVal);
           }
           // Preserve non-build-var assignments in the build var's chain
           // so the emitter outputs them at the correct position.
@@ -4741,7 +5922,12 @@
         if (eqTok && eqTok.type === 'op' && (eqTok.text === '++' || eqTok.text === '--')) {
           const cur = resolve(t.text);
           const n = cur && cur.kind === 'chain' ? chainAsNumber(cur) : null;
-          if (n !== null && loopStack.length === 0) {
+          if (inEventHandler) {
+            // Value depends on handler invocation count (symbolic).
+            var _ehRef2 = exprRef(t.text);
+            _ehRef2.taint = new Set(['event']);
+            assignName(t.text, chainBinding([_ehRef2]));
+          } else if (n !== null && loopStack.length === 0) {
             const delta = eqTok.text === '++' ? 1 : -1;
             assignName(t.text, chainBinding([makeSynthStr(String(n + delta))]));
           } else {
@@ -4764,8 +5950,64 @@
           i = i + 1;
           continue;
         }
+        // Logical assignment: IDENT ||= expr, IDENT &&= expr, IDENT ??= expr
+        if (eqTok && eqTok.type === 'sep' && (eqTok.char === '||=' || eqTok.char === '&&=' || eqTok.char === '??=')) {
+          var _laR = readValue(i + 2, stop, TERMS_TOP);
+          var _laRhs = _laR ? _laR.binding : null;
+          var _laCur = resolve(t.text);
+          var _laOp = eqTok.char;
+          // Evaluate the LHS concretely to determine which branch executes.
+          var _laTruth = _laCur ? evalTruthiness(_laCur) : null;
+          var _laIsNull = _laCur && _laCur.kind === 'chain' && _laCur.toks.length === 1 && (_laCur.toks[0].text === 'null' || _laCur.toks[0].text === 'undefined');
+          if (_laOp === '||=') {
+            // x ||= y: if x is truthy, keep x; else x = y.
+            if (_laTruth === true) { /* keep current, no change */ }
+            else if (_laTruth === false) { if (_laRhs) assignName(t.text, _laRhs); }
+            else {
+              // Unknown: could be either. Merge taint from both.
+              if (_laRhs && _laRhs.kind === 'chain' && _laCur && _laCur.kind === 'chain') {
+                assignName(t.text, chainBinding([deriveExprRef(t.text, _laCur.toks, _laRhs.toks)]));
+              } else if (_laRhs) { assignName(t.text, _laRhs); }
+            }
+          } else if (_laOp === '&&=') {
+            // x &&= y: if x is falsy, keep x; else x = y.
+            if (_laTruth === false) { /* keep current, no change */ }
+            else if (_laTruth === true) { if (_laRhs) assignName(t.text, _laRhs); }
+            else {
+              if (_laRhs && _laRhs.kind === 'chain' && _laCur && _laCur.kind === 'chain') {
+                assignName(t.text, chainBinding([deriveExprRef(t.text, _laCur.toks, _laRhs.toks)]));
+              } else if (_laRhs) { assignName(t.text, _laRhs); }
+            }
+          } else { // ??=
+            // x ??= y: if x is non-null/undefined, keep x; else x = y.
+            if (_laCur && !_laIsNull && _laTruth !== null) { /* keep current */ }
+            else if (_laIsNull || !_laCur) { if (_laRhs) assignName(t.text, _laRhs); }
+            else {
+              if (_laRhs && _laRhs.kind === 'chain' && _laCur && _laCur.kind === 'chain') {
+                assignName(t.text, chainBinding([deriveExprRef(t.text, _laCur.toks, _laRhs.toks)]));
+              } else if (_laRhs) { assignName(t.text, _laRhs); }
+            }
+          }
+          i = skipExpr(i + 2, stop) - 1;
+          continue;
+        }
       }
 
+      // setTimeout/setInterval with function callback: walk the callback.
+      if (t.type === 'other' && (t.text === 'setTimeout' || t.text === 'setInterval') && !declaredNames.has(t.text)) {
+        var _timerParen = tokens[i + 1];
+        if (_timerParen && _timerParen.type === 'open' && _timerParen.char === '(') {
+          var _timerArgs = readCallArgBindings(i + 1, stop);
+          if (_timerArgs && _timerArgs.bindings.length >= 1) {
+            var _timerCb = _timerArgs.bindings[0];
+            if (_timerCb && _timerCb.kind === 'function') {
+              instantiateFunction(_timerCb, []);
+            }
+            i = _timerArgs.next - 1;
+            continue;
+          }
+        }
+      }
       // Bare function call as a statement: `render(input);` or `obj.method(args);`.
       // Resolve the callee; if it's a function binding, inline it for side effects.
       if (t.type === 'other' && IDENT_OR_PATH_RE.test(t.text)) {
@@ -4773,23 +6015,21 @@
         if (callParen && callParen.type === 'open' && callParen.char === '(') {
           var calleeBind = resolvePath(t.text);
           if (calleeBind && calleeBind.kind === 'function') {
-            var callArgs = readConcatArgs(i + 1, stop);
+            var callArgs = readCallArgBindings(i + 1, stop);
             if (callArgs) {
-              instantiateFunction(calleeBind, callArgs.args.map(function(a) { return chainBinding(a); }));
-              // Also check for trailing .prop = value (e.g. returned element).
+              instantiateFunction(calleeBind, callArgs.bindings);
               i = callArgs.next - 1;
-              // Check for call-based sinks.
-              if (taintEnabled && TAINT_CALL_SINKS[t.text]) {
-                checkSinkCall(t.text, callArgs.args.map(function(a) { return chainBinding(a); }));
+              if (taintEnabled && TAINT_CALL_SINKS[t.text] && !declaredNames.has(t.text.split('.')[0])) {
+                checkSinkCall(t.text, callArgs.bindings, t);
               }
               continue;
             }
           }
           // Taint: even if callee isn't inlinable, check if it's a call-based sink.
-          if (taintEnabled && TAINT_CALL_SINKS[t.text]) {
+          if (taintEnabled && TAINT_CALL_SINKS[t.text] && !declaredNames.has(t.text.split('.')[0])) {
             var sinkArgs = readCallArgBindings(i + 1, stop);
             if (sinkArgs) {
-              checkSinkCall(t.text, sinkArgs.bindings);
+              checkSinkCall(t.text, sinkArgs.bindings, t);
               i = sinkArgs.next - 1;
               continue;
             }
@@ -4818,7 +6058,7 @@
                   var trailR = readValue(afterCall + 2, stop, TERMS_TOP);
                   var trailVal = trailR ? trailR.binding : null;
                   if (factoryResult.bind.kind === 'element') {
-                    applyElementSet(factoryResult.bind, [trailProp], trailVal);
+                    applyElementSet(factoryResult.bind, [trailProp], trailVal, trailTok);
                   }
                   i = skipExpr(afterCall + 2, stop) - 1;
                   continue;
@@ -4841,18 +6081,120 @@
         }
       }
 
+      // Navigation sink detection: location.href = expr, location = expr,
+      // location.assign(expr), opener.location = expr, etc.
+      if (t.type === 'other' && (PATH_RE.test(t.text) || IDENT_RE.test(t.text))) {
+        var _navType = isNavSink(t.text, declaredNames);
+        // Check for navigation property assignment: location.href = expr, location = expr
+        if (_navType) {
+          var _navEq = tokens[i + 1];
+          if (_navEq && _navEq.type === 'sep' && (_navEq.char === '=' || _navEq.char === '+=')) {
+            var _navR = readValue(i + 2, stop, TERMS_TOP);
+            var _navVal = _navR ? _navR.binding : null;
+            // Record as navigation sink finding.
+            if (taintEnabled && _navVal && _navVal.kind === 'chain') {
+              var _navTaint = collectChainTaint(_navVal.toks);
+              if (_navTaint && _navTaint.size) {
+                recordTaintFinding('navigation', 'high', t.text, null, _navTaint, taintCondStack,
+                  { expr: t.text, line: countLines(t._src, t.start) });
+              }
+            }
+            i = skipExpr(i + 2, stop) - 1;
+            continue;
+          }
+          // Check for navigation method call: location.assign(expr), location.replace(expr)
+          var _navParen = tokens[i + 1];
+          if (_navParen && _navParen.type === 'open' && _navParen.char === '(') {
+            var _navCallArgs = readCallArgBindings(i + 1, stop);
+            if (_navCallArgs && taintEnabled) {
+              checkSinkCall(t.text, _navCallArgs.bindings, t);
+            }
+            if (_navCallArgs) { i = _navCallArgs.next - 1; continue; }
+          }
+        }
+        // Check: frame.contentWindow.location[.href] = expr
+        // or opener.location[.href] = expr (handled by navType above for globals).
+        // For element-based: el.contentWindow.location.href = expr
+        if (t.text.endsWith('.contentWindow.location') || t.text.endsWith('.contentWindow.location.href')) {
+          var _cwParts = t.text.split('.');
+          var _cwBase = _cwParts[0];
+          var _cwBind = resolve(_cwBase);
+          if (_cwBind && _cwBind.kind === 'element') {
+            var _cwTag = getElementTag(_cwBind);
+            if (_cwTag === 'iframe' || _cwTag === 'frame') {
+              var _cwEq = tokens[i + 1];
+              if (_cwEq && _cwEq.type === 'sep' && _cwEq.char === '=') {
+                var _cwR = readValue(i + 2, stop, TERMS_TOP);
+                var _cwVal = _cwR ? _cwR.binding : null;
+                if (taintEnabled && _cwVal && _cwVal.kind === 'chain') {
+                  var _cwTaint = collectChainTaint(_cwVal.toks);
+                  if (_cwTaint && _cwTaint.size) {
+                    recordTaintFinding('navigation', 'high', t.text, _cwTag, _cwTaint, taintCondStack,
+                      { expr: t.text, line: countLines(t._src, t.start) });
+                  }
+                }
+                i = skipExpr(i + 2, stop) - 1;
+                continue;
+              }
+            }
+          }
+        }
+      }
+
       // Path assignment on a tracked DOM element: `el.prop = value`,
       // `el.style.color = value`, etc. Records the mutation on the
       // element binding so subsequent DOM serialization sees it.
       if (t.type === 'other' && PATH_RE.test(t.text)) {
         const eqTok = tokens[i + 1];
+        // Path post-increment/decrement: obj.prop++ / obj.prop--
+        if (eqTok && eqTok.type === 'op' && (eqTok.text === '++' || eqTok.text === '--')) {
+          const parts = t.text.split('.');
+          const baseBind = resolve(parts[0]);
+          if (baseBind && baseBind.kind === 'object' && parts.length === 2) {
+            var cur = baseBind.props[parts[1]];
+            var n = cur && cur.kind === 'chain' ? chainAsNumber(cur) : null;
+            var delta = eqTok.text === '++' ? 1 : -1;
+            if (inEventHandler) {
+              // Inside event handler: result depends on invocation count
+              // (attacker-controlled). Tag as event-derived taint.
+              var _ehRef = exprRef(t.text);
+              _ehRef.taint = new Set(['event']);
+              baseBind.props[parts[1]] = chainBinding([_ehRef]);
+            } else {
+              baseBind.props[parts[1]] = n !== null
+                ? chainBinding([makeSynthStr(String(n + delta))])
+                : chainBinding([deriveExprRef(t.text, cur ? cur.toks : null)]);
+            }
+          }
+          i = i + 1;
+          continue;
+        }
+        // Path compound assignment: obj.prop += value
         if (eqTok && eqTok.type === 'sep' && (eqTok.char === '=' || eqTok.char === '+=')) {
           const parts = t.text.split('.');
           const baseBind = resolve(parts[0]);
+          // Object property assignment: obj.prop = value
+          if (baseBind && baseBind.kind === 'object' && parts.length === 2) {
+            const r = readValue(i + 2, stop, TERMS_TOP);
+            if (r && r.binding) {
+              if (eqTok.char === '+=') {
+                var prev = baseBind.props[parts[1]];
+                if (prev && prev.kind === 'chain' && r.binding.kind === 'chain') {
+                  baseBind.props[parts[1]] = chainBinding([...prev.toks, SYNTH_PLUS, ...r.binding.toks]);
+                } else {
+                  baseBind.props[parts[1]] = r.binding;
+                }
+              } else {
+                baseBind.props[parts[1]] = r.binding;
+              }
+            }
+            i = skipExpr(i + 2, stop) - 1;
+            continue;
+          }
           if (baseBind && baseBind.kind === 'element') {
             const r = readValue(i + 2, stop, TERMS_TOP);
             const val = r ? r.binding : null;
-            applyElementSet(baseBind, parts.slice(1), val);
+            applyElementSet(baseBind, parts.slice(1), val, t);
             i = skipExpr(i + 2, stop) - 1;
             continue;
           }
@@ -4895,41 +6237,71 @@
                 continue;
               }
             }
-            // Taint: detect call-based sinks (eval, document.write, etc.).
-            if (taintEnabled && TAINT_CALL_SINKS[t.text]) {
-              const argResult = readCallArgBindings(i + 1, stop);
-              if (argResult) {
-                checkSinkCall(t.text, argResult.bindings);
-                i = argResult.next - 1;
+            // Array methods as statements: forEach, push, unshift.
+            if (baseBind && baseBind.kind === 'array' && (method === 'forEach' || method === 'map' || method === 'filter')) {
+              // Use applyMethod to handle the call — it walks forEach callbacks.
+              var arrMethodResult = applyMethod(baseBind, method, i + 1, stop);
+              if (arrMethodResult) {
+                i = arrMethodResult.next - 1;
                 continue;
               }
             }
-            // Taint: detect addEventListener('type', handler) and mark
-            // the handler's event parameter as a taint source.
-            if (taintEnabled && method === 'addEventListener') {
-              const argResult = readCallArgBindings(i + 1, stop);
-              if (argResult && argResult.bindings.length >= 2) {
-                const evType = argResult.bindings[0] && argResult.bindings[0].kind === 'chain' ? chainAsKnownString(argResult.bindings[0]) : null;
-                const handler = argResult.bindings[1];
-                if (evType && handler && handler.kind === 'function' && EVENT_TAINT_SOURCES[evType]) {
-                  // Build tainted parameter bindings for the event handler.
-                  const evSources = EVENT_TAINT_SOURCES[evType];
-                  var _evParamBindings = [];
-                  if (handler.params && handler.params.length > 0) {
-                    const paramName = handler.params[0].name;
-                    // Create a tainted binding for the event parameter.
-                    var _evRef = exprRef(paramName);
-                    _evRef.taint = new Set(Object.values(evSources));
-                    _evParamBindings.push(chainBinding([_evRef]));
-                    // Create tainted bindings for known event properties.
-                    for (var _evProp in evSources) {
-                      var _evPropRef = exprRef(paramName + '.' + _evProp);
-                      _evPropRef.taint = new Set([evSources[_evProp]]);
-                    }
+            if (baseBind && baseBind.kind === 'array' && (method === 'push' || method === 'unshift')) {
+              var arrArgs = readCallArgBindings(i + 1, stop);
+              if (arrArgs) {
+                for (var _ai = 0; _ai < arrArgs.bindings.length; _ai++) {
+                  if (arrArgs.bindings[_ai]) {
+                    if (method === 'push') baseBind.elems.push(arrArgs.bindings[_ai]);
+                    else baseBind.elems.unshift(arrArgs.bindings[_ai]);
                   }
-                  // Walk the handler body with tainted parameter bindings.
-                  instantiateFunction(handler, _evParamBindings);
                 }
+                i = arrArgs.next - 1;
+                continue;
+              }
+            }
+            // Taint: detect addEventListener on ANY object (window, document, element).
+            // readCallArgBindings now handles function expressions and arrows
+            // via readValue → readFunctionExpr, so no special parser needed.
+            if (taintEnabled && method === 'addEventListener') {
+              var _evArgs = readCallArgBindings(i + 1, stop);
+              if (_evArgs && _evArgs.bindings.length >= 2) {
+                var _evTypeStr = _evArgs.bindings[0] && _evArgs.bindings[0].kind === 'chain' ? chainAsKnownString(_evArgs.bindings[0]) : null;
+                var _evHandler = _evArgs.bindings[1];
+                if (_evHandler && _evHandler.kind === 'function') {
+                  // Build tainted param binding if this event type has known sources.
+                  var _evParamBindings = [];
+                  if (_evTypeStr && EVENT_TAINT_SOURCES[_evTypeStr] && _evHandler.params && _evHandler.params.length > 0) {
+                    var _evSources = EVENT_TAINT_SOURCES[_evTypeStr];
+                    var _pn = _evHandler.params[0].name;
+                    var _evRef = exprRef(_pn);
+                    _evRef.taint = new Set(Object.values(_evSources));
+                    _evParamBindings.push(chainBinding([_evRef]));
+                  } else if (_evHandler.params && _evHandler.params.length > 0) {
+                    // Unknown event type: param is opaque, no taint.
+                    _evParamBindings.push(chainBinding([exprRef(_evHandler.params[0].name)]));
+                  }
+                  // Walk the handler body twice: event handlers fire
+                  // multiple times. The first walk establishes mutations
+                  // (state transitions). The second walk sees accumulated
+                  // state and can reach branches guarded by it.
+                  // Suppress findings during the first walk.
+                  var _prevInEH = inEventHandler;
+                  inEventHandler = true;
+                  var _savedFindings = taintFindings ? taintFindings.length : 0;
+                  instantiateFunction(_evHandler, _evParamBindings);
+                  if (taintFindings) taintFindings.length = _savedFindings; // discard first-walk findings
+                  instantiateFunction(_evHandler, _evParamBindings);
+                  inEventHandler = _prevInEH;
+                }
+                i = _evArgs.next - 1;
+                continue;
+              }
+            }
+            // Taint: detect call-based sinks (eval, document.write, etc.).
+            if (taintEnabled && TAINT_CALL_SINKS[t.text] && !declaredNames.has(t.text.split('.')[0])) {
+              const argResult = readCallArgBindings(i + 1, stop);
+              if (argResult) {
+                checkSinkCall(t.text, argResult.bindings, t);
                 i = argResult.next - 1;
                 continue;
               }
@@ -4948,12 +6320,12 @@
         if (bracketTok && bracketTok.type === 'open' && bracketTok.char === '[') {
           // Walk past balanced [...] and any following .prop, [...], or (...)
           let j = i + 1;
-          while (j < _rangeEnd) {
+          while (j < endI) {
             const jt = tokens[j];
             if (jt.type === 'open' && (jt.char === '[' || jt.char === '(')) {
               const match = jt.char === '[' ? ']' : ')';
               let d = 1; j++;
-              while (j < _rangeEnd && d > 0) {
+              while (j < endI && d > 0) {
                 if (tokens[j].type === 'open' && tokens[j].char === jt.char) d++;
                 else if (tokens[j].type === 'close' && tokens[j].char === match) d--;
                 j++;
@@ -4970,7 +6342,29 @@
               (afterTok.char === '=' || afterTok.char === '+=' || afterTok.char === '-=' ||
                afterTok.char === '*=' || afterTok.char === '/=')) {
             // Bracket-access assignment: items[i].seen = true
-            const stmtEndIdx = skipExpr(j + 1, _rangeEnd);
+            // Update object/array bindings when the key is known.
+            var _baseBind = resolve(t.text);
+            if (_baseBind && afterTok.char === '=') {
+              // Find the key: tokens between [ and ] in the first bracket.
+              var _keyStart = i + 2, _keyEnd = i + 2;
+              var _kd = 1;
+              for (var _ki = i + 2; _ki < j && _kd > 0; _ki++) {
+                if (tokens[_ki].type === 'open' && tokens[_ki].char === '[') _kd++;
+                if (tokens[_ki].type === 'close' && tokens[_ki].char === ']') { _kd--; if (_kd === 0) { _keyEnd = _ki; break; } }
+              }
+              if (_keyEnd > _keyStart) {
+                var _keyVal = readValue(_keyStart, _keyEnd, null);
+                var _keyStr = _keyVal ? chainAsKnownString(_keyVal.binding) : null;
+                if (_keyStr !== null) {
+                  var _rhsVal = readValue(j + 1, stop, TERMS_TOP);
+                  if (_rhsVal && _rhsVal.binding) {
+                    if (_baseBind.kind === 'object') _baseBind.props[_keyStr] = _rhsVal.binding;
+                    if (_baseBind.kind === 'array' && /^\d+$/.test(_keyStr)) _baseBind.elems[parseInt(_keyStr, 10)] = _rhsVal.binding;
+                  }
+                }
+              }
+            }
+            const stmtEndIdx = skipExpr(j + 1, endI);
             // Preserve the statement in build var chains.
             if (trackBuildVar && (trackBuildVarDepth < 0 || funcDepth() === trackBuildVarDepth)) {
               const first = tokens[i];
@@ -4995,7 +6389,7 @@
           // (e.g. items[i].doSomething()). Skip to statement boundary.
           let stmtEnd = j;
           let sd = 0;
-          while (stmtEnd < _rangeEnd) {
+          while (stmtEnd < endI) {
             const st = tokens[stmtEnd];
             if (st.type === 'open') sd++;
             else if (st.type === 'close') sd--;
@@ -5023,7 +6417,6 @@
         }
       }
     }
-    } // end while (_ws)
     };
     walkRange(0, stop);
 
@@ -5051,7 +6444,7 @@
     };
     const setTrackBuildVar = (name) => { trackBuildVar = name ? new Set(Array.isArray(name) ? name : [name]) : null; };
     const getBuildVarDeclStart = () => buildVarDeclStart;
-    return { resolve, resolvePath, parseRange, rewriteTemplate, advanceTo, setTrackBuildVar, getBuildVarDeclStart, loopInfo, loopVars, inScope, domElements, domOps, taintFindings, resolveForTaint: resolve };
+    return { resolve, resolvePath, parseRange, rewriteTemplate, advanceTo, setTrackBuildVar, getBuildVarDeclStart, loopInfo, loopVars, inScope, declaredNames, domElements, domOps, taintFindings, resolveForTaint: resolve };
   }
 
   function hasBinding(stack, name) {
@@ -5206,9 +6599,8 @@
       if (c === ',' || c === ';') { push({ type: 'sep', char: c, start: i, end: i + 1 }); i++; continue; }
       if (c === ':') { push({ type: 'other', text: ':', start: i, end: i + 1 }); i++; continue; }
       if (c === '?') {
-        // Multi-char tokens starting with '?': `??` (nullish coalescing)
-        // and `?.` (optional chaining; ignore `?.<digit>` which is a
-        // ternary followed by a decimal number).
+        // ??= must be checked before ?? to avoid consuming ?? and leaving = separate.
+        if (src[i + 1] === '?' && src[i + 2] === '=') { push({ type: 'sep', char: '??=', start: i, end: i + 3 }); i += 3; continue; }
         if (src[i + 1] === '?') { push({ type: 'op', text: '??', start: i, end: i + 2 }); i += 2; continue; }
         if (src[i + 1] === '.' && !/[0-9]/.test(src[i + 2] || '')) {
           push({ type: 'op', text: '?.', start: i, end: i + 2 }); i += 2; continue;
@@ -6500,9 +7892,6 @@
     $('in').addEventListener('input', convert);
   }
 
-  const toggles = ['skipWS', 'useFragment', 'emitComments'];
-  for (const id of toggles) $(id).addEventListener('change', convert);
-
   convert();
 
   // --- Project-level API ---
@@ -6532,6 +7921,274 @@
     return scripts;
   }
 
+  // Scan JS source for navigation sinks and wrap them with protocol filtering.
+  // Returns the modified source, or null if no changes.
+  function filterUnsafeSinks(jsContent) {
+    var tokens = tokenize(jsContent);
+    if (!tokens.length) return null;
+    // Build scope to resolve variable types and taint.
+    var scope = buildScopeState(tokens, tokens.length, null, null, { enabled: true });
+    var replacements = []; // { start, end, replacement }
+    for (var i = 0; i < tokens.length; i++) {
+      var t = tokens[i];
+      if (t.type !== 'other') continue;
+
+      // --- Code execution sinks: eval, Function, setTimeout/setInterval ---
+      // Helper: resolve an argument's source text to a known string if possible.
+      // Checks literal strings, template literals, concat of literals, and
+      // variables that resolve to literal strings through scope.
+      var _resolveArgText = function(argStart, argEnd) {
+        if (argStart >= argEnd) return null;
+        // Single string token.
+        if (argEnd === argStart + 1 && tokens[argStart].type === 'str') return tokens[argStart].text;
+        // Single template literal with no expressions.
+        if (argEnd === argStart + 1 && tokens[argStart].type === 'tmpl') {
+          var parts = tokens[argStart].parts;
+          if (parts && parts.every(function(p) { return p.kind === 'text'; })) {
+            return parts.map(function(p) { return p.raw; }).join('');
+          }
+          return null;
+        }
+        // Single identifier: resolve through scope.
+        if (argEnd === argStart + 1 && tokens[argStart].type === 'other' && IDENT_RE.test(tokens[argStart].text)) {
+          var b = scope.resolve(tokens[argStart].text);
+          if (b && b.kind === 'chain' && b.toks.length === 1 && b.toks[0].type === 'str') return b.toks[0].text;
+          return null;
+        }
+        // Multi-token: try concat of string literals (e.g. "a" + "b").
+        var result = '';
+        for (var ai = argStart; ai < argEnd; ai++) {
+          var at = tokens[ai];
+          if (at.type === 'str') { result += at.text; continue; }
+          if (at.type === 'plus') continue;
+          if (at.type === 'other' && IDENT_RE.test(at.text)) {
+            var ab = scope.resolve(at.text);
+            if (ab && ab.kind === 'chain' && ab.toks.length === 1 && ab.toks[0].type === 'str') { result += ab.toks[0].text; continue; }
+          }
+          return null; // non-literal part
+        }
+        return result;
+      };
+      // Helper: split call args by commas at depth 0. Returns array of {start, end}.
+      var _splitCallArgs = function(openIdx) {
+        var args = [], argStart = openIdx + 1, d = 0;
+        for (var ai = openIdx + 1; ai < tokens.length; ai++) {
+          if (tokens[ai].type === 'open') d++;
+          if (tokens[ai].type === 'close') { if (d === 0) { if (ai > argStart) args.push({ start: argStart, end: ai }); return { args: args, callEnd: ai + 1 }; } d--; }
+          if (d === 0 && tokens[ai].type === 'sep' && tokens[ai].char === ',') { args.push({ start: argStart, end: ai }); argStart = ai + 1; }
+        }
+        return { args: args, callEnd: tokens.length };
+      };
+
+      // eval(expr) / Function(expr) — only real globals, not shadowed locals.
+      if ((t.text === 'eval' || t.text === 'Function') && !scope.declaredNames.has(t.text)) {
+        var paren = tokens[i + 1];
+        if (paren && paren.type === 'open' && paren.char === '(') {
+          var parsed = _splitCallArgs(i + 1);
+          var fullEnd = tokens[parsed.callEnd - 1] ? tokens[parsed.callEnd - 1].end : t.end;
+          if (parsed.args.length === 0) {
+            // eval() with no args — leave as is (returns undefined).
+            i = parsed.callEnd;
+            continue;
+          }
+          if (t.text === 'eval') {
+            // eval only uses first argument.
+            var code = _resolveArgText(parsed.args[0].start, parsed.args[0].end);
+            if (code !== null) {
+              replacements.push({ start: t.start, end: fullEnd, replacement: code });
+            } else {
+              replacements.push({ start: t.start, end: fullEnd, replacement: '/* [blocked: eval with dynamic argument] */ void 0' });
+            }
+          } else {
+            // Function(body) or Function(param1, param2, ..., body)
+            var lastArg = parsed.args[parsed.args.length - 1];
+            var bodyCode = _resolveArgText(lastArg.start, lastArg.end);
+            if (bodyCode !== null) {
+              var paramParts = [];
+              for (var pi = 0; pi < parsed.args.length - 1; pi++) {
+                var pText = _resolveArgText(parsed.args[pi].start, parsed.args[pi].end);
+                if (pText !== null) paramParts.push(pText);
+                else { bodyCode = null; break; }
+              }
+              if (bodyCode !== null) {
+                replacements.push({ start: t.start, end: fullEnd, replacement: '(function(' + paramParts.join(', ') + ') { ' + bodyCode + ' })' });
+              } else {
+                replacements.push({ start: t.start, end: fullEnd, replacement: '/* [blocked: Function with dynamic argument] */ void 0' });
+              }
+            } else {
+              replacements.push({ start: t.start, end: fullEnd, replacement: '/* [blocked: Function with dynamic argument] */ void 0' });
+            }
+          }
+          i = parsed.callEnd;
+          continue;
+        }
+      }
+      // new Function(...)
+      if (t.text === 'new' && tokens[i + 1] && tokens[i + 1].type === 'other' && tokens[i + 1].text === 'Function' && !scope.declaredNames.has('Function')) {
+        var paren2 = tokens[i + 2];
+        if (paren2 && paren2.type === 'open' && paren2.char === '(') {
+          var parsed2 = _splitCallArgs(i + 2);
+          var fullEnd2 = tokens[parsed2.callEnd - 1] ? tokens[parsed2.callEnd - 1].end : 0;
+          if (parsed2.args.length === 0) {
+            replacements.push({ start: t.start, end: fullEnd2, replacement: '(function() {})' });
+          } else {
+            var lastArg2 = parsed2.args[parsed2.args.length - 1];
+            var bodyCode2 = _resolveArgText(lastArg2.start, lastArg2.end);
+            if (bodyCode2 !== null) {
+              var paramParts2 = [];
+              for (var pi2 = 0; pi2 < parsed2.args.length - 1; pi2++) {
+                var pText2 = _resolveArgText(parsed2.args[pi2].start, parsed2.args[pi2].end);
+                if (pText2 !== null) paramParts2.push(pText2);
+                else { bodyCode2 = null; break; }
+              }
+              if (bodyCode2 !== null) {
+                replacements.push({ start: t.start, end: fullEnd2, replacement: '(function(' + paramParts2.join(', ') + ') { ' + bodyCode2 + ' })' });
+              } else {
+                replacements.push({ start: t.start, end: fullEnd2, replacement: '/* [blocked: new Function with dynamic argument] */ void 0' });
+              }
+            } else {
+              replacements.push({ start: t.start, end: fullEnd2, replacement: '/* [blocked: new Function with dynamic argument] */ void 0' });
+            }
+          }
+          i = parsed2.callEnd;
+          continue;
+        }
+      }
+      // setTimeout("code", delay) / setInterval("code", delay) — convert string to function
+      if ((t.text === 'setTimeout' || t.text === 'setInterval') && !scope.declaredNames.has(t.text)) {
+        var paren3 = tokens[i + 1];
+        if (paren3 && paren3.type === 'open' && paren3.char === '(') {
+          var firstArg = tokens[i + 2];
+          if (firstArg) {
+            var comma = null, commaIdx = -1;
+            // Find the comma separating first arg from the rest.
+            var d3 = 0;
+            for (var ci = i + 2; ci < tokens.length; ci++) {
+              if (tokens[ci].type === 'open') d3++;
+              if (tokens[ci].type === 'close') d3--;
+              if (d3 < 0) break;
+              if (d3 === 0 && tokens[ci].type === 'sep' && tokens[ci].char === ',') { commaIdx = ci; break; }
+            }
+            if (firstArg.type === 'str' && commaIdx > 0) {
+              // setTimeout("alert(1)", 100) → setTimeout(function() { alert(1) }, 100)
+              replacements.push({ start: firstArg.start, end: tokens[commaIdx - 1].end, replacement: 'function() { ' + firstArg.text + ' }' });
+              i = commaIdx;
+              continue;
+            }
+            // Check if first arg is tainted/dynamic (not a function keyword or arrow).
+            var resolved3 = firstArg.type === 'other' && IDENT_RE.test(firstArg.text) ? scope.resolve(firstArg.text) : null;
+            var isFn = firstArg.text === 'function' || (resolved3 && resolved3.kind === 'function');
+            var isArrow = false;
+            // Check for arrow: look for => before comma
+            if (!isFn && commaIdx > 0) {
+              for (var ai = i + 2; ai < commaIdx; ai++) {
+                if (tokens[ai].type === 'other' && tokens[ai].text === '=>') { isArrow = true; break; }
+              }
+            }
+            if (!isFn && !isArrow && commaIdx > 0 && firstArg.type !== 'str') {
+              // Dynamic string passed to setTimeout — check for taint.
+              var hasTaint = false;
+              if (resolved3 && resolved3.kind === 'chain') hasTaint = !!collectChainTaint(resolved3.toks);
+              if (hasTaint || firstArg.type === 'other') {
+                // Block it.
+                var timerEnd = commaIdx;
+                replacements.push({ start: firstArg.start, end: tokens[commaIdx - 1].end, replacement: '/* [blocked: ' + t.text + ' with dynamic string] */ function() {}' });
+                i = commaIdx;
+                continue;
+              }
+            }
+          }
+        }
+      }
+
+      // --- Navigation sinks ---
+      if (PATH_RE.test(t.text) || IDENT_RE.test(t.text)) {
+        var navType = isNavSink(t.text, scope.declaredNames);
+        if (navType) {
+          var eq = tokens[i + 1];
+          // location.href = expr / location = expr
+          if (eq && eq.type === 'sep' && eq.char === '=') {
+            var stmtEnd = i + 2;
+            while (stmtEnd < tokens.length && !(tokens[stmtEnd].type === 'sep' && tokens[stmtEnd].char === ';')) stmtEnd++;
+            var rhsStart = tokens[i + 2].start;
+            var rhsEnd = tokens[stmtEnd - 1].end;
+            var rhsSrc = t._src.slice(rhsStart, rhsEnd);
+            var fullStart = t.start;
+            var fullEnd = tokens[stmtEnd] ? tokens[stmtEnd].end : rhsEnd;
+            // Only wrap if the RHS isn't a plain string literal (string literals are safe).
+            if (tokens[i + 2].type !== 'str' || stmtEnd > i + 3) {
+              var safeExpr = '(function(){var __u=__safeNav(' + rhsSrc + ');if(__u!==undefined)' + t.text + '=__u}())';
+              replacements.push({ start: fullStart, end: fullEnd, replacement: safeExpr });
+            }
+            i = stmtEnd;
+            continue;
+          }
+          // location.assign(expr) / location.replace(expr) / navigation.navigate(expr)
+          if (eq && eq.type === 'open' && eq.char === '(') {
+            var callEnd = i + 2;
+            var depth = 1;
+            while (callEnd < tokens.length && depth > 0) {
+              if (tokens[callEnd].type === 'open' && tokens[callEnd].char === '(') depth++;
+              if (tokens[callEnd].type === 'close' && tokens[callEnd].char === ')') depth--;
+              callEnd++;
+            }
+            // Extract the first argument.
+            var argStart = tokens[i + 2] ? tokens[i + 2].start : null;
+            var argEnd = tokens[callEnd - 2] ? tokens[callEnd - 2].end : null;
+            if (argStart !== null && argEnd !== null) {
+              var argSrc = t._src.slice(argStart, argEnd);
+              if (tokens[i + 2].type !== 'str') {
+                var safeCall = '(function(){var __u=__safeNav(' + argSrc + ');if(__u!==undefined)' + t.text + '(__u)}())';
+                var cFullEnd = tokens[callEnd - 1] ? tokens[callEnd - 1].end : argEnd;
+                replacements.push({ start: t.start, end: cFullEnd, replacement: safeCall });
+              }
+            }
+            i = callEnd;
+            continue;
+          }
+        }
+        // frame.src = expr where frame is an iframe/frame element
+        if (PATH_RE.test(t.text)) {
+          var parts = t.text.split('.');
+          var lastProp = parts[parts.length - 1];
+          if (lastProp === 'src') {
+            var baseBind = scope.resolve(parts[0]);
+            var tag = getElementTag(baseBind);
+            if (tag === 'iframe' || tag === 'frame') {
+              var eq2 = tokens[i + 1];
+              if (eq2 && eq2.type === 'sep' && eq2.char === '=') {
+                var stmtEnd2 = i + 2;
+                while (stmtEnd2 < tokens.length && !(tokens[stmtEnd2].type === 'sep' && tokens[stmtEnd2].char === ';')) stmtEnd2++;
+                var rhsStart2 = tokens[i + 2].start;
+                var rhsEnd2 = tokens[stmtEnd2 - 1].end;
+                var rhsSrc2 = t._src.slice(rhsStart2, rhsEnd2);
+                if (tokens[i + 2].type !== 'str' || stmtEnd2 > i + 3) {
+                  var safeSrc = '(function(){var __u=__safeNav(' + rhsSrc2 + ');if(__u!==undefined)' + t.text + '=__u}())';
+                  var fFullEnd = tokens[stmtEnd2] ? tokens[stmtEnd2].end : rhsEnd2;
+                  replacements.push({ start: t.start, end: fFullEnd, replacement: safeSrc });
+                }
+                i = stmtEnd2;
+                continue;
+              }
+            }
+          }
+        }
+      }
+    }
+    if (!replacements.length) return null;
+    // Apply replacements in reverse order to preserve positions.
+    var result = jsContent;
+    for (var ri = replacements.length - 1; ri >= 0; ri--) {
+      var rep = replacements[ri];
+      result = result.slice(0, rep.start) + rep.replacement + result.slice(rep.end);
+    }
+    // Prepend the safe navigation helper if not already present.
+    if (result.indexOf('__safeNav') >= 0 && result.indexOf('function __safeNav') < 0) {
+      result = NAV_SAFE_FILTER + '\n' + result;
+    }
+    return result;
+  }
+
   function convertJsFile(jsContent, precedingCode, knownDomFunctions) {
     // Use extractAllHTML to detect actual innerHTML/outerHTML assignments.
     // This uses the tokenizer (skipping comments/strings) AND verifies
@@ -6540,18 +8197,25 @@
       ? precedingCode + '\n/*__FILE_BOUNDARY__*/\n' + jsContent
       : jsContent;
     const extractions = extractAllHTML(combined);
-    if (extractions.length === 0) return null;
-    const converted = convertRaw(combined, undefined, knownDomFunctions);
-    if (!converted || converted === '// (no nodes parsed)') return null;
+    // Also filter navigation sinks in the current file.
+    var navFiltered = filterUnsafeSinks(jsContent);
+    if (extractions.length === 0 && !navFiltered) return navFiltered;
+    var sourceToConvert = navFiltered || jsContent;
+    var combinedSrc = precedingCode
+      ? precedingCode + '\n/*__FILE_BOUNDARY__*/\n' + sourceToConvert
+      : sourceToConvert;
+    if (extractions.length === 0) return navFiltered;
+    const converted = convertRaw(combinedSrc, undefined, knownDomFunctions);
+    if (!converted || converted === '// (no nodes parsed)') return navFiltered;
     if (precedingCode) {
       const idx = converted.indexOf('/*__FILE_BOUNDARY__*/');
       if (idx >= 0) {
         const result = converted.slice(idx + '/*__FILE_BOUNDARY__*/'.length).trim();
         if (result && result !== jsContent.trim()) return result;
-        return null;
+        return navFiltered;
       }
     }
-    if (converted.trim() === jsContent.trim()) return null;
+    if (converted.trim() === jsContent.trim()) return navFiltered;
     return converted;
   }
 
@@ -7035,10 +8699,20 @@
             if (htmlTokens[si].type === 'text') scriptContent += htmlTokens[si].text;
           }
           if (scriptContent.trim()) {
+            // Compute the line offset: the script content's line 1 maps
+            // to this line in the HTML file.
+            var scriptLineOffset = 0;
+            var scriptToken = htmlTokens[scriptStart];
+            if (scriptToken && scriptToken.start !== undefined) {
+              scriptLineOffset = countLines(content, scriptToken.start);
+            }
             var inlineFindings = traceTaintInJs(scriptContent);
             for (var f of inlineFindings) {
               f.file = page;
               f.inline = true;
+              if (f.location && f.location.line) {
+                f.location.line += scriptLineOffset;
+              }
               allFindings.push(f);
             }
           }
@@ -7088,16 +8762,8 @@
         allFindings.push(f3);
       }
     }
-    // Deduplicate findings.
-    var seen = new Set();
-    var deduped = [];
-    for (var finding of allFindings) {
-      var key = finding.file + ':' + finding.type + ':' + (finding.sink.prop || '') + ':' + finding.sources.join(',');
-      if (!seen.has(key)) {
-        seen.add(key);
-        deduped.push(finding);
-      }
-    }
+    // No dedup — each finding is a distinct code path.
+    var deduped = allFindings;
     return {
       findings: deduped,
       summary: {

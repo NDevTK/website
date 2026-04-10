@@ -18,7 +18,7 @@
   };
 
   require(['vs/editor/editor.main'], function () {
-    var defaultInput = '<div style="position: fixed; z-index: -99; width: 100%; height: 100%">\n  <iframe credentialless loading="lazy" id="background" title="background" sandbox="allow-scripts" frameborder="0" height="100%" width="100%" src="https://random.ndev.tk/"></iframe>\n</div>\n<button onclick="alert(\'hello\')">Greet</button>\n<script>\nvar items = [\'Home\', \'About\', \'Contact\', location.search];\nvar html = \'<nav>\';\nfor (var i = 0; i < items.length; i++) {\n  html += \'<a href="/\' + items[i].toLowerCase() + \'"\' + \'>\' + items[i] + \'</a>\';\n}\nhtml += \'</nav>\';\ndocument.body.innerHTML = html;\n<\/script>';
+    var defaultInput = '<div style="position: fixed; z-index: -99; width: 100%; height: 100%">\n  <iframe credentialless loading="lazy" id="background" title="background" sandbox="allow-scripts" frameborder="0" height="100%" width="100%" src="https://random.ndev.tk/"></iframe>\n</div>\n<button onclick="alert(\'hello\')">Greet</button>\n<script>\nvar items = [\'Home\', \'About\', \'Contact\', location.search];\nvar html = \'<nav>\';\nfor (var i = 0; i < items.length; i++) {\n  html += \'<a href="/\' + items[i].toLowerCase() + \'"\' + \'>\' + items[i] + \'</a>\';\n}\nhtml += \'</nav>\';\ndocument.body.innerHTML = html;\n\nvar postMessageHandler = function(msg) {\n  var content = msg.data;\n  var msgObj = eval(content);\n  if (msgObj.isActive) {\n    document.write("PostMessage arrived!");\n  }\n}\nwindow.addEventListener(\'message\', postMessageHandler, false);\n\nvar redirect = location.hash.slice(1);\nlocation.href = redirect;\n\nvar frame = document.createElement(\'iframe\');\nframe.src = redirect;\ndocument.body.appendChild(frame);\n<\/script>';
 
     // Single editor — shows whichever file is selected.
     var editor = monaco.editor.create(document.getElementById('editor'), {
@@ -188,7 +188,6 @@
       var f = taintResults.findings;
       summary.style.display = '';
       var parts = [];
-      if (taintResults.summary.critical) parts.push(taintResults.summary.critical + ' critical');
       if (taintResults.summary.high) parts.push(taintResults.summary.high + ' high');
       if (taintResults.summary.medium) parts.push(taintResults.summary.medium + ' medium');
       summary.textContent = f.length + ' finding' + (f.length === 1 ? '' : 's') + (parts.length ? ': ' + parts.join(', ') : '');
@@ -237,7 +236,7 @@
         var f = taintResults.findings[i];
         if (f.file !== file || !f.location || !f.location.line) continue;
         var line = f.location.line;
-        var cls = f.severity === 'critical' ? 'taint-decoration-critical' : f.severity === 'high' ? 'taint-decoration-high' : 'taint-decoration-medium';
+        var cls = f.severity === 'high' ? 'taint-decoration-high' : 'taint-decoration-medium';
         decorations.push({
           range: new monaco.Range(line, 1, line, 1),
           options: {

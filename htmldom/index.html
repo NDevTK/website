@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>HTML to DOM API Converter</title>
+<title>HTML DOM Security Analyzer</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="script-src 'self' https://cdnjs.cloudflare.com 'inline-speculation-rules'; style-src 'self' https://cdnjs.cloudflare.com 'unsafe-inline'; object-src 'none'; base-uri 'none'; worker-src blob: data:;" />
 <style>
@@ -35,15 +35,13 @@ header .hint { color: #aaa; font-size: 0.8rem; margin-left: 1rem; }
 .sidebar .file-item .badge.has-inner { background: #f39c1233; color: #f39c12; }
 .sidebar .file-item .badge.clean { background: #33333366; color: #888; }
 .sidebar .file-item .badge.generated { background: #317EFB33; color: #6ea8fe; }
-.sidebar .file-item .badge.taint-critical { background: #e74c3c33; color: #e74c3c; }
-.sidebar .file-item .badge.taint-high { background: #e67e2233; color: #e67e22; }
+.sidebar .file-item .badge.taint-high { background: #e74c3c33; color: #e74c3c; }
 .sidebar .file-item .badge.taint-medium { background: #f1c40f33; color: #f1c40f; }
 .sidebar .empty-hint { padding: 1rem 0.75rem; color: #555; font-size: 0.8rem; font-style: italic; }
 .finding-item { padding: 0.4rem 0.75rem; cursor: pointer; font-size: 0.8rem; border-bottom: 1px solid #2a2e33; }
 .finding-item:hover { background: #2a2e33; }
 .finding-item .finding-severity { font-weight: bold; font-size: 0.7rem; padding: 0.1rem 0.3rem; border-radius: 3px; margin-right: 0.4rem; }
-.finding-item .finding-severity.critical { background: #e74c3c33; color: #e74c3c; }
-.finding-item .finding-severity.high { background: #e67e2233; color: #e67e22; }
+.finding-item .finding-severity.high { background: #e74c3c33; color: #e74c3c; }
 .finding-item .finding-severity.medium { background: #f1c40f33; color: #f1c40f; }
 .finding-item .finding-flow { color: #aaa; font-size: 0.75rem; margin-top: 0.15rem; }
 .finding-item .finding-cond { color: #888; font-size: 0.7rem; font-style: italic; margin-top: 0.1rem; }
@@ -54,16 +52,15 @@ header .hint { color: #aaa; font-size: 0.8rem; margin-left: 1rem; }
 .options { padding: 0.5rem 1rem; border-top: 1px solid #333; flex-shrink: 0; display: flex; gap: 1.5rem; align-items: center; font-size: 0.8rem; color: #aaa; }
 .options label { margin: 0; font-weight: normal; cursor: pointer; }
 code { background: #2a2e33; padding: 0.05rem 0.25rem; border-radius: 3px; font-size: 0.85em; }
-.taint-decoration-critical { background: rgba(231, 76, 60, 0.15) !important; }
-.taint-decoration-high { background: rgba(230, 126, 34, 0.12) !important; }
-.taint-decoration-medium { background: rgba(241, 196, 15, 0.1) !important; }
+.taint-decoration-high { background: rgba(231, 76, 60, 0.12) !important; }
+.taint-decoration-medium { background: rgba(241, 196, 15, 0.08) !important; }
 </style>
 </head>
 <body>
 
 <header>
-  <h1>HTML &rarr; DOM API Converter</h1>
-  <span class="hint">Converts <code>innerHTML</code> assignments to safe <code>createElement</code>/<code>appendChild</code> calls with full JS support.</span>
+  <h1>HTML DOM Security Analyzer</h1>
+  <span class="hint">Converts unsafe sinks to safe DOM API calls and traces taint from sources to sinks across files, functions, and control flow.</span>
 </header>
 
 <div class="toolbar">
@@ -99,10 +96,6 @@ code { background: #2a2e33; padding: 0.05rem 0.25rem; border-radius: 3px; font-s
 </div>
 
 <div class="options">
-  <label><input type="checkbox" id="skipWS"> Skip whitespace text</label>
-  <label><input type="checkbox" id="useFragment"> Use DocumentFragment</label>
-  <label><input type="checkbox" id="emitComments"> Include comments</label>
-  <span class="spacer"></span>
   <a href="/" style="color:#6ea8fe; font-size:0.8rem;">&larr; Home</a>
 </div>
 

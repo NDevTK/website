@@ -12,8 +12,9 @@
 const fs = require('fs');
 const path = require('path');
 
-// Minimal DOM stubs — just enough for htmldom.js's IIFE init to run without
-// exploding. extractHTML itself doesn't touch any of these.
+// Minimal DOM globals — htmldom.js's IIFE calls document.getElementById
+// at init time for its UI wiring. These provide just enough for the
+// file to load in Node; the analysis functions never use them.
 global.document = {
   getElementById: () => ({ addEventListener: () => {}, value: '' }),
 };
@@ -26,7 +27,7 @@ global.DOMParser = class {
 const src = fs.readFileSync(path.join(__dirname, 'htmldom.js'), 'utf8');
 const patched = src.replace(
   'function extractHTML(input) {',
-  'globalThis.__extractHTML = extractHTML;\n  globalThis.__extractAllHTML = extractAllHTML;\n  globalThis.__extractAllDOM = extractAllDOM;\n  globalThis.__tokenize = tokenize;\n  globalThis.__tokenizeHtml = tokenizeHtml;\n  globalThis.__serializeHtmlTokens = serializeHtmlTokens;\n  globalThis.__decodeHtmlEntities = decodeHtmlEntities;\n  globalThis.__parseStyleDecls = parseStyleDecls;\n  globalThis.__convertRaw = convertRaw;\n  globalThis.__makeVar = makeVar;\n  function extractHTML(input) {'
+  'globalThis.__extractHTML = extractHTML;\n  globalThis.__extractAllHTML = extractAllHTML;\n  globalThis.__extractAllDOM = extractAllDOM;\n  globalThis.__tokenize = tokenize;\n  globalThis.__tokenizeHtml = tokenizeHtml;\n  globalThis.__serializeHtmlTokens = serializeHtmlTokens;\n  globalThis.__decodeHtmlEntities = decodeHtmlEntities;\n  globalThis.__parseStyleDecls = parseStyleDecls;\n  globalThis.__convertRaw = convertRaw;\n  globalThis.__makeVar = makeVar;\n  globalThis.__traceTaint = traceTaint;\n  globalThis.__traceTaintInJs = traceTaintInJs;\n  globalThis.__convertJsFile = convertJsFile;\n  function extractHTML(input) {'
 );
 // eslint-disable-next-line no-eval
 eval(patched);
@@ -1935,8 +1936,7 @@ function render() {
 (function () {
   const cp = globalThis.__convertProject;
   if (!cp) return;
-  let JSDOM;
-  try { JSDOM = require('jsdom').JSDOM; } catch (e) { return; }
+  const JSDOM = require('jsdom').JSDOM;
   const before = pass + fail;
   console.log('\nbehavioral equivalence');
   console.log('----------------------');
@@ -1944,31 +1944,21 @@ function render() {
   // Execute a multi-file project in jsdom. Returns body.innerHTML after
   // all scripts run synchronously.
   function execProject(files) {
-    // Find the HTML file.
     const htmlPath = Object.keys(files).find(p => /\.html?$/i.test(p));
     if (!htmlPath) return '';
     const html = files[htmlPath];
-    // Run in a child process to avoid jsdom memory leaks accumulating.
-    const cp2 = require('child_process');
-    const script = `
-      const { JSDOM } = require('jsdom');
-      const files = JSON.parse(process.argv[1]);
-      const htmlPath = ${JSON.stringify(htmlPath)};
-      const dom = new JSDOM(files[htmlPath], { runScripts: 'dangerously', url: 'http://localhost/' });
-      const doc = dom.window.document;
-      const scripts = doc.querySelectorAll('script[src]');
-      for (const s of scripts) {
-        const src = s.getAttribute('src');
-        if (files[src]) {
-          try { dom.window.eval(files[src]); } catch (e) {}
-        }
+    const dom = new JSDOM(html, { runScripts: 'dangerously', url: 'http://localhost/' });
+    const doc = dom.window.document;
+    const scripts = doc.querySelectorAll('script[src]');
+    for (const s of scripts) {
+      const src = s.getAttribute('src');
+      if (files[src]) {
+        try { dom.window.eval(files[src]); } catch (e) {}
       }
-      process.stdout.write(doc.body.innerHTML.replace(/\\s+/g, ' ').trim());
-      dom.window.close();
-    `;
-    return cp2.execFileSync(process.execPath, ['-e', script, JSON.stringify(files)], {
-      encoding: 'utf8', timeout: 10000
-    });
+    }
+    const result = doc.body.innerHTML.replace(/\s+/g, ' ').trim();
+    dom.window.close();
+    return result;
   }
 
   function checkEquiv(name, files) {
@@ -3151,39 +3141,385 @@ function render() {
 // -----------------------------------------------------------------------
 (function () {
   const traceTaint = globalThis.__traceTaint;
+  const traceTaintInJs = globalThis.__traceTaintInJs;
   if (!traceTaint) return;
   const before = pass + fail;
   console.log('\ntaint analysis');
   console.log('--------------');
 
-  function checkTaint(name, files, expectedCount) {
-    try {
-      const result = traceTaint(files);
-      const count = result.findings.length;
-      if (count === expectedCount) { pass++; } else {
-        fail++;
-        failures.push({ name, input: JSON.stringify(files).slice(0, 120), want: expectedCount + ' findings', got: count + ' findings' });
-      }
-    } catch (e) {
+  function checkTaint(name, files, expectedCount, opts) {
+    opts = opts || {};
+    const r = traceTaint(files);
+    let ok = r.findings.length === expectedCount;
+    if (ok && opts.sources && r.findings.length > 0) {
+      if (JSON.stringify(r.findings[0].sources.sort()) !== JSON.stringify(opts.sources.sort())) ok = false;
+    }
+    if (ok && opts.sink && r.findings.length > 0) {
+      if (r.findings[0].sink.prop !== opts.sink) ok = false;
+    }
+    if (ok && opts.elementTag !== undefined && r.findings.length > 0) {
+      if (r.findings[0].sink.elementTag !== opts.elementTag) ok = false;
+    }
+    if (ok && opts.hasLine && r.findings.length > 0) {
+      if (!r.findings[0].location || !r.findings[0].location.line) ok = false;
+    }
+    if (ok && opts.conditions !== undefined && r.findings.length > 0) {
+      if (r.findings[0].conditions.length !== opts.conditions) ok = false;
+    }
+    if (ok) { pass++; } else {
       fail++;
-      failures.push({ name, input: JSON.stringify(files).slice(0, 120), want: expectedCount + ' findings', got: 'ERROR: ' + e.message });
+      failures.push({ name, input: Object.keys(files).join(', '),
+        want: { count: expectedCount, ...opts },
+        got: { count: r.findings.length, sources: r.findings[0]?.sources, sink: r.findings[0]?.sink?.prop, line: r.findings[0]?.location?.line } });
     }
   }
 
-  // Basic taint flows
-  checkTaint('direct innerHTML', { 'a.js': 'document.getElementById("o").innerHTML = location.search;' }, 1);
-  checkTaint('variable taint', { 'a.js': 'var x = location.search; document.getElementById("o").innerHTML = x;' }, 1);
-  checkTaint('safe literal', { 'a.js': 'document.getElementById("o").innerHTML = "safe";' }, 0);
-  checkTaint('postMessage handler', { 'a.js': 'window.addEventListener("message", function(e) { document.getElementById("o").innerHTML = e.data; });' }, 1);
+  // --- Direct sinks ---
+  checkTaint('innerHTML', { 'a.js': 'var x = location.search; document.getElementById("o").innerHTML = x;' }, 1, { sources: ['url'], sink: 'innerHTML', hasLine: true });
+  checkTaint('outerHTML', { 'a.js': 'var x = location.search; document.getElementById("o").outerHTML = x;' }, 1);
+  checkTaint('document.write', { 'a.js': 'var x = location.search; document.write(x);' }, 1, { sink: 'document.write' });
+  checkTaint('eval', { 'a.js': 'var x = location.search; eval(x);' }, 1, { sink: 'eval', hasLine: true });
+  checkTaint('getElementById().innerHTML', { 'a.js': 'var x = location.search; document.getElementById("o").innerHTML = x;' }, 1);
 
-  // Recursive functions (must not stack overflow)
-  checkTaint('recursive with taint', { 'a.js': 'var result = "";\nfunction build(data, depth) {\n  if (depth > 3) return;\n  result += data;\n  build(data, depth + 1);\n}\nbuild(location.search, 0);\ndocument.getElementById("o").innerHTML = result;' }, 1);
-  checkTaint('mutual recursion taint', { 'a.js': 'var out = "";\nfunction a(x) { out += x; b(x); }\nfunction b(x) { a(x); }\na(location.search);\ndocument.getElementById("o").innerHTML = out;' }, 1);
-  checkTaint('recursive safe', { 'a.js': 'var result = 0;\nfunction count(n) { if (n <= 0) return; result++; count(n - 1); }\ncount(5);\ndocument.getElementById("o").innerHTML = result;' }, 0);
+  // --- Taint sources ---
+  checkTaint('location.search', { 'a.js': 'document.getElementById("o").innerHTML = location.search;' }, 1, { sources: ['url'] });
+  checkTaint('location.hash', { 'a.js': 'var x = location.hash; document.getElementById("o").innerHTML = x;' }, 1, { sources: ['url'] });
+  checkTaint('document.cookie', { 'a.js': 'var c = document.cookie; document.getElementById("o").innerHTML = c;' }, 1, { sources: ['cookie'] });
+  checkTaint('document.referrer', { 'a.js': 'var r = document.referrer; document.getElementById("o").innerHTML = r;' }, 1, { sources: ['referrer'] });
+  checkTaint('window.name', { 'a.js': 'document.getElementById("o").innerHTML = window.name;' }, 1, { sources: ['window.name'] });
 
-  // Cross-function side effects
+  // --- Safe patterns (no false positives) ---
+  checkTaint('textContent safe', { 'a.js': 'var x = location.search; document.getElementById("o").textContent = x;' }, 0);
+  checkTaint('literal safe', { 'a.js': 'document.getElementById("o").innerHTML = "<b>safe</b>";' }, 0);
+  checkTaint('img.src safe', { 'a.js': 'var p = document.createElement("img"); p.src = location.search;' }, 0);
+  checkTaint('parseInt sanitizes', { 'a.js': 'var x = parseInt(location.search); document.getElementById("o").innerHTML = x;' }, 0);
+  checkTaint('Number sanitizes', { 'a.js': 'var x = Number(location.search); document.getElementById("o").innerHTML = x;' }, 0);
+  checkTaint('Boolean sanitizes', { 'a.js': 'var x = Boolean(location.search); document.getElementById("o").innerHTML = x;' }, 0);
+  checkTaint('encodeURIComponent sanitizes', { 'a.js': 'var x = encodeURIComponent(location.search); document.getElementById("o").innerHTML = x;' }, 0);
+
+  // --- Shadow detection (no false positives on local variables) ---
+  checkTaint('var location shadow', { 'a.js': 'var location = {}; location.href = location.search;' }, 0);
+  checkTaint('let location shadow', { 'a.js': 'let location = { search: "x" }; document.getElementById("o").innerHTML = location.search;' }, 0);
+  checkTaint('var eval shadow', { 'a.js': 'var eval = function(x) { return x; }; eval(location.search);' }, 0);
+  checkTaint('var document shadow', { 'a.js': 'var document = { write: function(){} }; document.write(location.search);' }, 0);
+  checkTaint('var setTimeout shadow', { 'a.js': 'var setTimeout = function(){}; var x = location.search; setTimeout(x, 100);' }, 0);
+
+  // --- Element type tracking ---
+  checkTaint('iframe.src sink', { 'a.js': 'var f = document.createElement("iframe"); f.src = location.search;' }, 1, { elementTag: 'iframe' });
+  checkTaint('script.src sink', { 'a.js': 'var s = document.createElement("script"); s.src = location.search;' }, 1, { elementTag: 'script' });
+  checkTaint('div.src safe', { 'a.js': 'var d = document.createElement("div"); d.src = location.search;' }, 0);
+  checkTaint('type by createElement not name', { 'a.js': 'var div = document.createElement("iframe"); div.src = location.search;' }, 1, { elementTag: 'iframe' });
+  checkTaint('name iframe but div type', { 'a.js': 'var iframe = document.createElement("div"); iframe.src = location.search;' }, 0);
+
+  // --- Cross-function taint ---
+  checkTaint('cross-function', { 'a.js': 'function render(d) { var e = document.getElementById("o"); e.innerHTML = d; }\nvar x = location.search; render(x);' }, 1);
+  checkTaint('two levels deep', { 'a.js': 'function setH(e,v){e.innerHTML=v;}\nfunction render(d){var e=document.getElementById("o");setH(e,d);}\nvar x=location.search;render(x);' }, 1);
+  checkTaint('three levels deep', { 'a.js': 'function a(x){return x;} function b(x){return a(x);} function c(x){var e=document.getElementById("o");e.innerHTML=b(x);} c(location.search);' }, 1);
+  checkTaint('callback passed as arg', { 'a.js': 'function apply(fn,val){fn(val);} function sink(x){document.getElementById("o").innerHTML=x;} apply(sink,location.search);' }, 1);
+  checkTaint('closure capture', { 'a.js': 'var x=location.search; function get(){return x;} document.getElementById("o").innerHTML=get();' }, 1);
+  checkTaint('nested closure', { 'a.js': 'var x=location.search; function outer(){function inner(){return x;} return inner();} document.getElementById("o").innerHTML=outer();' }, 1);
+  checkTaint('var=function handler', { 'a.js': 'var h = function(msg) { eval(msg.data); };\nwindow.addEventListener("message", h, false);' }, 1, { sources: ['postMessage'] });
+
+  // --- addEventListener ---
+  checkTaint('addEventListener function expr', { 'a.js': 'window.addEventListener("message", function(e) { document.getElementById("o").innerHTML = e.data; });' }, 1, { sources: ['postMessage'] });
+  checkTaint('addEventListener arrow', { 'a.js': 'window.addEventListener("message", (e) => { document.getElementById("o").innerHTML = e.data; });' }, 1, { sources: ['postMessage'] });
+  checkTaint('addEventListener named ref', { 'a.js': 'function h(e){document.getElementById("o").innerHTML=e.data;}\nwindow.addEventListener("message",h);' }, 1, { sources: ['postMessage'] });
+  checkTaint('two handlers', { 'a.js': 'window.addEventListener("message",function(e){document.getElementById("a").innerHTML=e.data;}); window.addEventListener("message",function(e){eval(e.data);});' }, 2);
+
+  // --- Multiple sources ---
+  checkTaint('multi-source concat', { 'a.js': 'var a = location.search; var b = document.cookie; var c = a + b; document.getElementById("o").innerHTML = c;' }, 1, { sources: ['cookie', 'url'] });
+  checkTaint('postMessage + url', { 'a.js': 'window.addEventListener("message",function(e){var x=e.data+location.search;document.getElementById("o").innerHTML=x;});' }, 1, { sources: ['postMessage', 'url'] });
+  checkTaint('multiple sinks', { 'a.js': 'var x=location.search; document.getElementById("a").innerHTML=x; document.getElementById("b").innerHTML=x;' }, 2);
+
+  // --- Complex state ---
+  checkTaint('reassign chain', { 'a.js': 'var a=location.search; var b=a; var c=b; document.getElementById("o").innerHTML=c;' }, 1);
+  checkTaint('obj.prop', { 'a.js': 'var o = { x: location.search }; document.getElementById("o").innerHTML = o.x;' }, 1);
+  checkTaint('nested obj', { 'a.js': 'var o={inner:{val:location.search}}; document.getElementById("o").innerHTML=o.inner.val;' }, 1);
+  checkTaint('array[0]', { 'a.js': 'var arr = [location.search]; document.getElementById("o").innerHTML = arr[0];' }, 1);
+  checkTaint('array[1]', { 'a.js': 'var a = ["safe", location.search]; document.getElementById("o").innerHTML = a[1];' }, 1);
+  checkTaint('array.join', { 'a.js': 'var a = ["a", location.search]; document.getElementById("o").innerHTML = a.join("");' }, 1);
+  checkTaint('array.push', { 'a.js': 'var a=[]; a.push(location.search); document.getElementById("o").innerHTML=a[0];' }, 1);
+  checkTaint('array.map fn expr', { 'a.js': 'var a=[location.search]; var b=a.map(function(x){return "<b>"+x+"</b>";}); document.getElementById("o").innerHTML=b[0];' }, 1);
+  checkTaint('forEach sink', { 'a.js': 'var items=[location.search]; items.forEach(function(item){ document.getElementById("o").innerHTML=item; });' }, 1);
+  checkTaint('fn return', { 'a.js': 'function get() { return location.search; } document.getElementById("o").innerHTML = get();' }, 1);
+  checkTaint('array destruct', { 'a.js': 'var arr=[location.search]; var [x]=arr; document.getElementById("o").innerHTML=x;' }, 1);
+  checkTaint('template literal', { 'a.js': 'var x = location.search; document.getElementById("o").innerHTML = `<div>${x}</div>`;' }, 1);
+  checkTaint('.slice preserves', { 'a.js': 'var x = location.hash.slice(1); document.getElementById("o").innerHTML = x;' }, 1);
+  checkTaint('.replace preserves', { 'a.js': 'var x=location.search.replace(/</g,""); document.getElementById("o").innerHTML=x;' }, 1);
+  checkTaint('ternary preserves', { 'a.js': 'var x = true ? location.search : "safe"; document.getElementById("o").innerHTML = x;' }, 1);
+
+  // --- Control flow ---
+  checkTaint('if branch', { 'a.js': 'var x = location.search; var e = document.getElementById("o"); if (x.length > 0) { e.innerHTML = x; }' }, 1, { conditions: 1 });
+  checkTaint('both if/else tainted', { 'a.js': 'var x; if(Math.random()){x=location.search;}else{x=document.cookie;} document.getElementById("o").innerHTML=x;' }, 1);
+  checkTaint('try/catch', { 'a.js': 'var x; try { x = location.search; } catch(e) { x = "safe"; } document.getElementById("o").innerHTML = x;' }, 1);
+  checkTaint('switch', { 'a.js': 'var x; switch(1) { case 1: x = location.search; break; default: x = "safe"; } document.getElementById("o").innerHTML = x;' }, 1);
+  checkTaint('loop +=', { 'a.js': 'var s = ""; var src = location.search; for (var i = 0; i < 3; i++) { s += src; } document.getElementById("o").innerHTML = s;' }, 1);
+  checkTaint('loop push accum', { 'a.js': 'var parts=[]; parts.push(location.search); parts.push(document.cookie); var s=""; for(var i=0;i<parts.length;i++){s+=parts[i];} document.getElementById("o").innerHTML=s;' }, 1, { sources: ['cookie', 'url'] });
+  checkTaint('array loop', { 'a.js': 'var items=["Home",location.search]; var html=""; for(var i=0;i<items.length;i++){html+=items[i];} document.getElementById("o").innerHTML=html;' }, 1);
+
+  // --- Navigation sinks ---
+  checkTaint('location.href', { 'a.js': 'var x = location.search; location.href = x;' }, 1, { sink: 'location.href' });
+  checkTaint('location = x', { 'a.js': 'var x = location.search; location = x;' }, 1);
+  checkTaint('location.assign', { 'a.js': 'var x = location.search; location.assign(x);' }, 1);
+  checkTaint('location.replace', { 'a.js': 'var x = location.search; location.replace(x);' }, 1);
+  checkTaint('opener.location', { 'a.js': 'var x = location.search; opener.location = x;' }, 1);
+  checkTaint('parent.location.href', { 'a.js': 'var x = location.search; parent.location.href = x;' }, 1);
+  checkTaint('top.location', { 'a.js': 'var x = location.search; top.location = x;' }, 1);
+  checkTaint('navigation.navigate', { 'a.js': 'var x = location.search; navigation.navigate(x);' }, 1);
+  checkTaint('nav literal safe', { 'a.js': 'location.href = "https://example.com";' }, 0);
+
+  // --- Inline script line numbers ---
+  checkTaint('inline script line', { 'e.html': '<div>hi</div>\n<script>\nvar x = location.search;\ndocument.body.innerHTML = x;\n</script>' }, 1, { hasLine: true });
+
+  // --- Array methods with function expression callbacks ---
+  checkTaint('filter fn expr', { 'a.js': 'var items = [location.search, "safe"]; var filtered = items.filter(function(x){ return x.length > 0; }); document.getElementById("o").innerHTML = filtered[0];' }, 1);
+  checkTaint('reduce fn expr', { 'a.js': 'var items = ["a", location.search]; var result = items.reduce(function(acc, x){ return acc + x; }, ""); document.getElementById("o").innerHTML = result;' }, 1);
+
+  // --- Advanced patterns ---
+  checkTaint('reassign in fn', { 'a.js': 'var x = "safe"; function f() { x = location.search; } f(); document.getElementById("o").innerHTML = x;' }, 1);
+  checkTaint('loop html builder', { 'a.js': 'var input = location.search; var rows = ""; for (var i = 0; i < 5; i++) { rows += "<tr><td>" + input + "</td></tr>"; } document.getElementById("table").innerHTML = "<table>" + rows + "</table>";' }, 1);
+  checkTaint('ternary to sink', { 'a.js': 'var x = location.search; var html = x ? "<b>" + x + "</b>" : "<b>empty</b>"; document.getElementById("o").innerHTML = html;' }, 1);
+  checkTaint('3 sources combine', { 'a.js': 'window.addEventListener("message", function(e) { var x = e.data + location.search + document.cookie; document.getElementById("o").innerHTML = x; });' }, 1);
+  checkTaint('eval built string', { 'a.js': 'var cmd = "alert(" + location.search + ")"; eval(cmd);' }, 1);
+  checkTaint('postMessage getElementById', { 'a.js': 'window.addEventListener("message", function(event) { var target = document.getElementById("output"); target.innerHTML = event.data; });' }, 1);
+  checkTaint('split then join', { 'a.js': 'var x = location.search; var parts = x.split("&"); document.getElementById("o").innerHTML = parts.join("");' }, 1);
+
+  // --- Cross-handler state ---
+  checkTaint('cross-handler state', { 'a.js': 'var saved; window.addEventListener("message", function(e) { saved = e.data; }); window.addEventListener("hashchange", function() { document.getElementById("o").innerHTML = saved; });' }, 1, { sources: ['postMessage'] });
+  checkTaint('handler sets, fn reads', { 'a.js': 'var data; window.addEventListener("message", function(e) { data = e.data; }); function render() { document.getElementById("o").innerHTML = data; } render();' }, 1);
+  checkTaint('postMessage + url combine', { 'a.js': 'var config = {}; window.addEventListener("message", function(e) { config.template = e.data; }); document.getElementById("o").innerHTML = config.template + location.search;' }, 1);
+
+  // --- Filter tracks taint from source elements ---
+  checkTaint('filter tainted', { 'a.js': 'var items = ["safe", location.search]; var filtered = items.filter(function(x){ return x.length > 0; }); document.getElementById("o").innerHTML = filtered[0];' }, 1);
+  checkTaint('filter safe', { 'a.js': 'var items = ["a", "b"]; var filtered = items.filter(function(x){ return x.length > 0; }); document.getElementById("o").innerHTML = filtered[0];' }, 0);
+
+  // --- for-in / for-of / comma / try-finally ---
+  checkTaint('for-in obj values', { 'a.js': 'var obj={a:location.search}; var s=""; for(var k in obj){s+=obj[k];} document.getElementById("o").innerHTML=s;' }, 1);
+  checkTaint('for-of array', { 'a.js': 'var arr=[location.search]; for(var x of arr){document.getElementById("o").innerHTML=x;}' }, 1);
+  checkTaint('comma operator', { 'a.js': 'var x=(0,location.search); document.getElementById("o").innerHTML=x;' }, 1);
+  checkTaint('try-finally no catch', { 'a.js': 'var x; try{x=location.search;}finally{} document.getElementById("o").innerHTML=x;' }, 1);
+  checkTaint('comparison preserves taint', { 'a.js': 'var x=location.search.length>0; document.getElementById("o").innerHTML=x;' }, 1);
+  checkTaint('equality preserves taint', { 'a.js': 'var x=location.search==="admin"; document.getElementById("o").innerHTML=x;' }, 1);
+  checkTaint('bitwise preserves taint', { 'a.js': 'var x=location.search|0; document.getElementById("o").innerHTML=x;' }, 1);
+
+  // --- SMT satisfiability ---
+  checkTaint('satisfiable: tainted bool gates sink', { 'a.js': 'var flag = location.search === "go"; if (flag) { document.getElementById("o").innerHTML = location.hash; }' }, 1);
+  checkTaint('satisfiable: handler flag', { 'a.js': 'var ready = false; window.addEventListener("message", function(e) { ready = e.data === "init"; }); if (ready) { document.getElementById("o").innerHTML = location.search; }' }, 1);
+  checkTaint('satisfiable: multi message accum', { 'a.js': 'var parts = []; window.addEventListener("message", function(e) { parts.push(e.data); if (parts.length >= 2) { document.getElementById("o").innerHTML = parts.join(""); } });' }, 1);
+  checkTaint('unsatisfiable: if(false) dead', { 'a.js': 'if (false) { document.getElementById("o").innerHTML = location.search; }' }, 0);
+  checkTaint('unsatisfiable: concrete false', { 'a.js': 'var x = 1 > 2; if (x) { document.getElementById("o").innerHTML = location.search; }' }, 0);
+  checkTaint('satisfiable: 3 handlers shared', { 'a.js': 'var a,b,c; window.addEventListener("message", function(e) { a = e.data; }); window.addEventListener("message", function(e) { b = e.origin; }); window.addEventListener("hashchange", function() { c = location.hash; if (a && b) { document.getElementById("o").innerHTML = a + b + c; } });' }, 1);
+
+  // --- SMT contradiction detection ---
+  checkTaint('unsatisfiable: x>5 && x<3', { 'a.js': 'var x = location.search; if (x > 5 && x < 3) { document.getElementById("o").innerHTML = x; }' }, 0);
+  checkTaint('unsatisfiable: x>=5 && x<5', { 'a.js': 'var x = location.search; if (x >= 5 && x < 5) { document.getElementById("o").innerHTML = x; }' }, 0);
+  checkTaint('unsatisfiable: x===a && x===b', { 'a.js': 'var x = location.search; if (x === "a" && x === "b") { document.getElementById("o").innerHTML = x; }' }, 0);
+  checkTaint('unsatisfiable: x===a && x!==a', { 'a.js': 'var x = location.search; if (x === "a" && x !== "a") { document.getElementById("o").innerHTML = x; }' }, 0);
+  checkTaint('satisfiable: x>3 && x<5', { 'a.js': 'var x = location.search; if (x > 3 && x < 5) { document.getElementById("o").innerHTML = x; }' }, 1);
+  checkTaint('satisfiable: x===a || x===b', { 'a.js': 'var x = location.search; if (x === "a" || x === "b") { document.getElementById("o").innerHTML = x; }' }, 1);
+
+  // --- SMT path constraint propagation ---
+  checkTaint('path: nested unsat (x>5 then x<3)', { 'a.js': 'var x = location.search; if (x > 5) { if (x < 3) { document.getElementById("o").innerHTML = x; } }' }, 0);
+  checkTaint('path: nested sat (x>3 then x<5)', { 'a.js': 'var x = location.search; if (x > 3) { if (x < 5) { document.getElementById("o").innerHTML = x; } }' }, 1);
+  checkTaint('path: triple nested unsat', { 'a.js': 'var x = location.search; if (x > 10) { if (x < 20) { if (x > 25) { document.getElementById("o").innerHTML = x; } } }' }, 0);
+  checkTaint('path: triple nested sat', { 'a.js': 'var x = location.search; if (x > 10) { if (x < 20) { if (x > 12) { document.getElementById("o").innerHTML = x; } } }' }, 1);
+  checkTaint('path: eq then neq', { 'a.js': 'var x = location.search; if (x === "admin") { if (x !== "admin") { document.getElementById("o").innerHTML = x; } }' }, 0);
+  checkTaint('path: else branch constraint', { 'a.js': 'var x = location.search; if (x > 5) { } else { if (x > 10) { document.getElementById("o").innerHTML = x; } }' }, 0);
+
+  // --- SMT relational constraints ---
+  checkTaint('relational: x>y then y>x', { 'a.js': 'var x = location.search; var y = location.hash; if (x > y) { if (y > x) { document.getElementById("o").innerHTML = x; } }' }, 0);
+  checkTaint('relational: x>y valid', { 'a.js': 'var x = location.search; var y = location.hash; if (x > y) { document.getElementById("o").innerHTML = x; }' }, 1);
+
+  // --- SMT transitive closure ---
+  checkTaint('transitive: x>y>z>x cycle', { 'a.js': 'var x = location.search; var y = location.hash; var z = document.cookie; if (x > y) { if (y > z) { if (z > x) { document.getElementById("o").innerHTML = x; } } }' }, 0);
+  checkTaint('transitive: x>y>z valid', { 'a.js': 'var x = location.search; var y = location.hash; var z = document.cookie; if (x > y) { if (y > z) { document.getElementById("o").innerHTML = x; } }' }, 1);
+
+  // --- SMT expression-level constraints ---
+  checkTaint('expr: x+y>10 && x+y<5', { 'a.js': 'var x = location.search; var y = location.hash; if (x + y > 10 && x + y < 5) { document.getElementById("o").innerHTML = x; }' }, 0);
+  checkTaint('expr: x+y>3 && x+y<5 sat', { 'a.js': 'var x = location.search; var y = location.hash; if (x + y > 3 && x + y < 5) { document.getElementById("o").innerHTML = x; }' }, 1);
+
+  // --- SMT integration: all branch types ---
+  checkTaint('while unsat path', { 'a.js': 'var x = location.search; if (x > 5) { while (x < 3) { document.getElementById("o").innerHTML = x; } }' }, 0);
+  checkTaint('for unsat path', { 'a.js': 'var x = location.search; if (x > 5) { for (var i = 0; x < 3; i++) { document.getElementById("o").innerHTML = x; } }' }, 0);
+  checkTaint('switch dead case', { 'a.js': 'var x = location.search; switch(true) { case x > 5 && x < 3: document.getElementById("o").innerHTML = x; break; }' }, 0);
+  checkTaint('handler path unsat', { 'a.js': 'window.addEventListener("message", function(e) { var x = e.data; if (x > 5) { if (x < 3) { document.getElementById("o").innerHTML = x; } } });' }, 0);
+  checkTaint('fn path unsat', { 'a.js': 'function render(x) { if (x > 5) { if (x < 3) { document.getElementById("o").innerHTML = x; } } } render(location.search);' }, 0);
+
+  // --- SMT OR handling ---
+  checkTaint('or both unsat with path', { 'a.js': 'var x = location.search; if (x > 5) { if (x < 3 || x < 2) { document.getElementById("o").innerHTML = x; } }' }, 0);
+  checkTaint('or one sat with path', { 'a.js': 'var x = location.search; if (x > 5) { if (x > 10 || x < 3) { document.getElementById("o").innerHTML = x; } }' }, 1);
+  checkTaint('or rescues dead branch', { 'a.js': 'var x = location.search; if (x > 5) { if (x < 3 || x > 7) { document.getElementById("o").innerHTML = x; } }' }, 1);
+
+  // --- SMT cross-function path constraints ---
+  checkTaint('fn1 constrains fn2', { 'a.js': 'var x = location.search; function validate() { if (x > 5) { render(); } } function render() { if (x < 3) { document.getElementById("o").innerHTML = x; } } validate();' }, 0);
+  checkTaint('fn sets then checks', { 'a.js': 'var x; function init() { x = location.search; } init(); if (x > 5 && x < 3) { document.getElementById("o").innerHTML = x; }' }, 0);
+
+  // --- SMT global scope with handlers ---
+  checkTaint('global cond set + handler read', { 'a.js': 'var config; if (location.search.indexOf("debug") >= 0) { config = location.search; } window.addEventListener("message", function(e) { if (config) { document.getElementById("o").innerHTML = config + e.data; } });' }, 1);
+  checkTaint('two messages state machine', { 'a.js': 'var step1 = null; window.addEventListener("message", function(e) { if (e.data.type === "init") { step1 = e.data.payload; } if (e.data.type === "exec" && step1) { document.getElementById("o").innerHTML = step1; } });' }, 1);
+  checkTaint('url gate + postMessage', { 'a.js': 'var isAdmin = location.search === "admin"; var payload; window.addEventListener("message", function(e) { payload = e.data; if (isAdmin && payload) { document.getElementById("o").innerHTML = payload; } });' }, 1);
+  checkTaint('impossible concrete state', { 'a.js': 'var allowed = false; window.addEventListener("message", function(e) { if (allowed === true && allowed === false) { document.getElementById("o").innerHTML = e.data; } });' }, 0);
+
+  // --- String theory ---
+  checkTaint('string: startsWith contradiction', { 'a.js': 'var x = location.search; if (x.startsWith("http")) { if (x.startsWith("javascript")) { document.getElementById("o").innerHTML = x; } }' }, 0);
+  checkTaint('string: startsWith compatible', { 'a.js': 'var x = location.search; if (x.startsWith("http")) { if (x.startsWith("https")) { document.getElementById("o").innerHTML = x; } }' }, 1);
+  checkTaint('string: length 0 + indexOf', { 'a.js': 'var x = location.search; if (x.length === 0) { if (x.indexOf("a") >= 0) { document.getElementById("o").innerHTML = x; } }' }, 0);
+
+  // --- Rest params ---
+  checkTaint('rest params', { 'a.js': 'function f(...args){document.getElementById("o").innerHTML=args[0];} f(location.search);' }, 1);
+
+  // --- setTimeout/setInterval callback ---
+  checkTaint('setTimeout reads global', { 'a.js': 'var data = location.search; setTimeout(function() { document.getElementById("o").innerHTML = data; }, 0);' }, 1);
+
+  // --- Event handler state machine ---
+  checkTaint('state machine two invocations', { 'a.js': 'var state = "idle"; window.addEventListener("message", function(e) { if (state === "idle") { state = "ready"; } else if (state === "ready") { document.getElementById("o").innerHTML = e.data; } });' }, 1);
+
+  // --- Array theory ---
+  checkTaint('array: len 0 access dead', { 'a.js': 'var arr = []; if (arr.length === 0) { if (arr[0]) { document.getElementById("o").innerHTML = arr[0]; } }' }, 0);
+  checkTaint('array: len > 0 access sat', { 'a.js': 'var arr = [location.search]; if (arr.length > 0) { document.getElementById("o").innerHTML = arr[0]; }' }, 1);
+
+  // --- Disjunctive merge ---
+  checkTaint('merge: y big or small', { 'a.js': 'var x = location.search; var y; if (x > 5) { y = "big"; } else { y = "small"; } if (y === "big" && y === "small") { document.getElementById("o").innerHTML = x; }' }, 0);
+
+  // --- IIFE ---
+  checkTaint('IIFE function', { 'a.js': '(function() { document.getElementById("o").innerHTML = location.search; })();' }, 1);
+  checkTaint('IIFE with args', { 'a.js': '(function(x) { document.getElementById("o").innerHTML = x; })(location.search);' }, 1);
+
+  // --- Computed property write ---
+  checkTaint('computed prop write+read', { 'a.js': 'var o = {}; var key = "x"; o[key] = location.search; document.getElementById("o").innerHTML = o[key];' }, 1);
+
+  // --- JSON.parse taint ---
+  checkTaint('JSON.parse tainted', { 'a.js': 'var x = JSON.parse(location.search); document.getElementById("o").innerHTML = x;' }, 1);
+
+  // --- Logical assignment ---
+  checkTaint('logical OR assign', { 'a.js': 'var x = ""; x ||= location.search; document.getElementById("o").innerHTML = x;' }, 1);
+
+  // --- Remaining features ---
+  checkTaint('??= taint', { 'a.js': 'var x = null; x ??= location.search; document.getElementById("o").innerHTML = x;' }, 1);
+  checkTaint('??= safe', { 'a.js': 'var x = "safe"; x ??= location.search; document.getElementById("o").innerHTML = x;' }, 0);
+  checkTaint('nested destruct', { 'a.js': 'var obj = { inner: { html: location.search } }; var { inner: { html } } = obj; document.getElementById("o").innerHTML = html;' }, 1);
+  checkTaint('destruct fn return', { 'a.js': 'function getData() { return { html: location.search }; } var { html } = getData(); document.getElementById("o").innerHTML = html;' }, 1);
+  checkTaint('class method', { 'a.js': 'class Renderer { render(html) { document.getElementById("o").innerHTML = html; } } var r = new Renderer(); r.render(location.search);' }, 1);
+  checkTaint('getter', { 'a.js': 'var obj = { get val() { return location.search; } }; document.getElementById("o").innerHTML = obj.val;' }, 1);
+  checkTaint('tagged template', { 'a.js': 'function tag(strings, ...vals) { return vals[0]; } var x = location.search; document.getElementById("o").innerHTML = tag`prefix${x}suffix`;' }, 1);
+
+  // --- Engine weakness fixes ---
+  checkTaint('alias contradiction', { 'a.js': 'var x = location.search; var y = x; if (y === "a") { if (x === "b") { document.getElementById("o").innerHTML = x; } }' }, 0);
+  checkTaint('array concat taint', { 'a.js': 'var a = [location.search]; var b = [].concat(a); document.getElementById("o").innerHTML = b[0];' }, 1);
+  checkTaint('promise-like then', { 'a.js': 'var p = { then: function(cb) { cb(location.search); } }; p.then(function(x) { document.getElementById("o").innerHTML = x; });' }, 1);
+  checkTaint('no dup closure', { 'a.js': 'var x = location.search; function outer() { function inner() { document.getElementById("o").innerHTML = x; } inner(); } outer();' }, 1);
+  checkTaint('no dup IIFE', { 'a.js': '(function() { document.getElementById("o").innerHTML = location.search; })();' }, 1);
+
+  // --- Complex cross-function side effects ---
+  checkTaint('fn modifies shared obj', { 'a.js': 'var state = { safe: true };\nfunction corrupt() { state.safe = false; state.data = location.search; }\nfunction render() { if (state.safe) { document.getElementById("o").innerHTML = state.data; } }\ncorrupt(); render();' }, 1);
+  checkTaint('validator transformer renderer', { 'a.js': 'var input = location.search;\nvar validated = false;\nvar transformed = "";\nfunction validate() { if (input.length > 0) { validated = true; } }\nfunction transform() { if (validated) { transformed = "<b>" + input + "</b>"; } }\nfunction render() { if (transformed) { document.getElementById("o").innerHTML = transformed; } }\nvalidate(); transform(); render();' }, 1);
   checkTaint('closure side effect', { 'a.js': 'var result = "";\nfunction process(data) { function inner() { result = data; } inner(); }\nprocess(location.search);\ndocument.getElementById("o").innerHTML = result;' }, 1);
   checkTaint('callback with taint', { 'a.js': 'function fetchData(callback) { callback(location.search); }\nfunction handleData(data) { document.getElementById("o").innerHTML = data; }\nfetchData(handleData);' }, 1);
+  checkTaint('handler modifies fn reads', { 'a.js': 'var cache = { html: "" };\nwindow.addEventListener("message", function(e) { cache.html = e.data; });\nfunction refresh() { document.getElementById("o").innerHTML = cache.html; }\nrefresh();' }, 1);
+  checkTaint('method returns this.data', { 'a.js': 'var api = { data: location.search, getData: function() { return this.data; } };\ndocument.getElementById("o").innerHTML = api.getData();' }, 1);
+  checkTaint('forEach side effect', { 'a.js': 'var output = "";\nvar items = [location.search, document.cookie];\nitems.forEach(function(item) { output += item; });\ndocument.getElementById("o").innerHTML = output;' }, 1);
+  checkTaint('fn sanitizes safe', { 'a.js': 'function safe(data) { var clean = parseInt(data, 10); document.getElementById("o").innerHTML = clean; }\nsafe(location.search);' }, 0);
+  checkTaint('satisfiable: obj.prop++ count', { 'a.js': 'var state = {count:0}; window.addEventListener("message", function(e) { state.count++; if (state.count > 3) { document.getElementById("o").innerHTML = e.data; } });' }, 1);
+  checkTaint('satisfiable: ident++ in handler', { 'a.js': 'var n = 0; window.addEventListener("message", function(e) { n++; if (n > 5) { document.getElementById("o").innerHTML = e.data; } });' }, 1);
+
+  // --- Chained assignment ---
+  checkTaint('chained assign', { 'a.js': 'var a,b; a=b=location.search; document.getElementById("o").innerHTML=a;' }, 1);
+
+  // --- Object property mutations ---
+  checkTaint('obj.prop += in handler', { 'a.js': 'var state = {html:""}; window.addEventListener("message", function(e) { state.html += e.data; }); document.getElementById("o").innerHTML = state.html;' }, 1);
+
+  // --- Object property mutation ---
+  checkTaint('obj.prop = tainted', { 'a.js': 'var state = { msg: "" }; state.msg = location.search; document.getElementById("o").innerHTML = state.msg;' }, 1);
+  checkTaint('obj prop via handler', { 'a.js': 'var state = { msg: "" }; window.addEventListener("message", function(e) { state.msg = e.data; }); function render() { document.getElementById("o").innerHTML = state.msg; } render();' }, 1);
+
+  // --- Multi-step accumulation ---
+  checkTaint('handler push + url join', { 'a.js': 'var parts = [];\nwindow.addEventListener("message", function(e) { parts.push(e.data); });\nvar url = location.search;\nvar html = parts.join("") + url;\ndocument.getElementById("o").innerHTML = html;' }, 1);
+  checkTaint('two handlers shared vars', { 'a.js': 'var a = "", b = "";\nwindow.addEventListener("message", function(e) { a = e.data; });\nwindow.addEventListener("message", function(e) { b = e.origin; });\ndocument.getElementById("o").innerHTML = a + b;' }, 1);
+  checkTaint('multi-step cache + hash', { 'a.js': 'var cache = {};\nwindow.addEventListener("message", function(e) { cache.content = e.data; });\nvar suffix = location.hash;\nfunction build() { return cache.content + suffix; }\ndocument.getElementById("o").innerHTML = build();' }, 1);
+  checkTaint('handler calls sink fn', { 'a.js': 'function setContent(html) { document.getElementById("o").innerHTML = html; }\nwindow.addEventListener("message", function(e) { setContent(e.data); });' }, 1);
+  checkTaint('message-store-hashchange-sink', { 'a.js': 'var pending;\nwindow.addEventListener("message", function(e) { pending = e.data; });\nwindow.addEventListener("hashchange", function() {\n  document.getElementById("o").innerHTML = pending + location.hash;\n});' }, 1);
+  checkTaint('conditional multi-source', { 'a.js': 'var result;\nwindow.addEventListener("message", function(e) {\n  if (location.search.indexOf("admin") >= 0) {\n    result = e.data;\n  }\n});\ndocument.getElementById("o").innerHTML = result;' }, 1);
+
+  // --- Method chains preserve taint ---
+  checkTaint('toString preserves', { 'a.js': 'var x = location.search.toString(); document.getElementById("o").innerHTML = x;' }, 1);
+  checkTaint('trim preserves', { 'a.js': 'var x = location.search.trim(); document.getElementById("o").innerHTML = x;' }, 1);
+  checkTaint('toLowerCase preserves', { 'a.js': 'var x = location.search.toLowerCase(); document.getElementById("o").innerHTML = x;' }, 1);
+  checkTaint('concat preserves', { 'a.js': 'var x = "prefix".concat(location.search); document.getElementById("o").innerHTML = x;' }, 1);
+
+  // --- Object methods ---
+  checkTaint('obj method returns taint', { 'a.js': 'var o = { get: function() { return location.search; } }; document.getElementById("o").innerHTML = o.get();' }, 1);
+
+  // --- Cross-file ---
+  checkTaint('cross-file taint', { 'index.html': '<html><body><div id="o"></div><script src="a.js"></script><script src="b.js"></script></body></html>', 'a.js': 'var shared = location.search;', 'b.js': 'document.getElementById("o").innerHTML = shared;' }, 1);
+
+  // --- False positive: reassigned to safe ---
+  checkTaint('reassigned to safe', { 'a.js': 'var x = location.search; x = "safe"; document.getElementById("o").innerHTML = x;' }, 0);
+
+  console.log(`  (${pass + fail - before} cases)`);
+})();
+
+// -----------------------------------------------------------------------
+// Converter: unsafe sink handling
+// -----------------------------------------------------------------------
+(function () {
+  const convertJsFile = globalThis.__convertJsFile;
+  if (!convertJsFile) return;
+  const before = pass + fail;
+  console.log('\nconverter sinks');
+  console.log('---------------');
+
+  function checkConv(name, input, expected) {
+    const r = convertJsFile(input, '');
+    let ok;
+    if (expected === null) {
+      ok = r === null;
+    } else if (typeof expected === 'string') {
+      ok = r !== null && r.indexOf(expected) >= 0;
+    } else {
+      ok = false;
+    }
+    if (ok) { pass++; } else {
+      fail++;
+      failures.push({ name, input, want: expected, got: r ? r.slice(0, 120) : null });
+    }
+  }
+
+  // eval
+  checkConv('eval literal', 'eval("alert(1)");', 'alert(1)');
+  checkConv('eval variable', 'var c = "alert(1)"; eval(c);', 'alert(1)');
+  checkConv('eval tainted', 'var x = location.search; eval(x);', 'blocked');
+  checkConv('eval concat', 'eval("var x = " + "1");', 'var x = 1');
+  checkConv('eval template', 'eval(`alert(1)`);', 'alert(1)');
+  checkConv('eval no args', 'eval();', null);
+  checkConv('eval in expr', 'var r = eval("1+1");', '1+1');
+  checkConv('eval shadow safe', 'var eval = function(x){return x;}; eval("test");', null);
+
+  // Function
+  checkConv('Function literal', 'Function("return 1");', '(function() { return 1 })');
+  checkConv('Function 2 args', 'Function("a", "return a");', '(function(a) { return a })');
+  checkConv('Function 3 args', 'Function("a", "b", "return a+b");', '(function(a, b) { return a+b })');
+  checkConv('new Function', 'new Function("return 1");', '(function() { return 1 })');
+  checkConv('new Function tainted', 'new Function(location.search);', 'blocked');
+  checkConv('new Function no args', 'new Function();', '(function() {})');
+
+  // setTimeout/setInterval
+  checkConv('setTimeout string', 'setTimeout("alert(1)", 100);', 'function() { alert(1) }');
+  checkConv('setInterval string', 'setInterval("tick()", 1000);', 'function() { tick() }');
+  checkConv('setTimeout fn safe', 'setTimeout(function() { alert(1); }, 100);', null);
+  checkConv('setTimeout tainted', 'var x = location.search; setTimeout(x, 100);', 'blocked');
+  checkConv('setTimeout shadow safe', 'var setTimeout = function(){}; setTimeout("test", 100);', null);
+
+  // Navigation
+  checkConv('location.href filter', 'var x = location.search; location.href = x;', '__safeNav');
+  checkConv('location.assign filter', 'var x = location.search; location.assign(x);', '__safeNav');
+  checkConv('location literal safe', 'location.href = "https://example.com";', null);
+  checkConv('location shadow safe', 'var location = {}; location.href = "x";', null);
+  checkConv('iframe.src filter', 'var f = document.createElement("iframe"); f.src = location.search;', '__safeNav');
+  checkConv('opener.location filter', 'opener.location = location.search;', '__safeNav');
+
+  // --- Converter in complex contexts ---
+  checkConv('setTimeout in loop', 'for (var i = 0; i < 3; i++) { setTimeout("alert(" + i + ")", i * 100); }', 'function()');
+  checkConv('iframe.src dynamic', 'var f = document.createElement("iframe"); f.src = location.hash;', '__safeNav');
 
   console.log(`  (${pass + fail - before} cases)`);
 })();
