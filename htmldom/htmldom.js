@@ -598,6 +598,30 @@
       return { expr: '(str.substr ' + l.expr + ' ' + startV + ' ' + lenV + ')',
                sorts: sortsS, isBool: false };
     }
+    // String concatenation: + with at least one String operand. JS
+    // overloads + for both numeric add and string concat; we detect
+    // the string variant whenever one side is a string literal (the
+    // common pattern \`"prefix" + x\` / \`x + ".html"\`) and translate
+    // to (str.++ a b), declaring any sym operand as String.
+    if (op === '+') {
+      var lIsStr = !!(l.value && l.value.kind === 'str') || (l.symName && l.sorts[l.symName] === 'String');
+      var rIsStr = !!(r.value && r.value.kind === 'str') || (r.symName && r.sorts[r.symName] === 'String');
+      if (lIsStr || rIsStr) {
+        // Const fold.
+        if (l.value && l.value.kind === 'str' && r.value && r.value.kind === 'str') {
+          return smtConst(l.value.val + r.value.val);
+        }
+        var sortsCat = _mergeSorts(l.sorts, r.sorts);
+        if (l.symName) sortsCat[l.symName] = 'String';
+        if (r.symName) sortsCat[r.symName] = 'String';
+        var ccIncompat = false;
+        if (l.incompatible || r.incompatible || sortsCat.__conflict) ccIncompat = true;
+        var rcc = { expr: '(str.++ ' + l.expr + ' ' + r.expr + ')',
+                    sorts: sortsCat, isBool: false };
+        if (ccIncompat) rcc.incompatible = true;
+        return rcc;
+      }
+    }
     // Numeric arithmetic.
     if (op === '+' || op === '-' || op === '*' || op === '/' || op === '%') {
       // Const fold.
@@ -4427,21 +4451,36 @@
     };
 
     const chainAsExprText = (chain) => {
-      if (chain.toks.length !== 1) return null;
-      const t = chain.toks[0];
-      if (t.type === 'str') {
-        // Quote literal strings; bare numbers flow as-is.
-        const n = Number(t.text);
-        if (!Number.isNaN(n) && String(n) === t.text) return t.text;
-        return JSON.stringify(t.text);
+      // Render a single-token chain.
+      const renderTok = (t) => {
+        if (t.type === 'str') {
+          const n = Number(t.text);
+          if (!Number.isNaN(n) && String(n) === t.text) return t.text;
+          return JSON.stringify(t.text);
+        }
+        if (t.type === 'other') return t.text;
+        if (t.type === 'cond') {
+          const tt = chainAsExprText(chainBinding(t.ifTrue));
+          const ft = chainAsExprText(chainBinding(t.ifFalse));
+          if (tt !== null && ft !== null) return '(' + t.condExpr + ' ? ' + tt + ' : ' + ft + ')';
+          return null;
+        }
+        return null;
+      };
+      if (chain.toks.length === 1) return renderTok(chain.toks[0]);
+      // Multi-token concat chain: alternate operand / `plus` tokens. Render
+      // each operand and join with `+`. This lets the walker pass concat
+      // conditions like `"http://" + x === "http://abc"` to the SMT layer
+      // where smtArith translates `+` between String operands to (str.++).
+      var parts = [];
+      for (var ci = 0; ci < chain.toks.length; ci++) {
+        var tk = chain.toks[ci];
+        if (tk.type === 'plus') { parts.push('+'); continue; }
+        var rendered = renderTok(tk);
+        if (rendered === null) return null;
+        parts.push(rendered);
       }
-      if (t.type === 'other') return t.text;
-      if (t.type === 'cond') {
-        const tt = chainAsExprText(chainBinding(t.ifTrue));
-        const ft = chainAsExprText(chainBinding(t.ifFalse));
-        if (tt !== null && ft !== null) return '(' + t.condExpr + ' ? ' + tt + ' : ' + ft + ')';
-      }
-      return null;
+      return parts.join(' ');
     };
 
     // Parse `( chain, chain, ... )` starting at the `(` token index. Returns

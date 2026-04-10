@@ -3450,6 +3450,12 @@ await (async function () {
   await checkTaint('z3: startsWith sym len0 unsat',  { 'a.js': 'var x = location.search; var y = location.hash; if (y.length > 0 && x.length === 0 && x.startsWith(y)) { document.getElementById("o").innerHTML = x; }' }, 0);
   await checkTaint('z3: includes sym sat',           { 'a.js': 'var x = location.search; var y = location.hash; if (x.includes(y)) { document.getElementById("o").innerHTML = x; }' }, 1);
   await checkTaint('z3: includes sym len-mismatch unsat', { 'a.js': 'var x = location.search; var y = location.hash; if (x.length < y.length && x.includes(y)) { document.getElementById("o").innerHTML = x; }' }, 0);
+  // String concatenation: + with at least one literal-string operand
+  // is translated to (str.++ ...) so concat conditions can be checked.
+  await checkTaint('z3: concat prefix sat',   { 'a.js': 'var x = location.search; if (("http://" + x) === "http://abc") { document.getElementById("o").innerHTML = x; }' }, 1);
+  await checkTaint('z3: concat prefix unsat', { 'a.js': 'var x = location.search; if (("http://" + x) === "ftp://abc") { document.getElementById("o").innerHTML = x; }' }, 0);
+  await checkTaint('z3: concat suffix sat',   { 'a.js': 'var x = location.search; if ((x + ".html") === "page.html") { document.getElementById("o").innerHTML = x; }' }, 1);
+  await checkTaint('z3: concat suffix unsat', { 'a.js': 'var x = location.search; if ((x + ".html") === "page.htmlx") { document.getElementById("o").innerHTML = x; }' }, 0);
 
   // --- IIFE ---
   await checkTaint('IIFE function', { 'a.js': '(function() { document.getElementById("o").innerHTML = location.search; })();' }, 1);
