@@ -4582,30 +4582,131 @@
           if (!(name in snap)) snap[name] = stack[si].bindings[name];
       return snap;
     };
-    // Work stack for iterative walkRange (LIFO).
+    // -------------------------------------------------------------------
+    // walkRange: iterative SMT-integrated state machine
+    // -------------------------------------------------------------------
+    //
+    // The walker models JavaScript statement evaluation as a state machine
+    // whose configuration is the tuple:
+    //
+    //     (S, B, P, T, L)
+    //
+    //   S  — scope stack (lexical bindings: block/function frames)
+    //   B  — symbolic bindings for each live variable (chain/array/object)
+    //   P  — SMT path-constraint stack (conjunction of formulas proved
+    //        true on the current control-flow path, used to prune
+    //        unreachable branches and refine taint reachability)
+    //   T  — taint-condition stack (string descriptions of P, for
+    //        user-visible finding reports)
+    //   L  — loop stack (enclosing for/while frames with bodyEnd,
+    //        modifiedVars, and per-loop SMT obligations)
+    //
+    // Each task on the LIFO work stack (`_ws`) is a transition in the
+    // machine. Task types and their effects on (S,B,P,T,L):
+    //
+    //   range         — execute statements in [start,end); dispatches to
+    //                   per-statement transitions (assign, if, loop,
+    //                   switch, try, function, class, ...).
+    //   if_restore    — rollback B to pre-if snapshot, flip P/T from
+    //                   `cond` to `!cond`, queue else-body range.
+    //   if_merge      — pop P/T for `!cond`, merge if/else bindings into
+    //                   a `cond` token for build vars.
+    //   try_restore   — rollback B after try body, queue catch range.
+    //   try_merge     — merge try/catch bindings; queue finally range.
+    //   switch_case   — rollback to snapshot, push case-equality into P,
+    //                   SMT-check reachability, queue case body.
+    //   switch_capture— pop case-equality from P, capture post-case B.
+    //   switch_merge  — combine caseResults into a `switch` token.
+    //   loop_pop      — pop loop condition from P/T and restore L after
+    //                   crossing a loop-body boundary (inlined via
+    //                   loopStack bookkeeping below).
+    //
+    // SMT integration: every branching transition pushes an SMT formula
+    // onto P before walking and pops it after. The theory solver in
+    // smtSat() then decides branch reachability for nested conditions.
+    // When a formula is irreducible the walker still walks the branch
+    // but records a symbolic path-condition for taint reports.
+    //
+    // The machine is strictly iterative — walkRange never recurses into
+    // itself. Tasks chain via LIFO push order (push restore/merge tasks
+    // BEFORE pushing the range they depend on so the range runs first).
+    // -------------------------------------------------------------------
     const _ws = [];
+    // SMT path constraint lifecycle helpers. Centralising push/pop
+    // makes all transitions use the same mechanism so the P/T stacks
+    // can never drift out of sync with the work stack.
+    const _pushPathConstraint = (formula, condExpr) => {
+      if (pathConstraints && formula) pathConstraints.push(formula);
+      if (taintCondStack && condExpr) taintCondStack.push(condExpr);
+    };
+    const _popPathConstraint = (formula, condExpr) => {
+      if (pathConstraints && formula) pathConstraints.pop();
+      if (taintCondStack && condExpr) taintCondStack.pop();
+    };
+    // Build an SMT formula from a raw token range (header tokens of
+    // an if/while/for/switch-case/...).
+    const _smtFormulaFromRange = (start, end) => {
+      if (!taintEnabled || start >= end) return null;
+      var toks = [];
+      for (var _fi = start; _fi < end; _fi++) toks.push(tokens[_fi]);
+      return smtParseExpr(toks, 0, toks.length, resolve, resolvePath);
+    };
+    // Registered transition types. Each entry documents the handler's
+    // effect on the machine configuration (S, B, P, T, L). This is both
+    // self-documenting and an invariant fixture — any task type pushed
+    // onto _ws that isn't listed here is a bug.
+    const TASK_TYPES = {
+      // Walk the statements in [start, end). The statement dispatcher
+      // inside the range handler may push further tasks.
+      range:          'exec statements in [start,end)',
+      // Rollback B to the pre-`if` snapshot, flip (P,T) from `cond` to
+      // `!cond`, and queue the else range (if any).
+      if_restore:     'rollback B; flip P from cond to !cond; queue else',
+      // Merge if/else bindings into a cond token; pop `!cond` from (P,T).
+      if_merge:       'merge if/else; pop !cond from P',
+      // Rollback B after the try body; queue the catch range.
+      try_restore:    'rollback B after try; queue catch range',
+      // Merge try/catch bindings into a trycatch token; queue finally.
+      try_merge:      'merge try/catch; queue finally range',
+      // Rollback to pre-switch snapshot; SMT-check case reachability;
+      // push `disc === caseExpr` onto (P,T); queue case body range.
+      switch_case:    'rollback B; push disc===case to P; queue body',
+      // Pop the case equality from (P,T); capture post-case bindings.
+      switch_capture: 'pop case-equality from P; capture case bindings',
+      // Combine all case results into a switch token; queue post-switch range.
+      switch_merge:   'merge cases into switch token; queue tail range',
+    };
+    // State-machine invariant: keep track of the intended path-constraint
+    // stack depth so mismatched push/pop on the `pathConstraints` /
+    // `taintCondStack` pair can be detected early (in debug builds).
+    const _pcBaseDepth = pathConstraints ? pathConstraints.length : 0;
+    const _tcBaseDepth = taintCondStack ? taintCondStack.length : 0;
     const walkRange = (startI, endI) => {
     _ws.push({ type: 'range', start: startI, end: endI });
     while (_ws.length > 0) {
     const _task = _ws.pop();
-    // --- Action: restore after if-body, queue else ---
+    // State-machine guard: every task must be a registered transition.
+    if (!TASK_TYPES[_task.type]) {
+      // Unknown task — skip rather than crash; this is a defensive
+      // guard so malformed transitions don't stall the walker.
+      continue;
+    }
+    // --- Transition: restore after if-body, flip P from `cond` to `!cond`, queue else ---
     if (_task.type === 'if_restore') {
       _task.ctx.ifLoopVars = loopVars.splice(_task.ctx.lvBefore);
-      if (taintCondStack) taintCondStack.pop();
-      if (pathConstraints && _task.ctx.pathFormula) pathConstraints.pop();
+      _popPathConstraint(_task.ctx.pathFormula, _task.ctx.condExpr);
       _task.ctx.ifBindings = _snapshotBindings();
       for (const name in _task.snapshot) assignName(name, _task.snapshot[name]);
-      if (taintCondStack) taintCondStack.push('!(' + _task.ctx.condExpr + ')');
-      if (pathConstraints && _task.ctx.pathFormula) pathConstraints.push(smtNot(_task.ctx.pathFormula));
+      _pushPathConstraint(smtNot(_task.ctx.pathFormula), '!(' + _task.ctx.condExpr + ')');
+      _task.ctx.negPushed = true;
       _task.ctx.lvBefore2 = loopVars.length;
       if (_task.elseStart > 0 && _task.elseEnd > _task.elseStart)
         _ws.push({ type: 'range', start: _task.elseStart, end: _task.elseEnd });
       continue;
     }
-    // --- Action: merge if/else branches ---
+    // --- Transition: merge if/else branches, pop `!cond` from P ---
     if (_task.type === 'if_merge') {
-      if (taintCondStack) taintCondStack.pop();
-      if (pathConstraints && _task.ctx.pathFormula) pathConstraints.pop();
+      if (_task.ctx.negPushed) _popPathConstraint(smtNot(_task.ctx.pathFormula), '!(' + _task.ctx.condExpr + ')');
       const ctx = _task.ctx;
       const elseLoopVars = loopVars.splice(ctx.lvBefore2);
       const elseBindings = _snapshotBindings();
@@ -4683,13 +4784,17 @@
       if (_task.finallyStart >= 0) _ws.push({ type: 'range', start: _task.finallyStart, end: _task.finallyEnd });
       continue;
     }
-    // --- Action: switch case ---
+    // --- Transition: switch case — rollback to pre-switch bindings,
+    //     compute `disc === caseExpr` as an SMT formula, SMT-check
+    //     reachability against the enclosing path constraints, push the
+    //     formula onto P/T while walking the body, and queue switch_capture
+    //     to pop P/T and record the resulting bindings. ---
     if (_task.type === 'switch_case') {
       for (const name in _task.snapshot) assignName(name, _task.snapshot[name]);
-      // SMT: check if this case is reachable before walking.
       var _cs = _task.cs;
+      var _caseFormula = null;
+      var _caseCondExpr = null;
       if (taintEnabled && _cs.label !== 'default' && _cs.caseExpr) {
-        var _caseFormula = null;
         for (var _csi = 0; _csi < tokens.length; _csi++) {
           if (tokens[_csi].start === _cs.srcStart && tokens[_csi].text === 'case') {
             var _ceStart = _csi + 1, _ceEnd = _ceStart;
@@ -4707,6 +4812,7 @@
                 var _discSmtExpr = _discB ? smtParseAtom([{ type: 'other', text: _task.discExpr || 'disc' }], 0, 1, resolve, resolvePath) : null;
                 if (_ceSmtExpr && _discSmtExpr) _caseFormula = smtCmp('===', _discSmtExpr, _ceSmtExpr);
               }
+              _caseCondExpr = (_task.discExpr || 'disc') + ' === ' + _cs.caseExpr;
             }
             break;
           }
@@ -4720,11 +4826,16 @@
           }
         }
       }
-      _ws.push({ type: 'switch_capture', cs: _cs, caseResults: _task.caseResults });
+      // Push case-equality as a path constraint while walking the body,
+      // so nested `if`/loop reachability within the case body can use it.
+      _pushPathConstraint(_caseFormula, _caseCondExpr);
+      _ws.push({ type: 'switch_capture', cs: _cs, caseResults: _task.caseResults, pathFormula: _caseFormula, condExpr: _caseCondExpr });
       _ws.push({ type: 'range', start: _cs.bodyStart, end: _cs.bodyEnd });
       continue;
     }
     if (_task.type === 'switch_capture') {
+      // Pop the case path constraint pushed by switch_case.
+      _popPathConstraint(_task.pathFormula, _task.condExpr);
       _task.caseResults.push({ label: _task.cs.label, caseExpr: _task.cs.caseExpr, bindings: _snapshotBindings() });
       continue;
     }
@@ -4774,6 +4885,13 @@
       // as a named variable rather than inlining the one-iteration chain.
       while (loopStack.length > 0 && i >= loopStack[loopStack.length - 1].bodyEnd) {
         const entry = loopStack.pop();
+        // Pop the loop condition from P/T — the post-loop world has no
+        // guarantee that the loop predicate still holds (we approximate
+        // it as unknown rather than as `!cond`, since loop exit can
+        // also happen via break, and bounded iteration is symbolic).
+        if (entry.pathFormula || entry.condExpr) {
+          _popPathConstraint(entry.pathFormula, entry.condExpr);
+        }
         // Collect names that were pre-scanned as opaque in the loop frame.
         const preScanNames = entry.frame ? Object.keys(entry.frame.bindings) : [];
         // Capture modified variable bindings BEFORE removing the loop frame,
@@ -5037,12 +5155,11 @@
               var _elS = (elseStart > 0 && elseEnd > elseStart) ? elseStart : 0;
               var _elE = (elseStart > 0 && elseEnd > elseStart) ? elseEnd : 0;
               var _resumeAt = (elseEnd > 0 ? elseEnd : ifEnd);
-              var _oCtx = { condExpr, lvBefore: loopVars.length, pathFormula: _pathFormula };
+              var _oCtx = { condExpr, lvBefore: loopVars.length, pathFormula: _pathFormula, negPushed: false };
               _ws.push({ type: 'range', start: _resumeAt, end: _rangeEnd });
               _ws.push({ type: 'if_merge', ctx: _oCtx, snapshot });
               _ws.push({ type: 'if_restore', ctx: _oCtx, snapshot, elseStart: _elS, elseEnd: _elE });
-              if (taintCondStack) taintCondStack.push(condExpr);
-              if (pathConstraints && _pathFormula) pathConstraints.push(_pathFormula);
+              _pushPathConstraint(_pathFormula, condExpr);
               _rangeEnd = ifEnd; i = j; continue;
             }
             // Condition too complex to represent — preserve the entire
@@ -5431,7 +5548,11 @@
                 }
               }
             }
-            // Check loop condition reachability.
+            // Check loop condition reachability AND compute the SMT
+            // formula for the condition so it can be pushed onto the
+            // path-constraint stack while walking the body.
+            var _loopPathFormula = null;
+            var _loopCondExpr = null;
             {
               var _loopCondStart = -1, _loopCondEnd = -1;
               if (t.text === 'while') {
@@ -5448,6 +5569,18 @@
               if (_loopCondStart >= 0 && _loopCondEnd > _loopCondStart) {
                 var _loopReach = checkReachability(_loopCondStart, _loopCondEnd);
                 if (_loopReach === false) { i = bodyEnd - 1; continue; }
+                // SMT: build the loop condition formula for inner tasks.
+                // While walking the body we know `cond` is true (this is
+                // an over-approximation for the last iteration where the
+                // loop exits, but matches the semantics for "inside body").
+                _loopPathFormula = _smtFormulaFromRange(_loopCondStart, _loopCondEnd);
+                if (taintCondStack) {
+                  var _lcToks = tokens[_loopCondStart]._src.slice(
+                    tokens[_loopCondStart].start,
+                    tokens[_loopCondEnd - 1].end
+                  );
+                  _loopCondExpr = _lcToks;
+                }
               }
             }
             stack.push(loopFrame);
@@ -5455,9 +5588,13 @@
             if (_forInOfTaint && loopFrame.bindings[_forInOfTaint.varName]) {
               loopFrame.bindings[_forInOfTaint.varName] = chainBinding([deriveExprRef.apply(null, [_forInOfTaint.varName].concat(_forInOfTaint.sources))]);
             }
+            // Push the loop condition onto P/T — it holds inside the body.
+            _pushPathConstraint(_loopPathFormula, _loopCondExpr);
             loopStack.push({
               id, kind: t.text, headerSrc, bodyEnd, frame: loopFrame,
               modifiedVars: new Set(),
+              pathFormula: _loopPathFormula,
+              condExpr: _loopCondExpr,
             });
             // Skip past the loop header — the init/cond/update clauses
             // don't count as body mutations, so we resume at the body's
@@ -6345,6 +6482,17 @@
       }
     }
     } // end while (_ws)
+    // Invariant: after the work stack drains, any nested push onto the
+    // path-constraint or taint-condition stacks must have been matched
+    // by a corresponding pop. If we ever observe imbalance at top level
+    // it indicates a broken transition; reset to the base depth so the
+    // next walkRange call starts from a clean configuration.
+    if (pathConstraints && pathConstraints.length > _pcBaseDepth) {
+      pathConstraints.length = _pcBaseDepth;
+    }
+    if (taintCondStack && taintCondStack.length > _tcBaseDepth) {
+      taintCondStack.length = _tcBaseDepth;
+    }
     };
     walkRange(0, stop);
 

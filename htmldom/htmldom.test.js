@@ -3381,6 +3381,15 @@ function render() {
   // --- Disjunctive merge ---
   checkTaint('merge: y big or small', { 'a.js': 'var x = location.search; var y; if (x > 5) { y = "big"; } else { y = "small"; } if (y === "big" && y === "small") { document.getElementById("o").innerHTML = x; }' }, 0);
 
+  // --- SMT: loop/switch path-constraint propagation INTO nested conditions.
+  // These exercise the state-machine transitions that push the loop
+  // condition (resp. switch case equality) onto the path-constraint
+  // stack while walking the body, so inner `if`s can be proved
+  // unreachable by the theory solver.
+  checkTaint('sm: while cond propagates', { 'a.js': 'var x = location.search; while (x < 3) { if (x > 5) { document.getElementById("o").innerHTML = x; } }' }, 0);
+  checkTaint('sm: for cond propagates', { 'a.js': 'var x = location.search; for (var i = 0; x < 3; i++) { if (x > 5) { document.getElementById("o").innerHTML = x; } }' }, 0);
+  checkTaint('sm: while cond compatible', { 'a.js': 'var x = location.search; while (x > 3) { if (x > 5) { document.getElementById("o").innerHTML = x; } }' }, 1);
+
   // --- IIFE ---
   checkTaint('IIFE function', { 'a.js': '(function() { document.getElementById("o").innerHTML = location.search; })();' }, 1);
   checkTaint('IIFE with args', { 'a.js': '(function(x) { document.getElementById("o").innerHTML = x; })(location.search);' }, 1);
