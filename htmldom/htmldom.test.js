@@ -3338,6 +3338,19 @@ await (async function () {
     { 'a.js': 'Promise.reject(location.hash).catch(e => document.getElementById("o").innerHTML = e);' }, 1);
   await checkTaint('deep then chain expr body sinks',
     { 'a.js': 'fetch("/" + location.hash).then(r => r.text()).then(t => document.getElementById("o").innerHTML = t);' }, 1);
+  // Real-world state machine patterns combining every recent feature:
+  // cross-handler shared state, object-prop state flags, async pipelines
+  // through .then chains, and array-iterated plugin dispatch.
+  await checkTaint('onMessage state machine + gated sink',
+    { 'a.js': 'var state="idle"; window.addEventListener("message",function(e){if(e.data.type==="init")state="inited"; else if(e.data.type==="ready")state="ready";}); window.addEventListener("click",function(){if(state==="ready") document.getElementById("o").innerHTML=location.hash;});' }, 1);
+  await checkTaint('state never ready refute across handlers',
+    { 'a.js': 'var state="idle"; window.addEventListener("message",function(e){if(e.data.type==="init")state="inited";}); window.addEventListener("click",function(){if(state==="ready") document.getElementById("o").innerHTML=location.hash;});' }, 0);
+  await checkTaint('cross-handler object prop flag',
+    { 'a.js': 'var store={loggedIn:false}; window.addEventListener("message",function(e){if(e.data==="auth")store.loggedIn=true;}); document.addEventListener("click",function(){if(store.loggedIn) document.getElementById("o").innerHTML=location.hash;});' }, 1);
+  await checkTaint('async config pipeline gated sink',
+    { 'a.js': 'var config={}; fetch("/config").then(r=>r.json()).then(c=>{config=c;}).then(()=>{if(config.allowHTML) document.getElementById("o").innerHTML=location.hash;});' }, 1);
+  await checkTaint('plugin dispatch refute unknown sink',
+    { 'a.js': 'var plugins=[]; plugins.push({name:"safe",run:function(d){document.getElementById("o").textContent=d;}}); for(var p of plugins) p.run(location.hash);' }, 0);
   await checkTaint('var=function handler', { 'a.js': 'var h = function(msg) { eval(msg.data); };\nwindow.addEventListener("message", h, false);' }, 1, { sources: ['postMessage'] });
 
   // --- addEventListener ---
