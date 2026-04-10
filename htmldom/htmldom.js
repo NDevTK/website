@@ -2063,7 +2063,8 @@
     return externallyMutable;
   }
 
-  async function buildScopeState(tokens, stopAt, externallyMutable, trackBuildVarInit, taintConfig) {
+  async function buildScopeState(tokens, stopAt, externallyMutable, trackBuildVarInit, taintConfig, options) {
+    options = options || {};
     const stack = [{ bindings: Object.create(null), isFunction: true }];
     let pendingFunctionBrace = false;
     let pendingFunctionParams = null;
@@ -2086,6 +2087,15 @@
     // entry on each iteration so callbacks see the cumulative state
     // of every other callback.
     const _pendingCallbacks = [];
+    // Call watchers: external consumers (fetch tracers, API discovery,
+    // sink finders, etc.) register callbacks here. The walker invokes
+    // every registered watcher for each call site it sees, passing
+    // (callee, argBindings, token, info). Watchers read the fully
+    // resolved argument bindings — concat chains, object literals,
+    // arrays, function refs — and record whatever shape they need.
+    // Registration happens via the public options object before
+    // buildScopeState runs.
+    const _callWatchers = (options && options.callWatchers) ? options.callWatchers.slice() : [];
     // ----------------------------------------------------------------
     // Per-variable may-be value lattice
     // ----------------------------------------------------------------
@@ -7330,6 +7340,35 @@
             }
           }
           var calleeBind = await resolvePath(t.text);
+          // Universal call watcher: when a recorder is registered,
+          // fire it for every bare-statement call regardless of whether
+          // the callee is resolvable. This is how external analyses
+          // (fetch/XHR tracers, sink finders, dead-code reporters)
+          // observe call sites without having to duplicate the
+          // walker. The recorder sees fully resolved argument
+          // bindings — chain tokens, object literals, arrays — as
+          // they exist at this call site.
+          if (_callWatchers && _callWatchers.length > 0) {
+            var _cwArgs = await readCallArgBindings(i + 1, stop);
+            if (_cwArgs) {
+              // Snapshot the active path constraint stack so watchers
+              // can reason about *under what conditions* this call is
+              // reachable. taintCondStack is human-readable JS-ish; the
+              // parallel pathConstraints array holds SMT formula nodes.
+              var _cwInfo = {
+                stage: 'statement',
+                reached: true,
+                pathConditions: taintCondStack ? taintCondStack.slice() : [],
+                pathFormulas: pathConstraints ? pathConstraints.slice() : [],
+                mayBe: _varMayBe,
+                resolve: resolve,
+                resolvePath: resolvePath,
+              };
+              for (var _cwi = 0; _cwi < _callWatchers.length; _cwi++) {
+                try { _callWatchers[_cwi](t.text, _cwArgs.bindings, t, _cwInfo); } catch (_) {}
+              }
+            }
+          }
           if (calleeBind && calleeBind.kind === 'function') {
             var callArgs = await readCallArgBindings(i + 1, stop);
             if (callArgs) {
