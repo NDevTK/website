@@ -3439,6 +3439,9 @@ await (async function () {
   await checkTaint('z3: substring unsat', { 'a.js': 'var x = location.search; if (x.substring(0, 4) === "http" && x.substring(0, 4) === "ftpx") { document.getElementById("o").innerHTML = x; }' }, 0);
   await checkTaint('z3: substring sat',   { 'a.js': 'var x = location.search; if (x.substring(0, 4) === "http") { document.getElementById("o").innerHTML = x; }' }, 1);
   await checkTaint('z3: slice unsat',     { 'a.js': 'var x = location.search; if (x.slice(0, 4) === "http" && x.slice(0, 4) === "data") { document.getElementById("o").innerHTML = x; }' }, 0);
+  // Bracket index access on a tainted string is the same shape.
+  await checkTaint('z3: bracket unsat',   { 'a.js': 'var x = location.search; if (x[0] === "a" && x[0] === "b") { document.getElementById("o").innerHTML = x; }' }, 0);
+  await checkTaint('z3: bracket sat',     { 'a.js': 'var x = location.search; if (x[0] === "/") { document.getElementById("o").innerHTML = x; }' }, 1);
 
   // --- IIFE ---
   await checkTaint('IIFE function', { 'a.js': '(function() { document.getElementById("o").innerHTML = location.search; })();' }, 1);

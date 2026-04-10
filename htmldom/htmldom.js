@@ -854,6 +854,26 @@
         }
       }
     }
+    // Pattern: IDENT[NUM] — bracket index access. Equivalent to charAt
+    // for strings. Example: x[0] === "/" becomes (str.at |x| 0).
+    if (end >= start + 4 &&
+        toks[start].type === 'other' &&
+        toks[start + 1].type === 'open' && toks[start + 1].char === '[' &&
+        toks[start + 2].type === 'other' && /^-?\d+$/.test(toks[start + 2].text) &&
+        toks[start + 3].type === 'close' && toks[start + 3].char === ']') {
+      var _bxBase = toks[start].text;
+      var _bxRoot = _bxBase.split('.')[0];
+      var _bxRb = await resolveFunc(_bxRoot);
+      if (_bxRb) {
+        var _bxht = function(b) { if (!b) return false; if (b.kind==='chain') return !!collectChainTaint(b.toks); if (b.kind==='array') { for (var e=0;e<b.elems.length;e++) if (_bxht(b.elems[e])) return true; } if (b.kind==='object') { for (var k in b.props) if (_bxht(b.props[k])) return true; } return false; };
+        if (_bxht(_bxRb)) {
+          var _bxResolved = _bxBase;
+          if (_bxRb.kind === 'chain' && _bxRb.toks.length === 1 && _bxRb.toks[0].type === 'other') _bxResolved = _bxRb.toks[0].text;
+          var _bxIdx = parseInt(toks[start + 2].text, 10);
+          return smtArith('charAt', smtSym(_bxResolved), smtConst(_bxIdx));
+        }
+      }
+    }
     // Pattern: IDENT.length — property access without call.
     if (end === start + 1 && toks[start].type === 'other' && toks[start].text.endsWith('.length')) {
       var _lBase = toks[start].text.slice(0, -7);
