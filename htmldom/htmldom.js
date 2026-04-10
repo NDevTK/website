@@ -7151,6 +7151,69 @@
             i = stmtEndIdx - 1;
             continue;
           }
+          // Indirect dispatcher call: `dispatch[expr]()` or `dispatch[expr](args)`.
+          // The bracket key is opaque (e.g. e.data) so we can't pick a
+          // single property — instead, walk EVERY function-typed
+          // property of the dispatcher object so any callback that
+          // could fire at runtime sees its body analysed.
+          if (taintEnabled) {
+            // Detect: ident [ ... ] ( ... )  with no further suffixes.
+            // j currently points at the first non-bracket-non-dot token
+            // after the chain we already walked. Look back to see if
+            // the chain ended with a `(`...`)` group right after a `]`.
+            var _dpBase = resolve(t.text);
+            if (_dpBase && _dpBase.kind === 'object') {
+              // Find the last `[` … `]` and the `(` that follows it.
+              var _bkOpen = i + 1;
+              var _bkClose = -1;
+              var _bkD = 1, _bkK = i + 2;
+              while (_bkK < _rangeEnd && _bkD > 0) {
+                if (tokens[_bkK].type === 'open' && tokens[_bkK].char === '[') _bkD++;
+                if (tokens[_bkK].type === 'close' && tokens[_bkK].char === ']') { _bkD--; if (_bkD === 0) { _bkClose = _bkK; break; } }
+                _bkK++;
+              }
+              if (_bkClose > 0) {
+                var _argOpen = _bkClose + 1;
+                if (tokens[_argOpen] && tokens[_argOpen].type === 'open' && tokens[_argOpen].char === '(') {
+                  // The bracket key isn't a known string → walk every
+                  // function property. Otherwise the existing handlers
+                  // resolve the specific target.
+                  var _bkVal = await readValue(_bkOpen + 1, _bkClose, null);
+                  var _bkStr = _bkVal && _bkVal.binding ? chainAsKnownString(_bkVal.binding) : null;
+                  if (_bkStr === null) {
+                    var _dispatchArgs = await readCallArgBindings(_argOpen, stop);
+                    if (_dispatchArgs) {
+                      for (var _dpName in _dpBase.props) {
+                        var _dpProp = _dpBase.props[_dpName];
+                        if (_dpProp && _dpProp.kind === 'function') {
+                          await instantiateFunction(_dpProp, _dispatchArgs.bindings);
+                          if (_pendingCallbacks) {
+                            _pendingCallbacks.push({ fn: _dpProp, params: _dispatchArgs.bindings, isEventHandler: false });
+                          }
+                        }
+                      }
+                      i = _dispatchArgs.next - 1;
+                      continue;
+                    }
+                  } else {
+                    // Known-key bracket call: dispatch["arm"]()
+                    var _knownProp = _dpBase.props[_bkStr];
+                    if (_knownProp && _knownProp.kind === 'function') {
+                      var _knArgs = await readCallArgBindings(_argOpen, stop);
+                      if (_knArgs) {
+                        await instantiateFunction(_knownProp, _knArgs.bindings);
+                        if (_pendingCallbacks) {
+                          _pendingCallbacks.push({ fn: _knownProp, params: _knArgs.bindings, isEventHandler: false });
+                        }
+                        i = _knArgs.next - 1;
+                        continue;
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
           // Bracket-access followed by ; or end — expression statement
           // (e.g. items[i].doSomething()). Skip to statement boundary.
           let stmtEnd = j;

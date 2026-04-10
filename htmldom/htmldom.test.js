@@ -3562,6 +3562,18 @@ await (async function () {
   await checkTaint('indirect call: single safe target stays safe',
     { 'a.js': 'function safe() {} var f = safe; f();' }, 0);
 
+  // --- Dispatcher table dispatch (dispatch[key]() patterns) ---
+  // When the bracket key is opaque, walk EVERY function-typed
+  // property of the dispatcher so any handler that could fire at
+  // runtime gets analysed. When the key is concrete, walk the
+  // specific target.
+  await checkTaint('dispatcher map: opaque key all walked',
+    { 'a.js': 'var dispatch = { arm: function() { armed = true; }, fire: function() { if (armed) document.body.innerHTML = location.search; } }; var armed = false; window.addEventListener("message", function(e) { dispatch[e.data](); });' }, 1);
+  await checkTaint('dispatcher map: all-safe stays safe',
+    { 'a.js': 'var dispatch = { a: function() { document.body.textContent = "safe"; }, b: function() { document.body.title = "ok"; } }; window.addEventListener("message", function(e) { dispatch[e.data](); });' }, 0);
+  await checkTaint('dispatcher map: known key resolves',
+    { 'a.js': 'var dispatch = { arm: function() { document.body.innerHTML = location.search; } }; dispatch["arm"]();' }, 1);
+
   // --- IIFE ---
   await checkTaint('IIFE function', { 'a.js': '(function() { document.getElementById("o").innerHTML = location.search; })();' }, 1);
   await checkTaint('IIFE with args', { 'a.js': '(function(x) { document.getElementById("o").innerHTML = x; })(location.search);' }, 1);
