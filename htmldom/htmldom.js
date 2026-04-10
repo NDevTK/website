@@ -743,11 +743,15 @@
   // above); smtSat just emits the necessary `(declare-const ...)` lines
   // from `formula.sorts`, asserts `formula` (coerced to Bool), and asks
   // Z3 to check satisfiability.
-  // Per-walk may-be lattice. buildScopeState sets this to its
-  // _varMayBe map for the duration of phase 1 + phase 2 walks; smtSat
-  // reads it when emitting extra (or (= sym v1) (= sym v2) ...) constraints
-  // for variables whose value space is fully enumerated.
+  // Per-walk may-be lattice. buildScopeState sets these to its own
+  // _varMayBe map and _mayBeKey resolver for the duration of phase 1 +
+  // phase 2 walks; smtSat reads them when emitting extra
+  // (or (= sym v1) (= sym v2) ...) constraints for variables whose
+  // value space is fully enumerated. _currentMayBeKey normalises
+  // textual paths to identity-keyed canonical form so aliases of the
+  // same object look up the same lattice slot.
   var _currentVarMayBe = null;
+  var _currentMayBeKey = null;
 
   async function smtSat(formula) {
     if (!formula) return true;
@@ -772,7 +776,10 @@
       // requiring any other value — even when the values were set
       // in a different callback / branch / loop iteration.
       if (_currentVarMayBe) {
-        var slot = _currentVarMayBe[name];
+        // Resolve the lookup key to its identity-canonical form so
+        // aliases of the same object hit the same slot.
+        var lookupKey = _currentMayBeKey ? _currentMayBeKey(name) : name;
+        var slot = _currentVarMayBe[lookupKey];
         if (slot && slot.complete && slot.vals && slot.vals.length > 1) {
           // Only emit when the recorded sort matches the formula sort
           // (mixing Int and String literals on the same symbol would
@@ -900,9 +907,13 @@
             // see whichever value happened to be most-recently
             // assigned in source order, missing branches that depend
             // on other values in the may-be set.
-            var _mbSlot = _currentVarMayBe ? _currentVarMayBe[t.text] : null;
+            var _mbKey = _currentMayBeKey ? _currentMayBeKey(t.text) : t.text;
+            var _mbSlot = _currentVarMayBe ? _currentVarMayBe[_mbKey] : null;
             if (_mbSlot && _mbSlot.complete && _mbSlot.vals && _mbSlot.vals.length > 1) {
-              return smtSym(t.text);
+              // Use the canonical identity-keyed name as the symbol so
+              // smtSat looks up the same slot when emitting the
+              // disjunction extras.
+              return smtSym(_mbKey);
             }
             var fv = fb.toks[0].text;
             if (fv === 'true') return smtConst(true);
@@ -1771,9 +1782,14 @@
   // A chain binding wraps an array of operand/plus tokens. Object and array
   // bindings hold named or indexed child bindings (each itself a chain,
   // object, or array) so member access and destructuring can walk into them.
+  // Each object binding gets a stable identity (`__objId`) so that the
+  // may-be lattice and other identity-sensitive analyses can track aliasing
+  // (`var x = obj; x.foo = "Y"` → `obj.foo` and `x.foo` resolve to the
+  // same lattice slot because they're the same underlying object).
   const chainBinding = (toks) => ({ kind: 'chain', toks });
-  const objectBinding = (props) => ({ kind: 'object', props });
-  const arrayBinding = (elems) => ({ kind: 'array', elems });
+  var _nextObjId = 0;
+  const objectBinding = (props) => ({ kind: 'object', props, __objId: ++_nextObjId });
+  const arrayBinding = (elems) => ({ kind: 'array', elems, __objId: ++_nextObjId });
   const functionBinding = (params, bodyStart, bodyEnd, isBlock) => ({
     kind: 'function', params, bodyStart, bodyEnd, isBlock,
   });
@@ -2059,10 +2075,33 @@
       // String literal — emit as a quoted SMT string.
       return { lit: _quoteSmtString(t.text), sort: 'String' };
     }
+    // Resolve a may-be lattice key. For plain variable names this is
+    // just the name. For property paths (`obj.prop`) we walk the path
+    // through the binding stack and replace the root segment with the
+    // resolved object's stable identity (`#<objId>`), so any alias of
+    // the object — `var x = obj; x.prop` — maps to the same key. If
+    // the path can't be resolved to an identity-rooted form (e.g. the
+    // root isn't a known object) we fall back to the textual path,
+    // which still works for the common case where the variable holding
+    // the object isn't aliased.
+    function _mayBeKey(textPath) {
+      if (typeof textPath !== 'string') return null;
+      var dot = textPath.indexOf('.');
+      if (dot < 0) return textPath;
+      var root = textPath.slice(0, dot);
+      var rest = textPath.slice(dot); // includes leading '.'
+      var b = resolve(root);
+      if (b && (b.kind === 'object' || b.kind === 'array') && b.__objId) {
+        return '#' + b.__objId + rest;
+      }
+      return textPath;
+    }
     function _trackMayBeAssign(name, binding) {
       if (!taintEnabled) return;
-      if (!_varMayBe[name]) _varMayBe[name] = { vals: [], keys: Object.create(null), complete: true };
-      var slot = _varMayBe[name];
+      var k0 = _mayBeKey(name);
+      if (!k0) return;
+      if (!_varMayBe[k0]) _varMayBe[k0] = { vals: [], keys: Object.create(null), complete: true };
+      var slot = _varMayBe[k0];
       if (slot.complete === false) return; // already poisoned, don't bother
       // Encode the assignment to detect duplicates and check encodability.
       var lit = _bindingToConcreteLit(binding);
@@ -7116,8 +7155,15 @@
     // Activate the per-walk may-be lattice. smtSat reads
     // _currentVarMayBe at SAT-check time so the same _varMayBe map
     // we populate during walks is what feeds the disjunction extras.
+    // _currentMayBeKey lets the IIFE-level smtSat / smtParseAtom
+    // resolve textual paths to identity-keyed canonical form
+    // (alias-aware lookups).
     var _savedCurrentVarMayBe = _currentVarMayBe;
-    if (taintEnabled) _currentVarMayBe = _varMayBe;
+    var _savedCurrentMayBeKey = _currentMayBeKey;
+    if (taintEnabled) {
+      _currentVarMayBe = _varMayBe;
+      _currentMayBeKey = _mayBeKey;
+    }
     try {
 
     // Phase 1: single forward walk.
@@ -7180,6 +7226,7 @@
 
     } finally {
       _currentVarMayBe = _savedCurrentVarMayBe;
+      _currentMayBeKey = _savedCurrentMayBeKey;
     }
 
     // Advance the scope walker to a new stop position, processing all

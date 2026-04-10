@@ -3521,6 +3521,18 @@ await (async function () {
   await checkTaint('mayBe prop: multi-handler hit B',
     { 'a.js': 'var s = {v: "init"}; window.addEventListener("hashchange", function() { s.v = "A"; }); window.addEventListener("popstate", function() { s.v = "B"; }); window.addEventListener("message", function(e) { if (s.v === "B") document.getElementById("o").innerHTML = e.data; });' }, 1);
 
+  // --- Alias-aware may-be lattice ---
+  // Object bindings get a stable __objId; the lattice keys property
+  // paths by `#<id>.prop` so writes through any alias of the same
+  // object hit the same slot. \`var x = obj; x.v = "X"\` is therefore
+  // visible to a read through \`obj.v\`.
+  await checkTaint('alias: write x.v, read obj.v',
+    { 'a.js': 'var obj = {v: "init"}; var x = obj; window.addEventListener("hashchange", function() { x.v = "X"; }); window.addEventListener("message", function(e) { if (obj.v === "X") document.getElementById("o").innerHTML = e.data; });' }, 1);
+  await checkTaint('alias: write obj.v, read x.v',
+    { 'a.js': 'var obj = {v: "init"}; var x = obj; window.addEventListener("hashchange", function() { obj.v = "Y"; }); window.addEventListener("message", function(e) { if (x.v === "Y") document.getElementById("o").innerHTML = e.data; });' }, 1);
+  await checkTaint('alias: refute miss across alias',
+    { 'a.js': 'var obj = {v: "init"}; var x = obj; window.addEventListener("hashchange", function() { x.v = "X"; }); window.addEventListener("message", function(e) { if (obj.v === "Z") document.getElementById("o").innerHTML = e.data; });' }, 0);
+
   // --- IIFE ---
   await checkTaint('IIFE function', { 'a.js': '(function() { document.getElementById("o").innerHTML = location.search; })();' }, 1);
   await checkTaint('IIFE with args', { 'a.js': '(function(x) { document.getElementById("o").innerHTML = x; })(location.search);' }, 1);
