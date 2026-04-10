@@ -4582,7 +4582,7 @@
     // names its effect on the configuration (S, B, P, T, L).
     const STATEMENT_DISPATCH = {
       // Scoping
-      'var':           'decl-block-scope(name); mutate B',
+      'var':           'decl-function-scope(name); mutate B',
       'let':           'decl-block-scope(name); mutate B',
       'const':         'decl-block-scope(name); mutate B',
       // Control flow — branching
@@ -4611,8 +4611,6 @@
       'export':        'strip and walk decl',
       'with':          'skip body (scope unpredictable)',
       'debugger':      'skip',
-      // Expression statements are handled after the keyword dispatch.
-      'expression':    'read LHS; if assign, mutate B; if call, side-effects',
     };
     // State-machine invariant: keep track of the intended path-constraint
     // stack depth so mismatched push/pop on the `pathConstraints` /
