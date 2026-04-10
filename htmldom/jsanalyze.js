@@ -764,6 +764,14 @@
   // Browser pages either pre-load z3-solver and set globalThis.__htmldomZ3Init
   // to its init function, or jsanalyze.js will dynamically import the
   // ES module from a CDN. Node loads via require('z3-solver').
+  //
+  // Detection note: Monaco's AMD loader (loader.min.js) defines a
+  // synchronous `require` shim in the page scope. We can't use
+  // `typeof require === 'function'` alone to detect Node — that
+  // matches Monaco too and leads to a synchronous require failure
+  // against z3-solver. The reliable Node signal is
+  // `typeof module === 'object' && module.exports` AND
+  // `typeof window === 'undefined'`.
   var _z3 = null;
   var _z3Promise = null;
   function _initZ3() {
@@ -772,13 +780,13 @@
       var initFn = null;
       if (typeof globalThis !== 'undefined' && typeof globalThis.__htmldomZ3Init === 'function') {
         initFn = globalThis.__htmldomZ3Init;
-      } else if (typeof require === 'function') {
-        // Node path.
+      } else if (typeof window === 'undefined' && typeof module === 'object' && module && module.exports && typeof require === 'function') {
+        // True Node environment — no browser window, CommonJS require available.
         var mod = require('z3-solver');
         initFn = mod.init;
       } else {
-        // Browser fallback: dynamic ESM import from jsDelivr. The host
-        // page's CSP must allow https://cdn.jsdelivr.net.
+        // Browser (or Monaco loader) path: dynamic ESM import from
+        // jsDelivr. The host page's CSP must allow https://cdn.jsdelivr.net.
         var mod = await import('https://cdn.jsdelivr.net/npm/z3-solver@4.16.0/+esm');
         initFn = mod.init;
       }
