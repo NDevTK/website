@@ -27,7 +27,12 @@ global.DOMParser = class {
 const src = fs.readFileSync(path.join(__dirname, 'htmldom.js'), 'utf8');
 const patched = src.replace(
   'async function extractHTML(input) {',
-  'globalThis.__extractHTML = extractHTML;\n  globalThis.__extractAllHTML = extractAllHTML;\n  globalThis.__extractAllDOM = extractAllDOM;\n  globalThis.__tokenize = tokenize;\n  globalThis.__tokenizeHtml = tokenizeHtml;\n  globalThis.__serializeHtmlTokens = serializeHtmlTokens;\n  globalThis.__decodeHtmlEntities = decodeHtmlEntities;\n  globalThis.__parseStyleDecls = parseStyleDecls;\n  globalThis.__convertRaw = convertRaw;\n  globalThis.__makeVar = makeVar;\n  globalThis.__traceTaint = traceTaint;\n  globalThis.__traceTaintInJs = traceTaintInJs;\n  globalThis.__convertJsFile = convertJsFile;\n  async function extractHTML(input) {'
+  // Inject global exports for the walker's internal functions so the
+  // test harness can reach them. Converter functions (convertRaw,
+  // convertJsFile, convertHtmlMarkup, convertProject) were moved to
+  // htmldom-convert.js in Stage 4b.2 — we wire them up separately
+  // below from the HtmldomConvert facade.
+  'globalThis.__extractHTML = extractHTML;\n  globalThis.__extractAllHTML = extractAllHTML;\n  globalThis.__extractAllDOM = extractAllDOM;\n  globalThis.__tokenize = tokenize;\n  globalThis.__tokenizeHtml = tokenizeHtml;\n  globalThis.__serializeHtmlTokens = serializeHtmlTokens;\n  globalThis.__decodeHtmlEntities = decodeHtmlEntities;\n  globalThis.__parseStyleDecls = parseStyleDecls;\n  globalThis.__makeVar = makeVar;\n  globalThis.__traceTaint = traceTaint;\n  globalThis.__traceTaintInJs = traceTaintInJs;\n  async function extractHTML(input) {'
 );
 // eslint-disable-next-line no-eval
 eval(patched);
@@ -45,6 +50,38 @@ const FetchTrace = require(path.join(__dirname, 'fetch-trace.js'));
 const TaintReport = require(path.join(__dirname, 'taint-report.js'));
 const CspDerive = require(path.join(__dirname, 'csp-derive.js'));
 const HtmldomConvert = require(path.join(__dirname, 'htmldom-convert.js'));
+
+// Stage 4b.2: the walker's copies of the converter functions have
+// been deleted from htmldom.js. The test harness now reaches the
+// converter exclusively through the HtmldomConvert facade. Legacy
+// __convert* globals are aliases for the facade so existing tests
+// keep working without rewrites.
+globalThis.__convertProject = HtmldomConvert.convertProject;
+globalThis.__convertJsFile = HtmldomConvert.convertJsFile;
+globalThis.__convertHtmlMarkup = HtmldomConvert.convertHtmlMarkup;
+// __convertRaw is a facade-internal entry point used by a handful
+// of older tests that predate the split. We expose it through the
+// facade for compatibility; future tests should use convertJsFile.
+globalThis.__convertRaw = async function (raw, name, known) {
+  // Route via convertJsFile when it's a pure-JS input (no leading <)
+  // — matches the walker's original convertRaw behavior for test
+  // purposes. HTML inputs go through convertHtmlMarkup + a project
+  // convert round-trip, same as convertProject does internally.
+  if (/^\s*</.test(raw)) {
+    // HTML input: delegate to convertProject on a single synthetic file.
+    const files = { 'index.html': raw };
+    const out = await HtmldomConvert.convertProject(files);
+    // convertProject returns { filename: content }; stitch the output
+    // in the same format as the old convertRaw.
+    let result = out['index.html'] || raw;
+    for (const k in out) {
+      if (k !== 'index.html') result += '\n\n// === ' + k + ' ===\n' + out[k];
+    }
+    return result;
+  }
+  // JS input: convertJsFile returns the rewritten source or null.
+  return await HtmldomConvert.convertJsFile(raw, undefined, known);
+};
 
 // Test harness.
 let pass = 0;
