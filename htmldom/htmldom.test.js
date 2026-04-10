@@ -3457,6 +3457,35 @@ await (async function () {
   await checkTaint('z3: concat suffix sat',   { 'a.js': 'var x = location.search; if ((x + ".html") === "page.html") { document.getElementById("o").innerHTML = x; }' }, 1);
   await checkTaint('z3: concat suffix unsat', { 'a.js': 'var x = location.search; if ((x + ".html") === "page.htmlx") { document.getElementById("o").innerHTML = x; }' }, 0);
 
+  // --- Promise / fetch tracking + cross-callback fixpoint ---
+  // fetch() is registered as a network taint source. .then(callback) walks
+  // the callback with the receiver's taint as the first arg. await unwraps
+  // the Promise transparently.
+  await checkTaint('promise: fetch direct',         { 'a.js': 'document.body.innerHTML = fetch("/api");' }, 1, { sources: ['network'] });
+  await checkTaint('promise: fetch then arrow',     { 'a.js': 'fetch("/api").then(d => { document.getElementById("o").innerHTML = d; });' }, 1, { sources: ['network'] });
+  await checkTaint('promise: fetch then fn',        { 'a.js': 'fetch("/api").then(function(d) { document.getElementById("o").innerHTML = d; });' }, 1, { sources: ['network'] });
+  await checkTaint('promise: fetch then chain',     { 'a.js': 'fetch("/api").then(r => r.text()).then(d => { document.getElementById("o").innerHTML = d; });' }, 1, { sources: ['network'] });
+  await checkTaint('promise: fetch catch',          { 'a.js': 'fetch("/api").catch(function(d) { document.getElementById("o").innerHTML = d; });' }, 1, { sources: ['network'] });
+  await checkTaint('promise: Promise.resolve',      { 'a.js': 'Promise.resolve(location.search).then(d => { document.getElementById("o").innerHTML = d; });' }, 1, { sources: ['url'] });
+  await checkTaint('promise: Promise.resolve safe', { 'a.js': 'Promise.resolve("safe").then(d => { document.getElementById("o").innerHTML = d; });' }, 0);
+  await checkTaint('promise: await fetch',          { 'a.js': 'async function f() { var d = await fetch("/api"); document.getElementById("o").innerHTML = d; } f();' }, 1, { sources: ['network'] });
+  await checkTaint('promise: await location',       { 'a.js': 'async function f() { var d = await location.search; document.getElementById("o").innerHTML = d; } f();' }, 1, { sources: ['url'] });
+  await checkTaint('promise: await chained',        { 'a.js': 'async function f() { var r = await fetch("/api"); var d = await r.text(); document.getElementById("o").innerHTML = d; } f();' }, 1, { sources: ['network'] });
+
+  // Phase-2 callback fixpoint: one handler mutates state, another reads
+  // it. The walker registers both handlers in phase 1; phase 2 iterates
+  // them until findings stabilise so the reading handler sees the
+  // writing handler's mutation regardless of registration order.
+  await checkTaint('fixpoint: msg-reads-after-hash-arms',
+    { 'a.js': 'var armed = false; window.addEventListener("message", function(e) { if (armed) document.getElementById("o").innerHTML = e.data; }); window.addEventListener("hashchange", function() { armed = true; });' }, 1);
+  // Reverse registration order: same finding should fire because the
+  // fixpoint re-walks the message handler after hashchange has armed.
+  await checkTaint('fixpoint: msg-reads-after-hash-arms (reversed)',
+    { 'a.js': 'var armed = false; window.addEventListener("hashchange", function() { armed = true; }); window.addEventListener("message", function(e) { if (armed) document.getElementById("o").innerHTML = e.data; });' }, 1);
+  // setTimeout sets a flag that an addEventListener handler reads.
+  await checkTaint('fixpoint: setTimeout sets, addEventListener reads',
+    { 'a.js': 'var ready = false; setTimeout(function() { ready = true; }, 0); window.addEventListener("message", function(e) { if (ready) document.getElementById("o").innerHTML = e.data; });' }, 1);
+
   // --- IIFE ---
   await checkTaint('IIFE function', { 'a.js': '(function() { document.getElementById("o").innerHTML = location.search; })();' }, 1);
   await checkTaint('IIFE with args', { 'a.js': '(function(x) { document.getElementById("o").innerHTML = x; })(location.search);' }, 1);

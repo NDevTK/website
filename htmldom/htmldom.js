@@ -123,6 +123,7 @@
     'sessionStorage':     'storage',
   };
   // Patterns matched against full expressions (method calls, etc.).
+  // The walker matches by the call's NAME prefix (the part before `(`).
   const TAINT_SOURCE_CALLS = {
     'localStorage.getItem':    'storage',
     'sessionStorage.getItem':  'storage',
@@ -130,12 +131,34 @@
     'decodeURIComponent':      'url', // preserves taint, not a sanitizer
     'decodeURI':               'url',
     'atob':                    'url', // often used to decode tainted base64
+    // Network — any data flowing back from a server is attacker-influenced.
+    'fetch':                   'network',
+    // XHR + IndexedDB + Cache API — server/storage payload.
+    'XMLHttpRequest':          'network',
+    'IDBObjectStore.get':      'storage',
+    'caches.match':            'storage',
   };
   // Event handler parameter sources: addEventListener type → param.property → label.
   const EVENT_TAINT_SOURCES = {
-    'message':    { 'data': 'postMessage', 'origin': 'postMessage' },
-    'hashchange': { 'newURL': 'url', 'oldURL': 'url' },
-    'popstate':   { 'state': 'url' },
+    // postMessage
+    'message':            { 'data': 'postMessage', 'origin': 'postMessage' },
+    // URL changes
+    'hashchange':         { 'newURL': 'url', 'oldURL': 'url' },
+    'popstate':           { 'state': 'url' },
+    // BroadcastChannel cross-tab messages
+    'messageerror':       { 'data': 'postMessage' },
+    // WebSocket / EventSource: server-pushed data
+    'open':               { 'data': 'network' },
+    // FileReader / progress events: file contents
+    'load':               { 'target.result': 'file', 'target.responseText': 'network', 'target.response': 'network' },
+    'loadend':            { 'target.result': 'file', 'target.responseText': 'network', 'target.response': 'network' },
+    // Drag & drop: dataTransfer payload from another origin
+    'drop':               { 'dataTransfer.getData': 'dragdrop', 'dataTransfer.files': 'file' },
+    'paste':              { 'clipboardData.getData': 'clipboard' },
+    // Network errors that may carry tainted URLs
+    'error':              { 'message': 'network', 'filename': 'url' },
+    // Storage events fire when another tab writes — payload is attacker-influenced
+    'storage':            { 'newValue': 'storage', 'oldValue': 'storage', 'url': 'url' },
   };
 
   // Sink classification: property → {type, severity, elementDependent}.
@@ -1687,6 +1710,9 @@
     'repeat', 'slice', 'substring', 'substr', 'charAt', 'indexOf', 'lastIndexOf',
     'includes', 'startsWith', 'endsWith', 'padStart', 'padEnd', 'toString',
     'split', 'reverse', 'map', 'filter', 'forEach', 'reduce',
+    // Promise continuation — applyMethod's then/catch/finally handler
+    // walks the callback with the receiver's taint as the first arg.
+    'then', 'catch', 'finally',
   ]);
 
   const MATH_CONSTANTS = {
@@ -1928,6 +1954,12 @@
     // outer-scope variables inside handlers produce values that depend
     // on the number of handler invocations (attacker-controlled).
     var inEventHandler = false;
+    // Pending callbacks for the phase-2 fixpoint. Each entry is
+    // { fn: functionBinding, params: paramBindings, isEventHandler: bool }.
+    // The fixpoint in buildScopeState's finalize block re-walks every
+    // entry on each iteration so callbacks see the cumulative state
+    // of every other callback.
+    const _pendingCallbacks = [];
     // Track function scope depth for taint. Findings inside function
     // bodies walked at definition time (not via instantiateFunction)
     // should be suppressed because there's no calling context.
@@ -2028,7 +2060,7 @@
       var tag = getElementTag(el);
       var sinkInfo = classifySink(propName, tag);
       if (sinkInfo && sinkInfo.severity !== 'safe') {
-        var loc = tok && tok._src ? { expr: tok.text || propName, line: countLines(tok._src, tok.start) } : null;
+        var loc = tok && tok._src ? { expr: tok.text || propName, line: countLines(tok._src, tok.start), pos: tok.start } : null;
         recordTaintFinding(sinkInfo.type, sinkInfo.severity, propName, tag, taint, taintCondStack, loc);
       }
     };
@@ -2061,7 +2093,7 @@
         var toks = ab.kind === 'chain' ? ab.toks : null;
         var taint = toks ? collectChainTaint(toks) : null;
         if (taint && taint.size) {
-          var loc = tok && tok._src ? { expr: callExpr, line: countLines(tok._src, tok.start) } : null;
+          var loc = tok && tok._src ? { expr: callExpr, line: countLines(tok._src, tok.start), pos: tok.start } : null;
           recordTaintFinding(sinkInfo.type, sinkInfo.severity, callExpr, null, taint, taintCondStack, loc);
           break;
         }
@@ -3439,6 +3471,83 @@
           next: fnEnd + 1,
         };
       }
+      // --- Promise tracking: .then / .catch / .finally on a chain ---
+      // The receiver is a Promise (typically opaque + tainted, e.g. the
+      // result of fetch()). The callback's first argument is the Promise's
+      // resolved value, which carries the receiver's taint. The callback's
+      // return value is the new Promise's resolved value, which inherits
+      // taint from both the callback body and the receiver.
+      if ((method === 'then' || method === 'catch' || method === 'finally') &&
+          bind && bind.kind === 'chain') {
+        const lp = tks[parenIdx];
+        if (!lp || lp.type !== 'open' || lp.char !== '(') return null;
+        // Parse the callback (arrow / function expression / identifier).
+        var pfn = null, pfnEnd = 0;
+        const parrow = peekArrow(parenIdx + 1, stop);
+        if (parrow) {
+          const pbody = readArrowBody(parrow.arrowNext, stop);
+          if (pbody) { pfn = functionBinding(parrow.params, pbody.bodyStart, pbody.bodyEnd, pbody.isBlock); pfnEnd = pbody.next; }
+        }
+        if (!pfn) {
+          var pfexpr = await readFunctionExpr(parenIdx + 1, stop);
+          if (pfexpr) { pfn = pfexpr.binding; pfnEnd = pfexpr.next; }
+        }
+        if (!pfn) {
+          var pcbTok = tks[parenIdx + 1];
+          if (pcbTok && pcbTok.type === 'other' && IDENT_RE.test(pcbTok.text)) {
+            var prefB = resolve(pcbTok.text);
+            if (prefB && prefB.kind === 'function') { pfn = prefB; pfnEnd = parenIdx + 2; }
+          }
+        }
+        if (!pfn) return null;
+        const prp = tks[pfnEnd];
+        if (!prp || prp.type !== 'close' || prp.char !== ')') return null;
+        // The first arg of the callback receives the Promise's resolved
+        // value — which is just the receiver chain itself, because the
+        // analyzer doesn't distinguish a Promise<T> from its T. Pass the
+        // receiver as the first arg so any taint flows through.
+        var receiverTaint = collectChainTaint(bind.toks);
+        var firstArgChain = chainBinding(bind.toks.slice());
+        if (receiverTaint && firstArgChain.toks.length) {
+          // Tag the first token with the receiver's taint so the inlined
+          // body sees a tainted parameter.
+          var pTok0 = Object.assign({}, firstArgChain.toks[0]);
+          if (!pTok0.taint) pTok0.taint = new Set();
+          for (var ptl of receiverTaint) pTok0.taint.add(ptl);
+          firstArgChain.toks[0] = pTok0;
+        }
+        var pParamBinds = pfn.params.map(function (p, idx) {
+          if (idx === 0) return firstArgChain;
+          return chainBinding([exprRef(p.name)]);
+        });
+        var pCallbackResult = await instantiateFunction(pfn, pParamBinds);
+        // Register the .then/.catch/.finally callback for the
+        // phase-2 fixpoint so it sees mutations made by other
+        // callbacks (e.g. another fetch's .then writing to a global).
+        if (_pendingCallbacks && taintEnabled) {
+          _pendingCallbacks.push({ fn: pfn, params: pParamBinds, isEventHandler: false });
+        }
+        // The callback's return value is the new Promise's resolved value.
+        // Wrap it as an opaque chain that inherits taint from both the
+        // receiver and the callback's return.
+        var pResultToks;
+        if (pCallbackResult && Array.isArray(pCallbackResult)) {
+          pResultToks = pCallbackResult;
+        } else if (pCallbackResult && pCallbackResult.kind === 'chain') {
+          pResultToks = pCallbackResult.toks;
+        } else {
+          pResultToks = [exprRef('promise.' + method + '()')];
+        }
+        // Propagate receiver taint into the result chain so chained
+        // .then(...).then(...) keeps flowing taint forward.
+        if (receiverTaint && pResultToks.length) {
+          var pRTok0 = Object.assign({}, pResultToks[0]);
+          if (!pRTok0.taint) pRTok0.taint = new Set();
+          for (var prtl of receiverTaint) pRTok0.taint.add(prtl);
+          pResultToks = [pRTok0].concat(pResultToks.slice(1));
+        }
+        return { bind: chainBinding(pResultToks), next: pfnEnd + 1 };
+      }
       return null;
     };
 
@@ -3534,9 +3643,24 @@
       for (var _pi = prefixes.length - 1; _pi >= 0; _pi--) {
         var _pf = prefixes[_pi];
         if (_pf.kind === 'keyword') {
+          // `await` and `yield` are unwrapping operations on Promises /
+          // generators — for taint analysis they're transparent: the
+          // result has the same taint as the inner expression. Pass the
+          // binding through unchanged so taint flows from `await fetch(...)`
+          // into the awaited value.
+          if (_pf.text === 'await' || _pf.text === 'yield') {
+            // baseResult unchanged — keep the binding's taint.
+            continue;
+          }
           var _et = chainAsExprText(baseResult.bind);
           if (_et === null) return null;
-          baseResult = { bind: chainBinding([exprRef(_pf.text + ' ' + _et)]), next: baseResult.next };
+          // Preserve the inner binding's taint on the wrapped expression.
+          var _wrappedRef = exprRef(_pf.text + ' ' + _et);
+          if (baseResult.bind && baseResult.bind.kind === 'chain') {
+            var _innerTaint = collectChainTaint(baseResult.bind.toks);
+            if (_innerTaint) _wrappedRef.taint = _innerTaint;
+          }
+          baseResult = { bind: chainBinding([_wrappedRef]), next: baseResult.next };
         } else {
           var _applied = applyUnary(_pf.text, baseResult.bind);
           if (!_applied) return null;
@@ -3855,6 +3979,13 @@
           while (end < stop) {
             const nx = tks[end];
             if (!nx) break;
+            // Stop before Promise continuation methods so applySuffixes
+            // can route them through applyMethod's .then/.catch/.finally
+            // handler. This is what makes \`fetch(...).then(d => sink(d))\`
+            // propagate taint into the callback.
+            if (nx.type === 'other' && /^\.(then|catch|finally)$/.test(nx.text)) {
+              break;
+            }
             if (nx.type === 'open' && (nx.char === '(' || nx.char === '[')) {
               const matchChar = nx.char === '(' ? ')' : ']';
               let depth = 1, j = end + 1;
@@ -3879,7 +4010,46 @@
           const last = tks[end - 1];
           var _opaqueText = first._src.slice(first.start, last.end);
           var _opaqueRef = exprRef(_opaqueText);
+          // Path-based taint sources (TAINT_SOURCES + member paths).
           var _opaqueTaint = checkTaintSource(_opaqueText);
+          // Call-based taint sources: extract everything before the first
+          // '(' and check it against TAINT_SOURCE_CALLS. Covers
+          // fetch("/api"), new XMLHttpRequest(), IndexedDB / Cache reads.
+          if (!_opaqueTaint) {
+            var _parenIdx = _opaqueText.indexOf('(');
+            if (_parenIdx > 0) {
+              var _callName = _opaqueText.slice(0, _parenIdx).replace(/^new\s+/, '');
+              var _callTaint = checkTaintSourceCall(_callName);
+              if (_callTaint) _opaqueTaint = _callTaint;
+            }
+          }
+          // Argument-taint propagation: parse the immediate `(...)` after
+          // the callee and collect taint from each arg. Promise.resolve(x),
+          // Promise.reject(x), wrapper functions like setTimeout(cb, ms),
+          // and any opaque call all preserve their arguments' taint
+          // through the opaque result. This is the same propagation the
+          // inlined-function path does at line ~3933.
+          var _firstParen = -1;
+          for (var _fp = k + 1; _fp < end; _fp++) {
+            if (tks[_fp] && tks[_fp].type === 'open' && tks[_fp].char === '(') { _firstParen = _fp; break; }
+          }
+          if (_firstParen >= 0 && taintEnabled && !isSanitizer(t.text)) {
+            var _opaqueArgs = await readConcatArgs(_firstParen, stop);
+            if (_opaqueArgs) {
+              var _opaqueArgTaint = null;
+              for (var _oai = 0; _oai < _opaqueArgs.args.length; _oai++) {
+                var _oat = collectChainTaint(_opaqueArgs.args[_oai]);
+                if (_oat) {
+                  if (!_opaqueArgTaint) _opaqueArgTaint = new Set();
+                  for (var _oal of _oat) _opaqueArgTaint.add(_oal);
+                }
+              }
+              if (_opaqueArgTaint) {
+                if (!_opaqueTaint) _opaqueTaint = _opaqueArgTaint;
+                else for (var _oalt of _opaqueArgTaint) _opaqueTaint.add(_oalt);
+              }
+            }
+          }
           if (_opaqueTaint) _opaqueRef.taint = _opaqueTaint;
           return { bind: chainBinding([_opaqueRef]), next: end };
         }
@@ -6284,6 +6454,9 @@
             var _timerCb = _timerArgs.bindings[0];
             if (_timerCb && _timerCb.kind === 'function') {
               await instantiateFunction(_timerCb, []);
+              if (_pendingCallbacks && taintEnabled) {
+                _pendingCallbacks.push({ fn: _timerCb, params: [], isEventHandler: false });
+              }
             }
             i = _timerArgs.next - 1;
             continue;
@@ -6314,6 +6487,30 @@
               checkSinkCall(t.text, sinkArgs.bindings, t);
               i = sinkArgs.next - 1;
               continue;
+            }
+          }
+          // Bare-call expression statement followed by a Promise
+          // continuation method (`.then` / `.catch` / `.finally`):
+          // run the whole expression through readValue so applySuffixes
+          // routes the .then(callback) to applyMethod, which walks the
+          // callback with the receiver's taint as the first arg. This
+          // lets fetch("/api").then(d => sink(d)) flow taint into the
+          // callback even though it's a bare expression statement.
+          if (taintEnabled) {
+            var _peekContEnd = -1;
+            var _peekDepth = 1, _peekJ = i + 2;
+            while (_peekJ < stop && _peekDepth > 0) {
+              if (tokens[_peekJ].type === 'open' && tokens[_peekJ].char === '(') _peekDepth++;
+              else if (tokens[_peekJ].type === 'close' && tokens[_peekJ].char === ')') _peekDepth--;
+              if (_peekDepth === 0) { _peekContEnd = _peekJ; break; }
+              _peekJ++;
+            }
+            if (_peekContEnd > 0) {
+              var _peekNext = tokens[_peekContEnd + 1];
+              if (_peekNext && _peekNext.type === 'other' && /^\.(then|catch|finally)$/.test(_peekNext.text)) {
+                var _exprResult = await readValue(i, stop, TERMS_TOP);
+                if (_exprResult) { i = _exprResult.next - 1; continue; }
+              }
             }
           }
         }
@@ -6562,18 +6759,19 @@
                     // Unknown event type: param is opaque, no taint.
                     _evParamBindings.push(chainBinding([exprRef(_evHandler.params[0].name)]));
                   }
-                  // Walk the handler body twice: event handlers fire
-                  // multiple times. The first walk establishes mutations
-                  // (state transitions). The second walk sees accumulated
-                  // state and can reach branches guarded by it.
-                  // Suppress findings during the first walk.
+                  // Walk the handler body once. Convergence (re-walking
+                  // until state stabilises) is handled at the OUTER
+                  // level, in buildScopeState's whole-program callback
+                  // fixpoint loop, so that every callback sees the
+                  // effects of every other callback.
                   var _prevInEH = inEventHandler;
                   inEventHandler = true;
-                  var _savedFindings = taintFindings ? taintFindings.length : 0;
-                  await instantiateFunction(_evHandler, _evParamBindings);
-                  if (taintFindings) taintFindings.length = _savedFindings; // discard first-walk findings
                   await instantiateFunction(_evHandler, _evParamBindings);
                   inEventHandler = _prevInEH;
+                  // Register for the phase-2 fixpoint re-walk.
+                  if (_pendingCallbacks) {
+                    _pendingCallbacks.push({ fn: _evHandler, params: _evParamBindings, isEventHandler: true });
+                  }
                 }
                 i = _evArgs.next - 1;
                 continue;
@@ -6712,7 +6910,94 @@
       taintCondStack.length = _tcBaseDepth;
     }
     };
+    // ----------------------------------------------------------------
+    // Top-level walk + whole-program callback fixpoint (taint mode)
+    // ----------------------------------------------------------------
+    // The walker uses a two-phase strategy when taint-enabled:
+    //
+    //   Phase 1 — top-level walk. walkRange runs once over the program
+    //     in source order. var/let/const declarations execute, function
+    //     bodies are inlined at call sites, addEventListener registers
+    //     and walks the handler body once. Phase 1 produces an initial
+    //     binding state and an initial set of findings.
+    //
+    //   Phase 2 — callback fixpoint. Every callback registered during
+    //     phase 1 (event handlers, setTimeout/setInterval, .then/.catch,
+    //     etc.) gets a re-walk request added to _pendingCallbacks. After
+    //     phase 1 returns, the analyser repeatedly re-walks every
+    //     pending callback in turn, observing the bindings + findings
+    //     produced by every other callback. This continues until the
+    //     program's observable state stops changing.
+    //
+    // Why the split? Re-running phase 1 would re-execute var
+    // declarations (`var state = "idle"`) and undo any mutations
+    // earlier callbacks made — the fixpoint would never advance. By
+    // freezing top-level state after phase 1 and only iterating the
+    // callback set, mutations from one callback persist into the next
+    // iteration of every other callback. This is what lets a finding
+    // gated on `state === "ready"` (set in callback A) fire from
+    // callback B even when neither callback alone reaches it.
+    //
+    // Findings are de-duplicated by source location so a callback
+    // emitting the same finding twice doesn't break convergence.
+
+    const _findingKey = function (f) {
+      return (f.type || '') + '|' + (f.sink ? (f.sink.prop || '') + ':' + (f.sink.elementTag || '') : '') +
+             '|' + (f.location ? (f.location.line || 0) + ':' + (f.location.pos || 0) + ':' + (f.location.expr || '') : '') +
+             '|' + (f.sources ? f.sources.slice().sort().join(',') : '');
+    };
+    const _dedupeFindings = function () {
+      if (!taintFindings) return;
+      var seen = Object.create(null);
+      var kept = [];
+      for (var _fi = 0; _fi < taintFindings.length; _fi++) {
+        var k = _findingKey(taintFindings[_fi]);
+        if (seen[k]) continue;
+        seen[k] = true;
+        kept.push(taintFindings[_fi]);
+      }
+      taintFindings.length = 0;
+      for (var _kj = 0; _kj < kept.length; _kj++) taintFindings.push(kept[_kj]);
+    };
+
+    // Phase 1: single forward walk.
     await walkRange(0, stop);
+
+    // Phase 2: callback fixpoint. Iterate all callbacks registered
+    // during phase 1 until findings + bindings stabilise.
+    if (taintEnabled && _pendingCallbacks && _pendingCallbacks.length > 0) {
+      _dedupeFindings();
+      const _snapshotBindingsJson = function () {
+        var snap = Object.create(null);
+        for (var _si = stack.length - 1; _si >= 0; _si--) {
+          for (var _bn in stack[_si].bindings) {
+            if (!(_bn in snap)) {
+              try { snap[_bn] = JSON.stringify(stack[_si].bindings[_bn]); }
+              catch (e) { snap[_bn] = '<cyclic>'; }
+            }
+          }
+        }
+        var keys = Object.keys(snap).sort();
+        var out = '';
+        for (var _ki = 0; _ki < keys.length; _ki++) out += keys[_ki] + '=' + snap[keys[_ki]] + ';';
+        return out;
+      };
+      const FIXPOINT_MAX_ITERS = 16;
+      var _prevSig = '';
+      for (var _fpIter = 0; _fpIter < FIXPOINT_MAX_ITERS; _fpIter++) {
+        for (var _cbi = 0; _cbi < _pendingCallbacks.length; _cbi++) {
+          var _cb = _pendingCallbacks[_cbi];
+          var _prevInEH = inEventHandler;
+          if (_cb.isEventHandler) inEventHandler = true;
+          try { await instantiateFunction(_cb.fn, _cb.params); }
+          finally { inEventHandler = _prevInEH; }
+        }
+        _dedupeFindings();
+        var _sig = _snapshotBindingsJson() + '||' + (taintFindings ? taintFindings.length + ':' + taintFindings.map(_findingKey).sort().join('|') : '');
+        if (_sig === _prevSig) break;
+        _prevSig = _sig;
+      }
+    }
 
     // Advance the scope walker to a new stop position, processing all
     // tokens between the current stop and the new one. This allows
