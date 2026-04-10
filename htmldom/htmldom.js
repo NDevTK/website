@@ -416,40 +416,184 @@
   //   - Event handler invocation counts (handler fires N times)
   //   - Any value derived from the above through operations
 
-  // --- Formula AST ---
-  // Each node: { type, ... } where type is one of:
-  //   sym    — symbolic variable: { id, name }
-  //   const  — concrete value: { value }
-  //   not    — negation: { arg }
-  //   and    — conjunction: { args: [...] }  (flattened)
-  //   or     — disjunction: { args: [...] }  (flattened)
-  //   cmp    — comparison: { op, left, right }
-  //   arith  — arithmetic: { op, left, right }
+  // --- Formula representation ---
+  // Each formula is a small object carrying its SMT-LIB s-expression
+  // alongside the metadata Z3 needs to type-check it:
+  //
+  //   { expr:    string  -- SMT-LIB s-expression
+  //     sorts:   { name → 'Int'|'String' }  -- declarations needed
+  //     isBool:  bool    -- true if expr is already a Bool s-expression
+  //     value:   { kind: 'bool'|'int'|'str', val } | undefined
+  //                       -- present for fully-concrete formulas, used
+  //                          for compile-time const folding
+  //     symName: string  -- when this object is a single sym, its name
+  //                          (used by smtCmp/smtStrProp to upgrade sort)
+  //   }
+  //
+  // The builders below construct these objects directly. There is no
+  // intermediate AST: smtSat just emits `(declare-const ...)` from
+  // `sorts` and `(assert <expr>)` and feeds it to Z3.
 
+  function _quoteSmtName(s) { return '|' + s.replace(/\|/g, '_') + '|'; }
+  function _quoteSmtString(s) { return '"' + s.replace(/"/g, '""') + '"'; }
+  function _mergeSorts(a, b) {
+    var out = {};
+    if (a) for (var k in a) out[k] = a[k];
+    if (b) for (var k2 in b) {
+      out[k2] = (out[k2] === 'String' || b[k2] === 'String') ? 'String' : (out[k2] || b[k2]);
+    }
+    return out;
+  }
+  // Coerce a value-typed expression to its boolean form (truthy check).
+  function _toBool(o) {
+    if (!o) return 'true';
+    if (o.isBool) return o.expr;
+    if (o.value) {
+      if (o.value.kind === 'bool') return o.value.val ? 'true' : 'false';
+      if (o.value.kind === 'int')  return o.value.val !== 0  ? 'true' : 'false';
+      if (o.value.kind === 'str')  return o.value.val !== '' ? 'true' : 'false';
+    }
+    if (o.symName) {
+      var sort = o.sorts[o.symName] || 'Int';
+      if (sort === 'String') return '(not (= ' + o.expr + ' ""))';
+      return '(not (= ' + o.expr + ' 0))';
+    }
+    return '(not (= ' + o.expr + ' 0))';
+  }
+
+  // Symbol identity tracking. Each symbolic variable name has a stable
+  // numeric id used by code that needs to compare symbols structurally.
   var _nextSymId = 0;
   var _symNameMap = Object.create(null);
-
-  function smtSym(name) {
-    if (name in _symNameMap) return { type: 'sym', id: _symNameMap[name], name: name };
+  function _symIdFor(name) {
+    if (name in _symNameMap) return _symNameMap[name];
     var id = _nextSymId++;
     _symNameMap[name] = id;
-    return { type: 'sym', id: id, name: name };
+    return id;
   }
-  function smtConst(value) { return { type: 'const', value: value }; }
-  function smtNot(e) { return !e ? null : e.type === 'not' ? e.arg : e.type === 'const' ? smtConst(!e.value) : { type: 'not', arg: e }; }
-  function smtAnd(a, b) { return !a ? b : !b ? a : a.type === 'const' ? (a.value ? b : a) : b.type === 'const' ? (b.value ? a : b) : { type: 'and', left: a, right: b }; }
-  function smtOr(a, b) { return !a ? b : !b ? a : a.type === 'const' ? (a.value ? a : b) : b.type === 'const' ? (b.value ? b : a) : { type: 'or', left: a, right: b }; }
-  function smtCmp(op, l, r) { return { type: 'cmp', op: op, left: l, right: r }; }
-  function smtArith(op, l, r) { return { type: 'arith', op: op, left: l, right: r }; }
-  // String theory constraints:
-  //   strProp: { symId, prop, value } — e.g. x.startsWith("http"), x.length === 0
-  function smtStrProp(symId, prop, value) { return { type: 'strProp', symId: symId, prop: prop, value: value }; }
 
-  function smtHasSym(e) {
-    if (!e) return false;
-    if (e.type === 'sym' || e.type === 'strProp') return true;
-    if (e.type === 'const') return false;
-    return (e.left && smtHasSym(e.left)) || (e.right && smtHasSym(e.right)) || (e.arg && smtHasSym(e.arg));
+  function smtSym(name) {
+    var id = _symIdFor(name);
+    var sorts = Object.create(null);
+    sorts[name] = 'Int';
+    return { expr: _quoteSmtName(name), sorts: sorts, isBool: false, symName: name, symId: id };
+  }
+  function smtConst(value) {
+    if (typeof value === 'boolean') {
+      return { expr: value ? 'true' : 'false', sorts: {}, isBool: true, value: { kind: 'bool', val: value } };
+    }
+    if (typeof value === 'number') {
+      var n = value < 0 ? '(- ' + (-value) + ')' : String(value);
+      return { expr: n, sorts: {}, isBool: false, value: { kind: 'int', val: value } };
+    }
+    if (typeof value === 'string') {
+      return { expr: _quoteSmtString(value), sorts: {}, isBool: false, value: { kind: 'str', val: value } };
+    }
+    return { expr: 'true', sorts: {}, isBool: true, value: { kind: 'bool', val: true } };
+  }
+  function smtNot(o) {
+    if (!o) return null;
+    if (o.value && o.value.kind === 'bool') return smtConst(!o.value.val);
+    return { expr: '(not ' + _toBool(o) + ')', sorts: o.sorts, isBool: true };
+  }
+  function smtAnd(a, b) {
+    if (!a) return b;
+    if (!b) return a;
+    if (a.value && a.value.kind === 'bool') return a.value.val ? b : a;
+    if (b.value && b.value.kind === 'bool') return b.value.val ? a : b;
+    return { expr: '(and ' + _toBool(a) + ' ' + _toBool(b) + ')',
+             sorts: _mergeSorts(a.sorts, b.sorts), isBool: true };
+  }
+  function smtOr(a, b) {
+    if (!a) return b;
+    if (!b) return a;
+    if (a.value && a.value.kind === 'bool') return a.value.val ? a : b;
+    if (b.value && b.value.kind === 'bool') return b.value.val ? b : a;
+    return { expr: '(or ' + _toBool(a) + ' ' + _toBool(b) + ')',
+             sorts: _mergeSorts(a.sorts, b.sorts), isBool: true };
+  }
+  function smtCmp(op, l, r) {
+    if (!l || !r) return null;
+    // Compile-time fold for fully-concrete operands.
+    if (l.value && r.value && l.value.kind === r.value.kind) {
+      var lv = l.value.val, rv = r.value.val, ok;
+      switch (op) {
+        case '<':  ok = lv < rv; break;
+        case '>':  ok = lv > rv; break;
+        case '<=': ok = lv <= rv; break;
+        case '>=': ok = lv >= rv; break;
+        case '==': case '===': ok = lv === rv; break;
+        case '!=': case '!==': ok = lv !== rv; break;
+        default: ok = true;
+      }
+      return smtConst(ok);
+    }
+    // Sort upgrade: a sym compared with a string literal becomes String.
+    var sorts = _mergeSorts(l.sorts, r.sorts);
+    if (l.symName && r.value && r.value.kind === 'str') sorts[l.symName] = 'String';
+    if (r.symName && l.value && l.value.kind === 'str') sorts[r.symName] = 'String';
+    var smtOp;
+    if (op === '<')  smtOp = '<';
+    else if (op === '>')  smtOp = '>';
+    else if (op === '<=') smtOp = '<=';
+    else if (op === '>=') smtOp = '>=';
+    else if (op === '==' || op === '===') smtOp = '=';
+    else if (op === '!=' || op === '!==') {
+      return { expr: '(not (= ' + l.expr + ' ' + r.expr + '))',
+               sorts: sorts, isBool: true };
+    } else return null;
+    return { expr: '(' + smtOp + ' ' + l.expr + ' ' + r.expr + ')',
+             sorts: sorts, isBool: true };
+  }
+  function smtArith(op, l, r) {
+    if (!l || !r) return null;
+    // String theory: x.length, x.indexOf(literal)
+    if (op === 'length' && l.symName) {
+      var sortsL = _mergeSorts(l.sorts, null);
+      sortsL[l.symName] = 'String';
+      return { expr: '(str.len ' + l.expr + ')', sorts: sortsL, isBool: false };
+    }
+    if (op === 'indexOf' && l.symName && r.value && r.value.kind === 'str') {
+      var sortsI = _mergeSorts(l.sorts, null);
+      sortsI[l.symName] = 'String';
+      return { expr: '(str.indexof ' + l.expr + ' ' + r.expr + ' 0)',
+               sorts: sortsI, isBool: false };
+    }
+    // Numeric arithmetic.
+    if (op === '+' || op === '-' || op === '*' || op === '/' || op === '%') {
+      // Const fold.
+      if (l.value && l.value.kind === 'int' && r.value && r.value.kind === 'int') {
+        switch (op) {
+          case '+': return smtConst(l.value.val + r.value.val);
+          case '-': return smtConst(l.value.val - r.value.val);
+          case '*': return smtConst(l.value.val * r.value.val);
+          case '/': if (r.value.val !== 0) return smtConst(l.value.val / r.value.val); break;
+          case '%': if (r.value.val !== 0) return smtConst(l.value.val % r.value.val); break;
+        }
+      }
+      var smtOp = op === '/' ? 'div' : op === '%' ? 'mod' : op;
+      return { expr: '(' + smtOp + ' ' + l.expr + ' ' + r.expr + ')',
+               sorts: _mergeSorts(l.sorts, r.sorts), isBool: false };
+    }
+    return null;
+  }
+  // String predicates: startsWith / endsWith / includes. `symObj` is a
+  // smtSym() result; `value` is the literal substring.
+  function smtStrProp(symObj, prop, value) {
+    if (!symObj || !symObj.symName) return null;
+    var sorts = _mergeSorts(symObj.sorts, null);
+    sorts[symObj.symName] = 'String';
+    var v = _quoteSmtString(value);
+    if (prop === 'startsWith') return { expr: '(str.prefixof ' + v + ' ' + symObj.expr + ')', sorts: sorts, isBool: true };
+    if (prop === 'endsWith')   return { expr: '(str.suffixof ' + v + ' ' + symObj.expr + ')', sorts: sorts, isBool: true };
+    if (prop === 'includes')   return { expr: '(str.contains ' + symObj.expr + ' ' + v + ')', sorts: sorts, isBool: true };
+    return null;
+  }
+
+  function smtHasSym(o) {
+    if (!o || !o.sorts) return false;
+    for (var k in o.sorts) return true;
+    return false;
   }
 
   // --- Z3 initialisation (mandatory; no fallback) ---
@@ -483,138 +627,22 @@
     return _z3Promise;
   }
 
-  // --- SMT-LIB serializer ---
-  // Builds a `(declare-const ...) (assert ...)` SMT-LIB 2 string from the
-  // internal SMT formula AST and feeds it to Z3 via solver.fromString.
-  // Using SMT-LIB strings (rather than the JS AST wrappers) keeps Z3's
-  // WASM heap free of per-call AST objects so the solver doesn't leak
-  // memory or trip its internal assertions over thousands of calls.
-  function _smtCollectSymsAndSorts(f, syms, sorts) {
-    if (!f || typeof f !== 'object') return;
-    if (f.type === 'sym') {
-      if (!(f.name in syms)) syms[f.name] = true;
-      if (!(f.name in sorts)) sorts[f.name] = 'Int';
-      return;
-    }
-    if (f.type === 'const') return;
-    if (f.type === 'not') { _smtCollectSymsAndSorts(f.arg, syms, sorts); return; }
-    if (f.type === 'and' || f.type === 'or') {
-      _smtCollectSymsAndSorts(f.left, syms, sorts);
-      _smtCollectSymsAndSorts(f.right, syms, sorts);
-      return;
-    }
-    if (f.type === 'cmp') {
-      if (f.left && f.left.type === 'sym' && f.right && f.right.type === 'const' && typeof f.right.value === 'string') sorts[f.left.name] = 'String';
-      if (f.right && f.right.type === 'sym' && f.left && f.left.type === 'const' && typeof f.left.value === 'string') sorts[f.right.name] = 'String';
-      _smtCollectSymsAndSorts(f.left, syms, sorts);
-      _smtCollectSymsAndSorts(f.right, syms, sorts);
-      return;
-    }
-    if (f.type === 'arith') {
-      if ((f.op === 'length' || f.op === 'indexOf') && f.left && f.left.type === 'sym') sorts[f.left.name] = 'String';
-      _smtCollectSymsAndSorts(f.left, syms, sorts);
-      _smtCollectSymsAndSorts(f.right, syms, sorts);
-      return;
-    }
-    if (f.type === 'strProp') {
-      for (var n in _symNameMap) {
-        if (_symNameMap[n] === f.symId) { syms[n] = true; sorts[n] = 'String'; break; }
-      }
-      return;
-    }
-  }
-  function _quoteSmtName(s) { return '|' + s.replace(/\|/g, '_') + '|'; }
-  function _quoteSmtString(s) { return '"' + s.replace(/"/g, '""') + '"'; }
-  // Emit an SMT-LIB s-expression for a formula. `boolPos` is true when
-  // the result must be a Bool (i.e. inside and/or/not or at the
-  // top-level assertion); false when the result must be a value (left
-  // or right of cmp/arith). Symbols are declared with one sort and
-  // coerced to bool when they appear in boolean position.
-  function _smtToSExpr(f, sorts, boolPos) {
-    if (!f) return boolPos ? 'true' : '0';
-    if (f.type === 'const') {
-      if (typeof f.value === 'boolean') return f.value ? 'true' : 'false';
-      if (typeof f.value === 'number') {
-        var n = f.value < 0 ? '(- ' + (-f.value) + ')' : String(f.value);
-        if (boolPos) return '(not (= ' + n + ' 0))';
-        return n;
-      }
-      if (typeof f.value === 'string') {
-        var sv = _quoteSmtString(f.value);
-        if (boolPos) return '(not (= ' + sv + ' ""))';
-        return sv;
-      }
-      return boolPos ? 'true' : '0';
-    }
-    if (f.type === 'sym') {
-      var sx = _quoteSmtName(f.name);
-      if (boolPos) {
-        var sort = sorts[f.name] || 'Int';
-        if (sort === 'String') return '(not (= ' + sx + ' ""))';
-        return '(not (= ' + sx + ' 0))';
-      }
-      return sx;
-    }
-    if (f.type === 'not') return '(not ' + _smtToSExpr(f.arg, sorts, true) + ')';
-    if (f.type === 'and') return '(and ' + _smtToSExpr(f.left, sorts, true) + ' ' + _smtToSExpr(f.right, sorts, true) + ')';
-    if (f.type === 'or')  return '(or '  + _smtToSExpr(f.left, sorts, true) + ' ' + _smtToSExpr(f.right, sorts, true) + ')';
-    if (f.type === 'cmp') {
-      var op = f.op;
-      var L = _smtToSExpr(f.left, sorts, false), R = _smtToSExpr(f.right, sorts, false);
-      if (op === '<')  return '(< '  + L + ' ' + R + ')';
-      if (op === '>')  return '(> '  + L + ' ' + R + ')';
-      if (op === '<=') return '(<= ' + L + ' ' + R + ')';
-      if (op === '>=') return '(>= ' + L + ' ' + R + ')';
-      if (op === '==' || op === '===') return '(= ' + L + ' ' + R + ')';
-      if (op === '!=' || op === '!==') return '(not (= ' + L + ' ' + R + '))';
-      return 'true';
-    }
-    if (f.type === 'arith') {
-      var aop = f.op;
-      var La = _smtToSExpr(f.left, sorts, false), Ra = _smtToSExpr(f.right, sorts, false);
-      if (aop === '+') return '(+ ' + La + ' ' + Ra + ')';
-      if (aop === '-') return '(- ' + La + ' ' + Ra + ')';
-      if (aop === '*') return '(* ' + La + ' ' + Ra + ')';
-      if (aop === '/') return '(div ' + La + ' ' + Ra + ')';
-      if (aop === '%') return '(mod ' + La + ' ' + Ra + ')';
-      if (aop === 'length' && f.left && f.left.type === 'sym') return '(str.len ' + La + ')';
-      if (aop === 'indexOf' && f.left && f.left.type === 'sym' && f.right && f.right.type === 'const' && typeof f.right.value === 'string') {
-        return '(str.indexof ' + La + ' ' + _quoteSmtString(f.right.value) + ' 0)';
-      }
-      return '0';
-    }
-    if (f.type === 'strProp') {
-      var symName = null;
-      for (var nn in _symNameMap) {
-        if (_symNameMap[nn] === f.symId) { symName = nn; break; }
-      }
-      if (!symName) return boolPos ? 'true' : '0';
-      var v = _quoteSmtString(f.value);
-      var sxx = _quoteSmtName(symName);
-      if (f.prop === 'startsWith') return '(str.prefixof ' + v + ' ' + sxx + ')';
-      if (f.prop === 'endsWith')   return '(str.suffixof ' + v + ' ' + sxx + ')';
-      if (f.prop === 'includes')   return '(str.contains ' + sxx + ' ' + v + ')';
-      return boolPos ? 'true' : '0';
-    }
-    return boolPos ? 'true' : '0';
-  }
-  function _formulaToSmtLib(formula) {
-    var syms = Object.create(null);
-    var sorts = Object.create(null);
-    _smtCollectSymsAndSorts(formula, syms, sorts);
-    var decls = '';
-    for (var name in syms) {
-      decls += '(declare-const ' + _quoteSmtName(name) + ' ' + (sorts[name] || 'Int') + ')\n';
-    }
-    return decls + '(assert ' + _smtToSExpr(formula, sorts, true) + ')\n';
-  }
-
   // --- Main satisfiability checker (Z3) ---
   // Every formula goes through Z3. There is no fallback solver.
+  // The formula is already in SMT-LIB form (built by the smt* helpers
+  // above); smtSat just emits the necessary `(declare-const ...)` lines
+  // from `formula.sorts`, asserts `formula` (coerced to Bool), and asks
+  // Z3 to check satisfiability.
   async function smtSat(formula) {
     if (!formula) return true;
+    // Compile-time fold for fully-concrete results.
+    if (formula.value && formula.value.kind === 'bool') return formula.value.val;
     var z3 = await _initZ3();
-    var smtlib = _formulaToSmtLib(formula);
+    var decls = '';
+    for (var name in formula.sorts) {
+      decls += '(declare-const ' + _quoteSmtName(name) + ' ' + (formula.sorts[name] || 'Int') + ')\n';
+    }
+    var smtlib = decls + '(assert ' + _toBool(formula) + ')\n';
     var solver = new z3.Solver();
     solver.fromString(smtlib);
     var result = await solver.check();
@@ -651,24 +679,12 @@
     if (lastAdd >= 0) {
       var al = await smtParseExpr(toks, start, lastAdd, resolveFunc, resolvePathFunc);
       var ar = await smtParseExpr(toks, lastAdd + 1, end, resolveFunc, resolvePathFunc);
-      if (al && ar) {
-        if (al.type === 'const' && ar.type === 'const' && typeof al.value === 'number' && typeof ar.value === 'number') {
-          return smtConst(lastAddOp === '+' ? al.value + ar.value : al.value - ar.value);
-        }
-        return smtArith(lastAddOp, al, ar);
-      }
+      if (al && ar) return smtArith(lastAddOp, al, ar);
     }
     if (lastMul >= 0) {
       var ml = await smtParseExpr(toks, start, lastMul, resolveFunc, resolvePathFunc);
       var mr = await smtParseExpr(toks, lastMul + 1, end, resolveFunc, resolvePathFunc);
-      if (ml && mr) {
-        if (ml.type === 'const' && mr.type === 'const' && typeof ml.value === 'number' && typeof mr.value === 'number') {
-          if (lastMulOp === '*') return smtConst(ml.value * mr.value);
-          if (lastMulOp === '/' && mr.value !== 0) return smtConst(ml.value / mr.value);
-          if (lastMulOp === '%' && mr.value !== 0) return smtConst(ml.value % mr.value);
-        }
-        return smtArith(lastMulOp, ml, mr);
-      }
+      if (ml && mr) return smtArith(lastMulOp, ml, mr);
     }
     return await smtParseAtom(toks, start, end, resolveFunc, resolvePathFunc);
   }
@@ -762,10 +778,10 @@
           // Resolve aliases for consistent symbolic ID.
           var _mResolvedBase = _mBase;
           if (_mRb && _mRb.kind === 'chain' && _mRb.toks.length === 1 && _mRb.toks[0].type === 'other') _mResolvedBase = _mRb.toks[0].text;
-          var _mSymId = smtSym(_mResolvedBase).id;
-          if (_mMethod === 'startsWith' && _mArgVal !== null) return smtStrProp(_mSymId, 'startsWith', _mArgVal);
-          if (_mMethod === 'endsWith' && _mArgVal !== null) return smtStrProp(_mSymId, 'endsWith', _mArgVal);
-          if (_mMethod === 'includes' && _mArgVal !== null) return smtStrProp(_mSymId, 'includes', _mArgVal);
+          var _mSymObj = smtSym(_mResolvedBase);
+          if (_mMethod === 'startsWith' && _mArgVal !== null) return smtStrProp(_mSymObj, 'startsWith', _mArgVal);
+          if (_mMethod === 'endsWith' && _mArgVal !== null) return smtStrProp(_mSymObj, 'endsWith', _mArgVal);
+          if (_mMethod === 'includes' && _mArgVal !== null) return smtStrProp(_mSymObj, 'includes', _mArgVal);
           if (_mMethod === 'indexOf' && _mArgVal !== null) return smtArith('indexOf', smtSym(_mResolvedBase), smtConst(_mArgVal));
           // .length is a property, not a method call.
         }
