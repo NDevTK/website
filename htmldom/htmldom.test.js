@@ -3406,6 +3406,21 @@ await (async function () {
   // Descending counter: for (i=3; i>=0; i--) — enumerate 3,2,1,0.
   await checkTaint('sm: unroll descending unsat', { 'a.js': 'var x = location.search; for (var i = 3; i >= 0; i--) { if (i > 5) { document.getElementById("o").innerHTML = x; } }' }, 0);
 
+  // --- SMT power: nonlinear arithmetic via Z3 ---
+  // Z3's full nonlinear arithmetic theory proves these unsat. The
+  // analyzer used to give up on x*x because the home-grown solver only
+  // tracked linear bounds; with Z3 inline these now fold correctly.
+  await checkTaint('z3: x*x < 0',          { 'a.js': 'var x = location.search; if (x * x < 0) { document.getElementById("o").innerHTML = x; }' }, 0);
+  await checkTaint('z3: bounded * overflow', { 'a.js': 'var x = location.search; if (x > 2 && x < 5 && x * x > 100) { document.getElementById("o").innerHTML = x; }' }, 0);
+  await checkTaint('z3: quadratic unique',  { 'a.js': 'var x = location.search; if (x * x === 4 && x > 0 && x !== 2) { document.getElementById("o").innerHTML = x; }' }, 0);
+  await checkTaint('z3: x*x >= 0 tautology', { 'a.js': 'var x = location.search; if (x * x >= 0) { document.getElementById("o").innerHTML = x; }' }, 1);
+  // --- SMT power: linear-real-arith with multi-variable sums ---
+  await checkTaint('z3: lra x+y<6 with x,y>3', { 'a.js': 'var x = location.search; var y = location.hash; if (x > 3 && y > 3 && x + y < 6) { document.getElementById("o").innerHTML = x; }' }, 0);
+  await checkTaint('z3: lra x+y>10 sat',      { 'a.js': 'var x = location.search; var y = location.hash; if (x > 3 && y > 3 && x + y > 10) { document.getElementById("o").innerHTML = x; }' }, 1);
+  // --- SMT power: string theory via str.indexof / str.len ---
+  await checkTaint('z3: empty string indexof', { 'a.js': 'var x = location.search; if (x.length === 0) { if (x.indexOf("a") >= 0) { document.getElementById("o").innerHTML = x; } }' }, 0);
+  await checkTaint('z3: prefix incompat',      { 'a.js': 'var x = location.search; if (x.startsWith("http://")) { if (x.startsWith("javascript:")) { document.getElementById("o").innerHTML = x; } }' }, 0);
+
   // --- IIFE ---
   await checkTaint('IIFE function', { 'a.js': '(function() { document.getElementById("o").innerHTML = location.search; })();' }, 1);
   await checkTaint('IIFE with args', { 'a.js': '(function(x) { document.getElementById("o").innerHTML = x; })(location.search);' }, 1);
