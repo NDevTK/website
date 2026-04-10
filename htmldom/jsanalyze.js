@@ -761,39 +761,28 @@
 
   // --- Z3 initialisation (mandatory; no fallback) ---
   // smtSat awaits this once; afterwards Z3 is a cached shared Context.
-  // Browser pages either pre-load z3-solver and set globalThis.__htmldomZ3Init
-  // to its init function, or jsanalyze.js will dynamically import the
-  // ES module from a CDN. Node loads via require('z3-solver').
   //
-  // Detection note: Monaco's AMD loader (loader.min.js) defines a
-  // synchronous `require` shim in the page scope. We can't use
-  // `typeof require === 'function'` alone to detect Node — that
-  // matches Monaco too and leads to a synchronous require failure
-  // against z3-solver. The reliable Node signal is
-  // `typeof module === 'object' && module.exports` AND
-  // `typeof window === 'undefined'`.
+  // Three loading paths, tried in order:
   //
-  // CDN notes:
-  //   - jsDelivr's `/+esm` wrapper fails to bundle z3-solver's
-  //     CommonJS dependency on async-mutex — the inner require()
-  //     call returns null at runtime and crashes the module at
-  //     `new async_mutex_1.Mutex()`. esm.sh with `?bundle-deps`
-  //     produces a self-contained ESM file that inlines every
-  //     transitive CommonJS dep.
+  //   1. `globalThis.__htmldomZ3Init` — a pre-registered init
+  //      function. This is the normal browser path: the page
+  //      loads `jsanalyze-z3-browser.js` before `jsanalyze.js`,
+  //      and that bootstrap file registers a lazy loader that
+  //      knows how to pull z3-built.js + browser.esm.js from the
+  //      vendored `htmldom/vendor/z3-solver/` directory. Using
+  //      this hook keeps jsanalyze.js browser-agnostic — no DOM
+  //      APIs, no dynamic imports, no CSP assumptions.
   //
-  //   - z3-solver's browser build (build/browser.js) reads
-  //     `global.initZ3` from its init() function. That global is
-  //     set by loading `build/z3-built.js` as a classic <script>
-  //     tag — the WASM loader is a UMD file that declares
-  //     `var initZ3 = (...)()` at top level, which becomes a
-  //     window property on load. The browser build's init() then
-  //     reads `global.initZ3`, which is undefined in browsers
-  //     unless we shim `window.global = window` first.
+  //   2. Node's `require('z3-solver')` — the test harness and
+  //      any CommonJS consumer that runs under Node. Detection
+  //      is strict: `window === undefined && module.exports &&
+  //      require === function`. Monaco's AMD loader defines
+  //      `require` but not `window === undefined`, so this
+  //      branch doesn't match under Monaco.
   //
-  //   - The page's CSP must allow https://esm.sh + https://cdn.jsdelivr.net
-  //     in both script-src (for the ESM import + classic WASM
-  //     loader script) and connect-src (for the WASM sub-resource
-  //     fetch that z3-built.js issues during its initialisation).
+  //   3. Error — neither path was set up. Emit a clear message
+  //      so the consumer knows to load jsanalyze-z3-browser.js
+  //      first (browser) or install z3-solver (Node).
   var _z3 = null;
   var _z3Promise = null;
   function _initZ3() {
@@ -803,39 +792,14 @@
       if (typeof globalThis !== 'undefined' && typeof globalThis.__htmldomZ3Init === 'function') {
         initFn = globalThis.__htmldomZ3Init;
       } else if (typeof window === 'undefined' && typeof module === 'object' && module && module.exports && typeof require === 'function') {
-        // True Node environment — no browser window, CommonJS require available.
         var mod = require('z3-solver');
         initFn = mod.init;
       } else {
-        // Browser (or Monaco loader) path. Three steps:
-        //
-        //   (1) Shim `window.global = window` so z3-solver's
-        //       browser build can read `global.initZ3` without
-        //       hitting ReferenceError.
-        //
-        //   (2) Load z3-built.js as a classic <script> tag so it
-        //       populates `window.initZ3` with the WASM loader.
-        //       (An ESM import won't work — the file is a UMD
-        //       classic script that declares `var initZ3` at top
-        //       level, and ESM doesn't promote top-level `var`
-        //       to window properties.)
-        //
-        //   (3) Dynamic-import the high-level browser module from
-        //       esm.sh with bundled deps. Its init() reads
-        //       `global.initZ3` (now resolved via our shim) and
-        //       wires it into the low-level loader.
-        if (typeof window.global === 'undefined') window.global = window;
-        if (typeof window.initZ3 !== 'function') {
-          await new Promise(function (resolve, reject) {
-            var s = document.createElement('script');
-            s.src = 'https://cdn.jsdelivr.net/npm/z3-solver@4.16.0/build/z3-built.js';
-            s.onload = resolve;
-            s.onerror = function () { reject(new Error('failed to load z3-built.js from cdn.jsdelivr.net')); };
-            document.head.appendChild(s);
-          });
-        }
-        var mod = await import('https://esm.sh/z3-solver@4.16.0?bundle-deps');
-        initFn = mod.init;
+        throw new Error(
+          'jsanalyze: Z3 is not available. In the browser, load ' +
+          'htmldom/jsanalyze-z3-browser.js before jsanalyze.js. ' +
+          'In Node, ensure z3-solver is installed.'
+        );
       }
       var api = await initFn();
       var ctx = api.Context('htmldom');

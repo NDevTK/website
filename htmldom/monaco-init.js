@@ -37,10 +37,28 @@
     window._monacoIn = editor;
     window._monacoOut = { setValue: function() {}, getValue: function() { return ''; } };
 
-    // Load jsanalyze-schemas first (needed by the bindingToValue
-    // seam inside jsanalyze.js). Then jsanalyze.js (which contains the
-    // walker + legacy converter). Then the jsanalyze consumer
-    // wrappers so page scripts can reach them as globals.
+    // Script load order matters. In this order:
+    //
+    //   1. jsanalyze-schemas.js          — public Value factories
+    //      (needed by the bindingToValue seam inside jsanalyze.js)
+    //
+    //   2. jsanalyze-z3-browser.js       — Z3 bootstrap for the
+    //      browser. Registers globalThis.__htmldomZ3Init as a lazy
+    //      loader that pulls z3-built.js + browser.esm.js from
+    //      htmldom/vendor/z3-solver/ on first use. Must come
+    //      before jsanalyze.js so the walker's _initZ3 sees the
+    //      hook when it's first called.
+    //
+    //   3. jsanalyze.js                  — the walker engine
+    //
+    //   4. jsanalyze-query.js            — analyze() + query primitives
+    //
+    //   5. htmldom-convert.js            — DOM conversion consumer
+    //      (depends on the walker being loaded, which is why the
+    //      facade's awaitWalker() retries across microtasks)
+    //
+    //   6. fetch-trace.js / taint-report.js / csp-derive.js
+    //      — other jsanalyze consumers, in any order
     function appendScript(src, onload) {
       var s = document.createElement('script');
       s.src = src;
@@ -48,12 +66,14 @@
       document.body.appendChild(s);
     }
     appendScript('jsanalyze-schemas.js', function () {
-      appendScript('jsanalyze.js', function () {
-        appendScript('jsanalyze-query.js');
-        appendScript('htmldom-convert.js');
-        appendScript('fetch-trace.js');
-        appendScript('taint-report.js');
-        appendScript('csp-derive.js');
+      appendScript('jsanalyze-z3-browser.js', function () {
+        appendScript('jsanalyze.js', function () {
+          appendScript('jsanalyze-query.js');
+          appendScript('htmldom-convert.js');
+          appendScript('fetch-trace.js');
+          appendScript('taint-report.js');
+          appendScript('csp-derive.js');
+        });
       });
     });
 

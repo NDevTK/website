@@ -3911,6 +3911,44 @@ await (async function () {
 })();
 
 // -----------------------------------------------------------------------
+// vendor presence (z3-solver browser files)
+//
+// Catches broken vendor layouts in the Node test run. The browser
+// path requires htmldom/vendor/z3-solver/ to contain z3-built.js,
+// z3-built.wasm, and the pre-bundled browser.esm.js. We don't
+// actually load them here — just assert the files exist so
+// regressions show up in CI instead of silently breaking the
+// browser UI.
+// -----------------------------------------------------------------------
+await (async function () {
+  const before = pass + fail;
+  console.log('\nvendor presence');
+  console.log('---------------');
+  const required = [
+    'vendor/z3-solver/z3-built.js',
+    'vendor/z3-solver/z3-built.wasm',
+    'vendor/z3-solver/browser.esm.js',
+    'jsanalyze-z3-browser.js',
+  ];
+  for (const rel of required) {
+    const abs = path.join(__dirname, rel);
+    try {
+      const stat = fs.statSync(abs);
+      if (stat.size < 100) {
+        fail++;
+        failures.push({ name: 'vendor ' + rel, want: 'non-trivial file', got: 'size=' + stat.size, input: abs });
+      } else {
+        pass++;
+      }
+    } catch (e) {
+      fail++;
+      failures.push({ name: 'vendor ' + rel, want: 'present', got: 'missing: ' + e.message, input: abs });
+    }
+  }
+  console.log(`  (${pass + fail - before} cases)`);
+})();
+
+// -----------------------------------------------------------------------
 // jsanalyze schemas (Stage 1: seam + value factories + translation)
 // -----------------------------------------------------------------------
 await (async function () {

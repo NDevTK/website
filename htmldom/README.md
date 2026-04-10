@@ -1,40 +1,149 @@
-# htmldom — JS → DOM-API converter
+# jsanalyze — whole-program static analysis library for browser JavaScript
 
-Converts `innerHTML`/`outerHTML` assignments in JavaScript to safe
-`createElement`/`appendChild` DOM code. Statically resolves as much
-of the input as possible; runtime-only values flow through as named
-references.
+`jsanalyze` is a reusable JavaScript static analysis library. Its
+engine is a symbolic interpreter that walks a multi-file JS bundle,
+folds constants across functions and branches, tracks taint with
+Z3-backed path-constraint reasoning, and produces a versioned,
+queryable `Trace` of everything it learned. Consumers read the
+trace through a small query API and project it into domain-specific
+views.
+
+The library ships with four reference consumers. **DOM conversion
+(`htmldom-convert.js`) is one of them** — the original use case
+that drove the walker's development — but the engine is deliberately
+decoupled from any single output format.
+
+| Consumer | What it does |
+|---|---|
+| `htmldom-convert.js` | Rewrites `innerHTML` / `outerHTML` / `document.write` assignments into safe `createElement` / `appendChild` DOM code, preserving loops and branches. |
+| `fetch-trace.js` | Discovers every HTTP endpoint a bundle reaches — `fetch` / `XMLHttpRequest` / `WebSocket` / `Worker` / dynamic `import` — with resolved URLs, methods, headers, bodies, and per-argument allowed-value sets. Includes APIs that are defined but never called. |
+| `taint-report.js` | Path-sensitive taint reporter that flows known sources (`location.hash`, `document.cookie`, `event.data`, …) through the program and reports reachable sinks (`innerHTML`, `eval`, `document.write`, …). Uses Z3 to refute unreachable flows. |
+| `csp-derive.js` | Derives a minimal Content-Security-Policy from observed `script-src` / `connect-src` / `worker-src` / `frame-src` / `img-src` targets plus flags on `eval` / `new Function` / tainted `innerHTML`. |
+
+New consumers are written in ~200–500 LOC against the published
+query API. None of them reach into the walker's internals.
+
+## Quick start
+
+### Node
+
+```js
+const { analyze, query } = require('./htmldom/jsanalyze-query.js');
+
+const trace = await analyze({
+  'api.js': 'function loadUser(id) { return fetch("/api/users/" + id); }',
+  'app.js': 'loadUser(42);',
+});
+
+for (const call of query.calls(trace, { targets: ['fetch'] })) {
+  console.log(call.site.file + ':' + call.site.line, query.asConcrete(call.args[0]));
+  // api.js:1  /api/users/42
+}
+```
+
+### Browser
+
+`index.html` loads the files in dependency order via `monaco-init.js`:
+
+1. `jsanalyze-schemas.js` — public `Value` factories
+2. `jsanalyze-z3-browser.js` — Z3 bootstrap (registers
+   `globalThis.__htmldomZ3Init` lazily)
+3. `jsanalyze.js` — the engine
+4. `jsanalyze-query.js` — `analyze()` + query primitives
+5. `htmldom-convert.js` / `fetch-trace.js` / `taint-report.js` /
+   `csp-derive.js` — consumers
+
+Everything runs client-side with no build step and no third-party
+CDN dependency. Z3 is vendored under `htmldom/vendor/z3-solver/`.
 
 ## Public API
 
-Loaded as a plain `<script>` in `index.html`. Three extraction
-functions are exposed inside the IIFE (accessible via the UI's
-`Convert` button):
+### `analyze(input, options)` → `Promise<Trace>`
 
-### `extractHTML(input)` → `{ html, autoSubs, target, assignProp, assignOp, loops?, loopVars? }`
+Runs the engine over a single source string or a `{filename → source}`
+map and returns a Trace. A Trace is pure data, JSON-serializable,
+and versioned via `schemaVersion`.
 
-Extracts the FIRST `X.innerHTML`/`X.outerHTML` assignment from
-`input`. Returns raw-HTML input unchanged. Fields:
+```js
+const trace = await analyze(files, {
+  taint: true,           // enable taint flow tracking + Z3 reachability
+  watchers: { ... },     // optional streaming hooks
+});
+```
 
-- `html` — the materialized HTML string, with `__HDX#__` placeholders
-  for unresolved sub-expressions and `__HDLOOP#S__`/`__HDLOOP#E__`
-  markers around for/while loop bodies.
-- `autoSubs` — `[[placeholder, source-expression], ...]` mapping
-  each placeholder to the original JS expression it represents.
-- `target`, `assignProp`, `assignOp` — the LHS target (e.g.
-  `document.body`), `'innerHTML'` or `'outerHTML'`, and `'='` or `'+='`.
-- `loops` — loop metadata when markers are present.
-- `loopVars` — per-loop-built-variable metadata.
+### `query.*` — pure functions over a Trace
 
-### `extractAllHTML(input)` → `[extractHTML-result, ...]`
+All queries take a `Trace` and return typed results. They never
+re-walk the source, so you can run any number of queries on a single
+trace cheaply.
 
-Returns one result per `.innerHTML`/`.outerHTML` site in source order.
+| Primitive | Returns |
+|---|---|
+| `query.calls(trace, { targets, reached?, reachability? })` | Every call site matching the target filter, with resolved arguments, caller, and reachability. |
+| `query.property(value, path)` | Navigate into a nested `Value` via dotted path (`'headers.Content-Type'`). |
+| `query.enumerate(value)` | Every concrete primitive a `Value` can take, or `null` if unenumerable. |
+| `query.asConcrete(value)` | The single concrete primitive if the `Value` is `kind: 'concrete'`, else `null`. |
+| `query.innerHtmlAssignments(trace)` | Every `innerHTML` / `outerHTML` / `document.write` site. |
+| `query.taintFlows(trace, { severity?, source?, sinkProp? })` | Taint flows with source + sink + path conditions. |
+| `query.stringLiterals(trace, { context })` | String literals in a given context (e.g. assigned to `script.src`). |
+| `query.valueSetOf(trace, name)` | Every concrete literal a variable takes across the program. |
+| `query.callGraph(trace)` | `{ nodes, edges }` built from observed calls. |
 
-### `extractAllDOM(input)` → `{ elements, ops, roots, html }`
+### `Value` — the versioned tagged union consumers see
 
-Tracks virtual DOM state built via `document.createElement`,
-`getElementById`, `querySelector`, `createTextNode` plus subsequent
-`el.prop = ...`, `el.setAttribute(...)`, `el.appendChild(...)`, etc.
+Defined in `jsanalyze-schemas.js`. Every binding the walker knows
+about converts to one of these shapes via the `bindingToValue`
+boundary function:
+
+```ts
+type Value =
+  | { kind: 'concrete',  value: string|number|boolean|null,          provenance: Source[] }
+  | { kind: 'oneOf',     values: ConcreteValue[], source: OneOfSource, provenance: Source[] }
+  | { kind: 'template',  parts: TemplatePart[],                       provenance: Source[] }
+  | { kind: 'object',    props: Record<string, Value>,                provenance: Source[] }
+  | { kind: 'array',     elems: Value[],                              provenance: Source[] }
+  | { kind: 'function',  name?, params, bodyRef,                      provenance: Source[] }
+  | { kind: 'unknown',   reason: UnknownReason, taint?: string[],     provenance: Source[] };
+```
+
+Every `Value` carries **provenance** — the source locations where
+it got its current shape. `unknown` carries an explicit `reason`
+(`unresolved-identifier` / `runtime-random` / `user-input` /
+`unknown-call-return` / `loop-poisoned` / `recursion-cap` /
+`opaque-external`) so consumers can distinguish "external library"
+from "user input" from "walker gave up".
+
+See `jsanalyze-schemas.js` for the full list and the helper
+functions (`asConcrete`, `enumerate`, `mergeBranches`, `stringify`).
+
+## Library layout
+
+| File | Role |
+|---|---|
+| `jsanalyze.js`                | Engine: tokenizer, walker, SMT path reasoner, taint propagation, virtual DOM, binding seam |
+| `jsanalyze-schemas.js`        | Public `Value` factories + versioned schema + validation |
+| `jsanalyze-query.js`          | `analyze()` entry point + `query.*` primitives over a Trace |
+| `jsanalyze-z3-browser.js`     | Browser bootstrap for Z3 (registers `globalThis.__htmldomZ3Init` lazily) |
+| `vendor/z3-solver/`           | Vendored z3-solver (WASM + ESM-bundled browser.js). Self-hosted; no CDN dependency. |
+| `htmldom-convert.js`          | Consumer: innerHTML/outerHTML → DOM API rewriter |
+| `fetch-trace.js`              | Consumer: HTTP endpoint discovery |
+| `taint-report.js`             | Consumer: taint flow reporter |
+| `csp-derive.js`                | Consumer: CSP derivation |
+| `htmldom.test.js`             | Shared test harness |
+| `index.html`                  | Browser UI (Monaco editor + sidebar + findings panel) |
+| `monaco-init.js`              | UI bootstrap (loads the scripts in dependency order) |
+
+**Consumer dependency rule:** consumers depend on
+`jsanalyze-query.js` + `jsanalyze-schemas.js` only. They never
+reach into the engine's internals. The engine's public surface
+is the `analyze()` + `query.*` + `Value` trio documented above.
+
+## What the walker can fold
+
+The engine is a symbolic interpreter — it runs the JS code at
+analysis time, inlining functions, tracking object state across
+assignments, and folding constants wherever possible. This section
+documents what it understands.
 
 ## Supported JS subset
 
@@ -192,43 +301,76 @@ is used instead.
 
 ## Testing
 
-A Node.js test harness lives in `htmldom.test.js`:
-
 ```
 node htmldom/htmldom.test.js
 ```
 
-The harness loads `jsanalyze.js` (the symbolic interpreter engine)
-and its consumers with minimal DOM stubs, exposes the extract
-functions, and runs inline assertions. 895+ tests covering:
+The harness loads `jsanalyze.js` and every consumer with minimal
+DOM stubs and runs inline assertions. 899+ tests covering:
 
-- Token + scope walker behavior
-- Virtual DOM extraction
-- Behavioral equivalence (converted output runs identically in JSDOM)
-- Taint flow tracing with SMT refutation
-- DOM API conversion output
-- jsanalyze schema factories + validation
-- jsanalyze query primitives (`analyze`, `query.calls`, `query.taintFlows`, …)
-- Consumer outputs (`fetch-trace`, `taint-report`, `csp-derive`, `htmldom-convert`)
+- **Engine**: tokenizer, scope walker, virtual DOM extraction,
+  SMT-refuted taint reachability, cross-file inter-procedural flow
+- **Schemas**: `Value` factory shapes, validation, helpers
+- **Query primitives**: `analyze`, `query.calls`, `query.property`,
+  `query.enumerate`, `query.taintFlows`, `query.callGraph`, JSON
+  round-trip, query purity
+- **Consumers**: `htmldom-convert` (111 behavioral-equivalence
+  cases — converted output runs identically in JSDOM), `fetch-trace`
+  (API discovery across realistic bundles), `taint-report` (grouping
+  + rendering), `csp-derive` (origin extraction + unsafe-eval detection),
+  plus an integration case that runs all three consumers on one walk
+- **Vendor presence**: the browser Z3 bootstrap + its vendored
+  WASM files exist and are non-trivial
 
-## Library layout
+## Vendoring Z3
 
-After the Stage-5 split the `htmldom/` directory contains:
+z3-solver ships separate Node and browser builds and the browser
+build has a non-trivial loading protocol (`global.initZ3` shim,
+classic-script WASM loader, ESM high-level module). To avoid
+shipping a CDN dependency for a security tool, `jsanalyze` vendors
+the z3-solver `build/` directory under `htmldom/vendor/z3-solver/`
+and ships a pre-bundled ESM wrapper alongside the original files.
 
-| File                    | Role                                                              |
-|-------------------------|-------------------------------------------------------------------|
-| `jsanalyze.js`          | Core: tokenizer, walker, SMT, taint, virtual DOM, binding seam    |
-| `jsanalyze-schemas.js`  | Public `Value` factories, versioned schema, validation            |
-| `jsanalyze-query.js`    | `analyze()` entry + query primitives over a Trace                 |
-| `fetch-trace.js`        | Consumer: HTTP endpoint discovery (fetch/XHR/WS/Worker)           |
-| `taint-report.js`       | Consumer: human-readable taint flow reporter                      |
-| `csp-derive.js`         | Consumer: Content-Security-Policy generator                      |
-| `htmldom-convert.js`    | Consumer: innerHTML/outerHTML → DOM API rewriter                 |
-| `htmldom.test.js`       | Shared test harness                                               |
-| `index.html`            | Browser UI                                                        |
-| `monaco-init.js`        | UI bootstrap (loads the scripts in dependency order)              |
+The vendor layout:
 
-Consumers depend on `jsanalyze-query.js` + `jsanalyze-schemas.js`.
-None of them reach into `jsanalyze.js` directly — the walker's
-internals are accessed only via the boundary functions exposed
-on the public `api` object.
+```
+htmldom/vendor/z3-solver/
+  z3-built.js          ← WASM loader (classic UMD script; 338 KB)
+  z3-built.wasm        ← the actual Z3 WASM binary (33 MB)
+  browser.js           ← original CommonJS high-level wrapper
+  browser.esm.js       ← esbuild-bundled ESM form of browser.js (297 KB)
+  node.js              ← Node entry (unused in the browser)
+  high-level/          ← original CommonJS sources (kept for reference)
+  low-level/           ← original CommonJS sources
+```
+
+`htmldom/jsanalyze-z3-browser.js` orchestrates the browser-side
+loading on first use:
+
+1. Aliases `window.global = window` so z3-solver's browser build
+   can read `global.initZ3` without a `ReferenceError`.
+2. Injects `vendor/z3-solver/z3-built.js` as a classic `<script>`,
+   awaiting `onload`. The UMD top-level `var initZ3 = (...)();`
+   becomes a `window.initZ3` property.
+3. Dynamic-imports `vendor/z3-solver/browser.esm.js`. Its
+   `default` export is the z3-solver browser module with `init`.
+4. Registers `globalThis.__htmldomZ3Init` as a lazy wrapper that
+   runs steps 1–3 on first call, then calls `mod.init()`.
+
+`jsanalyze.js`'s `_initZ3` picks up `globalThis.__htmldomZ3Init`
+on its first branch and uses it directly — it does no DOM,
+dynamic-import, or CDN work itself. Node continues to use
+`require('z3-solver')` against the installed npm package.
+
+### Re-bundling `browser.esm.js` on z3-solver upgrade
+
+```
+npx esbuild htmldom/vendor/z3-solver/browser.js \
+  --bundle --format=esm --platform=browser \
+  --outfile=htmldom/vendor/z3-solver/browser.esm.js
+```
+
+Run this after upgrading `z3-solver` in `package.json` and
+re-copying `node_modules/z3-solver/build/` to
+`htmldom/vendor/z3-solver/`. The `htmldom.test.js` vendor-presence
+section will fail on Node if either file is missing.
