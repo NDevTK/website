@@ -569,11 +569,16 @@
       sortsL[l.symName] = 'String';
       return { expr: '(str.len ' + l.expr + ')', sorts: sortsL, isBool: false };
     }
-    if (op === 'indexOf' && l.symName && r.value && r.value.kind === 'str') {
-      var sortsI = _mergeSorts(l.sorts, null);
-      sortsI[l.symName] = 'String';
-      return { expr: '(str.indexof ' + l.expr + ' ' + r.expr + ' 0)',
-               sorts: sortsI, isBool: false };
+    if (op === 'indexOf' && l.symName) {
+      // The needle can be a literal string (r.value) OR another sym
+      // (r.symName) — both are valid second args to str.indexof.
+      if ((r.value && r.value.kind === 'str') || r.symName) {
+        var sortsI = _mergeSorts(l.sorts, null);
+        sortsI[l.symName] = 'String';
+        if (r.symName) sortsI[r.symName] = 'String';
+        return { expr: '(str.indexof ' + l.expr + ' ' + r.expr + ' 0)',
+                 sorts: sortsI, isBool: false };
+      }
     }
     if (op === 'charAt' && l.symName && r.value && r.value.kind === 'int') {
       var sortsC = _mergeSorts(l.sorts, null);
@@ -834,6 +839,14 @@
           if (_mMethod === 'endsWith' && _mArgVal !== null) return smtStrProp(_mSymObj, 'endsWith', _mArgVal);
           if (_mMethod === 'includes' && _mArgVal !== null) return smtStrProp(_mSymObj, 'includes', _mArgVal);
           if (_mMethod === 'indexOf' && _mArgVal !== null) return smtArith('indexOf', _mSymObj, smtConst(_mArgVal));
+          // indexOf(IDENT) — second arg is another identifier; if it
+          // resolves to a tainted sym, build (str.indexof base needle 0).
+          if (_mMethod === 'indexOf' && _mArgTok && _mArgTok.type === 'other' && IDENT_RE.test(_mArgTok.text) && toks[start + 3] && toks[start + 3].type === 'close') {
+            var _needleParsed = await smtParseAtom([_mArgTok], 0, 1, resolveFunc, resolvePathFunc);
+            if (_needleParsed && _needleParsed.symName) {
+              return smtArith('indexOf', _mSymObj, _needleParsed);
+            }
+          }
           // Single-int-literal arg: charAt(N) → (str.at sym N)
           var _mIntArg = null;
           if (_mArgTok && _mArgTok.type === 'other' && /^-?\d+$/.test(_mArgTok.text) && toks[start + 3] && toks[start + 3].type === 'close') {

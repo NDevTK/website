@@ -3442,6 +3442,9 @@ await (async function () {
   // Bracket index access on a tainted string is the same shape.
   await checkTaint('z3: bracket unsat',   { 'a.js': 'var x = location.search; if (x[0] === "a" && x[0] === "b") { document.getElementById("o").innerHTML = x; }' }, 0);
   await checkTaint('z3: bracket sat',     { 'a.js': 'var x = location.search; if (x[0] === "/") { document.getElementById("o").innerHTML = x; }' }, 1);
+  // indexOf with a sym needle (both haystack and needle tainted).
+  await checkTaint('z3: indexOf sym sat',       { 'a.js': 'var x = location.search; var y = location.hash; if (x.indexOf(y) >= 0) { document.getElementById("o").innerHTML = x; }' }, 1);
+  await checkTaint('z3: indexOf sym len0 unsat',{ 'a.js': 'var x = location.search; var y = location.hash; if (y.length > 0 && x.length === 0 && x.indexOf(y) >= 0) { document.getElementById("o").innerHTML = x; }' }, 0);
 
   // --- IIFE ---
   await checkTaint('IIFE function', { 'a.js': '(function() { document.getElementById("o").innerHTML = location.search; })();' }, 1);
