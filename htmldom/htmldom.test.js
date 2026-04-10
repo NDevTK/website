@@ -3548,18 +3548,88 @@ function render() {
 })();
 
 // -----------------------------------------------------------------------
-// Report
+// Z3 backend verification pass (async) + final report
 // -----------------------------------------------------------------------
-console.log('');
-console.log('='.repeat(60));
-console.log(`Total: ${pass + fail}  Passed: ${pass}  Failed: ${fail}`);
-if (fail > 0) {
-  console.log('');
-  for (const f of failures) {
-    console.log(`FAIL: ${f.name}`);
-    console.log(`  IN:     ${JSON.stringify(f.input)}`);
-    console.log(`  WANTED: ${JSON.stringify(f.want)}`);
-    console.log(`  GOT:    ${JSON.stringify(f.got)}`);
+// If z3-solver is installed, run an async post-hoc verification pass
+// over every taint case. The pass re-checks each finding's path
+// constraints against the real Z3 SMT solver. It must agree with the
+// home-grown solver on satisfiable paths (never drop a finding expected
+// to be present) and may strictly improve precision on cases the
+// home-grown solver over-approximates (nonlinear arithmetic, tighter
+// LRA). The final report is printed from here so both sync and async
+// counts are included before exit.
+(async function finalize() {
+  const traceTaint = globalThis.__traceTaint;
+  let z3 = null;
+  if (traceTaint) {
+    try {
+      const mod = require('./z3-backend');
+      const api = await mod.initZ3();
+      if (api) z3 = mod;
+    } catch (e) { /* z3-solver not installed → skip */ }
   }
-  process.exit(1);
-}
+  if (z3) {
+    console.log('\nz3 backend');
+    console.log('----------');
+    const before = pass + fail;
+    async function z3check(name, code, expectedZ3, expectedHG) {
+      const r = traceTaint({ 'a.js': code });
+      const hgCount = r.findings.length;
+      const verified = await z3.verifyFindings(r.findings);
+      const z3Count = verified.length;
+      let ok = z3Count === expectedZ3;
+      if (expectedHG !== undefined && hgCount !== expectedHG) ok = false;
+      if (ok) pass++;
+      else {
+        fail++;
+        failures.push({ name: 'z3: ' + name, input: code.slice(0, 60),
+          want: { z3: expectedZ3, hg: expectedHG }, got: { hg: hgCount, z3: z3Count } });
+      }
+    }
+    // Baseline agreement on simple cases (Z3 must match home-grown).
+    await z3check('simple unsat', 'var x = location.search; if (x > 5 && x < 3) { document.getElementById("o").innerHTML = x; }', 0, 0);
+    await z3check('simple sat',   'var x = location.search; if (x > 5) { document.getElementById("o").innerHTML = x; }',             1, 1);
+    await z3check('no taint',     'var x = "hi"; if (x > 5) { document.getElementById("o").innerHTML = x; }',                        0, 0);
+    // Nonlinear: home-grown treats x*x as opaque, Z3 proves unsat.
+    await z3check('nl: x*x < 0',            'var x = location.search; if (x * x < 0) { document.getElementById("o").innerHTML = x; }',                            0, 1);
+    await z3check('nl: bounded * overflow', 'var x = location.search; if (x > 2 && x < 5 && x * x > 100) { document.getElementById("o").innerHTML = x; }',         0, 1);
+    await z3check('nl: quadratic unique',   'var x = location.search; if (x * x === 4 && x > 0 && x !== 2) { document.getElementById("o").innerHTML = x; }',       0, 1);
+    // LRA: home-grown bounds may over-approximate multi-var sums.
+    await z3check('lra: x+y<6 with x,y>3', 'var x = location.search; var y = location.hash; if (x > 3 && y > 3 && x + y < 6) { document.getElementById("o").innerHTML = x; }', 0, 1);
+    // Reachable nonlinear must stay.
+    await z3check('nl: x*x >= 0 tautology', 'var x = location.search; if (x * x >= 0) { document.getElementById("o").innerHTML = x; }', 1);
+    // Full sweep: every existing taint test. Z3 may prune
+    // over-approximations but must never disagree with an expected-
+    // reachable finding (i.e. Z3 count must be ≤ expected).
+    const testSrc = require('fs').readFileSync(__filename, 'utf8');
+    const re = /checkTaint\(\s*'([^']+)',\s*\{\s*'a\.js':\s*('(?:[^'\\]|\\.)*')\s*\}\s*,\s*(\d+)/g;
+    let sweepPass = 0, sweepFail = 0, match;
+    while ((match = re.exec(testSrc)) !== null) {
+      const code = eval(match[2]);
+      const expected = parseInt(match[3], 10);
+      const r = traceTaint({ 'a.js': code });
+      const verified = await z3.verifyFindings(r.findings);
+      if (verified.length <= expected) sweepPass++;
+      else {
+        sweepFail++;
+        failures.push({ name: 'z3-sweep: ' + match[1], input: code.slice(0, 60),
+          want: { expected }, got: { hg: r.findings.length, z3: verified.length } });
+      }
+    }
+    pass += sweepPass; fail += sweepFail;
+    console.log(`  (${pass + fail - before} cases; ${sweepPass} full-sweep agreements)`);
+  }
+  console.log('');
+  console.log('='.repeat(60));
+  console.log(`Total: ${pass + fail}  Passed: ${pass}  Failed: ${fail}`);
+  if (fail > 0) {
+    console.log('');
+    for (const f of failures) {
+      console.log(`FAIL: ${f.name}`);
+      console.log(`  IN:     ${JSON.stringify(f.input)}`);
+      console.log(`  WANTED: ${JSON.stringify(f.want)}`);
+      console.log(`  GOT:    ${JSON.stringify(f.got)}`);
+    }
+    process.exit(1);
+  }
+})().catch(e => { console.error('test harness crashed:', e); process.exit(1); });

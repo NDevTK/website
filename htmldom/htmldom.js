@@ -2001,12 +2001,18 @@
       // Suppress findings inside function bodies walked at definition time.
       // These are re-walked via instantiateFunction with proper context.
       if (taintFnDepth > 0) return;
+      // Snapshot the current SMT path-constraint formulas so a post-hoc
+      // verification backend (e.g. Z3) can re-check reachability without
+      // re-running the walker. The formulas are internal SMT AST nodes
+      // (see smtSym/smtCmp/smtAnd/...).
+      var _formulaSnapshot = pathConstraints ? pathConstraints.slice() : [];
       taintFindings.push({
         type: sinkType,
         severity: severity,
         sink: { prop: prop, elementTag: elementTag || null },
         sources: Array.from(taintLabels),
         conditions: pathConditions ? pathConditions.slice() : [],
+        formulas: _formulaSnapshot,
         location: location || null,
       });
     };

@@ -1,5 +1,6 @@
 {
   "dependencies": {
-    "jsdom": "^29.0.2"
+    "jsdom": "^29.0.2",
+    "z3-solver": "^4.16.0"
   }
 }
