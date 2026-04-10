@@ -1,5 +1,5 @@
 // HTML to DOM API Converter
-(function () {
+(async function () {
   'use strict';
 
   // IDL properties that reflect HTML attributes on common elements.
@@ -452,333 +452,179 @@
     return (e.left && smtHasSym(e.left)) || (e.right && smtHasSym(e.right)) || (e.arg && smtHasSym(e.arg));
   }
 
-  // --- Normalize: push NOT inward (NNF), flatten AND/OR ---
-  var _flipCmp = { '<':'>=', '>':'<=', '<=':'>', '>=':'<', '==':'!=', '===':'!==', '!=':'==', '!==':'===' };
-  var _swapCmp = { '>':'<', '<':'>', '>=':'<=', '<=':'>=', '==':'==', '===':'===', '!=':'!=', '!==':'!==' };
-  function smtNNF(f) {
-    if (!f) return f;
-    if (f.type === 'const' || f.type === 'sym') return f;
-    if (f.type === 'and') return smtAnd(smtNNF(f.left), smtNNF(f.right));
-    if (f.type === 'or') return smtOr(smtNNF(f.left), smtNNF(f.right));
-    if (f.type === 'cmp' || f.type === 'arith') return f;
-    if (f.type === 'not') {
-      var a = f.arg;
-      if (a.type === 'const') return smtConst(!a.value);
-      if (a.type === 'sym') return f; // NOT(sym) stays
-      if (a.type === 'not') return smtNNF(a.arg);
-      if (a.type === 'and') return smtOr(smtNNF(smtNot(a.left)), smtNNF(smtNot(a.right)));
-      if (a.type === 'or') return smtAnd(smtNNF(smtNot(a.left)), smtNNF(smtNot(a.right)));
-      if (a.type === 'cmp') return smtCmp(_flipCmp[a.op] || a.op, a.left, a.right);
-      return f;
-    }
-    return f;
-  }
-
-  // --- Collect all atomic constraints from a conjunction (NNF form) ---
-  // Returns array of cmp/not nodes. Returns null if formula contains OR (non-conjunctive).
-  function smtCollectAtoms(f) {
-    if (!f) return [];
-    if (f.type === 'const') return f.value ? [] : null; // false = unsat
-    if (f.type === 'and') {
-      var l = smtCollectAtoms(f.left), r = smtCollectAtoms(f.right);
-      if (!l || !r) return null;
-      return l.concat(r);
-    }
-    if (f.type === 'cmp' || f.type === 'not' || f.type === 'strProp') return [f];
-    if (f.type === 'or') return null; // can't flatten disjunction
-    if (f.type === 'sym') return []; // symbolic = satisfiable, no constraint
-    return [];
-  }
-
-  // --- Theory solver: arithmetic bounds + relational + equality ---
-  // Checks if a set of atomic constraints is jointly satisfiable.
-  // Handles: sym OP const, sym OP sym, arith(sym,const) OP const/sym.
-  function smtTheorySat(atoms) {
-    if (!atoms) return false; // null = had a const(false)
-    // Evaluate any fully-concrete atoms first.
-    for (var ci = 0; ci < atoms.length; ci++) {
-      var ca = atoms[ci];
-      if (ca.type === 'cmp' && ca.left.type === 'const' && ca.right.type === 'const') {
-        var lv = ca.left.value, rv = ca.right.value;
-        var ok;
-        switch (ca.op) {
-          case '<': ok = lv < rv; break; case '>': ok = lv > rv; break;
-          case '<=': ok = lv <= rv; break; case '>=': ok = lv >= rv; break;
-          case '==': case '===': ok = lv === rv; break;
-          case '!=': case '!==': ok = lv !== rv; break;
-          default: ok = true;
-        }
-        if (!ok) return false; // concrete comparison fails → unsat
-      }
-    }
-    // Per-symbol bounds: { symId → { lo, hi, loStrict, hiStrict, eqs:[], neqs:[] } }
-    var bounds = Object.create(null);
-    // Relational pairs: [{leftId, rightId, op}] for sym OP sym constraints
-    var relations = [];
-    var getBounds = function(id) {
-      if (!bounds[id]) bounds[id] = { lo: -Infinity, hi: Infinity, loStrict: false, hiStrict: false, eqs: [], neqs: [] };
-      return bounds[id];
-    };
-    var addBound = function(id, op, val) {
-      var b = getBounds(id);
-      if (typeof val === 'number') {
-        switch (op) {
-          case '>': if (val >= b.lo) { b.lo = val; b.loStrict = true; } break;
-          case '>=': if (val > b.lo || (val === b.lo && !b.loStrict)) { b.lo = val; b.loStrict = false; } break;
-          case '<': if (val <= b.hi) { b.hi = val; b.hiStrict = true; } break;
-          case '<=': if (val < b.hi || (val === b.hi && !b.hiStrict)) { b.hi = val; b.hiStrict = false; } break;
-          case '===': case '==': b.eqs.push(val); break;
-          case '!==': case '!=': b.neqs.push(val); break;
-        }
+  // --- Z3 initialisation (mandatory; no fallback) ---
+  // smtSat awaits this once; afterwards Z3 is a cached shared Context.
+  // Browser pages either pre-load z3-solver and set globalThis.__htmldomZ3Init
+  // to its init function, or htmldom.js will dynamically import the
+  // ES module from a CDN. Node loads via require('z3-solver').
+  var _z3 = null;
+  var _z3Promise = null;
+  function _initZ3() {
+    if (_z3Promise) return _z3Promise;
+    _z3Promise = (async function () {
+      var initFn = null;
+      if (typeof globalThis !== 'undefined' && typeof globalThis.__htmldomZ3Init === 'function') {
+        initFn = globalThis.__htmldomZ3Init;
+      } else if (typeof require === 'function') {
+        // Node path.
+        var mod = require('z3-solver');
+        initFn = mod.init;
       } else {
-        if (op === '===' || op === '==') b.eqs.push(val);
-        else if (op === '!==' || op === '!=') b.neqs.push(val);
+        // Browser fallback: dynamic ESM import from jsDelivr. The host
+        // page's CSP must allow https://cdn.jsdelivr.net.
+        var mod = await import('https://cdn.jsdelivr.net/npm/z3-solver@4.16.0/+esm');
+        initFn = mod.init;
       }
-    };
-    // Extract constraints from atoms.
-    for (var i = 0; i < atoms.length; i++) {
-      var a = atoms[i];
-      if (a.type === 'cmp') {
-        var L = a.left, R = a.right, op = a.op;
-        if (L.type === 'sym' && R.type === 'const') { addBound(L.id, op, R.value); }
-        else if (R.type === 'sym' && L.type === 'const') { addBound(R.id, _swapCmp[op] || op, L.value); }
-        else if (L.type === 'sym' && R.type === 'sym') { relations.push({ leftId: L.id, rightId: R.id, op: op }); }
-        // arith(sym, const) OP const: e.g. (x + 1) > 5 → x > 4
-        else if (L.type === 'arith' && R.type === 'const') {
-          if (L.left.type === 'sym' && L.right.type === 'const') {
-            var adjusted = null;
-            if (L.op === '+') adjusted = R.value - L.right.value;
-            else if (L.op === '-') adjusted = R.value + L.right.value;
-            if (adjusted !== null) addBound(L.left.id, op, adjusted);
-          }
-          // Any arith expression with a sym operand: create synthetic variable.
-          // Handles arith(sym, sym), arith('length', sym, _), arith('indexOf', sym, _), etc.
-          if (L.left.type === 'sym') {
-            var exprKey = 'expr:' + L.left.id + ':' + L.op + ':' + (L.right.type === 'sym' ? L.right.id : L.right.type === 'const' ? L.right.value : '_');
-            var exprId = smtSym(exprKey).id;
-            addBound(exprId, op, R.value);
-          }
-        }
-        else if (R.type === 'arith' && L.type === 'const') {
-          if (R.left.type === 'sym' && R.right.type === 'const') {
-            var adjusted2 = null;
-            if (R.op === '+') adjusted2 = L.value - R.right.value;
-            else if (R.op === '-') adjusted2 = L.value + R.right.value;
-            if (adjusted2 !== null) addBound(R.left.id, _swapCmp[op] || op, adjusted2);
-          }
-          if (R.left.type === 'sym') {
-            var exprKey2 = 'expr:' + R.left.id + ':' + R.op + ':' + (R.right.type === 'sym' ? R.right.id : R.right.type === 'const' ? R.right.value : '_');
-            var exprId2 = smtSym(exprKey2).id;
-            addBound(exprId2, _swapCmp[op] || op, L.value);
-          }
-        }
-      }
-      // NOT(sym) is like sym == false — no arithmetic bound.
-    }
-    // Check per-variable bound contradictions.
-    for (var sid in bounds) {
-      var b = bounds[sid];
-      if (b.loStrict || b.hiStrict) { if (b.lo >= b.hi) return false; }
-      else { if (b.lo > b.hi) return false; }
-      if (b.eqs.length >= 2) { for (var j = 1; j < b.eqs.length; j++) if (b.eqs[j] !== b.eqs[0]) return false; }
-      if (b.eqs.length >= 1) {
-        for (var k = 0; k < b.neqs.length; k++) if (b.neqs[k] === b.eqs[0]) return false;
-        var ev = b.eqs[0];
-        if (typeof ev === 'number') {
-          if (b.loStrict ? ev <= b.lo : ev < b.lo) return false;
-          if (b.hiStrict ? ev >= b.hi : ev > b.hi) return false;
-        }
-      }
-    }
-    // Check relational constraints via transitive closure.
-    // Build a directed graph: edge from A to B with weight means A + weight <= B (or <).
-    // Use Floyd-Warshall to detect negative cycles (contradiction).
-    // --- String theory: check string property constraints ---
-    // Collect strProp atoms per symbolic variable.
-    var strConstraints = Object.create(null); // symId → [{prop, value}]
-    // Also collect length constraints for string-length correlation.
-    var lengthBounds = Object.create(null); // symId → bounds
-    for (var si = 0; si < atoms.length; si++) {
-      var sa = atoms[si];
-      if (sa.type === 'strProp') {
-        if (!strConstraints[sa.symId]) strConstraints[sa.symId] = [];
-        strConstraints[sa.symId].push({ prop: sa.prop, value: sa.value });
-      }
-      // cmp where left is arith('length', sym, _) and right is const
-      // e.g. x.length === 0
-      if (sa.type === 'cmp' && sa.left && sa.left.type === 'arith' && sa.left.op === 'length' && sa.left.left.type === 'sym' && sa.right.type === 'const') {
-        var _lsId = sa.left.left.id;
-        if (!lengthBounds[_lsId]) lengthBounds[_lsId] = { eqs: [], lo: -Infinity, hi: Infinity };
-        var _lv = sa.right.value;
-        if (typeof _lv === 'number') {
-          switch (sa.op) {
-            case '===': case '==': lengthBounds[_lsId].eqs.push(_lv); break;
-            case '>': lengthBounds[_lsId].lo = Math.max(lengthBounds[_lsId].lo, _lv + 1); break;
-            case '>=': lengthBounds[_lsId].lo = Math.max(lengthBounds[_lsId].lo, _lv); break;
-            case '<': lengthBounds[_lsId].hi = Math.min(lengthBounds[_lsId].hi, _lv - 1); break;
-            case '<=': lengthBounds[_lsId].hi = Math.min(lengthBounds[_lsId].hi, _lv); break;
-          }
-        }
-      }
-      // cmp where left is arith('indexOf', sym, const) and right is const
-      // e.g. x.indexOf("a") >= 0
-      if (sa.type === 'cmp' && sa.left && sa.left.type === 'arith' && sa.left.op === 'indexOf' && sa.left.left.type === 'sym' && sa.left.right.type === 'const' && sa.right.type === 'const') {
-        var _isId = sa.left.left.id;
-        var _idxStr = sa.left.right.value;
-        // indexOf >= 0 means string contains the substring → like includes.
-        if ((sa.op === '>=' && sa.right.value === 0) || (sa.op === '>' && sa.right.value === -1)) {
-          if (!strConstraints[_isId]) strConstraints[_isId] = [];
-          strConstraints[_isId].push({ prop: 'includes', value: _idxStr });
-        }
-      }
-    }
-    // Check string contradictions.
-    for (var scId in strConstraints) {
-      var sc = strConstraints[scId];
-      // startsWith contradictions: two different prefixes where neither is a prefix of the other.
-      var starts = sc.filter(function(c) { return c.prop === 'startsWith'; });
-      for (var s1 = 0; s1 < starts.length; s1++) {
-        for (var s2 = s1 + 1; s2 < starts.length; s2++) {
-          var p1 = starts[s1].value, p2 = starts[s2].value;
-          if (!p1.startsWith(p2) && !p2.startsWith(p1)) return false;
-        }
-      }
-      // endsWith contradictions.
-      var ends = sc.filter(function(c) { return c.prop === 'endsWith'; });
-      for (var e1 = 0; e1 < ends.length; e1++) {
-        for (var e2 = e1 + 1; e2 < ends.length; e2++) {
-          var s1e = ends[e1].value, s2e = ends[e2].value;
-          if (!s1e.endsWith(s2e) && !s2e.endsWith(s1e)) return false;
-        }
-      }
-      // length === 0 contradicts includes/startsWith/endsWith with non-empty string.
-      var lb = lengthBounds[scId];
-      if (lb && lb.eqs.indexOf(0) >= 0) {
-        for (var sci = 0; sci < sc.length; sci++) {
-          if (sc[sci].value && sc[sci].value.length > 0) return false;
-        }
-      }
-      if (lb && lb.hi === 0) {
-        for (var sci2 = 0; sci2 < sc.length; sci2++) {
-          if (sc[sci2].value && sc[sci2].value.length > 0) return false;
-        }
-      }
-    }
-
-    var allIds = Object.keys(bounds).map(Number);
-    for (var ri = 0; ri < relations.length; ri++) {
-      var rel = relations[ri];
-      if (allIds.indexOf(rel.leftId) < 0) allIds.push(rel.leftId);
-      if (allIds.indexOf(rel.rightId) < 0) allIds.push(rel.rightId);
-    }
-    if (relations.length > 0 && allIds.length <= 20) {
-      // Build difference constraints: x OP y → difference bounds.
-      // x > y means x - y > 0, i.e. y - x < 0.
-      // We track: dist[i][j] = max proven lower bound on (var_i - var_j).
-      var n = allIds.length;
-      var idxOf = Object.create(null);
-      for (var ii = 0; ii < n; ii++) idxOf[allIds[ii]] = ii;
-      // dist[i][j] = upper bound on (j - i), i.e. j <= i + dist[i][j].
-      var dist = [];
-      for (var di = 0; di < n; di++) {
-        dist[di] = [];
-        for (var dj = 0; dj < n; dj++) dist[di][dj] = di === dj ? 0 : Infinity;
-      }
-      // Add relational edges.
-      for (var re = 0; re < relations.length; re++) {
-        var r = relations[re];
-        var li = idxOf[r.leftId], ri2 = idxOf[r.rightId];
-        if (li === undefined || ri2 === undefined) continue;
-        // x > y → y - x < 0 → dist[x][y] = min(dist[x][y], -1) (strict)
-        // x >= y → y - x <= 0 → dist[x][y] = min(dist[x][y], 0)
-        // x < y → x - y < 0 → dist[y][x] = min(dist[y][x], -1)
-        // x <= y → x - y <= 0 → dist[y][x] = min(dist[y][x], 0)
-        // x == y → both directions = 0
-        switch (r.op) {
-          case '>': dist[li][ri2] = Math.min(dist[li][ri2], -1); break;
-          case '>=': dist[li][ri2] = Math.min(dist[li][ri2], 0); break;
-          case '<': dist[ri2][li] = Math.min(dist[ri2][li], -1); break;
-          case '<=': dist[ri2][li] = Math.min(dist[ri2][li], 0); break;
-          case '===': case '==':
-            dist[li][ri2] = Math.min(dist[li][ri2], 0);
-            dist[ri2][li] = Math.min(dist[ri2][li], 0);
-            break;
-        }
-      }
-      // Also add const bounds as edges to a virtual "zero" node — not needed for
-      // pure relational contradictions but helps with mixed constraints.
-      // Floyd-Warshall: find shortest paths (min weights).
-      for (var fk = 0; fk < n; fk++) {
-        for (var fi = 0; fi < n; fi++) {
-          for (var fj = 0; fj < n; fj++) {
-            if (dist[fi][fk] + dist[fk][fj] < dist[fi][fj]) {
-              dist[fi][fj] = dist[fi][fk] + dist[fk][fj];
-            }
-          }
-        }
-      }
-      // Negative cycle on diagonal = contradiction.
-      for (var ci = 0; ci < n; ci++) {
-        if (dist[ci][ci] < 0) return false;
-      }
-    }
-    return true;
+      var api = await initFn();
+      var ctx = api.Context('htmldom');
+      _z3 = { api: api, Context: ctx, Solver: ctx.Solver };
+      return _z3;
+    })();
+    return _z3Promise;
   }
 
-  // --- Main satisfiability checker ---
-  function smtSat(formula) {
+  // --- SMT-LIB serializer ---
+  // Builds a `(declare-const ...) (assert ...)` SMT-LIB 2 string from the
+  // internal SMT formula AST and feeds it to Z3 via solver.fromString.
+  // Using SMT-LIB strings (rather than the JS AST wrappers) keeps Z3's
+  // WASM heap free of per-call AST objects so the solver doesn't leak
+  // memory or trip its internal assertions over thousands of calls.
+  function _smtCollectSymsAndSorts(f, syms, sorts) {
+    if (!f || typeof f !== 'object') return;
+    if (f.type === 'sym') {
+      if (!(f.name in syms)) syms[f.name] = true;
+      if (!(f.name in sorts)) sorts[f.name] = 'Int';
+      return;
+    }
+    if (f.type === 'const') return;
+    if (f.type === 'not') { _smtCollectSymsAndSorts(f.arg, syms, sorts); return; }
+    if (f.type === 'and' || f.type === 'or') {
+      _smtCollectSymsAndSorts(f.left, syms, sorts);
+      _smtCollectSymsAndSorts(f.right, syms, sorts);
+      return;
+    }
+    if (f.type === 'cmp') {
+      if (f.left && f.left.type === 'sym' && f.right && f.right.type === 'const' && typeof f.right.value === 'string') sorts[f.left.name] = 'String';
+      if (f.right && f.right.type === 'sym' && f.left && f.left.type === 'const' && typeof f.left.value === 'string') sorts[f.right.name] = 'String';
+      _smtCollectSymsAndSorts(f.left, syms, sorts);
+      _smtCollectSymsAndSorts(f.right, syms, sorts);
+      return;
+    }
+    if (f.type === 'arith') {
+      if ((f.op === 'length' || f.op === 'indexOf') && f.left && f.left.type === 'sym') sorts[f.left.name] = 'String';
+      _smtCollectSymsAndSorts(f.left, syms, sorts);
+      _smtCollectSymsAndSorts(f.right, syms, sorts);
+      return;
+    }
+    if (f.type === 'strProp') {
+      for (var n in _symNameMap) {
+        if (_symNameMap[n] === f.symId) { syms[n] = true; sorts[n] = 'String'; break; }
+      }
+      return;
+    }
+  }
+  function _quoteSmtName(s) { return '|' + s.replace(/\|/g, '_') + '|'; }
+  function _quoteSmtString(s) { return '"' + s.replace(/"/g, '""') + '"'; }
+  // Emit an SMT-LIB s-expression for a formula. `boolPos` is true when
+  // the result must be a Bool (i.e. inside and/or/not or at the
+  // top-level assertion); false when the result must be a value (left
+  // or right of cmp/arith). Symbols are declared with one sort and
+  // coerced to bool when they appear in boolean position.
+  function _smtToSExpr(f, sorts, boolPos) {
+    if (!f) return boolPos ? 'true' : '0';
+    if (f.type === 'const') {
+      if (typeof f.value === 'boolean') return f.value ? 'true' : 'false';
+      if (typeof f.value === 'number') {
+        var n = f.value < 0 ? '(- ' + (-f.value) + ')' : String(f.value);
+        if (boolPos) return '(not (= ' + n + ' 0))';
+        return n;
+      }
+      if (typeof f.value === 'string') {
+        var sv = _quoteSmtString(f.value);
+        if (boolPos) return '(not (= ' + sv + ' ""))';
+        return sv;
+      }
+      return boolPos ? 'true' : '0';
+    }
+    if (f.type === 'sym') {
+      var sx = _quoteSmtName(f.name);
+      if (boolPos) {
+        var sort = sorts[f.name] || 'Int';
+        if (sort === 'String') return '(not (= ' + sx + ' ""))';
+        return '(not (= ' + sx + ' 0))';
+      }
+      return sx;
+    }
+    if (f.type === 'not') return '(not ' + _smtToSExpr(f.arg, sorts, true) + ')';
+    if (f.type === 'and') return '(and ' + _smtToSExpr(f.left, sorts, true) + ' ' + _smtToSExpr(f.right, sorts, true) + ')';
+    if (f.type === 'or')  return '(or '  + _smtToSExpr(f.left, sorts, true) + ' ' + _smtToSExpr(f.right, sorts, true) + ')';
+    if (f.type === 'cmp') {
+      var op = f.op;
+      var L = _smtToSExpr(f.left, sorts, false), R = _smtToSExpr(f.right, sorts, false);
+      if (op === '<')  return '(< '  + L + ' ' + R + ')';
+      if (op === '>')  return '(> '  + L + ' ' + R + ')';
+      if (op === '<=') return '(<= ' + L + ' ' + R + ')';
+      if (op === '>=') return '(>= ' + L + ' ' + R + ')';
+      if (op === '==' || op === '===') return '(= ' + L + ' ' + R + ')';
+      if (op === '!=' || op === '!==') return '(not (= ' + L + ' ' + R + '))';
+      return 'true';
+    }
+    if (f.type === 'arith') {
+      var aop = f.op;
+      var La = _smtToSExpr(f.left, sorts, false), Ra = _smtToSExpr(f.right, sorts, false);
+      if (aop === '+') return '(+ ' + La + ' ' + Ra + ')';
+      if (aop === '-') return '(- ' + La + ' ' + Ra + ')';
+      if (aop === '*') return '(* ' + La + ' ' + Ra + ')';
+      if (aop === '/') return '(div ' + La + ' ' + Ra + ')';
+      if (aop === '%') return '(mod ' + La + ' ' + Ra + ')';
+      if (aop === 'length' && f.left && f.left.type === 'sym') return '(str.len ' + La + ')';
+      if (aop === 'indexOf' && f.left && f.left.type === 'sym' && f.right && f.right.type === 'const' && typeof f.right.value === 'string') {
+        return '(str.indexof ' + La + ' ' + _quoteSmtString(f.right.value) + ' 0)';
+      }
+      return '0';
+    }
+    if (f.type === 'strProp') {
+      var symName = null;
+      for (var nn in _symNameMap) {
+        if (_symNameMap[nn] === f.symId) { symName = nn; break; }
+      }
+      if (!symName) return boolPos ? 'true' : '0';
+      var v = _quoteSmtString(f.value);
+      var sxx = _quoteSmtName(symName);
+      if (f.prop === 'startsWith') return '(str.prefixof ' + v + ' ' + sxx + ')';
+      if (f.prop === 'endsWith')   return '(str.suffixof ' + v + ' ' + sxx + ')';
+      if (f.prop === 'includes')   return '(str.contains ' + sxx + ' ' + v + ')';
+      return boolPos ? 'true' : '0';
+    }
+    return boolPos ? 'true' : '0';
+  }
+  function _formulaToSmtLib(formula) {
+    var syms = Object.create(null);
+    var sorts = Object.create(null);
+    _smtCollectSymsAndSorts(formula, syms, sorts);
+    var decls = '';
+    for (var name in syms) {
+      decls += '(declare-const ' + _quoteSmtName(name) + ' ' + (sorts[name] || 'Int') + ')\n';
+    }
+    return decls + '(assert ' + _smtToSExpr(formula, sorts, true) + ')\n';
+  }
+
+  // --- Main satisfiability checker (Z3) ---
+  // Every formula goes through Z3. There is no fallback solver.
+  async function smtSat(formula) {
     if (!formula) return true;
-    var nnf = smtNNF(formula);
-    if (!nnf) return true;
-    if (nnf.type === 'const') return !!nnf.value;
-    if (nnf.type === 'sym') return true;
-    // Try to collect atoms from pure conjunction.
-    var atoms = smtCollectAtoms(nnf);
-    if (atoms !== null) return smtTheorySat(atoms);
-    // Disjunction: at least one branch must be satisfiable.
-    if (nnf.type === 'or') return smtSat(nnf.left) || smtSat(nnf.right);
-    // Conjunction with nested OR: distribute AND over OR (DNF conversion).
-    // A ∧ (B ∨ C) = (A ∧ B) ∨ (A ∧ C). Check each conjunct.
-    if (nnf.type === 'and') {
-      var orChild = null, otherChild = null;
-      if (nnf.left.type === 'or') { orChild = nnf.left; otherChild = nnf.right; }
-      else if (nnf.right.type === 'or') { orChild = nnf.right; otherChild = nnf.left; }
-      if (orChild) {
-        return smtSat(smtAnd(otherChild, orChild.left)) || smtSat(smtAnd(otherChild, orChild.right));
-      }
-      // Nested AND with deeper OR: flatten and retry.
-      // Collect all conjuncts, find the first OR, distribute.
-      var conjuncts = [];
-      var _flatAnd = function(f) { if (f.type === 'and') { _flatAnd(f.left); _flatAnd(f.right); } else conjuncts.push(f); };
-      _flatAnd(nnf);
-      for (var ci = 0; ci < conjuncts.length; ci++) {
-        if (conjuncts[ci].type === 'or') {
-          var rest = null;
-          for (var cj = 0; cj < conjuncts.length; cj++) {
-            if (cj !== ci) rest = rest ? smtAnd(rest, conjuncts[cj]) : conjuncts[cj];
-          }
-          return smtSat(smtAnd(rest, conjuncts[ci].left)) || smtSat(smtAnd(rest, conjuncts[ci].right));
-        }
-      }
-    }
-    // Comparison with concrete operands.
-    if (nnf.type === 'cmp' && nnf.left.type === 'const' && nnf.right.type === 'const') {
-      var l = nnf.left.value, r = nnf.right.value;
-      switch (nnf.op) {
-        case '<': return l < r; case '>': return l > r;
-        case '<=': return l <= r; case '>=': return l >= r;
-        case '==': case '===': return l === r;
-        case '!=': case '!==': return l !== r;
-      }
-    }
-    return true;
+    var z3 = await _initZ3();
+    var smtlib = _formulaToSmtLib(formula);
+    var solver = new z3.Solver();
+    solver.fromString(smtlib);
+    var result = await solver.check();
+    return result !== 'unsat';
   }
-
   // --- Condition parser: raw JS tokens → SMT formula ---
   // Operator precedence: || < && < comparisons < atoms
   var _cmpOps = { '<':1, '>':1, '<=':1, '>=':1, '==':1, '!=':1, '===':1, '!==':1 };
 
-  function smtParseExpr(toks, start, end, resolveFunc, resolvePathFunc) {
+  async function smtParseExpr(toks, start, end, resolveFunc, resolvePathFunc) {
     if (start >= end) return null;
     // Find lowest-precedence binary operator at depth 0.
     // Precedence (low→high): || < && < comparisons < +/- < */% < atoms
@@ -795,18 +641,17 @@
       else if ((toks[i].type === 'op' && (tt === '-')) || (toks[i].type === 'plus')) { lastAdd = i; lastAddOp = tt === '-' ? '-' : '+'; }
       else if (toks[i].type === 'op' && (tt === '*' || tt === '/' || tt === '%')) { lastMul = i; lastMulOp = tt; }
     }
-    if (lastOr >= 0) return smtOr(smtParseExpr(toks, start, lastOr, resolveFunc, resolvePathFunc), smtParseExpr(toks, lastOr + 1, end, resolveFunc, resolvePathFunc));
-    if (lastAnd >= 0) return smtAnd(smtParseExpr(toks, start, lastAnd, resolveFunc, resolvePathFunc), smtParseExpr(toks, lastAnd + 1, end, resolveFunc, resolvePathFunc));
+    if (lastOr >= 0) return smtOr(await smtParseExpr(toks, start, lastOr, resolveFunc, resolvePathFunc), await smtParseExpr(toks, lastOr + 1, end, resolveFunc, resolvePathFunc));
+    if (lastAnd >= 0) return smtAnd(await smtParseExpr(toks, start, lastAnd, resolveFunc, resolvePathFunc), await smtParseExpr(toks, lastAnd + 1, end, resolveFunc, resolvePathFunc));
     if (lastCmp >= 0) {
-      var cl = smtParseExpr(toks, start, lastCmp, resolveFunc, resolvePathFunc);
-      var cr = smtParseExpr(toks, lastCmp + 1, end, resolveFunc, resolvePathFunc);
+      var cl = await smtParseExpr(toks, start, lastCmp, resolveFunc, resolvePathFunc);
+      var cr = await smtParseExpr(toks, lastCmp + 1, end, resolveFunc, resolvePathFunc);
       return (cl && cr) ? smtCmp(lastCmpOp, cl, cr) : null;
     }
     if (lastAdd >= 0) {
-      var al = smtParseExpr(toks, start, lastAdd, resolveFunc, resolvePathFunc);
-      var ar = smtParseExpr(toks, lastAdd + 1, end, resolveFunc, resolvePathFunc);
+      var al = await smtParseExpr(toks, start, lastAdd, resolveFunc, resolvePathFunc);
+      var ar = await smtParseExpr(toks, lastAdd + 1, end, resolveFunc, resolvePathFunc);
       if (al && ar) {
-        // Fold const + const.
         if (al.type === 'const' && ar.type === 'const' && typeof al.value === 'number' && typeof ar.value === 'number') {
           return smtConst(lastAddOp === '+' ? al.value + ar.value : al.value - ar.value);
         }
@@ -814,8 +659,8 @@
       }
     }
     if (lastMul >= 0) {
-      var ml = smtParseExpr(toks, start, lastMul, resolveFunc, resolvePathFunc);
-      var mr = smtParseExpr(toks, lastMul + 1, end, resolveFunc, resolvePathFunc);
+      var ml = await smtParseExpr(toks, start, lastMul, resolveFunc, resolvePathFunc);
+      var mr = await smtParseExpr(toks, lastMul + 1, end, resolveFunc, resolvePathFunc);
       if (ml && mr) {
         if (ml.type === 'const' && mr.type === 'const' && typeof ml.value === 'number' && typeof mr.value === 'number') {
           if (lastMulOp === '*') return smtConst(ml.value * mr.value);
@@ -825,21 +670,21 @@
         return smtArith(lastMulOp, ml, mr);
       }
     }
-    return smtParseAtom(toks, start, end, resolveFunc, resolvePathFunc);
+    return await smtParseAtom(toks, start, end, resolveFunc, resolvePathFunc);
   }
 
-  function smtParseAtom(toks, start, end, resolveFunc, resolvePathFunc) {
+  async function smtParseAtom(toks, start, end, resolveFunc, resolvePathFunc) {
     if (start >= end) return null;
     // NOT prefix.
     if (toks[start].type === 'op' && toks[start].text === '!') {
-      var inner = smtParseAtom(toks, start + 1, end, resolveFunc, resolvePathFunc);
+      var inner = await smtParseAtom(toks, start + 1, end, resolveFunc, resolvePathFunc);
       return inner ? smtNot(inner) : null;
     }
     // Parenthesized.
     if (toks[start].type === 'open' && toks[start].char === '(') {
       var d2 = 1, j2 = start + 1;
       while (j2 < end && d2 > 0) { if (toks[j2].type === 'open') d2++; if (toks[j2].type === 'close') d2--; j2++; }
-      return smtParseExpr(toks, start + 1, j2 - 1, resolveFunc, resolvePathFunc);
+      return await smtParseExpr(toks, start + 1, j2 - 1, resolveFunc, resolvePathFunc);
     }
     // Single token.
     if (end === start + 1) {
@@ -855,7 +700,7 @@
         // Identifier: check if symbolic (tainted / event-modified).
         var root = t.text.split('.')[0];
         if (IDENT_RE.test(root)) {
-          var rb = resolveFunc(root);
+          var rb = await resolveFunc(root);
           if (rb) {
             // Check root binding for taint (recursive into arrays/objects).
             var _hasTaint = function(b) {
@@ -878,7 +723,7 @@
             }
           }
           // Resolve full path to concrete value.
-          var fb = resolvePathFunc(t.text);
+          var fb = await resolvePathFunc(t.text);
           if (fb && fb.kind === 'chain' && fb.toks.length === 1 && fb.toks[0].type === 'str') {
             var fv = fb.toks[0].text;
             if (fv === 'true') return smtConst(true);
@@ -901,7 +746,7 @@
         var _mMethod = _mPath.slice(_mDot + 1);
         // Resolve the base to check if it's symbolic.
         var _mRoot = _mBase.split('.')[0];
-        var _mRb = resolveFunc(_mRoot);
+        var _mRb = await resolveFunc(_mRoot);
         var _mIsSym = false;
         if (_mRb) {
           var _ht = function(b) { if (!b) return false; if (b.kind==='chain') return !!collectChainTaint(b.toks); if (b.kind==='array') { for (var e=0;e<b.elems.length;e++) if (_ht(b.elems[e])) return true; } if (b.kind==='object') { for (var k in b.props) if (_ht(b.props[k])) return true; } return false; };
@@ -930,7 +775,7 @@
     if (end === start + 1 && toks[start].type === 'other' && toks[start].text.endsWith('.length')) {
       var _lBase = toks[start].text.slice(0, -7);
       var _lRoot = _lBase.split('.')[0];
-      var _lRb = resolveFunc(_lRoot);
+      var _lRb = await resolveFunc(_lRoot);
       if (_lRb) {
         var _lt = function(b) { if (!b) return false; if (b.kind==='chain') return !!collectChainTaint(b.toks); if (b.kind==='array') { for (var e=0;e<b.elems.length;e++) if (_lt(b.elems[e])) return true; } if (b.kind==='object') { for (var k in b.props) if (_lt(b.props[k])) return true; } return false; };
         if (_lt(_lRb)) return smtArith('length', smtSym(_lBase), smtConst(0));
@@ -943,8 +788,8 @@
   // condTokens: raw JS tokens of the condition expression
   // pathConstraintStack: array of SMT formulas from enclosing branches
   // Returns { sat, unsat } or null if purely concrete.
-  function smtCheckCondition(condTokens, resolveFunc, resolvePathFunc, pathConstraintStack) {
-    var formula = smtParseExpr(condTokens, 0, condTokens.length, resolveFunc, resolvePathFunc);
+  async function smtCheckCondition(condTokens, resolveFunc, resolvePathFunc, pathConstraintStack) {
+    var formula = await smtParseExpr(condTokens, 0, condTokens.length, resolveFunc, resolvePathFunc);
     if (!formula) return null;
     // Combine with path constraints: the full context is
     // pathConstraint[0] ∧ pathConstraint[1] ∧ ... ∧ formula
@@ -961,7 +806,9 @@
       context = smtAnd(pathConj, formula);
       negContext = smtAnd(pathConj, smtNot(formula));
     }
-    return { sat: smtSat(context), unsat: smtSat(negContext) };
+    var sat = await smtSat(context);
+    var unsat = await smtSat(negContext);
+    return { sat: sat, unsat: unsat };
   }
 
   // -----------------------------------------------------------------------
@@ -977,11 +824,11 @@
   //   - ops:      the sequence of DOM operations the script performs
   //   - roots:    elements that weren't appended to another tracked element
   //   - html:     a per-element HTML serialization (best-effort)
-  function extractAllDOM(input) {
+  async function extractAllDOM(input) {
     const trimmed = input.trim();
     if (!trimmed) return { elements: [], ops: [], roots: [], html: {} };
     const tokens = tokenize(trimmed);
-    const state = buildScopeState(tokens, tokens.length, scanMutations(tokens));
+    const state = await buildScopeState(tokens, tokens.length, scanMutations(tokens));
     const elements = state.domElements;
     const roots = elements.filter((el) => !el.attached);
     const html = {};
@@ -1112,7 +959,7 @@
     return out;
   }
 
-  function extractAllHTML(input) {
+  async function extractAllHTML(input) {
     const trimmed = input.trim();
     if (!trimmed) return [];
     const tokens = tokenize(trimmed);
@@ -1121,7 +968,7 @@
     // Extract each assignment independently first.
     const singles = [];
     for (const assign of assigns) {
-      const result = extractOneAssignment(tokens, assign);
+      const result = await extractOneAssignment(tokens, assign);
       if (!result) continue;
       result.srcStart = assign.srcStart;
       result.srcEnd = assign.srcEnd;
@@ -1201,7 +1048,7 @@
       // Build scope state with all build vars tracked.
       const lastAssign = group[group.length - 1]._assign;
       const extMut = scanMutations(tokens);
-      const state = buildScopeState(tokens, lastAssign.rhsStart, extMut, allBuildVars);
+      const state = await buildScopeState(tokens, lastAssign.rhsStart, extMut, allBuildVars);
 
       // Extract each build var's chain, expand loopVars, and build
       // a mapping of varName → expanded chain.
@@ -1308,7 +1155,7 @@
   // Produce a { target, assignProp, assignOp, chainTokens, ... } record
   // for a single innerHTML/outerHTML assignment located in `tokens`.
   // Returns null if the target is known to NOT be a DOM element.
-  function extractOneAssignment(tokens, assign) {
+  async function extractOneAssignment(tokens, assign) {
     const target = assign.target;
     const assignProp = assign.prop;
     const assignOp = assign.op;
@@ -1345,7 +1192,7 @@
       if (isBuildVar) buildVars.push(rt.text);
     }
     const buildVar = buildVars.length === 1 ? buildVars[0] : null;
-    const r = resolveIdentifiers(tokens, assign.rhsStart, assign.rhsEnd, buildVars.length ? buildVars : null);
+    const r = await resolveIdentifiers(tokens, assign.rhsStart, assign.rhsEnd, buildVars.length ? buildVars : null);
 
     // Verify the target is not a known non-element. Extract the base
     // variable name from the target (e.g. "el" from "el.innerHTML").
@@ -1411,7 +1258,7 @@
     return { target, assignProp, assignOp, chainTokens: r.tokens };
   }
 
-  function extractHTML(input) {
+  async function extractHTML(input) {
     const trimmed = input.trim();
     if (!trimmed) return { target: null, assignProp: null, assignOp: null, chainTokens: [] };
     if (trimmed.startsWith('<')) return { target: null, assignProp: null, assignOp: null, chainTokens: [{ type: 'str', text: trimmed }] };
@@ -1428,7 +1275,7 @@
     // Resolve identifier references inside the RHS using the scope state at
     // the assignment site.
     if (assign) {
-      const result = extractOneAssignment(tokens, assign);
+      const result = await extractOneAssignment(tokens, assign);
       // If target is a known non-element, fall through to no-innerHTML path.
       if (result) return result;
     }
@@ -1441,7 +1288,7 @@
       (t.type === 'tmpl') ||
       (t.type === 'plus'));
     if (hasHtmlHint) {
-      const r = resolveIdentifiers(tokens, 0, tokens.length);
+      const r = await resolveIdentifiers(tokens, 0, tokens.length);
       if (r.parsed) {
         return { target, assignProp, assignOp, chainTokens: r.tokens, loopInfoMap: r.loopInfo };
       }
@@ -1907,7 +1754,7 @@
     return externallyMutable;
   }
 
-  function buildScopeState(tokens, stopAt, externallyMutable, trackBuildVarInit, taintConfig) {
+  async function buildScopeState(tokens, stopAt, externallyMutable, trackBuildVarInit, taintConfig) {
     const stack = [{ bindings: Object.create(null), isFunction: true }];
     let pendingFunctionBrace = false;
     let pendingFunctionParams = null;
@@ -2220,7 +2067,7 @@
     // Walk a dotted path ('obj.a.b') resolving into object/array/chain
     // bindings. Handles `.length` specially on arrays and on chains whose
     // operands are all known string/template literals.
-    const resolvePath = (path) => {
+    const resolvePath = async (path) => {
       const parts = path.split('.');
       let b = resolve(parts[0]);
       for (let i = 1; i < parts.length && b; i++) {
@@ -2229,7 +2076,7 @@
           // Check for getter: __getter_prop is a function that returns the value.
           var _getter = b.props['__getter_' + p];
           if (_getter && _getter.kind === 'function') {
-            var _getResult = instantiateFunction(_getter, []);
+            var _getResult = await instantiateFunction(_getter, []);
             if (_getResult && _getResult.kind) b = _getResult;
             else if (_getResult) b = chainBinding(_getResult);
             else b = null;
@@ -2269,7 +2116,7 @@
     };
     // Flatten a binding to plain text if possible (all parts are string
     // literals or templates whose exprs all resolve). Returns null otherwise.
-    const bindingToText = (b) => {
+    const bindingToText = async (b) => {
       if (!b) return null;
       if (b.kind !== 'chain') return null;
       let text = '';
@@ -2277,7 +2124,7 @@
         if (t.type === 'plus') continue;
         if (t.type === 'str') { text += t.text; continue; }
         if (t.type === 'tmpl') {
-          const rw = templateToText(t);
+          const rw = await templateToText(t);
           if (rw === null) return null;
           text += rw;
           continue;
@@ -2288,12 +2135,12 @@
     };
     // Re-tokenize an expression source string and parse it as a concat chain
     // using the in-scope bindings. Returns the chain token list or null.
-    const evalExprSrc = (src) => {
+    const evalExprSrc = async (src) => {
       const exprTokens = tokenize(src);
       if (!exprTokens.length) return null;
       const saved = tks;
       tks = exprTokens;
-      const r = readConcatExpr(0, exprTokens.length, TERMS_NONE);
+      const r = await readConcatExpr(0, exprTokens.length, TERMS_NONE);
       tks = saved;
       if (!r || r.next !== exprTokens.length) return null;
       return r.toks;
@@ -2301,24 +2148,24 @@
 
     // Rewrite a template literal as plain text by resolving each ${expr}.
     // Returns null if any expr can't be resolved to plain text.
-    const templateToText = (tok) => {
+    const templateToText = async (tok) => {
       let text = '';
       for (const p of tok.parts) {
         if (p.kind === 'text') { text += decodeJsString(p.raw, '`'); continue; }
         // Fast path: bare identifier/member path.
         if (TEMPLATE_EXPR_PATH_RE.test(p.expr)) {
           const path = p.expr.replace(/\s+/g, '');
-          const b = resolvePath(path);
+          const b = await resolvePath(path);
           if (!b) return null;
-          const t2 = bindingToText(b);
+          const t2 = await bindingToText(b);
           if (t2 === null) return null;
           text += t2;
           continue;
         }
         // General expression: re-tokenize and evaluate as a concat chain.
-        const chain = evalExprSrc(p.expr);
+        const chain = await evalExprSrc(p.expr);
         if (!chain) return null;
-        const t2 = bindingToText(chainBinding(chain));
+        const t2 = await bindingToText(chainBinding(chain));
         if (t2 === null) return null;
         text += t2;
       }
@@ -2326,10 +2173,10 @@
     };
     // Rewrite a tmpl token in place to inline every resolvable expr; falls
     // back to the original token if any expr can't be resolved.
-    const rewriteTemplate = (tok) => {
+    const rewriteTemplate = async (tok) => {
       if (tok.type !== 'tmpl') return tok;
       // All-resolvable fast path: full text.
-      const asText = templateToText(tok);
+      const asText = await templateToText(tok);
       if (asText !== null) return makeSynthStr(asText);
       // Partial rewrite: replace resolvable exprs with their plain text, keep
       // others. Coalesce adjacent text parts afterward.
@@ -2341,10 +2188,10 @@
         var _tmplChain = null;
         if (TEMPLATE_EXPR_PATH_RE.test(p.expr)) {
           const path = p.expr.replace(/\s+/g, '');
-          const b = resolvePath(path);
-          if (b) { resolvedText = bindingToText(b); if (b.kind === 'chain') _tmplChain = b.toks; }
+          const b = await resolvePath(path);
+          if (b) { resolvedText = await bindingToText(b); if (b.kind === 'chain') _tmplChain = b.toks; }
         } else {
-          const chain = evalExprSrc(p.expr);
+          const chain = await evalExprSrc(p.expr);
           _tmplChain = chain;
           if (chain) {
             // Check if the chain contains structured tokens (cond, trycatch, switch).
@@ -2371,7 +2218,7 @@
               // Return a synthetic chain token that expandChain can handle.
               return { type: '_chain', toks: out };
             }
-            resolvedText = bindingToText(chainBinding(chain));
+            resolvedText = await bindingToText(chainBinding(chain));
           }
         }
         if (resolvedText !== null) {
@@ -2565,9 +2412,9 @@
     // Resolve a default-value token range to a binding. Falls through to a
     // chain reference if the expression isn't foldable, so the name still
     // binds to *something* deterministic rather than null.
-    const resolveDefault = (dflt) => {
+    const resolveDefault = async (dflt) => {
       if (!dflt) return null;
-      const r = readValue(dflt.start, dflt.end, null);
+      const r = await readValue(dflt.start, dflt.end, null);
       if (r && r.binding) return r.binding;
       const toks = [];
       for (let j = dflt.start; j < dflt.end; j++) toks.push(tks[j]);
@@ -2575,17 +2422,17 @@
     };
 
     // Bind names from `pattern` by walking into `source` (a binding).
-    const applyPatternBindings = (pattern, source, bind) => {
+    const applyPatternBindings = async (pattern, source, bind) => {
       if (pattern.kind === 'obj-pattern') {
         const props = source && source.kind === 'object' ? source.props : null;
         const seen = Object.create(null);
         for (const entry of pattern.entries) {
           seen[entry.key] = true;
           let val = props ? (props[entry.key] || null) : null;
-          if (val === null && entry.dflt) val = resolveDefault(entry.dflt);
+          if (val === null && entry.dflt) val = await resolveDefault(entry.dflt);
           if (entry.nested) {
             // Nested destructuring: recursively apply pattern.
-            applyPatternBindings(entry.nested, val, bind);
+            await applyPatternBindings(entry.nested, val, bind);
           } else {
             bind(entry.name, val);
           }
@@ -2609,7 +2456,7 @@
           const entry = pattern.entries[i];
           if (entry === null) continue;
           let val = elems ? (elems[i] || null) : null;
-          if (val === null && entry.dflt) val = resolveDefault(entry.dflt);
+          if (val === null && entry.dflt) val = await resolveDefault(entry.dflt);
           bind(entry.name, val);
         }
         if (pattern.rest) {
@@ -2632,19 +2479,19 @@
     const _resultSlot = { value: null, has: false };
     const _completeFrame = (result) => { _evalStack.pop(); _resultSlot.value = result; _resultSlot.has = true; };
     const _consumeResult = () => { if (!_resultSlot.has) return undefined; const v = _resultSlot.value; _resultSlot.value = null; _resultSlot.has = false; return v; };
-    const _evalLoop = () => {
+    const _evalLoop = async () => {
       const baseDepth = _evalStack.length - 1;
       while (_evalStack.length > baseDepth) {
         const _f = _evalStack[_evalStack.length - 1];
         switch (_f.type) {
-          case 'READ_ARRAY_LIT':         _stepReadArrayLit(_f); break;
-          case 'READ_OBJECT_LIT':        _stepReadObjectLit(_f); break;
-          case 'READ_CALL_ARG_BINDINGS': _stepReadCallArgBindings(_f); break;
+          case 'READ_ARRAY_LIT':         await _stepReadArrayLit(_f); break;
+          case 'READ_OBJECT_LIT':        await _stepReadObjectLit(_f); break;
+          case 'READ_CALL_ARG_BINDINGS': await _stepReadCallArgBindings(_f); break;
           case 'READ_CONCAT_ARGS':       _stepReadConcatArgs(_f); break;
-          case 'READ_CALL_ARG_BINDINGS': _stepReadCallArgBindings(_f); break;
+          case 'READ_CALL_ARG_BINDINGS': await _stepReadCallArgBindings(_f); break;
           case 'READ_CONCAT_ARGS':       _stepReadConcatArgs(_f); break;
-          case 'READ_VALUE':             { const r = readValue(_f.k, _f.stop, _f.terms); _completeFrame(r); break; }
-          case 'READ_CONCAT_EXPR':       { const r = readConcatExpr(_f.i, _f.stop, _f.terms); _completeFrame(r); break; }
+          case 'READ_VALUE':             { const r = await readValue(_f.k, _f.stop, _f.terms); _completeFrame(r); break; }
+          case 'READ_CONCAT_EXPR':       { const r = await readConcatExpr(_f.i, _f.stop, _f.terms); _completeFrame(r); break; }
           default: _completeFrame(null); break;
         }
       }
@@ -2654,12 +2501,12 @@
     // Read an object literal `{ key: value, ... }` starting at index `k`.
     // Keys are bare identifiers or quoted strings. Values are any readValue
     // (chain, nested object, or nested array). Returns { binding, next }.
-    const readObjectLit = (k, stop) => {
+    const readObjectLit = async (k, stop) => {
       if (!tks[k] || tks[k].type !== 'open' || tks[k].char !== '{') return null;
       _evalStack.push({ type: 'READ_OBJECT_LIT', i: k + 1, stop, props: Object.create(null), _waitingKey: null });
-      return _evalLoop();
+      return await _evalLoop();
     };
-    const _stepReadObjectLit = (frame) => {
+    const _stepReadObjectLit = async (frame) => {
       // Consume child result based on resume phase
       if (_resultSlot.has) {
         if (frame._rp === 'val') {
@@ -2683,7 +2530,7 @@
         if (tk.type === 'close' && tk.char === '}') break;
         if (tk.type === 'other' && tk.text.startsWith('...')) {
           const name = tk.text.slice(3);
-          if (IDENT_OR_PATH_RE.test(name)) { const b = resolvePath(name); if (b && b.kind === 'object') { for (const kk in b.props) props[kk] = b.props[kk]; frame.i++; const sep = tks[frame.i]; if (sep && sep.type === 'sep' && sep.char === ',') { frame.i++; continue; } break; } }
+          if (IDENT_OR_PATH_RE.test(name)) { const b = await resolvePath(name); if (b && b.kind === 'object') { for (const kk in b.props) props[kk] = b.props[kk]; frame.i++; const sep = tks[frame.i]; if (sep && sep.type === 'sep' && sep.char === ',') { frame.i++; continue; } break; } }
           _completeFrame(null); return;
         }
         var keyName = frame._pendingKey || null; frame._pendingKey = null;
@@ -2744,12 +2591,12 @@
     };
 
     // Read an array literal `[ v, v, ... ]`. Returns { binding, next } or null.
-    const readArrayLit = (k, stop) => {
+    const readArrayLit = async (k, stop) => {
       if (!tks[k] || tks[k].type !== 'open' || tks[k].char !== '[') return null;
       _evalStack.push({ type: 'READ_ARRAY_LIT', i: k + 1, stop, elems: [] });
-      return _evalLoop();
+      return await _evalLoop();
     };
-    const _stepReadArrayLit = (frame) => {
+    const _stepReadArrayLit = async (frame) => {
       if (_resultSlot.has) {
         const val = _consumeResult();
         if (!val) { _completeFrame(null); return; }
@@ -2766,7 +2613,7 @@
         if (tk.type === 'other' && tk.text.startsWith('...')) {
           const name = tk.text.slice(3);
           if (IDENT_OR_PATH_RE.test(name)) {
-            const b = resolvePath(name);
+            const b = await resolvePath(name);
             if (b && b.kind === 'array') { for (const e of b.elems) frame.elems.push(e); frame.i++; const sep = tks[frame.i]; if (sep && sep.type === 'sep' && sep.char === ',') { frame.i++; continue; } break; }
           }
           _completeFrame(null); return;
@@ -2850,7 +2697,7 @@
     // parsing. Returns { binding, next } or null.
     // Parse a function expression: function [name](params) { body }.
     // Returns { binding: functionBinding, next } or null.
-    const readFunctionExpr = (k, stop) => {
+    const readFunctionExpr = async (k, stop) => {
       var ft = tks[k];
       if (!ft || ft.type !== 'other' || ft.text !== 'function') return null;
       var fk = k + 1;
@@ -2905,11 +2752,11 @@
       return { binding: functionBinding(params, fj, bodyEnd, true), next: bodyEnd };
     };
 
-    const readValue = (k, stop, terms) => {
+    const readValue = async (k, stop, terms) => {
       const t = tks[k];
       if (!t) return null;
       // Function expression: function(params) { body }
-      var fnExpr = readFunctionExpr(k, stop);
+      var fnExpr = await readFunctionExpr(k, stop);
       if (fnExpr) return fnExpr;
       // Arrow function (it can start with `(` or with an ident).
       const arrow = peekArrow(k, stop);
@@ -2927,31 +2774,31 @@
       // the RHS is a bare literal or member access. If the next top-level
       // token is `+`, escalate to concat-chain parsing so the result
       // becomes the first operand.
-      const arith = parseArithExpr(k, stop, 0);
+      const arith = await parseArithExpr(k, stop, 0);
       if (arith && arith.bind) {
         const nt = tks[arith.next];
         if (nt && nt.type === 'plus') {
-          const r = readConcatExpr(k, stop, terms);
+          const r = await readConcatExpr(k, stop, terms);
           if (r) return { binding: chainBinding(r.toks), next: r.next };
         }
         return { binding: arith.bind, next: arith.next };
       }
       // Fall back to readBase for typed bindings (array/object) that
       // parseArithExpr rejected because they're not chain results.
-      const base = readBase(k, stop);
+      const base = await readBase(k, stop);
       if (base) {
-        const s = applySuffixes(base.bind, base.next, stop);
+        const s = await applySuffixes(base.bind, base.next, stop);
         if (s.bind) {
           const nt = tks[s.next];
           if (nt && nt.type === 'plus') {
-            const r = readConcatExpr(k, stop, terms);
+            const r = await readConcatExpr(k, stop, terms);
             if (r) return { binding: chainBinding(r.toks), next: r.next };
           }
           return { binding: s.bind, next: s.next };
         }
       }
       // Fall through: chain parsing (with opaque-capture for unresolved).
-      const r = readConcatExpr(k, stop, terms);
+      const r = await readConcatExpr(k, stop, terms);
       if (r) return { binding: chainBinding(r.toks), next: r.next };
       return null;
     };
@@ -2966,7 +2813,7 @@
 
     // Apply `[key]` subscripts and separate-token `.method(args)` calls as
     // postfix accessors on a typed binding. Returns { bind, next }.
-    const applySuffixes = (bind, next, stop) => {
+    const applySuffixes = async (bind, next, stop) => {
       while (next < stop && bind) {
         const t = tks[next];
         if (!t) break;
@@ -3008,7 +2855,7 @@
           if (!close || close.type !== 'close' || close.char !== ']') break;
           let resolved = false;
           if (j > next + 1) {
-            const inner = parseArithExpr(next + 1, j, 0);
+            const inner = await parseArithExpr(next + 1, j, 0);
             if (inner && inner.next === j && inner.bind && inner.bind.toks.length === 1 && inner.bind.toks[0].type === 'str') {
               const keyText = inner.bind.toks[0].text;
               const asNum = Number(keyText);
@@ -3103,7 +2950,7 @@
             }
           }
           if (isMethodCall) {
-            const r = applyMethod(cur, lastSeg, next + 1, stop);
+            const r = await applyMethod(cur, lastSeg, next + 1, stop);
             if (!r) break;
             bind = r.bind;
             next = r.next;
@@ -3112,10 +2959,10 @@
           // Object method call: cur is a function binding accessed via .prop,
           // followed by (args). Inline the function.
           if (isCall && cur && cur.kind === 'function') {
-            var _omArgs = readCallArgBindings(next + 1, stop);
+            var _omArgs = await readCallArgBindings(next + 1, stop);
             if (_omArgs) {
               // Pass the receiver object as 'this' for method calls.
-              var _omResult = instantiateFunction(cur, _omArgs.bindings, bind);
+              var _omResult = await instantiateFunction(cur, _omArgs.bindings, bind);
               if (_omResult && _omResult.kind) { bind = _omResult; next = _omArgs.next; continue; }
               if (_omResult) { bind = chainBinding(_omResult); next = _omArgs.next; continue; }
             }
@@ -3124,7 +2971,7 @@
           if (!isCall && cur && cur.kind === 'object' && cur.props['__getter_' + lastSeg]) {
             var _gtrFn = cur.props['__getter_' + lastSeg];
             if (_gtrFn.kind === 'function') {
-              var _gtrResult = instantiateFunction(_gtrFn, []);
+              var _gtrResult = await instantiateFunction(_gtrFn, []);
               if (_gtrResult && _gtrResult.kind) { cur = _gtrResult; }
               else if (_gtrResult) { cur = chainBinding(_gtrResult); }
             }
@@ -3139,11 +2986,11 @@
     };
 
     // Apply a method call: .concat on chain, or .join on array.
-    const applyMethod = (bind, method, parenIdx, stop) => {
+    const applyMethod = async (bind, method, parenIdx, stop) => {
       if (method === 'concat') {
         // Array concat: [].concat(arr) → merge elements.
         if (bind && bind.kind === 'array') {
-          var _cArgs = readCallArgBindings(parenIdx, stop);
+          var _cArgs = await readCallArgBindings(parenIdx, stop);
           if (_cArgs) {
             var _cElems = bind.elems.slice();
             for (var _ci = 0; _ci < _cArgs.bindings.length; _ci++) {
@@ -3156,7 +3003,7 @@
         }
         // String concat.
         if (!bind || bind.kind !== 'chain') return null;
-        const args = readConcatArgs(parenIdx, stop);
+        const args = await readConcatArgs(parenIdx, stop);
         if (!args) return null;
         const toks = bind.toks.slice();
         for (const a of args.args) { toks.push(SYNTH_PLUS); for (const v of a) toks.push(v); }
@@ -3191,7 +3038,7 @@
         for (let e = 0; e < elems.length; e++) {
           const eb = elems[e];
           if (!eb || eb.kind !== 'chain') return null;
-          if (e > 0) { out.push(SYNTH_PLUS); out.push(rewriteTemplate(sepTok)); out.push(SYNTH_PLUS); }
+          if (e > 0) { out.push(SYNTH_PLUS); out.push(await rewriteTemplate(sepTok)); out.push(SYNTH_PLUS); }
           for (const vt of eb.toks) out.push(vt);
         }
         return { bind: chainBinding(out), next: parenIdx + 3 };
@@ -3201,7 +3048,7 @@
       if (bind && bind.kind === 'chain') {
         const s = chainAsKnownString(bind);
         if (s !== null) {
-          const args = readConcatArgs(parenIdx, stop);
+          const args = await readConcatArgs(parenIdx, stop);
           if (!args) return null;
           const argVals = [];
           let allConcrete = true;
@@ -3265,7 +3112,7 @@
             if (body) { fn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock); fnNext = body.next; }
           }
           if (!fn) {
-            var fexpr = readFunctionExpr(parenIdx + 1, stop);
+            var fexpr = await readFunctionExpr(parenIdx + 1, stop);
             if (fexpr) { fn = fexpr.binding; fnNext = fexpr.next; }
           }
           if (!fn) {
@@ -3283,14 +3130,14 @@
             // Walk callback for each element to detect side effects
             // (e.g. el.innerHTML = item inside the callback).
             for (const el of bind.elems) {
-              if (el) instantiateFunction(fn, [el]);
+              if (el) await instantiateFunction(fn, [el]);
             }
             return { bind: chainBinding([makeSynthStr('undefined')]), next: fnNext + 1 };
           }
           const results = [];
           for (const el of bind.elems) {
             if (!el) return null;
-            const toks = instantiateFunction(fn, [el]);
+            const toks = await instantiateFunction(fn, [el]);
             if (!toks) return null;
             if (method === 'map') {
               results.push(chainBinding(toks));
@@ -3332,7 +3179,7 @@
             if (body) { reduceFn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock); reduceFnNext = body.next; }
           }
           if (!reduceFn) {
-            var rfexpr = readFunctionExpr(parenIdx + 1, stop);
+            var rfexpr = await readFunctionExpr(parenIdx + 1, stop);
             if (rfexpr && rfexpr.binding.params && rfexpr.binding.params.length === 2) { reduceFn = rfexpr.binding; reduceFnNext = rfexpr.next; }
           }
           if (!reduceFn) {
@@ -3345,7 +3192,7 @@
           if (!reduceFn) return null;
           const sep = tks[reduceFnNext];
           if (!sep || sep.type !== 'sep' || sep.char !== ',') return null;
-          const init = readConcatExpr(reduceFnNext + 1, stop, { sep: [], close: [')'] });
+          const init = await readConcatExpr(reduceFnNext + 1, stop, { sep: [], close: [')'] });
           if (!init) return null;
           const rp = tks[init.next];
           if (!rp || rp.type !== 'close' || rp.char !== ')') return null;
@@ -3353,14 +3200,14 @@
           let accBind = chainBinding(init.toks);
           for (const el of bind.elems) {
             if (!el) return null;
-            const toks = instantiateFunction(fn, [accBind, el]);
+            const toks = await instantiateFunction(fn, [accBind, el]);
             if (!toks) return null;
             accBind = chainBinding(toks);
           }
           const acc = accBind.toks;
           return { bind: chainBinding(acc), next: init.next + 1 };
         }
-        const args = readConcatArgs(parenIdx, stop);
+        const args = await readConcatArgs(parenIdx, stop);
         if (!args) return null;
         const argVals = [];
         let allConcrete = true;
@@ -3417,7 +3264,7 @@
         }
         // Try function expression: `.map(function(x) { ... })`
         if (!fn) {
-          var _fexpr = readFunctionExpr(parenIdx + 1, stop);
+          var _fexpr = await readFunctionExpr(parenIdx + 1, stop);
           if (_fexpr) {
             fn = _fexpr.binding;
             fnEnd = _fexpr.next;
@@ -3427,7 +3274,7 @@
         const rp = tks[fnEnd];
         if (!rp || rp.type !== 'close' || rp.char !== ')') return null;
         const paramBinds = fn.params.map((p) => chainBinding([exprRef(p.name)]));
-        const toks = instantiateFunction(fn, paramBinds);
+        const toks = await instantiateFunction(fn, paramBinds);
         if (!toks) return null;
         const iterExpr = bind ? chainAsExprText(bind) : null;
         return {
@@ -3511,7 +3358,7 @@
     // Read a "base" value before any suffixes: literals, identifiers/paths
     // (with optional attached .concat/.join method), parenthesized
     // subexpressions, array literals, and object literals.
-    const readBase = (k, stop) => {
+    const readBase = async (k, stop) => {
       // Collect prefix operators iteratively instead of recursing.
       const prefixes = [];
       while (k < stop) {
@@ -3525,7 +3372,7 @@
         }
         break;
       }
-      var baseResult = _readBaseCore(k, stop);
+      var baseResult = await _readBaseCore(k, stop);
       if (!baseResult) return null;
       for (var _pi = prefixes.length - 1; _pi >= 0; _pi--) {
         var _pf = prefixes[_pi];
@@ -3541,7 +3388,7 @@
       }
       return baseResult;
     };
-    const _readBaseCore = (k, stop) => {
+    const _readBaseCore = async (k, stop) => {
       const t = tks[k];
       if (!t) return null;
       // `new X(args)` / `new X.Y` / `new X` — absorb the constructor call
@@ -3587,7 +3434,7 @@
       }
       if (t.type === 'str') return { bind: chainBinding([t]), next: k + 1 };
       if (t.type === 'tmpl') {
-        const rw = rewriteTemplate(t);
+        const rw = await rewriteTemplate(t);
         if (rw.type === '_chain') return { bind: chainBinding(rw.toks), next: k + 1 };
         return { bind: chainBinding([rw]), next: k + 1 };
       }
@@ -3596,7 +3443,7 @@
         // Handle comma operator: (expr1, expr2, ..., exprN) → value is exprN.
         var _lastToks = null, _parenNext = k + 1;
         while (_parenNext < stop) {
-          var _pr = readConcatExpr(_parenNext, stop, { sep: [','], close: [')'] });
+          var _pr = await readConcatExpr(_parenNext, stop, { sep: [','], close: [')'] });
           if (!_pr) break;
           _lastToks = _pr.toks;
           _parenNext = _pr.next;
@@ -3609,18 +3456,18 @@
         return { bind: chainBinding(_lastToks), next: _parenNext + 1 };
       }
       if (t.type === 'open' && t.char === '[') {
-        const a = readArrayLit(k, stop);
+        const a = await readArrayLit(k, stop);
         if (!a) return null;
         return { bind: a.binding, next: a.next };
       }
       if (t.type === 'open' && t.char === '{') {
-        const o = readObjectLit(k, stop);
+        const o = await readObjectLit(k, stop);
         if (!o) return null;
         return { bind: o.binding, next: o.next };
       }
       // Function expression in expression position.
       if (t.type === 'other' && t.text === 'function') {
-        var _fnExpr = readFunctionExpr(k, stop);
+        var _fnExpr = await readFunctionExpr(k, stop);
         if (_fnExpr) return { bind: _fnExpr.binding, next: _fnExpr.next };
       }
       if (t.type !== 'other') return null;
@@ -3633,20 +3480,20 @@
         const isCall = paren && paren.type === 'open' && paren.char === '(';
         // Tagged template: tag`...` — call the tag function with template parts.
         if (paren && paren.type === 'tmpl') {
-          var tagBind = resolvePath(t.text);
+          var tagBind = await resolvePath(t.text);
           if (tagBind && tagBind.kind === 'function') {
             // Build arguments: first arg is strings array, rest are expression values.
             var _tagArgs = [chainBinding([makeSynthStr('')])]; // strings placeholder
             if (paren.parts) {
               for (var _tp = 0; _tp < paren.parts.length; _tp++) {
                 if (paren.parts[_tp].kind === 'expr') {
-                  var _tagExpr = evalExprSrc(paren.parts[_tp].expr);
+                  var _tagExpr = await evalExprSrc(paren.parts[_tp].expr);
                   if (_tagExpr) _tagArgs.push(chainBinding(_tagExpr));
                   else _tagArgs.push(chainBinding([exprRef(paren.parts[_tp].expr)]));
                 }
               }
             }
-            var _tagResult = instantiateFunction(tagBind, _tagArgs);
+            var _tagResult = await instantiateFunction(tagBind, _tagArgs);
             if (_tagResult && _tagResult.kind) return { bind: _tagResult, next: k + 2 };
             if (_tagResult) return { bind: chainBinding(_tagResult), next: k + 2 };
           }
@@ -3657,7 +3504,7 @@
           if (paren.parts) {
             for (var _tp2 = 0; _tp2 < paren.parts.length; _tp2++) {
               if (paren.parts[_tp2].kind === 'expr') {
-                var _te = evalExprSrc(paren.parts[_tp2].expr);
+                var _te = await evalExprSrc(paren.parts[_tp2].expr);
                 var _tt = _te ? collectChainTaint(_te) : null;
                 if (_tt) { if (!_tagRef.taint) _tagRef.taint = new Set(); for (var _tl of _tt) _tagRef.taint.add(_tl); }
               }
@@ -3671,7 +3518,7 @@
         }
         // Known global builtin function call (numeric Math.*, parseInt...).
         if (isCall && BUILTINS[t.text]) {
-          const args = readConcatArgs(k + 1, stop);
+          const args = await readConcatArgs(k + 1, stop);
           if (args) {
             const nums = [];
             let allNum = true;
@@ -3689,7 +3536,7 @@
         }
         // Object.keys/values/entries on known object bindings.
         if (isCall && (t.text === 'Object.keys' || t.text === 'Object.values' || t.text === 'Object.entries')) {
-          const argRes = readCallArgBindings(k + 1, stop);
+          const argRes = await readCallArgBindings(k + 1, stop);
           if (argRes && argRes.bindings.length === 1) {
             const ob = argRes.bindings[0];
             if (ob && ob.kind === 'object') {
@@ -3711,7 +3558,7 @@
         }
         // Array.isArray / Array.from / Array.of on known bindings.
         if (isCall && t.text === 'Array.isArray') {
-          const argRes = readCallArgBindings(k + 1, stop);
+          const argRes = await readCallArgBindings(k + 1, stop);
           if (argRes && argRes.bindings.length === 1) {
             const ob = argRes.bindings[0];
             const v = ob && ob.kind === 'array' ? 'true' : (ob && (ob.kind === 'object' || ob.kind === 'chain') ? 'false' : null);
@@ -3719,11 +3566,11 @@
           }
         }
         if (isCall && t.text === 'Array.of') {
-          const argRes = readCallArgBindings(k + 1, stop);
+          const argRes = await readCallArgBindings(k + 1, stop);
           if (argRes) return { bind: arrayBinding(argRes.bindings.slice()), next: argRes.next };
         }
         if (isCall && t.text === 'Array.from') {
-          const argRes = readCallArgBindings(k + 1, stop);
+          const argRes = await readCallArgBindings(k + 1, stop);
           if (argRes && argRes.bindings.length >= 1) {
             const src = argRes.bindings[0];
             const mapFn = argRes.bindings[1] || null;
@@ -3734,7 +3581,7 @@
                 for (let idx = 0; idx < out.length; idx++) {
                   const el = out[idx];
                   if (!el) return null;
-                  const toks = instantiateFunction(mapFn, [el, chainBinding([makeSynthStr(String(idx))])]);
+                  const toks = await instantiateFunction(mapFn, [el, chainBinding([makeSynthStr(String(idx))])]);
                   if (!toks) return null;
                   mapped.push(chainBinding(toks));
                 }
@@ -3750,7 +3597,7 @@
                 const out = [];
                 for (let idx = 0; idx < lenN; idx++) {
                   if (mapFn && mapFn.kind === 'function') {
-                    const toks = instantiateFunction(mapFn, [
+                    const toks = await instantiateFunction(mapFn, [
                       chainBinding([exprRef('undefined')]),
                       chainBinding([makeSynthStr(String(idx))]),
                     ]);
@@ -3767,7 +3614,7 @@
         }
         // JSON.stringify on known scalar / object / array bindings.
         if (isCall && (t.text === 'JSON.stringify' || t.text === 'JSON.parse')) {
-          const argRes = readCallArgBindings(k + 1, stop);
+          const argRes = await readCallArgBindings(k + 1, stop);
           if (argRes && argRes.bindings.length >= 1) {
             // Check taint BEFORE concrete evaluation — if the argument
             // carries taint, the result should too regardless of concrete value.
@@ -3805,7 +3652,7 @@
         }
         // DOM factories return a tracked virtual element.
         if (isCall && DOM_FACTORIES[t.text]) {
-          const args = readConcatArgs(k + 1, stop);
+          const args = await readConcatArgs(k + 1, stop);
           if (args) {
             const r = DOM_FACTORIES[t.text](args.args, k, args.next, t);
             if (r) return r;
@@ -3813,7 +3660,7 @@
         }
         // `String(x)` coerces any literal to its string form.
         if (isCall && t.text === 'String') {
-          const args = readConcatArgs(k + 1, stop);
+          const args = await readConcatArgs(k + 1, stop);
           if (args && args.args.length === 1) {
             const ch = chainBinding(args.args[0]);
             if (ch.toks.length === 1 && ch.toks[0].type === 'str') {
@@ -3827,19 +3674,19 @@
             const method = t.text.slice(dot + 1);
             if (KNOWN_METHODS.has(method)) {
               const prefix = t.text.slice(0, dot);
-              const prefBind = resolvePath(prefix) || chainBinding([exprRef(prefix)]);
-              const r = applyMethod(prefBind, method, k + 1, stop);
+              const prefBind = await resolvePath(prefix) || chainBinding([exprRef(prefix)]);
+              const r = await applyMethod(prefBind, method, k + 1, stop);
               if (r) return { bind: r.bind, next: r.next };
             }
             // Fall through to the opaque-ident handling below for unknown
             // methods or unresolved prefixes.
           }
         }
-        const b = resolvePath(t.text);
+        const b = await resolvePath(t.text);
         // Taint: check call-based sinks even in expression position
         // (e.g. var x = eval(tainted)).
         if (taintEnabled && isCall && TAINT_CALL_SINKS[t.text] && !declaredNames.has(t.text.split('.')[0])) {
-          var _sinkCallArgs = readCallArgBindings(k + 1, stop);
+          var _sinkCallArgs = await readCallArgBindings(k + 1, stop);
           if (_sinkCallArgs) checkSinkCall(t.text, _sinkCallArgs.bindings, t);
         }
         if (!b) {
@@ -3882,15 +3729,15 @@
         if (b) {
           // Call syntax: `name(args)` where name resolves to a function binding.
           if (b.kind === 'function' && isCall) {
-            const args = readConcatArgs(k + 1, stop);
+            const args = await readConcatArgs(k + 1, stop);
             if (!args) return null;
             // For method calls (dotted path), bind 'this' to the receiver object.
             var _thisBind = null;
             var _dot = t.text.lastIndexOf('.');
             if (_dot > 0) {
-              _thisBind = resolvePath(t.text.slice(0, _dot));
+              _thisBind = await resolvePath(t.text.slice(0, _dot));
             }
-            var _fnResult = instantiateFunction(b, args.args.map((a) => chainBinding(a)), _thisBind);
+            var _fnResult = await instantiateFunction(b, args.args.map((a) => chainBinding(a)), _thisBind);
             // Non-chain return (object/array/function binding).
             if (_fnResult && _fnResult.kind && _fnResult.kind !== 'chain') {
               return { bind: _fnResult, next: args.next };
@@ -3929,7 +3776,7 @@
     // Invoke a function binding with a list of argument chains (token lists).
     // Pushes a temporary scope with param→arg bindings, parses the body
     // expression in the original token array, then pops the scope.
-    const instantiateFunction = (fn, argBindings, thisBinding) => {
+    const instantiateFunction = async (fn, argBindings, thisBinding) => {
       stack.push({ bindings: Object.create(null), isFunction: true });
       const frame = stack[stack.length - 1];
       // Bind 'this' if provided (for method calls on objects).
@@ -3956,7 +3803,7 @@
         } else if (pi.defaultStart != null) {
           // Evaluate the parameter's default expression in the current
           // (call-site) scope so enclosing bindings can be referenced.
-          const r = readConcatExpr(pi.defaultStart, pi.defaultEnd, TERMS_NONE);
+          const r = await readConcatExpr(pi.defaultStart, pi.defaultEnd, TERMS_NONE);
           frame.bindings[pi.name] = (r && r.next === pi.defaultEnd) ? chainBinding(r.toks) : null;
         } else {
           frame.bindings[pi.name] = null;
@@ -4013,7 +3860,7 @@
         }
         buildVarDeclStart = -1; // reset so inner decls don't leak out
         const lvBefore = loopVars.length;
-        walkRange(bodyStart, bodyEnd);
+        await walkRange(bodyStart, bodyEnd);
         fnLoopVars = loopVars.splice(lvBefore);
         trackBuildVar = savedTrackBuildVar;
         trackBuildVarDepth = savedTrackDepth;
@@ -4024,12 +3871,12 @@
           const t = tks[ri];
           if (t && t.type === 'other' && t.text === 'return') {
             // Use readValue to preserve object/array/function bindings.
-            const rv = readValue(ri + 1, bodyEnd, TERMS_TOP);
+            const rv = await readValue(ri + 1, bodyEnd, TERMS_TOP);
             if (rv && rv.binding) {
               if (rv.binding.kind === 'chain') { result = rv.binding.toks; }
               else { fnReturnBinding = rv.binding; }
             } else {
-              const r = readConcatExpr(ri + 1, bodyEnd, TERMS_TOP);
+              const r = await readConcatExpr(ri + 1, bodyEnd, TERMS_TOP);
               if (r) result = r.toks;
             }
             break;
@@ -4046,7 +3893,7 @@
           ri++;
         }
       } else {
-        const r = readConcatExpr(fn.bodyStart, fn.bodyEnd, TERMS_NONE);
+        const r = await readConcatExpr(fn.bodyStart, fn.bodyEnd, TERMS_NONE);
         if (r && r.next === fn.bodyEnd) result = r.toks;
       }
       tks = savedTks;
@@ -4092,8 +3939,8 @@
     // unresolved identifiers already emitted by the tokenizer). This dual
     // representation is the tool's fundamental model for string expressions:
     // known parts become string tokens, unknown parts become expression refs.
-    const readOperand = (k, stop, terms) => {
-      const parsed = parseArithExpr(k, stop);
+    const readOperand = async (k, stop, terms) => {
+      const parsed = await parseArithExpr(k, stop);
       if (parsed) {
         const boundary = skipOperand(parsed.next, stop, terms);
         if (boundary === parsed.next) {
@@ -4156,7 +4003,7 @@
     };
     // Iterative Pratt parser. Uses explicit stacks instead of recursive
     // calls so deeply nested expressions can't overflow the JS call stack.
-    const parseArithExpr = (k, stop, minPrec) => {
+    const parseArithExpr = async (k, stop, minPrec) => {
       minPrec = minPrec || 0;
       const opStack = [];
       const ternStack = [];
@@ -4167,7 +4014,7 @@
       var needOperand = true;
       for (;;) {
         if (needOperand) {
-          const base = readBase(pos, stop);
+          const base = await readBase(pos, stop);
           if (!base) {
             while (opStack.length > 0) {
               const top = opStack.pop();
@@ -4177,7 +4024,7 @@
             if (!cur) return null;
             break;
           }
-          const r = applySuffixes(base.bind, base.next, stop);
+          const r = await applySuffixes(base.bind, base.next, stop);
           cur = r.bind;
           next = r.next;
           needOperand = false;
@@ -4428,16 +4275,14 @@
     // Takes a token range (start, end) in the main tokens array.
     // Returns: true (always true), false (always false), null (both possible).
     // Uses concrete evaluation first, then SMT with path constraints.
-    const checkReachability = (start, end) => {
+    const checkReachability = async (start, end) => {
       if (start >= end) return null;
-      // Concrete evaluation via readValue.
-      var condVal = readValue(start, end, null);
+      var condVal = await readValue(start, end, null);
       var concrete = condVal ? evalTruthiness(condVal.binding) : null;
-      // SMT: build formula from raw tokens in range and check satisfiability.
       if (taintEnabled) {
         var condToks = [];
         for (var ci = start; ci < end; ci++) condToks.push(tokens[ci]);
-        var smtResult = smtCheckCondition(condToks, resolve, resolvePath, pathConstraints);
+        var smtResult = await smtCheckCondition(condToks, resolve, resolvePath, pathConstraints);
         if (smtResult) {
           if (smtResult.sat && smtResult.unsat) return null;
           if (smtResult.sat && !smtResult.unsat) return true;
@@ -4471,13 +4316,13 @@
     // Parse `( arg, arg, ... )` where each arg is a full value (binding),
     // returning { bindings: [binding|null, ...], next } or null. Used by
     // the DOM method call handler so element-typed arguments stay intact.
-    const readCallArgBindings = (k, stop) => {
+    const readCallArgBindings = async (k, stop) => {
       if (!tks[k] || tks[k].type !== 'open' || tks[k].char !== '(') return null;
       if (tks[k + 1] && tks[k + 1].type === 'close' && tks[k + 1].char === ')') return { bindings: [], next: k + 2 };
       _evalStack.push({ type: 'READ_CALL_ARG_BINDINGS', i: k + 1, stop, bindings: [] });
-      return _evalLoop();
+      return await _evalLoop();
     };
-    const _stepReadCallArgBindings = (frame) => {
+    const _stepReadCallArgBindings = async (frame) => {
       if (_resultSlot.has) {
         const v = _consumeResult();
         if (!v) { _completeFrame(null); return; }
@@ -4490,7 +4335,7 @@
         if (tks[frame.i] && tks[frame.i].type === 'close' && tks[frame.i].char === ')') break;
         if (tks[frame.i] && tks[frame.i].type === 'other' && tks[frame.i].text.startsWith('...')) {
           var _sn = tks[frame.i].text.slice(3);
-          var _sb = IDENT_RE.test(_sn) ? resolvePath(_sn) : null;
+          var _sb = IDENT_RE.test(_sn) ? await resolvePath(_sn) : null;
           if (_sb && _sb.kind === 'array') { for (var _si = 0; _si < _sb.elems.length; _si++) if (_sb.elems[_si]) frame.bindings.push(_sb.elems[_si]); }
           else frame.bindings.push(chainBinding([deriveExprRef(_sn, _sb && _sb.kind === 'chain' ? _sb.toks : null)]));
           frame.i++; if (tks[frame.i] && tks[frame.i].type === 'sep' && tks[frame.i].char === ',') { frame.i++; continue; } break;
@@ -4503,11 +4348,11 @@
       _completeFrame({ bindings: frame.bindings, next: frame.i + 1 });
     };
 
-    const readConcatArgs = (k, stop) => {
+    const readConcatArgs = async (k, stop) => {
       if (!tks[k] || tks[k].type !== 'open' || tks[k].char !== '(') return null;
       if (tks[k + 1] && tks[k + 1].type === 'close' && tks[k + 1].char === ')') return { args: [], next: k + 2 };
       _evalStack.push({ type: 'READ_CONCAT_ARGS', i: k + 1, stop, args: [] });
-      return _evalLoop();
+      return await _evalLoop();
     };
     const _stepReadConcatArgs = (frame) => {
       if (_resultSlot.has) {
@@ -4529,7 +4374,7 @@
     // Read a concat chain (operand [+ operand]*) starting at `k`, stopping at
     // the first top-level token matching any terminator in `terms`
     // (`{ sep: [...], close: [...] }`). Returns `{ toks, next }` or null.
-    const readConcatExpr = (k, stop, terms) => {
+    const readConcatExpr = async (k, stop, terms) => {
       const out = [];
       const endAt = (tk) => {
         if (!tk) return true;
@@ -4540,7 +4385,7 @@
       let i = k;
       // Read first operand.
       if (endAt(tks[i])) return null;
-      let op = readOperand(i, stop, terms);
+      let op = await readOperand(i, stop, terms);
       if (!op) return null;
       for (const t of op.toks) out.push(t);
       i = op.next;
@@ -4549,7 +4394,7 @@
         const plus = tks[i];
         if (!plus || plus.type !== 'plus') return null;
         i++;
-        op = readOperand(i, stop, terms);
+        op = await readOperand(i, stop, terms);
         if (!op) return null;
         out.push(plus);
         for (const t of op.toks) out.push(t);
@@ -4559,8 +4404,8 @@
     };
 
     // Top-level RHS reader: reads a concat chain up to `,`/`;`/stop.
-    const readInit = (k, stop) => {
-      const r = readConcatExpr(k, stop, TERMS_TOP);
+    const readInit = async (k, stop) => {
+      const r = await readConcatExpr(k, stop, TERMS_TOP);
       return r ? r.toks : null;
     };
 
@@ -4651,11 +4496,11 @@
     };
     // Build an SMT formula from a raw token range (header tokens of
     // an if/while/for/switch-case/...).
-    const _smtFormulaFromRange = (start, end) => {
+    const _smtFormulaFromRange = async (start, end) => {
       if (!taintEnabled || start >= end) return null;
       var toks = [];
       for (var _fi = start; _fi < end; _fi++) toks.push(tokens[_fi]);
-      return smtParseExpr(toks, 0, toks.length, resolve, resolvePath);
+      return await smtParseExpr(toks, 0, toks.length, resolve, resolvePath);
     };
     // Registered transition types. Each entry documents the handler's
     // effect on the machine configuration (S, B, P, T, L). This is both
@@ -4726,7 +4571,11 @@
     // `taintCondStack` pair can be detected early (in debug builds).
     const _pcBaseDepth = pathConstraints ? pathConstraints.length : 0;
     const _tcBaseDepth = taintCondStack ? taintCondStack.length : 0;
-    const walkRange = (startI, endI) => {
+    const walkRange = async (startI, endI) => {
+    // Per-invocation work stack: recursive walkRange calls (e.g.
+    // from instantiateFunction walking a function body) get their
+    // own stack and never drain parent tasks.
+    const _ws = [];
     _ws.push({ type: 'range', start: startI, end: endI });
     while (_ws.length > 0) {
     const _task = _ws.pop();
@@ -4851,10 +4700,10 @@
               for (var _ck = _ceStart; _ck < _ceEnd; _ck++) _ceToks.push(tokens[_ck]);
               var _discB = _task.discVal ? _task.discVal.binding : null;
               var _discIsTrueConst = _discB && _discB.kind === 'chain' && _discB.toks.length === 1 && _discB.toks[0].type === 'str' && _discB.toks[0].text === 'true';
-              if (_discIsTrueConst) _caseFormula = smtParseExpr(_ceToks, 0, _ceToks.length, resolve, resolvePath);
+              if (_discIsTrueConst) _caseFormula = await smtParseExpr(_ceToks, 0, _ceToks.length, resolve, resolvePath);
               else {
-                var _ceSmtExpr = smtParseAtom(_ceToks, 0, _ceToks.length, resolve, resolvePath);
-                var _discSmtExpr = _discB ? smtParseAtom([{ type: 'other', text: _task.discExpr || 'disc' }], 0, 1, resolve, resolvePath) : null;
+                var _ceSmtExpr = await smtParseAtom(_ceToks, 0, _ceToks.length, resolve, resolvePath);
+                var _discSmtExpr = _discB ? (await smtParseAtom([{ type: 'other', text: _task.discExpr || 'disc' }], 0, 1, resolve, resolvePath)) : null;
                 if (_ceSmtExpr && _discSmtExpr) _caseFormula = smtCmp('===', _discSmtExpr, _ceSmtExpr);
               }
               _caseCondExpr = (_task.discExpr || 'disc') + ' === ' + _cs.caseExpr;
@@ -4865,7 +4714,7 @@
         if (_caseFormula) {
           var _fullCaseFormula = _caseFormula;
           if (pathConstraints && pathConstraints.length > 0) for (var _pi = 0; _pi < pathConstraints.length; _pi++) _fullCaseFormula = smtAnd(pathConstraints[_pi], _fullCaseFormula);
-          if (!smtSat(_fullCaseFormula)) {
+          if (!(await smtSat(_fullCaseFormula))) {
             _task.caseResults.push({ label: _cs.label, caseExpr: _cs.caseExpr, bindings: _task.snapshot });
             continue;
           }
@@ -5005,15 +4854,15 @@
           if (tokens[_ii].type === 'open' && tokens[_ii].char === '(') { _iifeDep--; if (_iifeDep === 0) { _iifeOpenIdx = _ii; break; } }
         }
         if (_iifeOpenIdx >= 0) {
-          var _iifeFnE = readFunctionExpr(_iifeOpenIdx + 1, i);
+          var _iifeFnE = await readFunctionExpr(_iifeOpenIdx + 1, i);
           var _iifeFn = _iifeFnE ? _iifeFnE.binding : null;
           if (!_iifeFn) {
             var _iifeArr = peekArrow(_iifeOpenIdx + 1, i);
             if (_iifeArr) { var _iifeB = readArrowBody(_iifeArr.arrowNext, i); if (_iifeB) _iifeFn = functionBinding(_iifeArr.params, _iifeB.bodyStart, _iifeB.bodyEnd, _iifeB.isBlock); }
           }
           if (_iifeFn) {
-            var _iifeA = readCallArgBindings(i + 1, stop);
-            if (_iifeA) { instantiateFunction(_iifeFn, _iifeA.bindings); i = _iifeA.next - 1; continue; }
+            var _iifeA = await readCallArgBindings(i + 1, stop);
+            if (_iifeA) { await instantiateFunction(_iifeFn, _iifeA.bindings); i = _iifeA.next - 1; continue; }
           }
         }
       }
@@ -5063,8 +4912,8 @@
           }
           if (j < stop) {
             // Evaluate the condition via unified reachability check.
-            const condVal = readValue(i + 2, j, null);
-            var concrete = taintEnabled ? checkReachability(i + 2, j) : (condVal ? evalTruthiness(condVal.binding) : null);
+            const condVal = await readValue(i + 2, j, null);
+            var concrete = taintEnabled ? (await checkReachability(i + 2, j)) : (condVal ? evalTruthiness(condVal.binding) : null);
             // Determine if-body range.
             const bodyTok = tokens[j + 1];
             let ifEnd;
@@ -5201,7 +5050,7 @@
               if (pathConstraints) {
                 var _condToks = [];
                 for (var _pi = i + 2; _pi < j; _pi++) _condToks.push(tokens[_pi]);
-                _pathFormula = smtParseExpr(_condToks, 0, _condToks.length, resolve, resolvePath);
+                _pathFormula = await smtParseExpr(_condToks, 0, _condToks.length, resolve, resolvePath);
               }
               var _elS = (elseStart > 0 && elseEnd > elseStart) ? elseStart : 0;
               var _elE = (elseStart > 0 && elseEnd > elseStart) ? elseEnd : 0;
@@ -5317,7 +5166,7 @@
         if (lp && lp.type === 'open' && lp.char === '(') {
           const cp = findCloseParen(i + 1);
           // Read the discriminant expression.
-          const discVal = readValue(i + 2, cp - 1, null);
+          const discVal = await readValue(i + 2, cp - 1, null);
           const discExpr = discVal ? chainAsExprText(discVal.binding) : null;
           const bodyOpen = tokens[cp];
           if (bodyOpen && bodyOpen.type === 'open' && bodyOpen.char === '{') {
@@ -5335,10 +5184,10 @@
                 let colonIdx = j + 1;
                 while (colonIdx < switchEnd - 1 && !(tokens[colonIdx].type === 'other' && tokens[colonIdx].text === ':')) colonIdx++;
                 const label = tk.text === 'default' ? 'default' : null;
-                const caseExpr = tk.text === 'case' ? (function() {
-                  const v = readValue(j + 1, colonIdx, null);
+                const caseExpr = tk.text === 'case' ? (await (async function() {
+                  const v = await readValue(j + 1, colonIdx, null);
                   return v ? chainAsExprText(v.binding) : null;
-                })() : null;
+                })()) : null;
                 cases.push({ label, caseExpr, bodyStart: colonIdx + 1, bodyEnd: -1, srcStart: tk.start });
               }
             }
@@ -5474,7 +5323,7 @@
                   if (tokens[_fiVarStart].type === 'other' && (tokens[_fiVarStart].text === 'var' || tokens[_fiVarStart].text === 'let' || tokens[_fiVarStart].text === 'const')) _fiVarStart++;
                   var _fiVarName = tokens[_fiVarStart] && IDENT_RE.test(tokens[_fiVarStart].text) ? tokens[_fiVarStart].text : null;
                   if (_fiVarName) {
-                    var _fiExprVal = readValue(_fi + 1, j, null);
+                    var _fiExprVal = await readValue(_fi + 1, j, null);
                     var _fiIterBind = _fiExprVal ? _fiExprVal.binding : null;
                     var _fiTaintSources = [];
                     if (_fiIterBind && _fiIterBind.kind === 'array') {
@@ -5536,7 +5385,7 @@
                   headerParts.push(gap2 + ht._src.slice(ht.start, ht.end));
                   continue;
                 }
-                var resolved = resolvePath(ht.text);
+                var resolved = await resolvePath(ht.text);
                 if (resolved && resolved.kind === 'chain') {
                   var exprText = chainAsExprText(resolved);
                   if (exprText !== null && exprText !== ht.text) {
@@ -5618,13 +5467,13 @@
                 }
               }
               if (_loopCondStart >= 0 && _loopCondEnd > _loopCondStart) {
-                var _loopReach = checkReachability(_loopCondStart, _loopCondEnd);
+                var _loopReach = await checkReachability(_loopCondStart, _loopCondEnd);
                 if (_loopReach === false) { i = bodyEnd - 1; continue; }
                 // SMT: build the loop condition formula for inner tasks.
                 // While walking the body we know `cond` is true (this is
                 // an over-approximation for the last iteration where the
                 // loop exits, but matches the semantics for "inside body").
-                _loopPathFormula = _smtFormulaFromRange(_loopCondStart, _loopCondEnd);
+                _loopPathFormula = await _smtFormulaFromRange(_loopCondStart, _loopCondEnd);
                 if (taintCondStack) {
                   var _lcToks = tokens[_loopCondStart]._src.slice(
                     tokens[_loopCondStart].start,
@@ -5660,7 +5509,7 @@
                     );
                     // Construct a length>0 atom via a synthetic token.
                     var _iterToks = [{ type: 'other', text: _iterSrc + '.length', _src: tokens[_iterStart]._src, start: tokens[_iterStart].start, end: tokens[_iterEnd - 1].end }];
-                    var _lenAtom = smtParseAtom(_iterToks, 0, 1, resolve, resolvePath);
+                    var _lenAtom = await smtParseAtom(_iterToks, 0, 1, resolve, resolvePath);
                     if (_lenAtom) {
                       var _lenFormula = smtCmp('>', _lenAtom, smtConst(0));
                       _extraLoopFormulas.push(_lenFormula);
@@ -6009,9 +5858,9 @@
               j = skipExpr(pat.next, stop);
               break;
             }
-            const val = readValue(pat.next + 1, stop, TERMS_TOP);
+            const val = await readValue(pat.next + 1, stop, TERMS_TOP);
             const srcBinding = val ? val.binding : null;
-            applyPatternBindings(pat.pattern, srcBinding, declBind);
+            await applyPatternBindings(pat.pattern, srcBinding, declBind);
             j = val ? val.next : skipExpr(pat.next + 1, stop);
             if (tokens[j] && tokens[j].type === 'sep' && tokens[j].char === ',') { j++; continue; }
             break;
@@ -6026,7 +5875,7 @@
             hasInit = true;
             // readValue handles function expressions, arrows, and all
             // other value types through a single code path.
-            const r = readValue(j + 2, stop, TERMS_TOP);
+            const r = await readValue(j + 2, stop, TERMS_TOP);
             value = r ? r.binding : null;
             // For function bindings use the precise end; for chains use
             // skipExpr to ensure we consume the full statement.
@@ -6088,7 +5937,7 @@
         const eqTok = tokens[i + 1];
         // Navigation sink: bare assignment to a navigation global (location = expr).
         if (taintEnabled && eqTok && eqTok.type === 'sep' && eqTok.char === '=' && isNavSink(t.text, declaredNames)) {
-          var _bNavR = readValue(i + 2, stop, TERMS_TOP);
+          var _bNavR = await readValue(i + 2, stop, TERMS_TOP);
           if (_bNavR && _bNavR.binding && _bNavR.binding.kind === 'chain') {
             var _bNavTaint = collectChainTaint(_bNavR.binding.toks);
             if (_bNavTaint && _bNavTaint.size) {
@@ -6111,7 +5960,7 @@
               _rhsStart += 2;
             } else break;
           }
-          const r = readValue(_rhsStart, stop, TERMS_TOP);
+          const r = await readValue(_rhsStart, stop, TERMS_TOP);
           // Detect prepend pattern: x = expr + x (builds string in reverse).
           // Treat as equivalent to x += expr but with the new content prepended.
           // For build variables assigned via = inside a loop (prepend
@@ -6145,7 +5994,7 @@
           continue;
         }
         if (eqTok && eqTok.type === 'sep' && eqTok.char === '+=') {
-          const r = readValue(i + 2, stop, TERMS_TOP);
+          const r = await readValue(i + 2, stop, TERMS_TOP);
           const rhs = r ? r.binding : null;
           const cur = resolve(t.text);
           let combined = null;
@@ -6215,7 +6064,7 @@
         }
         // Logical assignment: IDENT ||= expr, IDENT &&= expr, IDENT ??= expr
         if (eqTok && eqTok.type === 'sep' && (eqTok.char === '||=' || eqTok.char === '&&=' || eqTok.char === '??=')) {
-          var _laR = readValue(i + 2, stop, TERMS_TOP);
+          var _laR = await readValue(i + 2, stop, TERMS_TOP);
           var _laRhs = _laR ? _laR.binding : null;
           var _laCur = resolve(t.text);
           var _laOp = eqTok.char;
@@ -6260,11 +6109,11 @@
       if (t.type === 'other' && (t.text === 'setTimeout' || t.text === 'setInterval') && !declaredNames.has(t.text)) {
         var _timerParen = tokens[i + 1];
         if (_timerParen && _timerParen.type === 'open' && _timerParen.char === '(') {
-          var _timerArgs = readCallArgBindings(i + 1, stop);
+          var _timerArgs = await readCallArgBindings(i + 1, stop);
           if (_timerArgs && _timerArgs.bindings.length >= 1) {
             var _timerCb = _timerArgs.bindings[0];
             if (_timerCb && _timerCb.kind === 'function') {
-              instantiateFunction(_timerCb, []);
+              await instantiateFunction(_timerCb, []);
             }
             i = _timerArgs.next - 1;
             continue;
@@ -6276,11 +6125,11 @@
       if (t.type === 'other' && IDENT_OR_PATH_RE.test(t.text)) {
         const callParen = tokens[i + 1];
         if (callParen && callParen.type === 'open' && callParen.char === '(') {
-          var calleeBind = resolvePath(t.text);
+          var calleeBind = await resolvePath(t.text);
           if (calleeBind && calleeBind.kind === 'function') {
-            var callArgs = readCallArgBindings(i + 1, stop);
+            var callArgs = await readCallArgBindings(i + 1, stop);
             if (callArgs) {
-              instantiateFunction(calleeBind, callArgs.bindings);
+              await instantiateFunction(calleeBind, callArgs.bindings);
               i = callArgs.next - 1;
               if (taintEnabled && TAINT_CALL_SINKS[t.text] && !declaredNames.has(t.text.split('.')[0])) {
                 checkSinkCall(t.text, callArgs.bindings, t);
@@ -6290,7 +6139,7 @@
           }
           // Taint: even if callee isn't inlinable, check if it's a call-based sink.
           if (taintEnabled && TAINT_CALL_SINKS[t.text] && !declaredNames.has(t.text.split('.')[0])) {
-            var sinkArgs = readCallArgBindings(i + 1, stop);
+            var sinkArgs = await readCallArgBindings(i + 1, stop);
             if (sinkArgs) {
               checkSinkCall(t.text, sinkArgs.bindings, t);
               i = sinkArgs.next - 1;
@@ -6306,7 +6155,7 @@
       if (t.type === 'other' && DOM_FACTORIES[t.text]) {
         const factoryParen = tokens[i + 1];
         if (factoryParen && factoryParen.type === 'open' && factoryParen.char === '(') {
-          const factoryArgs = readConcatArgs(i + 1, stop);
+          const factoryArgs = await readConcatArgs(i + 1, stop);
           if (factoryArgs) {
             const factoryResult = DOM_FACTORIES[t.text](factoryArgs.args, i, factoryArgs.next, t);
             if (factoryResult && factoryResult.bind) {
@@ -6318,7 +6167,7 @@
                 var trailEq = tokens[afterCall + 1];
                 if (trailEq && trailEq.type === 'sep' && (trailEq.char === '=' || trailEq.char === '+=')) {
                   // Property assignment on DOM factory result.
-                  var trailR = readValue(afterCall + 2, stop, TERMS_TOP);
+                  var trailR = await readValue(afterCall + 2, stop, TERMS_TOP);
                   var trailVal = trailR ? trailR.binding : null;
                   if (factoryResult.bind.kind === 'element') {
                     applyElementSet(factoryResult.bind, [trailProp], trailVal, trailTok);
@@ -6328,7 +6177,7 @@
                 } else if (trailEq && trailEq.type === 'open' && trailEq.char === '(') {
                   // Method call on DOM factory result.
                   if (factoryResult.bind.kind === 'element' && DOM_METHODS.has(trailProp)) {
-                    var methodArgs = readCallArgBindings(afterCall + 1, stop);
+                    var methodArgs = await readCallArgBindings(afterCall + 1, stop);
                     if (methodArgs) {
                       applyElementMethod(factoryResult.bind, trailProp, methodArgs.bindings);
                       i = methodArgs.next - 1;
@@ -6352,7 +6201,7 @@
         if (_navType) {
           var _navEq = tokens[i + 1];
           if (_navEq && _navEq.type === 'sep' && (_navEq.char === '=' || _navEq.char === '+=')) {
-            var _navR = readValue(i + 2, stop, TERMS_TOP);
+            var _navR = await readValue(i + 2, stop, TERMS_TOP);
             var _navVal = _navR ? _navR.binding : null;
             // Record as navigation sink finding.
             if (taintEnabled && _navVal && _navVal.kind === 'chain') {
@@ -6368,7 +6217,7 @@
           // Check for navigation method call: location.assign(expr), location.replace(expr)
           var _navParen = tokens[i + 1];
           if (_navParen && _navParen.type === 'open' && _navParen.char === '(') {
-            var _navCallArgs = readCallArgBindings(i + 1, stop);
+            var _navCallArgs = await readCallArgBindings(i + 1, stop);
             if (_navCallArgs && taintEnabled) {
               checkSinkCall(t.text, _navCallArgs.bindings, t);
             }
@@ -6387,7 +6236,7 @@
             if (_cwTag === 'iframe' || _cwTag === 'frame') {
               var _cwEq = tokens[i + 1];
               if (_cwEq && _cwEq.type === 'sep' && _cwEq.char === '=') {
-                var _cwR = readValue(i + 2, stop, TERMS_TOP);
+                var _cwR = await readValue(i + 2, stop, TERMS_TOP);
                 var _cwVal = _cwR ? _cwR.binding : null;
                 if (taintEnabled && _cwVal && _cwVal.kind === 'chain') {
                   var _cwTaint = collectChainTaint(_cwVal.toks);
@@ -6438,7 +6287,7 @@
           const baseBind = resolve(parts[0]);
           // Object property assignment: obj.prop = value
           if (baseBind && baseBind.kind === 'object' && parts.length === 2) {
-            const r = readValue(i + 2, stop, TERMS_TOP);
+            const r = await readValue(i + 2, stop, TERMS_TOP);
             if (r && r.binding) {
               if (eqTok.char === '+=') {
                 var prev = baseBind.props[parts[1]];
@@ -6455,7 +6304,7 @@
             continue;
           }
           if (baseBind && baseBind.kind === 'element') {
-            const r = readValue(i + 2, stop, TERMS_TOP);
+            const r = await readValue(i + 2, stop, TERMS_TOP);
             const val = r ? r.binding : null;
             applyElementSet(baseBind, parts.slice(1), val, t);
             i = skipExpr(i + 2, stop) - 1;
@@ -6465,7 +6314,7 @@
           if (taintEnabled && parts.length >= 2) {
             const sinkProp = parts[parts.length - 1];
             if (TAINT_SINKS[sinkProp] || sinkProp === 'src' || sinkProp === 'href' || sinkProp === 'action' || sinkProp === 'srcdoc') {
-              const r = readValue(i + 2, stop, TERMS_TOP);
+              const r = await readValue(i + 2, stop, TERMS_TOP);
               const val = r ? r.binding : null;
               if (val && val.kind === 'chain') {
                 var _taint = collectChainTaint(val.toks);
@@ -6493,7 +6342,7 @@
             const method = t.text.slice(dot + 1);
             const baseBind = resolve(base);
             if (baseBind && baseBind.kind === 'element' && DOM_METHODS.has(method)) {
-              const argResult = readCallArgBindings(i + 1, stop);
+              const argResult = await readCallArgBindings(i + 1, stop);
               if (argResult) {
                 applyElementMethod(baseBind, method, argResult.bindings);
                 i = argResult.next - 1;
@@ -6503,14 +6352,14 @@
             // Array methods as statements: forEach, push, unshift.
             if (baseBind && baseBind.kind === 'array' && (method === 'forEach' || method === 'map' || method === 'filter')) {
               // Use applyMethod to handle the call — it walks forEach callbacks.
-              var arrMethodResult = applyMethod(baseBind, method, i + 1, stop);
+              var arrMethodResult = await applyMethod(baseBind, method, i + 1, stop);
               if (arrMethodResult) {
                 i = arrMethodResult.next - 1;
                 continue;
               }
             }
             if (baseBind && baseBind.kind === 'array' && (method === 'push' || method === 'unshift')) {
-              var arrArgs = readCallArgBindings(i + 1, stop);
+              var arrArgs = await readCallArgBindings(i + 1, stop);
               if (arrArgs) {
                 for (var _ai = 0; _ai < arrArgs.bindings.length; _ai++) {
                   if (arrArgs.bindings[_ai]) {
@@ -6526,7 +6375,7 @@
             // readCallArgBindings now handles function expressions and arrows
             // via readValue → readFunctionExpr, so no special parser needed.
             if (taintEnabled && method === 'addEventListener') {
-              var _evArgs = readCallArgBindings(i + 1, stop);
+              var _evArgs = await readCallArgBindings(i + 1, stop);
               if (_evArgs && _evArgs.bindings.length >= 2) {
                 var _evTypeStr = _evArgs.bindings[0] && _evArgs.bindings[0].kind === 'chain' ? chainAsKnownString(_evArgs.bindings[0]) : null;
                 var _evHandler = _evArgs.bindings[1];
@@ -6551,9 +6400,9 @@
                   var _prevInEH = inEventHandler;
                   inEventHandler = true;
                   var _savedFindings = taintFindings ? taintFindings.length : 0;
-                  instantiateFunction(_evHandler, _evParamBindings);
+                  await instantiateFunction(_evHandler, _evParamBindings);
                   if (taintFindings) taintFindings.length = _savedFindings; // discard first-walk findings
-                  instantiateFunction(_evHandler, _evParamBindings);
+                  await instantiateFunction(_evHandler, _evParamBindings);
                   inEventHandler = _prevInEH;
                 }
                 i = _evArgs.next - 1;
@@ -6562,7 +6411,7 @@
             }
             // Taint: detect call-based sinks (eval, document.write, etc.).
             if (taintEnabled && TAINT_CALL_SINKS[t.text] && !declaredNames.has(t.text.split('.')[0])) {
-              const argResult = readCallArgBindings(i + 1, stop);
+              const argResult = await readCallArgBindings(i + 1, stop);
               if (argResult) {
                 checkSinkCall(t.text, argResult.bindings, t);
                 i = argResult.next - 1;
@@ -6616,10 +6465,10 @@
                 if (tokens[_ki].type === 'close' && tokens[_ki].char === ']') { _kd--; if (_kd === 0) { _keyEnd = _ki; break; } }
               }
               if (_keyEnd > _keyStart) {
-                var _keyVal = readValue(_keyStart, _keyEnd, null);
+                var _keyVal = await readValue(_keyStart, _keyEnd, null);
                 var _keyStr = _keyVal ? chainAsKnownString(_keyVal.binding) : null;
                 if (_keyStr !== null) {
-                  var _rhsVal = readValue(j + 1, stop, TERMS_TOP);
+                  var _rhsVal = await readValue(j + 1, stop, TERMS_TOP);
                   if (_rhsVal && _rhsVal.binding) {
                     if (_baseBind.kind === 'object') _baseBind.props[_keyStr] = _rhsVal.binding;
                     if (_baseBind.kind === 'array' && /^\d+$/.test(_keyStr)) _baseBind.elems[parseInt(_keyStr, 10)] = _rhsVal.binding;
@@ -6693,22 +6542,22 @@
       taintCondStack.length = _tcBaseDepth;
     }
     };
-    walkRange(0, stop);
+    await walkRange(0, stop);
 
     // Advance the scope walker to a new stop position, processing all
     // tokens between the current stop and the new one. This allows
     // the caller to incrementally build scope state for each statement
     // in a build region.
-    const advanceTo = (newStop) => {
+    const advanceTo = async (newStop) => {
       const ns = Math.min(newStop, tokens.length);
-      if (ns > stop) { walkRange(stop, ns); stop = ns; }
+      if (ns > stop) { await walkRange(stop, ns); stop = ns; }
     };
 
     // Parse tokens[start, end) as a concat chain, expanding identifier
     // references, member paths, `[...].join(sep)`, and `.concat(...)` calls.
     // Returns the flat chain tokens (alternating operand / plus) or null.
-    const parseRange = (start, end) => {
-      const r = readConcatExpr(start, end, TERMS_NONE);
+    const parseRange = async (start, end) => {
+      const r = await readConcatExpr(start, end, TERMS_NONE);
       if (!r || r.next !== end) return null;
       return r.toks;
     };
@@ -6732,16 +6581,16 @@
   // paths, `.join(sep)`, `.concat(...)`, and template interpolation); if that
   // fails, falls back to per-identifier substitution so downstream chain
   // detection can still find partial matches.
-  function resolveIdentifiers(tokens, startIdx, endIdx, buildVarOrVars) {
+  async function resolveIdentifiers(tokens, startIdx, endIdx, buildVarOrVars) {
     const externallyMutable = scanMutations(tokens);
-    const state = buildScopeState(tokens, startIdx, externallyMutable, buildVarOrVars);
-    const full = state.parseRange(startIdx, endIdx);
+    const state = await buildScopeState(tokens, startIdx, externallyMutable, buildVarOrVars);
+    const full = await state.parseRange(startIdx, endIdx);
     if (full) return { tokens: full, parsed: true, loopInfo: state.loopInfo, loopVars: state.loopVars, buildVarDeclStart: state.getBuildVarDeclStart(), inScope: state.inScope, resolve: state.resolve };
     const out = [];
     for (let i = startIdx; i < endIdx; i++) {
       const t = tokens[i];
       if (t.type === 'tmpl') {
-        const rw = state.rewriteTemplate(t);
+        const rw = await state.rewriteTemplate(t);
         if (rw.type === '_chain') { for (const ct of rw.toks) out.push(ct); }
         else out.push(rw);
         continue;
@@ -6750,7 +6599,7 @@
         const next = tokens[i + 1];
         const isLhs = next && next.type === 'sep' && next.char === '=';
         if (!isLhs) {
-          const b = state.resolvePath(t.text);
+          const b = await state.resolvePath(t.text);
           if (b && b.kind === 'chain') { for (const vt of b.toks) out.push(vt); continue; }
         }
       }
@@ -7082,7 +6931,7 @@
   // This avoids multi-level inlining which flattens scopes.
   // Uses the JS tokenizer for proper function detection and brace
   // matching (handles strings, comments, regex containing braces).
-  function convertHtmlBuilderFunctions(source) {
+  async function convertHtmlBuilderFunctions(source) {
     const result = { source: source, converted: new Set() };
     const toks = tokenize(source);
     const replacements = []; // { start, end, replacement }
@@ -7184,11 +7033,11 @@
         }
       }
 
-      const extractions = extractAllHTML(syntheticBody);
+      const extractions = await extractAllHTML(syntheticBody);
       if (extractions.length > 0) {
         const ex = extractions[0];
         const used = new Set();
-        const domBlock = convertOne(syntheticBody, ex, false, false, used, '__frag', result.converted);
+        const domBlock = await convertOne(syntheticBody, ex, false, false, used, '__frag', result.converted);
         if (domBlock) {
           let converted = domBlock
             .replace('__frag.replaceChildren();\n', '')
@@ -7218,7 +7067,7 @@
 
   // Core conversion: takes a raw input string, returns the converted output.
   // sourceName: optional filename for naming output files (e.g. 'index.html').
-  function convertRaw(raw, sourceName, externalDomFunctions) {
+  async function convertRaw(raw, sourceName, externalDomFunctions) {
     // Derive the handlers filename from the source.
     const baseName = sourceName ? sourceName.replace(/\.[^.]+$/, '') : 'index';
     const handlersFile = baseName + '.handlers.js';
@@ -7228,16 +7077,16 @@
       // innerHTML replacements, extract unsafe attributes (events, styles,
       // javascript: URLs) into a separate JS file.
       if (/^\s*</.test(raw)) {
-        const markup = convertHtmlMarkup(raw, sourceName || 'index.html');
+        const markup = await convertHtmlMarkup(raw, sourceName || 'index.html');
         // Combine inline script blocks and process innerHTML assignments.
         const jsFileLines = [];
         const sharedUsed = new Set();
         if (markup.extractedScripts.length > 0) {
           const separator = '\n/*__BLOCK_SEP__*/\n';
           let combinedJs = markup.extractedScripts.map(function(s) { return s.content; }).join(separator);
-          const prepass = convertHtmlBuilderFunctions(combinedJs);
+          const prepass = await convertHtmlBuilderFunctions(combinedJs);
           combinedJs = prepass.source;
-          const extractions = extractAllHTML(combinedJs);
+          const extractions = await extractAllHTML(combinedJs);
           if (extractions.length === 0) {
             for (const s of markup.extractedScripts) jsFileLines.push(s.content.trim());
           } else {
@@ -7246,7 +7095,7 @@
             let cursor = 0;
             for (const ex of extractions) {
               if (ex.srcStart === undefined) continue;
-              const domBlock = convertOne(combinedJs, ex, false, false, sharedUsed, null, prepass.converted);
+              const domBlock = await convertOne(combinedJs, ex, false, false, sharedUsed, null, prepass.converted);
               let srcStart = ex.srcStart;
               let srcEnd = ex.srcEnd;
               if (ex.buildVarDeclStart >= 0) {
@@ -7291,11 +7140,11 @@
       if (externalDomFunctions) {
         for (const fn of externalDomFunctions) allDomFunctions.add(fn);
       }
-      const extractions = extractAllHTML(processedRaw);
+      const extractions = await extractAllHTML(processedRaw);
       if (extractions.length === 0) {
-        const summary = summarizeDomConstruction(processedRaw);
+        const summary = await summarizeDomConstruction(processedRaw);
         if (summary) { return summary; }
-        return (convertOne(processedRaw, extractHTML(processedRaw), false, false) || '');
+        return (await convertOne(processedRaw, await extractHTML(processedRaw), false, false) || '');
         return;
       }
       // Inline rewriting: preserve original code, replace innerHTML sites.
@@ -7321,7 +7170,7 @@
         const target = ex.target || 'document.body';
         const assignOp = ex.assignOp || '=';
 
-        const domBlock = convertOne(processedRaw, ex, false, false, sharedUsed, null, allDomFunctions);
+        const domBlock = await convertOne(processedRaw, ex, false, false, sharedUsed, null, allDomFunctions);
         let srcStart = ex.srcStart;
         let srcEnd = ex.srcEnd;
         // When the chain carries preserve tokens, the region starts at
@@ -7350,9 +7199,9 @@
   }
 
   // UI wrapper: reads from editor, converts, writes to output.
-  function convert() {
+  async function convert() {
     const raw = (typeof window !== 'undefined' && window._monacoIn) ? window._monacoIn.getValue() : ($('in') ? $('in').value : '');
-    setOutput(convertRaw(raw) || '');
+    setOutput(await convertRaw(raw) || '');
   }
 
   let lastOutput = '';
@@ -7369,8 +7218,8 @@
   // appendChild / setAttribute as HTML comments. The script's own code
   // is already safe (no innerHTML), so there's nothing to rewrite; the
   // summary shows what the user ends up building.
-  function summarizeDomConstruction(raw) {
-    const dom = extractAllDOM(raw);
+  async function summarizeDomConstruction(raw) {
+    const dom = await extractAllDOM(raw);
     if (!dom || !dom.roots || !dom.roots.length) return '';
     const hasCreate = dom.ops && dom.ops.some((o) => o.op === 'create' || o.op === 'createTextNode');
     if (!hasCreate) return '';
@@ -7407,7 +7256,7 @@
   //
   // For runtime-dependent structure (state machines with unbalanced
   // tags), falls back to a runtime parent pointer only where needed.
-  function convertOne(raw, result, multi, emitTitle, sharedUsed, parentOverride, domFunctions) {
+  async function convertOne(raw, result, multi, emitTitle, sharedUsed, parentOverride, domFunctions) {
     const { target, assignProp, assignOp } = result;
 
     let parent = parentOverride || 'document.body';
@@ -8167,7 +8016,7 @@
     $('in').addEventListener('input', convert);
   }
 
-  convert();
+  await convert();
 
   // --- Project-level API ---
 
@@ -8198,11 +8047,11 @@
 
   // Scan JS source for navigation sinks and wrap them with protocol filtering.
   // Returns the modified source, or null if no changes.
-  function filterUnsafeSinks(jsContent) {
+  async function filterUnsafeSinks(jsContent) {
     var tokens = tokenize(jsContent);
     if (!tokens.length) return null;
     // Build scope to resolve variable types and taint.
-    var scope = buildScopeState(tokens, tokens.length, null, null, { enabled: true });
+    var scope = await buildScopeState(tokens, tokens.length, null, null, { enabled: true });
     var replacements = []; // { start, end, replacement }
     for (var i = 0; i < tokens.length; i++) {
       var t = tokens[i];
@@ -8464,23 +8313,23 @@
     return result;
   }
 
-  function convertJsFile(jsContent, precedingCode, knownDomFunctions) {
+  async function convertJsFile(jsContent, precedingCode, knownDomFunctions) {
     // Use extractAllHTML to detect actual innerHTML/outerHTML assignments.
     // This uses the tokenizer (skipping comments/strings) AND verifies
     // the target is not a known non-element via scope resolution.
     const combined = precedingCode
       ? precedingCode + '\n/*__FILE_BOUNDARY__*/\n' + jsContent
       : jsContent;
-    const extractions = extractAllHTML(combined);
+    const extractions = await extractAllHTML(combined);
     // Also filter navigation sinks in the current file.
-    var navFiltered = filterUnsafeSinks(jsContent);
+    var navFiltered = await filterUnsafeSinks(jsContent);
     if (extractions.length === 0 && !navFiltered) return navFiltered;
     var sourceToConvert = navFiltered || jsContent;
     var combinedSrc = precedingCode
       ? precedingCode + '\n/*__FILE_BOUNDARY__*/\n' + sourceToConvert
       : sourceToConvert;
     if (extractions.length === 0) return navFiltered;
-    const converted = convertRaw(combinedSrc, undefined, knownDomFunctions);
+    const converted = await convertRaw(combinedSrc, undefined, knownDomFunctions);
     if (!converted || converted === '// (no nodes parsed)') return navFiltered;
     if (precedingCode) {
       const idx = converted.indexOf('/*__FILE_BOUNDARY__*/');
@@ -8680,7 +8529,7 @@
     return out;
   }
 
-  function convertHtmlMarkup(htmlContent, htmlPath, reservedIdents) {
+  async function convertHtmlMarkup(htmlContent, htmlPath, reservedIdents) {
     // Derive filenames from source path.
     let baseName = htmlPath;
     const slashIdx = baseName.lastIndexOf('/');
@@ -8927,12 +8776,12 @@
 
   // Analyze a single JS source for taint flows. Returns an array of findings.
   // All detection happens inside the scope walker — no post-hoc regex scanning.
-  function traceTaintInJs(jsContent, precedingCode) {
+  async function traceTaintInJs(jsContent, precedingCode) {
     var src = (precedingCode ? precedingCode + '\n' : '') + jsContent;
     var tokens = tokenize(src.trim());
     if (!tokens.length) return [];
     // Run scope walker with taint enabled — it detects all sinks internally.
-    var scope = buildScopeState(tokens, tokens.length, null, null, { enabled: true });
+    var scope = await buildScopeState(tokens, tokens.length, null, null, { enabled: true });
     return scope.taintFindings || [];
   }
 
@@ -8948,7 +8797,7 @@
 
   // Analyze a multi-file project for taint flows.
   // Returns { findings: [...], summary: { ... } }.
-  function traceTaint(files) {
+  async function traceTaint(files) {
     var allFindings = [];
     // Find HTML pages and their referenced scripts.
     var htmlPages = Object.keys(files).filter(function(p) { return /\.html?$/i.test(p); });
@@ -8981,7 +8830,7 @@
             if (scriptToken && scriptToken.start !== undefined) {
               scriptLineOffset = countLines(content, scriptToken.start);
             }
-            var inlineFindings = traceTaintInJs(scriptContent);
+            var inlineFindings = await traceTaintInJs(scriptContent);
             for (var f of inlineFindings) {
               f.file = page;
               f.inline = true;
@@ -9008,7 +8857,7 @@
       var precedingCode = '';
       for (var sr of scriptRefs) {
         if (files[sr]) {
-          var extFindings = traceTaintInJs(files[sr], precedingCode);
+          var extFindings = await traceTaintInJs(files[sr], precedingCode);
           for (var f2 of extFindings) {
             f2.file = sr;
             allFindings.push(f2);
@@ -9031,7 +8880,7 @@
     }
     var standaloneJs = Object.keys(files).filter(function(p) { return /\.js$/i.test(p) && !referencedJs.has(p); });
     for (var sj of standaloneJs) {
-      var sjFindings = traceTaintInJs(files[sj]);
+      var sjFindings = await traceTaintInJs(files[sj]);
       for (var f3 of sjFindings) {
         f3.file = sj;
         allFindings.push(f3);
@@ -9050,7 +8899,7 @@
     };
   }
 
-  function convertProject(files) {
+  async function convertProject(files) {
     const output = {};
     const htmlPages = Object.keys(files).filter(function(p) { return /\.html?$/i.test(p); }).sort();
     const referencedJs = new Set();
@@ -9072,7 +8921,7 @@
           if (t.type === 'other' && IDENT_RE.test(t.text)) pageIdents.add(t.text);
         }
       }
-      const markup = convertHtmlMarkup(files[page], page, pageIdents);
+      const markup = await convertHtmlMarkup(files[page], page, pageIdents);
       const dir = page.indexOf('/') >= 0 ? page.slice(0, page.lastIndexOf('/') + 1) : '';
       // Only output HTML if it actually changed.
       if (markup.html !== files[page]) output[page] = markup.html;
@@ -9117,7 +8966,7 @@
         }
         // Skip pre-pass for files with innerHTML — scope walker handles them.
         if (fileHasInnerHTML) continue;
-        const prepass = convertHtmlBuilderFunctions(workingFiles[sp]);
+        const prepass = await convertHtmlBuilderFunctions(workingFiles[sp]);
         for (const fn of prepass.converted) allConvertedFns.add(fn);
         if (prepass.converted.size > 0 && prepass.source !== workingFiles[sp]) {
           workingFiles[sp] = prepass.source;
@@ -9129,7 +8978,7 @@
       let precedingCode = '';
       for (const sp of scripts) {
         if (!workingFiles[sp]) continue;
-        const converted = convertJsFile(workingFiles[sp], precedingCode, allConvertedFns);
+        const converted = await convertJsFile(workingFiles[sp], precedingCode, allConvertedFns);
         if (converted) output[sp] = converted;
         precedingCode += (precedingCode ? '\n' : '') + workingFiles[sp];
       }
@@ -9137,14 +8986,14 @@
       for (const script of markup.extractedScripts) {
         const key = dir + script.name;
         const content = workingFiles[key] || script.content;
-        const converted = convertJsFile(content, precedingCode, allConvertedFns);
+        const converted = await convertJsFile(content, precedingCode, allConvertedFns);
         output[key] = converted || content;
         precedingCode += (precedingCode ? '\n' : '') + content;
       }
     }
     const standaloneJs = Object.keys(files).filter(function(p) { return /\.js$/i.test(p) && !referencedJs.has(p); }).sort();
     for (const jp of standaloneJs) {
-      const converted = convertJsFile(files[jp], '');
+      const converted = await convertJsFile(files[jp], '');
       if (converted) output[jp] = converted;
     }
     return output;
