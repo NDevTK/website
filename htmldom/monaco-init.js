@@ -168,28 +168,42 @@
     }
 
     // --- Conversion ---
-    // Use the project-level API from htmldom-convert.js.
+    // Uses HtmldomConvert.convertProject (a consumer built on jsanalyze)
+    // for DOM rewriting and globalThis.__traceTaint (exposed by the
+    // walker) for taint flow analysis. Both are async so convertAll
+    // is async too; callers (setTimeout, init timer) don't need to
+    // await it.
     var convertAllRunning = false;
     var taintResults = null;
     var editorDecorations = [];
-    function convertAll() {
+    async function convertAll() {
       if (convertAllRunning || !folderFiles) return;
       convertAllRunning = true;
-      // __convertProject processes each HTML page independently.
-      outputFiles = globalThis.__convertProject ? globalThis.__convertProject(folderFiles) : {};
-      // Run taint analysis.
-      if (globalThis.__traceTaint) {
-        try {
-          taintResults = globalThis.__traceTaint(folderFiles);
-        } catch (e) {
-          taintResults = { findings: [], summary: { total: 0 } };
+      try {
+        // HtmldomConvert processes every HTML page and rewrites any
+        // innerHTML sinks in the referenced JS files. The facade
+        // waits for jsanalyze.js's async IIFE to finish loading
+        // before running.
+        if (globalThis.HtmldomConvert) {
+          outputFiles = await globalThis.HtmldomConvert.convertProject(folderFiles) || {};
+        } else {
+          outputFiles = {};
         }
+        // Taint analysis returns { findings, summary }.
+        if (globalThis.__traceTaint) {
+          try {
+            taintResults = await globalThis.__traceTaint(folderFiles);
+          } catch (e) {
+            taintResults = { findings: [], summary: { total: 0 } };
+          }
+        }
+        renderSidebar();
+        renderTaintFindings();
+        updateEditorDecorations();
+        document.getElementById('downloadAll').disabled = !Object.keys(outputFiles).length;
+      } finally {
+        convertAllRunning = false;
       }
-      renderSidebar();
-      renderTaintFindings();
-      updateEditorDecorations();
-      document.getElementById('downloadAll').disabled = !Object.keys(outputFiles).length;
-      convertAllRunning = false;
     }
 
     function renderTaintFindings() {
@@ -362,9 +376,12 @@
     });
 
     // Initial conversion of the example file.
-    // Wait for jsanalyze.js to load before converting.
+    // Wait for HtmldomConvert (the DOM conversion consumer) to
+    // finish loading before running the first convertAll. This
+    // replaces the pre-Stage-5 check for globalThis.__convertProject
+    // which was removed when the converter moved out of jsanalyze.js.
     var initTimer = setInterval(function() {
-      if (globalThis.__convertProject) {
+      if (globalThis.HtmldomConvert && globalThis.__traceTaint) {
         clearInterval(initTimer);
         convertAll();
         selectFile('example.html', 'original');
