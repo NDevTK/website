@@ -3355,13 +3355,37 @@
           }
           if (isMethodCall) {
             const r = await applyMethod(cur, lastSeg, next + 1, stop);
-            if (!r) break;
-            bind = r.bind;
-            next = r.next;
-            continue;
+            if (r) {
+              bind = r.bind;
+              next = r.next;
+              continue;
+            }
+            // applyMethod returned null — fall through to the
+            // object-method-call path below for cases like a thenable
+            // object whose .then property is a user-defined function.
+            // (applyMethod's then handler only fires when the receiver
+            // is a chain; an object with a .then function should be
+            // dispatched via the inline-method path.)
+            if (cur && cur.kind === 'object' && cur.props && cur.props[lastSeg] && cur.props[lastSeg].kind === 'function') {
+              // fall through to the function-call branch below
+            } else {
+              break;
+            }
           }
           // Object method call: cur is a function binding accessed via .prop,
           // followed by (args). Inline the function.
+          if (isCall && cur && cur.kind === 'object' && cur.props && cur.props[lastSeg] && cur.props[lastSeg].kind === 'function') {
+            var _omFn = cur.props[lastSeg];
+            var _omArgs = await readCallArgBindings(next + 1, stop);
+            if (_omArgs) {
+              var _omResult = await instantiateFunction(_omFn, _omArgs.bindings, cur);
+              if (_omResult && _omResult.kind) { bind = _omResult; next = _omArgs.next; continue; }
+              if (_omResult) { bind = chainBinding(_omResult); next = _omArgs.next; continue; }
+              bind = chainBinding([exprRef('()')]);
+              next = _omArgs.next;
+              continue;
+            }
+          }
           if (isCall && cur && cur.kind === 'function') {
             var _omArgs = await readCallArgBindings(next + 1, stop);
             if (_omArgs) {
@@ -6687,11 +6711,52 @@
           }
         }
       }
+      // Bare-method Promise continuation: `p.then(...)` / `p.catch(...)`
+      // / `p.finally(...)` as a statement, where p is a stored Promise
+      // (a chain produced by fetch / await / etc.). When p resolves to
+      // a chain (Promise-shaped value), route through readValue so
+      // applyMethod's then/catch/finally handler walks the callback
+      // with the receiver's taint. When p resolves to a real object
+      // with a .then function property (a "thenable"), let the existing
+      // bare-call handler dispatch through resolvePath instead — its
+      // path-walking is what makes inline thenables work.
+      if (taintEnabled && t.type === 'other' && /\.(then|catch|finally)$/.test(t.text)) {
+        var _bmParen = tokens[i + 1];
+        if (_bmParen && _bmParen.type === 'open' && _bmParen.char === '(') {
+          var _bmRoot = t.text.slice(0, t.text.lastIndexOf('.')).split('.')[0];
+          var _bmRootBind = resolve(_bmRoot);
+          if (_bmRootBind && _bmRootBind.kind === 'chain') {
+            var _bmResult = await readValue(i, stop, TERMS_TOP);
+            if (_bmResult) { i = _bmResult.next - 1; continue; }
+          }
+        }
+      }
       // Bare function call as a statement: `render(input);` or `obj.method(args);`.
       // Resolve the callee; if it's a function binding, inline it for side effects.
       if (t.type === 'other' && IDENT_OR_PATH_RE.test(t.text)) {
         const callParen = tokens[i + 1];
         if (callParen && callParen.type === 'open' && callParen.char === '(') {
+          // Promise continuation peek BEFORE the inline-call path:
+          // `load().then(d => sink(d))` should be routed through
+          // readValue so the .then callback flows through applyMethod
+          // with the receiver's taint. If we let the bare-call handler
+          // inline load() in isolation, the trailing .then is lost.
+          if (taintEnabled) {
+            var _bcDepth = 1, _bcK = i + 2;
+            while (_bcK < stop && _bcDepth > 0) {
+              if (tokens[_bcK].type === 'open' && tokens[_bcK].char === '(') _bcDepth++;
+              else if (tokens[_bcK].type === 'close' && tokens[_bcK].char === ')') _bcDepth--;
+              if (_bcDepth === 0) break;
+              _bcK++;
+            }
+            if (_bcDepth === 0) {
+              var _bcAfter = tokens[_bcK + 1];
+              if (_bcAfter && _bcAfter.type === 'other' && /^\.(then|catch|finally)$/.test(_bcAfter.text)) {
+                var _bcResult = await readValue(i, stop, TERMS_TOP);
+                if (_bcResult) { i = _bcResult.next - 1; continue; }
+              }
+            }
+          }
           var calleeBind = await resolvePath(t.text);
           if (calleeBind && calleeBind.kind === 'function') {
             var callArgs = await readCallArgBindings(i + 1, stop);

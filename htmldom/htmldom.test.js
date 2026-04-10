@@ -3574,6 +3574,20 @@ await (async function () {
   await checkTaint('dispatcher map: known key resolves',
     { 'a.js': 'var dispatch = { arm: function() { document.body.innerHTML = location.search; } }; dispatch["arm"]();' }, 1);
 
+  // --- Promise pipeline through stored variables and function returns ---
+  // The bare-method statement detector routes \`p.then(...)\` through
+  // readValue → applyMethod when p is a stored Promise (chain), and
+  // the bare-call peek detects \`f().then(...)\` so the inlined return
+  // value flows into the .then callback.
+  await checkTaint('promise: var-stored fetch.then',
+    { 'a.js': 'var p = fetch("/api"); p.then(function(d) { document.body.innerHTML = d; });' }, 1);
+  await checkTaint('promise: var-stored fetch chain.then',
+    { 'a.js': 'var p = fetch("/api").then(function(r) { return r.text(); }); p.then(function(d) { document.body.innerHTML = d; });' }, 1);
+  await checkTaint('promise: fn-wrapped fetch().then',
+    { 'a.js': 'function load() { return fetch("/api"); } load().then(function(d) { document.body.innerHTML = d; });' }, 1);
+  await checkTaint('promise: fn-wrapped chain().then',
+    { 'a.js': 'function load(url) { return fetch(url).then(function(r) { return r.text(); }); } load("/api").then(function(d) { document.body.innerHTML = d; });' }, 1);
+
   // --- IIFE ---
   await checkTaint('IIFE function', { 'a.js': '(function() { document.getElementById("o").innerHTML = location.search; })();' }, 1);
   await checkTaint('IIFE with args', { 'a.js': '(function(x) { document.getElementById("o").innerHTML = x; })(location.search);' }, 1);
