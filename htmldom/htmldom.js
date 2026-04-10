@@ -2635,6 +2635,8 @@
           case 'READ_OBJECT_LIT':        _stepReadObjectLit(_f); break;
           case 'READ_CALL_ARG_BINDINGS': _stepReadCallArgBindings(_f); break;
           case 'READ_CONCAT_ARGS':       _stepReadConcatArgs(_f); break;
+          case 'READ_CALL_ARG_BINDINGS': _stepReadCallArgBindings(_f); break;
+          case 'READ_CONCAT_ARGS':       _stepReadConcatArgs(_f); break;
           default: _completeFrame(null); break;
         }
       }
@@ -2645,165 +2647,86 @@
     // Keys are bare identifiers or quoted strings. Values are any readValue
     // (chain, nested object, or nested array). Returns { binding, next }.
     const readObjectLit = (k, stop) => {
-      const open = tks[k];
-      if (!open || open.type !== 'open' || open.char !== '{') return null;
-      const props = Object.create(null);
-      let i = k + 1;
-      while (i < stop) {
-        const tk = tks[i];
+      if (!tks[k] || tks[k].type !== 'open' || tks[k].char !== '{') return null;
+      _evalStack.push({ type: 'READ_OBJECT_LIT', i: k + 1, stop, props: Object.create(null), _waitingKey: null });
+      return _evalLoop();
+    };
+    const _stepReadObjectLit = (frame) => {
+      // Consume child readValue result
+      if (_resultSlot.has) {
+        const val = _consumeResult();
+        if (!val) { _completeFrame(null); return; }
+        frame.props[frame._waitingKey] = val.binding; frame.i = val.next;
+        const sep = tks[frame.i]; if (sep && sep.type === 'sep' && sep.char === ',') frame.i++;
+      }
+      const props = frame.props, stop = frame.stop;
+      while (frame.i < stop) {
+        const tk = tks[frame.i];
+        if (!tk) { _completeFrame(null); return; }
         if (tk.type === 'close' && tk.char === '}') break;
-        // Spread: `...obj` merges a known object binding's props in.
         if (tk.type === 'other' && tk.text.startsWith('...')) {
           const name = tk.text.slice(3);
-          if (IDENT_OR_PATH_RE.test(name)) {
-            const b = resolvePath(name);
-            if (b && b.kind === 'object') {
-              for (const kk in b.props) props[kk] = b.props[kk];
-              i++;
-              const sep = tks[i];
-              if (sep && sep.type === 'sep' && sep.char === ',') { i++; continue; }
-              break;
-            }
-          }
-          return null;
+          if (IDENT_OR_PATH_RE.test(name)) { const b = resolvePath(name); if (b && b.kind === 'object') { for (const kk in b.props) props[kk] = b.props[kk]; frame.i++; const sep = tks[frame.i]; if (sep && sep.type === 'sep' && sep.char === ',') { frame.i++; continue; } break; } }
+          _completeFrame(null); return;
         }
-        // Key: either a str token or an 'other' identifier (possibly with
-        // an attached trailing ':').
-        let keyName = null;
-        if (tk.type === 'str') {
-          keyName = tk.text;
-          i++;
-        } else if (tk.type === 'other') {
-          // Strip one optional trailing ':' that the tokenizer left attached.
+        var keyName = null;
+        if (tk.type === 'str') { keyName = tk.text; frame.i++; }
+        else if (tk.type === 'other') {
           if (tk.text.endsWith(':') && IDENT_RE.test(tk.text.slice(0, -1))) {
-            keyName = tk.text.slice(0, -1);
-            i++;
-            // The ':' was consumed as part of the token.
-            // Value follows directly.
-            const val = readValue(i, stop, TERMS_OBJ);
-            if (!val) return null;
-            props[keyName] = val.binding;
-            i = val.next;
-            const sep = tks[i];
-            if (sep && sep.type === 'sep' && sep.char === ',') { i++; continue; }
-            break;
+            keyName = tk.text.slice(0, -1); frame.i++;
+            frame._waitingKey = keyName;
+            const val = readValue(frame.i, stop, TERMS_OBJ);
+            if (!val) { _completeFrame(null); return; }
+            props[keyName] = val.binding; frame.i = val.next;
+            const sep = tks[frame.i]; if (sep && sep.type === 'sep' && sep.char === ',') { frame.i++; continue; } break;
           }
           if (IDENT_RE.test(tk.text)) {
-            // `get`/`set`/`async` prefix on a method definition — skip the
-            // leading keyword and treat the following name as the key.
-            if ((tk.text === 'get' || tk.text === 'set' || tk.text === 'async') &&
-                tks[i + 1] && tks[i + 1].type === 'other' && IDENT_RE.test(tks[i + 1].text) &&
-                tks[i + 2] && tks[i + 2].type === 'open' && tks[i + 2].char === '(') {
-              var _gsPrefix = tk.text;
-              i++; // skip prefix
-              keyName = tks[i].text;
-              i++;
-              // Parse params and body directly (no 'function' keyword).
-              var _gsParams = [], _gsJ = i; // i points to '('
-              if (tks[_gsJ] && tks[_gsJ].type === 'open' && tks[_gsJ].char === '(') {
-                _gsJ++;
-                while (_gsJ < stop) {
-                  if (tks[_gsJ].type === 'close' && tks[_gsJ].char === ')') { _gsJ++; break; }
-                  var _gsp = parseParamWithDefault(tks, _gsJ, stop);
-                  if (_gsp) { _gsParams.push(_gsp.param); _gsJ = _gsp.next; }
-                  else _gsJ++;
-                  if (tks[_gsJ] && tks[_gsJ].type === 'sep' && tks[_gsJ].char === ',') _gsJ++;
-                }
-              }
+            if ((tk.text === 'get' || tk.text === 'set' || tk.text === 'async') && tks[frame.i + 1] && tks[frame.i + 1].type === 'other' && IDENT_RE.test(tks[frame.i + 1].text) && tks[frame.i + 2] && tks[frame.i + 2].type === 'open' && tks[frame.i + 2].char === '(') {
+              var _gsPrefix = tk.text; frame.i++; keyName = tks[frame.i].text; frame.i++;
+              var _gsParams = [], _gsJ = frame.i;
+              if (tks[_gsJ] && tks[_gsJ].type === 'open' && tks[_gsJ].char === '(') { _gsJ++; while (_gsJ < stop) { if (tks[_gsJ].type === 'close' && tks[_gsJ].char === ')') { _gsJ++; break; } var _gsp = parseParamWithDefault(tks, _gsJ, stop); if (_gsp) { _gsParams.push(_gsp.param); _gsJ = _gsp.next; } else _gsJ++; if (tks[_gsJ] && tks[_gsJ].type === 'sep' && tks[_gsJ].char === ',') _gsJ++; } }
               if (tks[_gsJ] && tks[_gsJ].type === 'open' && tks[_gsJ].char === '{') {
                 var _gsBD = 1, _gsBE = _gsJ + 1;
                 while (_gsBE < stop && _gsBD > 0) { if (tks[_gsBE].type === 'open' && tks[_gsBE].char === '{') _gsBD++; if (tks[_gsBE].type === 'close' && tks[_gsBE].char === '}') _gsBD--; _gsBE++; }
                 var _gsFnBind = functionBinding(_gsParams, _gsJ, _gsBE, true);
-                if (_gsPrefix === 'get') props['__getter_' + keyName] = _gsFnBind;
-                else props[keyName] = _gsFnBind;
-                i = _gsBE;
-                if (tks[i] && tks[i].type === 'sep' && tks[i].char === ',') i++;
+                if (_gsPrefix === 'get') props['__getter_' + keyName] = _gsFnBind; else props[keyName] = _gsFnBind;
+                frame.i = _gsBE; if (tks[frame.i] && tks[frame.i].type === 'sep' && tks[frame.i].char === ',') frame.i++;
                 continue;
               }
-            } else {
-              keyName = tk.text;
-              i++;
-            }
-          }
-          else return null;
+            } else { keyName = tk.text; frame.i++; }
+          } else { _completeFrame(null); return; }
         } else if (tk.type === 'open' && tk.char === '[') {
-          // Computed key `[expr]: value` — evaluate expr as a concat
-          // chain, use its known string as the property name.
-          let depth = 1, j = i + 1;
-          while (j < stop && depth > 0) {
-            const tkk = tks[j];
-            if (tkk.type === 'open' && tkk.char === '[') depth++;
-            else if (tkk.type === 'close' && tkk.char === ']') depth--;
-            if (depth === 0) break;
-            j++;
-          }
-          if (!tks[j] || tks[j].type !== 'close') return null;
-          const inner = readConcatExpr(i + 1, j, TERMS_NONE);
-          if (!inner || !inner.toks || inner.toks.length !== 1) return null;
-          const keyTok = inner.toks[0];
-          if (keyTok.type === 'str') keyName = keyTok.text;
-          else return null;
-          i = j + 1;
-        } else {
-          return null;
+          let depth = 1, j = frame.i + 1;
+          while (j < stop && depth > 0) { if (tks[j].type === 'open' && tks[j].char === '[') depth++; else if (tks[j].type === 'close' && tks[j].char === ']') depth--; if (depth === 0) break; j++; }
+          if (!tks[j] || tks[j].type !== 'close') { _completeFrame(null); return; }
+          const inner = readConcatExpr(frame.i + 1, j, TERMS_NONE);
+          if (!inner || !inner.toks || inner.toks.length !== 1) { _completeFrame(null); return; }
+          if (inner.toks[0].type === 'str') keyName = inner.toks[0].text; else { _completeFrame(null); return; }
+          frame.i = j + 1;
+        } else { _completeFrame(null); return; }
+        if (tks[frame.i] && tks[frame.i].type === 'open' && tks[frame.i].char === '(') {
+          let d = 1; frame.i++; while (frame.i < stop && d > 0) { if (tks[frame.i].type === 'open' && tks[frame.i].char === '(') d++; if (tks[frame.i].type === 'close' && tks[frame.i].char === ')') d--; frame.i++; }
+          if (tks[frame.i] && tks[frame.i].type === 'open' && tks[frame.i].char === '{') { let bd = 1; frame.i++; while (frame.i < stop && bd > 0) { if (tks[frame.i].type === 'open' && tks[frame.i].char === '{') bd++; if (tks[frame.i].type === 'close' && tks[frame.i].char === '}') bd--; frame.i++; } }
+          const sep = tks[frame.i]; if (sep && sep.type === 'sep' && sep.char === ',') { frame.i++; continue; } break;
         }
-        // Method shorthand: `key(...) { ... }` — skip over the method body
-        // entirely and continue to the next property.
-        if (tks[i] && tks[i].type === 'open' && tks[i].char === '(') {
-          // Skip `(...)`
-          let d = 1; i++;
-          while (i < stop && d > 0) {
-            const tkk = tks[i];
-            if (tkk.type === 'open' && tkk.char === '(') d++;
-            else if (tkk.type === 'close' && tkk.char === ')') d--;
-            i++;
-          }
-          // Skip `{...}`
-          if (tks[i] && tks[i].type === 'open' && tks[i].char === '{') {
-            let bd = 1; i++;
-            while (i < stop && bd > 0) {
-              const tkk = tks[i];
-              if (tkk.type === 'open' && tkk.char === '{') bd++;
-              else if (tkk.type === 'close' && tkk.char === '}') bd--;
-              i++;
-            }
-          }
-          const sep = tks[i];
-          if (sep && sep.type === 'sep' && sep.char === ',') { i++; continue; }
-          break;
+        if (tks[frame.i] && (tks[frame.i].type === 'sep' && (tks[frame.i].char === ',' || tks[frame.i].char === ';') || tks[frame.i].type === 'close' && tks[frame.i].char === '}')) {
+          const b = resolve(keyName); props[keyName] = b || chainBinding([exprRef(keyName)]);
+          if (tks[frame.i].type === 'sep' && tks[frame.i].char === ',') { frame.i++; continue; } break;
         }
-        // Shorthand property `{ name }` → `{ name: name }` (name is a
-        // reference to a binding in scope).
-        if (tks[i] && (tks[i].type === 'sep' && (tks[i].char === ',' || tks[i].char === ';') ||
-                       tks[i].type === 'close' && tks[i].char === '}')) {
-          const b = resolve(keyName);
-          props[keyName] = b || chainBinding([exprRef(keyName)]);
-          if (tks[i].type === 'sep' && tks[i].char === ',') { i++; continue; }
-          break;
-        }
-        // Expect a separate ':' delimiter — either an 'other' token of just ':'
-        // or an 'other' token starting with ':' (rare).
-        const colon = tks[i];
-        if (!colon) return null;
-        if (colon.type === 'other' && colon.text === ':') { i++; }
-        else if (colon.type === 'other' && colon.text.startsWith(':')) {
-          // Split unusual cases: treat ':' as the separator, push rest back.
-          // We don't support this cleanly; bail.
-          return null;
-        } else {
-          return null;
-        }
-        const val = readValue(i, stop, TERMS_OBJ);
-        if (!val) return null;
-        props[keyName] = val.binding;
-        i = val.next;
-        const sep = tks[i];
-        if (sep && sep.type === 'sep' && sep.char === ',') { i++; continue; }
-        break;
+        const colon = tks[frame.i];
+        if (!colon) { _completeFrame(null); return; }
+        if (colon.type === 'other' && colon.text === ':') { frame.i++; }
+        else if (colon.type === 'other' && colon.text.startsWith(':')) { _completeFrame(null); return; }
+        else { _completeFrame(null); return; }
+        frame._waitingKey = keyName;
+        const val = readValue(frame.i, stop, TERMS_OBJ);
+        if (!val) { _completeFrame(null); return; }
+        props[keyName] = val.binding; frame.i = val.next;
+        const sep = tks[frame.i]; if (sep && sep.type === 'sep' && sep.char === ',') { frame.i++; continue; } break;
       }
-      const close = tks[i];
-      if (!close || close.type !== 'close' || close.char !== '}') return null;
-      return { binding: objectBinding(props), next: i + 1 };
+      const close = tks[frame.i];
+      if (!close || close.type !== 'close' || close.char !== '}') { _completeFrame(null); return; }
+      _completeFrame({ binding: objectBinding(props), next: frame.i + 1 });
     };
 
     // Read an array literal `[ v, v, ... ]`. Returns { binding, next } or null.
