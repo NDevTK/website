@@ -743,6 +743,12 @@
   // above); smtSat just emits the necessary `(declare-const ...)` lines
   // from `formula.sorts`, asserts `formula` (coerced to Bool), and asks
   // Z3 to check satisfiability.
+  // Per-walk may-be lattice. buildScopeState sets this to its
+  // _varMayBe map for the duration of phase 1 + phase 2 walks; smtSat
+  // reads it when emitting extra (or (= sym v1) (= sym v2) ...) constraints
+  // for variables whose value space is fully enumerated.
+  var _currentVarMayBe = null;
+
   async function smtSat(formula) {
     if (!formula) return true;
     // Compile-time fold for fully-concrete results.
@@ -754,11 +760,38 @@
     if (formula.incompatible) return true;
     var z3 = await _initZ3();
     var decls = '';
+    var extras = '';
     for (var name in formula.sorts) {
       if (name === '__conflict') continue;
-      decls += '(declare-const ' + _quoteSmtName(name) + ' ' + (formula.sorts[name] || 'Int') + ')\n';
+      var sort = formula.sorts[name] || 'Int';
+      decls += '(declare-const ' + _quoteSmtName(name) + ' ' + sort + ')\n';
+      // Emit a may-be disjunction if the variable's value space is
+      // fully enumerated (every assignment was a literal we could
+      // encode). The disjunction tells Z3 the sym CAN ONLY equal one
+      // of these specific values, which lets it refute paths
+      // requiring any other value — even when the values were set
+      // in a different callback / branch / loop iteration.
+      if (_currentVarMayBe) {
+        var slot = _currentVarMayBe[name];
+        if (slot && slot.complete && slot.vals && slot.vals.length > 1) {
+          // Only emit when the recorded sort matches the formula sort
+          // (mixing Int and String literals on the same symbol would
+          // produce a sort-mismatched disjunction).
+          var sortOk = true;
+          for (var _vi = 0; _vi < slot.vals.length; _vi++) {
+            if (slot.vals[_vi].sort !== sort) { sortOk = false; break; }
+          }
+          if (sortOk) {
+            var lits = [];
+            for (var _vj = 0; _vj < slot.vals.length; _vj++) {
+              lits.push('(= ' + _quoteSmtName(name) + ' ' + slot.vals[_vj].lit + ')');
+            }
+            extras += '(assert (or ' + lits.join(' ') + '))\n';
+          }
+        }
+      }
     }
-    var smtlib = decls + '(assert ' + _toBool(formula) + ')\n';
+    var smtlib = decls + extras + '(assert ' + _toBool(formula) + ')\n';
     var solver = new z3.Solver();
     solver.fromString(smtlib);
     var result = await solver.check();
@@ -857,6 +890,20 @@
           // Resolve full path to concrete value.
           var fb = await resolvePathFunc(t.text);
           if (fb && fb.kind === 'chain' && fb.toks.length === 1 && fb.toks[0].type === 'str') {
+            // Before folding to a single concrete value, check the
+            // may-be lattice. If the variable has been assigned more
+            // than one distinct literal across the analyzed program
+            // (e.g. set in two different callbacks), DON'T fold to
+            // the current value — return a sym so smtSat emits the
+            // (or (= sym v1) (= sym v2) …) disjunction over the full
+            // value space. Without this, the SMT layer would only
+            // see whichever value happened to be most-recently
+            // assigned in source order, missing branches that depend
+            // on other values in the may-be set.
+            var _mbSlot = _currentVarMayBe ? _currentVarMayBe[t.text] : null;
+            if (_mbSlot && _mbSlot.complete && _mbSlot.vals && _mbSlot.vals.length > 1) {
+              return smtSym(t.text);
+            }
             var fv = fb.toks[0].text;
             if (fv === 'true') return smtConst(true);
             if (fv === 'false' || fv === 'null' || fv === 'undefined' || fv === '') return smtConst(false);
@@ -1960,6 +2007,86 @@
     // entry on each iteration so callbacks see the cumulative state
     // of every other callback.
     const _pendingCallbacks = [];
+    // ----------------------------------------------------------------
+    // Per-variable may-be value lattice
+    // ----------------------------------------------------------------
+    // For each variable name we record EVERY value the walker has
+    // assigned to it. The set is the JOIN of all reaching definitions
+    // and is exactly what an SMT solver needs to reason about state
+    // mutated indirectly across callbacks, branches and loops.
+    //
+    //   _varMayBe[name] = { vals: [binding, ...], keys: { json → true },
+    //                       complete: bool }
+    //
+    // `complete` is true iff EVERY observed assignment was a binding
+    // we can faithfully encode as a single SMT-LIB literal (a chain
+    // of one literal-string token, or a chain of one literal-number
+    // token). Once any assignment of an opaque / tainted / multi-token
+    // chain happens, complete flips to false: we can no longer
+    // enumerate the value space, so the set is conservatively
+    // unbounded and SMT must NOT receive a closed disjunction over
+    // it (that would be unsound — it would falsely exclude the
+    // unencoded values).
+    //
+    // smtSat consults _varMayBe at SAT-check time. For every symbol
+    // declared in the formula whose may-be set is complete with more
+    // than one literal value, smtSat emits an extra
+    //   (assert (or (= sym v1) (= sym v2) ...))
+    // alongside the main assertion. Z3 then refutes any path that
+    // requires sym to take a value outside the enumerated set.
+    //
+    // The phase-2 callback fixpoint includes _varMayBe in its
+    // convergence signature, so iteration continues until no new
+    // values are added to any variable's set. The lattice is
+    // monotone (values only ever join in, never leave) so
+    // convergence is guaranteed in a bounded number of iterations.
+    const _varMayBe = Object.create(null);
+    function _bindingToConcreteLit(b) {
+      // Returns null if the binding cannot be expressed as a single
+      // SMT-LIB literal. Returns { lit, sort } otherwise where sort
+      // is 'String' or 'Int' and lit is the s-expression form.
+      if (!b || b.kind !== 'chain') return null;
+      if (b.toks.length !== 1) return null;
+      var t = b.toks[0];
+      if (t.type !== 'str') return null;
+      // collectChainTaint will report any taint on the operand —
+      // tainted operands are unencodable.
+      if (t.taint && t.taint.size) return null;
+      var n = Number(t.text);
+      if (!Number.isNaN(n) && String(n) === t.text) {
+        return { lit: n < 0 ? '(- ' + (-n) + ')' : String(n), sort: 'Int' };
+      }
+      // String literal — emit as a quoted SMT string.
+      return { lit: _quoteSmtString(t.text), sort: 'String' };
+    }
+    function _trackMayBeAssign(name, binding) {
+      if (!taintEnabled) return;
+      if (!_varMayBe[name]) _varMayBe[name] = { vals: [], keys: Object.create(null), complete: true };
+      var slot = _varMayBe[name];
+      if (slot.complete === false) return; // already poisoned, don't bother
+      // Encode the assignment to detect duplicates and check encodability.
+      var lit = _bindingToConcreteLit(binding);
+      if (!lit) {
+        // Opaque / tainted / multi-token / non-chain assignment —
+        // the may-be set can no longer enumerate every reachable value.
+        slot.complete = false;
+        slot.vals = null; // free, no longer needed
+        slot.keys = null;
+        return;
+      }
+      var k = lit.sort + ':' + lit.lit;
+      if (slot.keys[k]) return;
+      slot.keys[k] = true;
+      slot.vals.push({ lit: lit.lit, sort: lit.sort });
+      // Cap the lattice size as a performance guard. If the cap is hit
+      // we conservatively poison the slot rather than emitting a
+      // partial disjunction.
+      if (slot.vals.length > 32) {
+        slot.complete = false;
+        slot.vals = null;
+        slot.keys = null;
+      }
+    }
     // Track function scope depth for taint. Findings inside function
     // bodies walked at definition time (not via instantiateFunction)
     // should be suppressed because there's no calling context.
@@ -2234,18 +2361,31 @@
     // Track names explicitly declared with var/let/const/function.
     // Used to distinguish `var location = x` (local) from `location = x` (global write).
     const declaredNames = new Set();
-    const declBlock = (name, value) => { declaredNames.add(name); topBlock().bindings[name] = asRef(name, value); };
+    const declBlock = (name, value) => {
+      declaredNames.add(name);
+      topBlock().bindings[name] = asRef(name, value);
+      _trackMayBeAssign(name, value);
+    };
     const declFunction = (name, value) => {
       declaredNames.add(name);
       for (let i = stack.length - 1; i >= 0; i--) {
-        if (stack[i].isFunction) { stack[i].bindings[name] = asRef(name, value); return; }
+        if (stack[i].isFunction) {
+          stack[i].bindings[name] = asRef(name, value);
+          _trackMayBeAssign(name, value);
+          return;
+        }
       }
     };
     const assignName = (name, value) => {
       for (let i = stack.length - 1; i >= 0; i--) {
-        if (name in stack[i].bindings) { stack[i].bindings[name] = asRef(name, value); return; }
+        if (name in stack[i].bindings) {
+          stack[i].bindings[name] = asRef(name, value);
+          _trackMayBeAssign(name, value);
+          return;
+        }
       }
       stack[0].bindings[name] = asRef(name, value); // implicit global
+      _trackMayBeAssign(name, value);
     };
     const resolve = (name) => {
       for (let i = stack.length - 1; i >= 0; i--) {
@@ -6960,11 +7100,21 @@
       for (var _kj = 0; _kj < kept.length; _kj++) taintFindings.push(kept[_kj]);
     };
 
+    // Activate the per-walk may-be lattice. smtSat reads
+    // _currentVarMayBe at SAT-check time so the same _varMayBe map
+    // we populate during walks is what feeds the disjunction extras.
+    var _savedCurrentVarMayBe = _currentVarMayBe;
+    if (taintEnabled) _currentVarMayBe = _varMayBe;
+    try {
+
     // Phase 1: single forward walk.
     await walkRange(0, stop);
 
     // Phase 2: callback fixpoint. Iterate all callbacks registered
-    // during phase 1 until findings + bindings stabilise.
+    // during phase 1 until findings + bindings + may-be lattices
+    // stabilise. The may-be lattice is monotone (values only join
+    // in, never leave) so adding it to the convergence signature
+    // doesn't break termination.
     if (taintEnabled && _pendingCallbacks && _pendingCallbacks.length > 0) {
       _dedupeFindings();
       const _snapshotBindingsJson = function () {
@@ -6982,6 +7132,21 @@
         for (var _ki = 0; _ki < keys.length; _ki++) out += keys[_ki] + '=' + snap[keys[_ki]] + ';';
         return out;
       };
+      const _snapshotMayBe = function () {
+        var keys = Object.keys(_varMayBe).sort();
+        var out = '';
+        for (var _mki = 0; _mki < keys.length; _mki++) {
+          var slot = _varMayBe[keys[_mki]];
+          out += keys[_mki] + '=' + (slot.complete ? '*' : '#');
+          if (slot.complete && slot.vals) {
+            for (var _mvi = 0; _mvi < slot.vals.length; _mvi++) {
+              out += '|' + slot.vals[_mvi].sort + ':' + slot.vals[_mvi].lit;
+            }
+          }
+          out += ';';
+        }
+        return out;
+      };
       const FIXPOINT_MAX_ITERS = 16;
       var _prevSig = '';
       for (var _fpIter = 0; _fpIter < FIXPOINT_MAX_ITERS; _fpIter++) {
@@ -6993,10 +7158,15 @@
           finally { inEventHandler = _prevInEH; }
         }
         _dedupeFindings();
-        var _sig = _snapshotBindingsJson() + '||' + (taintFindings ? taintFindings.length + ':' + taintFindings.map(_findingKey).sort().join('|') : '');
+        var _sig = _snapshotBindingsJson() + '||MB:' + _snapshotMayBe() + '||' +
+                   (taintFindings ? taintFindings.length + ':' + taintFindings.map(_findingKey).sort().join('|') : '');
         if (_sig === _prevSig) break;
         _prevSig = _sig;
       }
+    }
+
+    } finally {
+      _currentVarMayBe = _savedCurrentVarMayBe;
     }
 
     // Advance the scope walker to a new stop position, processing all

@@ -3486,6 +3486,26 @@ await (async function () {
   await checkTaint('fixpoint: setTimeout sets, addEventListener reads',
     { 'a.js': 'var ready = false; setTimeout(function() { ready = true; }, 0); window.addEventListener("message", function(e) { if (ready) document.getElementById("o").innerHTML = e.data; });' }, 1);
 
+  // --- Per-variable may-be value lattice ---
+  // Each assignment to a variable is recorded as a possible value;
+  // smtSat emits (or (= sym v1) (= sym v2) ...) over the full set
+  // when the variable's value space is fully enumerated. This refutes
+  // branches that test against values the variable was never assigned,
+  // even when those values are touched in unrelated callbacks.
+  await checkTaint('mayBe: X-only is sat',
+    { 'a.js': 'var s = "init"; window.addEventListener("hashchange", function() { s = "X"; }); window.addEventListener("message", function(e) { if (s === "X") document.getElementById("o").innerHTML = e.data; });' }, 1);
+  await checkTaint('mayBe: Y excluded',
+    { 'a.js': 'var s = "init"; window.addEventListener("hashchange", function() { s = "X"; }); window.addEventListener("message", function(e) { if (s === "Y") document.getElementById("o").innerHTML = e.data; });' }, 0);
+  await checkTaint('mayBe: ready not in {init, armed}',
+    { 'a.js': 'var s = "init"; window.addEventListener("hashchange", function() { s = "armed"; }); window.addEventListener("message", function(e) { if (s === "ready") document.getElementById("o").innerHTML = e.data; });' }, 0);
+  await checkTaint('mayBe: multi-handler hit',
+    { 'a.js': 'var s = "init"; window.addEventListener("hashchange", function() { s = "A"; }); window.addEventListener("popstate", function() { s = "B"; }); window.addEventListener("message", function(e) { if (s === "A") document.getElementById("o").innerHTML = e.data; });' }, 1);
+  await checkTaint('mayBe: multi-handler miss',
+    { 'a.js': 'var s = "init"; window.addEventListener("hashchange", function() { s = "A"; }); window.addEventListener("popstate", function() { s = "B"; }); window.addEventListener("message", function(e) { if (s === "C") document.getElementById("o").innerHTML = e.data; });' }, 0);
+  // Tainted assignment poisons the lattice → conservative (no refutation).
+  await checkTaint('mayBe: tainted assignment poisons lattice',
+    { 'a.js': 'var s = "init"; s = location.search; window.addEventListener("message", function(e) { if (s === "Z") document.getElementById("o").innerHTML = e.data; });' }, 1);
+
   // --- IIFE ---
   await checkTaint('IIFE function', { 'a.js': '(function() { document.getElementById("o").innerHTML = location.search; })();' }, 1);
   await checkTaint('IIFE with args', { 'a.js': '(function(x) { document.getElementById("o").innerHTML = x; })(location.search);' }, 1);
