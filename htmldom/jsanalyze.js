@@ -6909,7 +6909,15 @@
             if (taintEnabled && isSanitizer(t.text, typedScope)) {
               return { bind: chainBinding(toks.map(function(tk) { var c = Object.assign({}, tk); delete c.taint; return c; })), next: args.next };
             }
-            return { bind: chainBinding(toks), next: args.next };
+            // Preserve parametric metadata annotated on the
+            // return tokens (see instantiateFunction's return
+            // handler): `_typeName` / `_innerType` carry
+            // through so Promise<T> returned from an async
+            // function still unwraps to T at the call site.
+            var _retBind = chainBinding(toks);
+            if (toks && toks._typeName) _retBind.typeName = toks._typeName;
+            if (toks && toks._innerType) _retBind.innerType = toks._innerType;
+            return { bind: _retBind, next: args.next };
           }
           return { bind: b, next: k + 1 };
         }
@@ -7104,7 +7112,17 @@
             // Use readValue to preserve object/array/function bindings.
             const rv = await readValue(ri + 1, bodyEnd, TERMS_TOP);
             if (rv && rv.binding) {
-              if (rv.binding.kind === 'chain') { result = rv.binding.toks; }
+              if (rv.binding.kind === 'chain') {
+                result = rv.binding.toks;
+                // Preserve parametric metadata (typeName /
+                // innerType / labels) through the return so
+                // typed Promise<T> values survive the call
+                // boundary without forcing the whole return
+                // to fnReturnBinding (which breaks legacy
+                // token-based callers).
+                if (rv.binding.typeName) result._typeName = rv.binding.typeName;
+                if (rv.binding.innerType) result._innerType = rv.binding.innerType;
+              }
               else { fnReturnBinding = rv.binding; }
             } else {
               const r = await readConcatExpr(ri + 1, bodyEnd, TERMS_TOP);

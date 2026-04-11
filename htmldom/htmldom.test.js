@@ -3940,6 +3940,10 @@ await (async function () {
   // --- Precision on destructured event ---
   await checkTaint('destructure via var from event.data', { 'a.js': 'window.addEventListener("message", function(e) { var d = e.data; document.getElementById("o").innerHTML = d; });' }, 1, { sources: ['postMessage'] });
 
+  // --- Parametric return type preservation across call boundary ---
+  await checkTaint('async fn returns fetch', { 'a.js': 'async function load() { return fetch("/api"); } async function show() { var r = await load(); document.getElementById("o").innerHTML = r.url; } show();' }, 1);
+  await checkTaint('nested typed returns', { 'a.js': 'function a() { return fetch("/x"); } function b() { return a(); } b().then(r => document.getElementById("o").innerHTML = r.url);' }, 1);
+
   // --- Function.prototype.call / apply / bind ---
   await checkTaint('fn.call dispatch', { 'a.js': 'function f(x) { document.getElementById("o").innerHTML = x; } f.call(null, location.hash);' }, 1, { sources: ['url'] });
   await checkTaint('fn.apply dispatch', { 'a.js': 'function f(x) { document.getElementById("o").innerHTML = x; } f.apply(null, [location.hash]);' }, 1, { sources: ['url'] });
