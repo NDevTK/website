@@ -7297,14 +7297,29 @@
                 var _cFormula = smtCmp(_ascending ? '>=' : '<=', _cSym, smtConst(_cInit));
                 _extraLoopFormulas.push(_cFormula);
                 _extraLoopExprs.push(_cName + ' ' + (_ascending ? '>=' : '<=') + ' ' + _cInit);
-                // UNROLLING as an SMT refinement: if the loop has a
-                // concrete upper bound, push a disjunction of concrete
-                // values `i === init || i === init±step || ...` so the
-                // theory solver can prove properties that depend on
-                // specific iteration values, not just the range [init,
-                // bound). The disjunction length equals the concrete
-                // iteration count — no upper cap, because any cap
-                // would silently drop precision for larger loops.
+                // Upper-bound SMT refinement: if the loop has a
+                // concrete upper bound, push `i OP bound` so the
+                // theory solver knows the counter's range inside
+                // the body. Combined with the `i >= init` bound
+                // pushed above, this gives Z3 a full interval
+                // constraint on the counter — and that's enough for
+                // the linear arithmetic solver to prove any bound-
+                // sensitive path condition that doesn't also depend
+                // on the step size.
+                //
+                // We deliberately do NOT emit a full per-iteration
+                // disjunction `i === init || i === init+step || ...`
+                // here. The disjunction would be more precise for
+                // loops where step > 1 (since the range constraint
+                // admits non-step values the real loop never sees),
+                // but the per-value atoms cause the emitted SMT-LIB
+                // string to grow linearly with the concrete iteration
+                // count. For loops like `for (let i=0;i<200;i++)` we
+                // would otherwise feed a 200-term OR into every SMT
+                // query executed inside the body, blowing up both
+                // Z3's solver state and our smt-cache key space.
+                // The range constraint is O(1) regardless of how
+                // many times the loop runs.
                 var _boundTok = null;
                 var _boundOp = null;
                 // Condition parsed as `i OP LIT` or `LIT OP i`.
@@ -7325,30 +7340,12 @@
                   }
                 }
                 if (_boundTok) {
-                  var _bound = parseInt(_boundTok.text, 10);
-                  var _iterCount;
-                  if (_ascending) {
-                    if (_boundOp === '<') _iterCount = Math.max(0, Math.ceil((_bound - _cInit) / _step));
-                    else if (_boundOp === '<=') _iterCount = Math.max(0, Math.floor((_bound - _cInit) / _step) + 1);
-                    else return;
-                  } else {
-                    if (_boundOp === '>') _iterCount = Math.max(0, Math.ceil((_cInit - _bound) / _step));
-                    else if (_boundOp === '>=') _iterCount = Math.max(0, Math.floor((_cInit - _bound) / _step) + 1);
-                    else return;
-                  }
-                  if (_iterCount > 0) {
-                    // Build disjunction: i === v_0 OR i === v_1 OR ...
-                    var _disj = null;
-                    var _disjExprs = [];
-                    for (var _it = 0; _it < _iterCount; _it++) {
-                      var _val = _ascending ? (_cInit + _it * _step) : (_cInit - _it * _step);
-                      var _atom = smtCmp('===', _cSym, smtConst(_val));
-                      _disj = _disj ? smtOr(_disj, _atom) : _atom;
-                      _disjExprs.push(_cName + ' === ' + _val);
-                    }
-                    _extraLoopFormulas.push(_disj);
-                    _extraLoopExprs.push('unroll(' + _iterCount + '): ' + _disjExprs.join(' || '));
-                  }
+                  // Emit the upper-bound constraint: `i OP bound`.
+                  // `_boundOp` is already normalised so the counter
+                  // is on the left-hand side.
+                  var _bndFormula = smtCmp(_boundOp, _cSym, smtConst(parseInt(_boundTok.text, 10)));
+                  _extraLoopFormulas.push(_bndFormula);
+                  _extraLoopExprs.push(_cName + ' ' + _boundOp + ' ' + _boundTok.text);
                 }
               })();
             }
