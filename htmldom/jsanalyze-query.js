@@ -191,7 +191,16 @@
         const mut = scanMutations(tokens);
         const scope = await buildScopeState(
           tokens, tokens.length, mut, null, taintConfig,
-          { callWatchers: [callRecorder] }
+          {
+            callWatchers: [callRecorder],
+            // Optional custom TypeDB: a consumer that wants to
+            // analyse a different runtime (Node, WebWorker, a
+            // custom framework) passes a declarative type graph
+            // here. Shape identical to the engine's
+            // DEFAULT_TYPE_DB — see the README "Type system"
+            // section.
+            typeDB: options.typeDB || undefined,
+          }
         );
         anyWalked = true;
 

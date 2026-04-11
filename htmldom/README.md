@@ -138,6 +138,225 @@ functions (`asConcrete`, `enumerate`, `mergeBranches`, `stringify`).
 reach into the engine's internals. The engine's public surface
 is the `analyze()` + `query.*` + `Value` trio documented above.
 
+## The type system
+
+The walker is **type-first**: every binding carries a `typeName`
+resolved against a declarative **TypeDB**, and sink / source /
+sanitizer / navigation classification is driven entirely by that
+type — not by hardcoded name lists. This is what makes it a
+reusable engine: a consumer that wants to analyse a different
+runtime (Node APIs, WebWorker APIs, a custom host) swaps in its
+own TypeDB and the same walker produces the same shape of trace.
+
+### The TypeDB (`DEFAULT_TYPE_DB`)
+
+The TypeDB is pure data — no code — and lives at the bottom of
+`jsanalyze.js`. It has three top-level fields:
+
+```js
+{
+  types: {                          // the type graph
+    Window: {
+      extends: 'EventTarget',
+      props: {
+        location:   { readType: 'Location' },
+        document:   { readType: 'Document' },
+        name:       { source: 'window.name', readType: 'String' },
+        // ...
+      },
+      methods: {
+        open: { args: [{ sink: 'navigation', severity: 'medium' }] },
+        // ...
+      },
+    },
+    Location: {
+      selfSource: 'url',            // reading a bare Location yields `url`
+      props: {
+        href:  { source: 'url', readType: 'String', sink: 'navigation' },
+        hash:  { source: 'url', readType: 'String' },
+        // ...
+      },
+      methods: {
+        assign:  { args: [{ sink: 'navigation' }] },
+        replace: { args: [{ sink: 'navigation' }] },
+      },
+    },
+    GlobalEval: {
+      call: { args: [{ sink: 'code', severity: 'high' }] },
+    },
+    GlobalFetch: {
+      call: { source: 'network', returnType: 'Promise' },
+    },
+    HTMLIFrameElement: {
+      extends: 'HTMLElement',
+      props: { src: { sink: 'url' }, srcdoc: { sink: 'html' } },
+    },
+    // ...65 types total
+  },
+
+  roots: {                          // unshadowed globals → type
+    window:         'Window',
+    document:       'Document',
+    location:       'Location',
+    localStorage:   'Storage',
+    eval:           'GlobalEval',
+    fetch:          'GlobalFetch',
+    XMLHttpRequest: 'GlobalXMLHttpRequestCtor',
+    FileReader:     'GlobalFileReaderCtor',
+    // ...
+  },
+
+  tagMap: {                         // createElement(tag) → concrete type
+    iframe: 'HTMLIFrameElement',
+    script: 'HTMLScriptElement',
+    a:      'HTMLAnchorElement',
+    input:  'HTMLInputElement',
+    // ...
+  },
+
+  eventMap: {                       // addEventListener(name) → Event subtype
+    message:    'MessageEvent',
+    hashchange: 'HashChangeEvent',
+    drop:       'DragEvent',
+    paste:      'ClipboardEvent',
+    // ...
+  },
+
+  attrSinks: {                      // setAttribute(name, v) sinks
+    onclick: 'code', onload: 'code', /* ... */
+    style:   'css',
+  },
+}
+```
+
+Every type descriptor field is optional. Fields the walker
+recognises:
+
+| Field | Meaning |
+|---|---|
+| `extends: 'T'` | Inherit props/methods from type `T`. |
+| `props: { [name]: PropDescriptor }` | Readable / writable properties. |
+| `methods: { [name]: MethodDescriptor }` | Callable methods. |
+| `call: MethodDescriptor` | The type's value is a callable (e.g. `eval`). |
+| `construct: MethodDescriptor` | The type's value is a constructor (e.g. `FileReader`). |
+| `selfSource: 'label'` | A bare reference to this type carries this label (used for `Location`, `Storage`). |
+
+A **PropDescriptor** carries:
+
+| Field | Meaning |
+|---|---|
+| `source: 'label'` | Reading this property attaches `'label'` to the result. |
+| `sink: 'kind'` | Writing this property is a sink of kind `html` / `url` / `code` / `navigation` / `css` / `text` / `safe`. |
+| `severity: 'critical' \| 'high' \| 'medium' \| 'safe'` | Overrides the default severity for this sink kind. |
+| `readType: 'T'` | Property reads produce a value of type `T`. |
+
+A **MethodDescriptor** carries:
+
+| Field | Meaning |
+|---|---|
+| `args: [ArgDescriptor, …]` | Per-positional-arg sink labels. |
+| `returnType: 'T'` | Static return type for `_resolveExprTypeViaDB`. |
+| `source: 'label'` | Calling the method yields the label on its result. |
+| `sink: 'kind'` | The call itself is a sink (e.g. `document.write`). |
+| `sanitizer: true` | The call neutralises taint on its return value (e.g. `encodeURIComponent`, `DOMPurify.sanitize`). |
+| `preservesLabelsFromReceiver: true` | Result carries the receiver's labels (e.g. `String.slice`). |
+
+An **ArgDescriptor** carries `sink`, `severity`, `sinkIfArgEquals`
+(for `setAttribute` — look up the sink based on the value of
+another arg), and accepts all the same fields as PropDescriptor.
+
+### Flow-sensitive type tracking on bindings
+
+Every variable binding the walker produces carries an optional
+`typeName` inferred at assignment time. The walker's
+`_withInferredType(binding)` runs on:
+
+- Single opaque-ref chains (`var loc = window.location` →
+  walks `window.location` through the TypeDB → Location).
+- Bare-call roots and constructors (`var resp = fetch('/x')` →
+  Promise; `var fr = new FileReader()` → FileReader).
+- String concatenation chains (`var url = base + '/' + path` →
+  String when every operand is string-producing).
+- Template literals (`` `pre${x}post` `` → String).
+- Ternary expressions with same-type arms (simple lattice join).
+- Element bindings from `createElement` / `getElementById`
+  (tagged at factory-creation time via `db.tagMap`).
+- Event-handler parameters typed via `db.eventMap`
+  (`addEventListener('message', e => …)` → `e` is `MessageEvent`).
+
+Once typed, **every subsequent property read on the binding**
+resolves through `_lookupProp` / `_lookupMethod` on its
+`typeName`. This is what makes aliasing work:
+
+```js
+var loc = window.location;   // loc.typeName = 'Location'
+x.innerHTML = loc.hash;      // resolves Location.hash → source='url'
+
+var f = eval;                // f.typeName = 'GlobalEval'
+f(userInput);                // code sink via GlobalEval.call.args[0].sink
+
+var fr = new FileReader();   // fr.typeName = 'FileReader'
+x.innerHTML = fr.result;     // FileReader.result → source='file'
+
+var el = document.createElement('iframe');  // el.typeName = 'HTMLIFrameElement'
+el.src = userInput;                         // url sink on HTMLIFrameElement.src
+```
+
+**Shadowing is handled via flow-sensitive scope lookup**, not a
+file-wide declared-names set. `typedScope(name)` consults the
+current binding via `resolve()`: when the name is in scope and
+carries a `typeName`, that type wins; when it's in scope with no
+type (a plain user var), the walker treats it as shadowed and
+refuses to fall back to `db.roots`. Function parameters,
+closures, and block-scoped locals all participate automatically.
+
+### How taint tracing uses the type system
+
+Taint tracing is one **consumer** of the type system. Source and
+sink detection are thin wrappers over the TypeDB walkers:
+
+| Engine helper | Purpose |
+|---|---|
+| `getTaintSource(expr, scope)` | Returns the source label for an expression (walks via `_walkPathInDB`). |
+| `getBindingLabels(binding)` | Returns the taint labels a binding's value carries. |
+| `classifySink(prop, elementTag)` | Returns sink info for a property write. |
+| `_classifySinkByTypeViaDB(db, typeName, prop)` | Type-first sink classifier for typed bindings. |
+| `_classifyCallSinkViaDB(db, callExpr, scope)` | Returns sink info for a call expression. |
+| `_isSanitizerCallViaDB(db, callExpr, scope)` | Returns `true` if the call neutralises taint. |
+| `_isNavSinkViaDB(db, expr, scope)` | Returns `true` if the expression addresses a navigation sink. |
+
+At each sink site, the walker:
+
+1. Computes `getBindingLabels(valueBinding)` — a `Set<label>` of
+   the value's taint labels.
+2. Classifies the sink via the receiver binding's `typeName`
+   (falling back to element-tag lookup when untyped).
+3. Emits a finding linking the source labels to the sink kind +
+   severity, with the path constraints active at that program
+   point (for Z3 reachability refutation).
+
+**No hardcoded name lists, regex heuristics, or flat tables**.
+Every security decision traces back to a TypeDB descriptor.
+
+### Swapping in a custom TypeDB
+
+Consumers can pass `options.typeDB` to `analyze(...)` to
+override the default. The shape is identical to `DEFAULT_TYPE_DB`
+— add, remove, or replace types, roots, tagMap entries, and
+event-map entries to match the runtime you're analysing.
+
+```js
+const customDB = require('./my-typedb.js');
+const trace = await analyze(files, {
+  taint: true,
+  typeDB: customDB,          // your declarative types + roots
+});
+```
+
+This is how a consumer for Node built-ins (`fs`, `child_process`,
+`http`) or for a custom framework's surface would be written:
+describe the API in data, reuse the walker unchanged.
+
 ## What the walker can fold
 
 The engine is a symbolic interpreter — it runs the JS code at

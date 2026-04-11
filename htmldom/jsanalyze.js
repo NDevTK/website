@@ -3088,20 +3088,21 @@
   // `origin` records how the element was created: either
   // `{kind:'create', tag}` from document.createElement, `{kind:'lookup',
   // by:'id', value}` from document.getElementById, etc.
-  const makeElementFactory = () => {
+  const makeElementFactory = (typeDB) => {
     let nextElementId = 0;
+    var _factoryDB = typeDB || DEFAULT_TYPE_DB;
     return {
       element: (origin) => {
         // Resolve the element's concrete HTMLxElement type via
-        // the TypeDB tagMap so the binding is flow-sensitively
-        // typed from the moment of creation. Bindings created
-        // via `document.createElement('iframe')` get
-        // `typeName: 'HTMLIFrameElement'`, and subsequent reads
-        // / writes on them resolve sinks through the type
+        // the factory's TypeDB tagMap so the binding is
+        // flow-sensitively typed from the moment of creation.
+        // Bindings created via `document.createElement('iframe')`
+        // get `typeName: 'HTMLIFrameElement'`, and subsequent
+        // reads / writes on them resolve sinks through the type
         // chain instead of scanning every HTML subtype.
         var _typeName = null;
         if (origin && origin.kind === 'create' && origin.tag) {
-          _typeName = DEFAULT_TYPE_DB.tagMap[origin.tag.toLowerCase()] || 'HTMLElement';
+          _typeName = (_factoryDB.tagMap && _factoryDB.tagMap[origin.tag.toLowerCase()]) || 'HTMLElement';
         } else if (origin && origin.kind === 'lookup') {
           // getElementById / querySelector results: unknown
           // concrete subtype at analysis time → HTMLElement.
@@ -3310,6 +3311,13 @@
 
   async function buildScopeState(tokens, stopAt, externallyMutable, trackBuildVarInit, taintConfig, options) {
     options = options || {};
+    // The active TypeDB for this walk. Defaults to the preset
+    // DEFAULT_TYPE_DB but can be overridden via `options.typeDB`
+    // so a consumer for a different runtime (Node, Worker,
+    // custom host) can plug in its own declarative type graph
+    // without touching the walker. Shape identical to
+    // DEFAULT_TYPE_DB — see the README "Type system" section.
+    const _activeDB = (options && options.typeDB) || DEFAULT_TYPE_DB;
     const stack = [{ bindings: Object.create(null), isFunction: true }];
     // Find the token index of the `}` matching the `{` at index
     // `openIdx`. Returns -1 if not found. Used by the IIFE
@@ -3680,12 +3688,12 @@
     // lookup into real flow-sensitive type tracking.
     const _classifyBindingSink = (bind, propName) => {
       if (bind && bind.typeName) {
-        return _classifySinkByTypeViaDB(DEFAULT_TYPE_DB, bind.typeName, propName);
+        return _classifySinkByTypeViaDB(_activeDB, bind.typeName, propName);
       }
       // Untyped binding — fall back to tag-based lookup for
       // element bindings whose origin tag is known.
       var tag = getElementTag(bind);
-      return classifySink(propName, tag);
+      return _classifySinkViaDB(_activeDB, propName, tag);
     };
     const checkSinkAssignment = (el, propName, valBinding, tok) => {
       if (!taintEnabled || !valBinding) return;
@@ -3704,7 +3712,7 @@
       if (!labels || !labels.size) return;
       var tag = getElementTag(el);
       // Attribute-name sinks (onclick, style, etc.) via db.attrSinks.
-      var attrSinkInfo = _classifyAttrSinkViaDB(DEFAULT_TYPE_DB, attrName);
+      var attrSinkInfo = _classifyAttrSinkViaDB(_activeDB, attrName);
       if (attrSinkInfo) {
         recordTaintFinding(attrSinkInfo.type, attrSinkInfo.severity, attrName, tag, labels, taintCondStack);
       }
@@ -3717,7 +3725,7 @@
     };
     const checkSinkCall = (callExpr, argBindings, tok) => {
       if (!taintEnabled || !argBindings) return;
-      var sinkInfo = _classifyCallSinkViaDB(DEFAULT_TYPE_DB, callExpr, typedScope);
+      var sinkInfo = _classifyCallSinkViaDB(_activeDB, callExpr, typedScope);
       if (!sinkInfo) return;
       for (var ai = 0; ai < argBindings.length; ai++) {
         var ab = argBindings[ai];
@@ -3737,7 +3745,7 @@
     // object across references.
     const domElements = [];
     const domOps = [];
-    const domFactory = makeElementFactory();
+    const domFactory = makeElementFactory(_activeDB);
     const elementBinding = domFactory.element;
     const textNodeBinding = domFactory.textNode;
     // Apply a mutation to an element binding's property path.
@@ -3899,7 +3907,7 @@
         var t = toks[0];
         if (!t) return null;
         if (t.type === 'other' && t.text) {
-          return _resolveExprTypeViaDB(DEFAULT_TYPE_DB, t.text, typedScope);
+          return _resolveExprTypeViaDB(_activeDB, t.text, typedScope);
         }
         if (t.type === 'str') return 'String';
         if (t.type === 'tmpl') return 'String';
@@ -3939,7 +3947,7 @@
         if (tk.type === 'plus') continue;
         if (tk.type === 'str' || tk.type === 'tmpl') continue;
         if (tk.type === 'other' && tk.text) {
-          var refType = _resolveExprTypeViaDB(DEFAULT_TYPE_DB, tk.text, typedScope);
+          var refType = _resolveExprTypeViaDB(_activeDB, tk.text, typedScope);
           if (refType === 'String') continue;
           // Non-String operand → chain isn't uniformly String.
           return null;
@@ -4042,8 +4050,8 @@
               return function (n) { return n === rootName ? { typeName: rootType } : typedScope(n); };
             })(_typedRootName, b.typeName);
             var _syntheticExpr = _typedRootName + '.' + _remainingPath;
-            _extLabel = getTaintSource(_syntheticExpr, _typedRootScope);
-            _extType = _resolveExprTypeViaDB(DEFAULT_TYPE_DB, _syntheticExpr, _typedRootScope);
+            _extLabel = _walkPathInDB(_activeDB, _syntheticExpr, _typedRootScope);
+            _extType = _resolveExprTypeViaDB(_activeDB, _syntheticExpr, _typedRootScope);
             _typed = (_extLabel != null || _extType != null);
           }
           var _extRef;
@@ -4074,7 +4082,7 @@
             }
           }
           b = chainBinding([_extRef]);
-          if (!_extType) _extType = _resolveExprTypeViaDB(DEFAULT_TYPE_DB, _extText, typedScope);
+          if (!_extType) _extType = _resolveExprTypeViaDB(_activeDB, _extText, typedScope);
           if (_extType) b.typeName = _extType;
           // Store labels at the binding level too, so
           // getBindingLabels is O(1) and downstream consumers
@@ -4114,8 +4122,8 @@
           //   var s = `x${location.hash}`; s.toUpperCase()
           //   var loc = window.location; loc.hash.slice(1)
           //       (where loc.hash was already walked to String)
-          var _propDesc = _lookupProp(DEFAULT_TYPE_DB, b.typeName, p);
-          var _methodDesc = _propDesc ? null : _lookupMethod(DEFAULT_TYPE_DB, b.typeName, p);
+          var _propDesc = _lookupProp(_activeDB, b.typeName, p);
+          var _methodDesc = _propDesc ? null : _lookupMethod(_activeDB, b.typeName, p);
           if (!_propDesc && !_methodDesc) return null;
           var _nextType = null;
           var _nextLabel = null;
@@ -6097,7 +6105,7 @@
         const b = await resolvePath(t.text);
         // Taint: check call-based sinks even in expression position
         // (e.g. var x = eval(tainted)).
-        if (taintEnabled && isCall && _classifyCallSinkViaDB(DEFAULT_TYPE_DB, t.text, typedScope)) {
+        if (taintEnabled && isCall && _classifyCallSinkViaDB(_activeDB, t.text, typedScope)) {
           var _sinkCallArgs = await readCallArgBindings(k + 1, stop);
           if (_sinkCallArgs) checkSinkCall(t.text, _sinkCallArgs.bindings, t);
         }
@@ -9276,7 +9284,7 @@
                 }
               }
               i = callArgs.next - 1;
-              if (taintEnabled && _classifyCallSinkViaDB(DEFAULT_TYPE_DB, t.text, typedScope)) {
+              if (taintEnabled && _classifyCallSinkViaDB(_activeDB, t.text, typedScope)) {
                 checkSinkCall(t.text, callArgs.bindings, t);
               }
               continue;
@@ -9303,7 +9311,7 @@
             }
           }
           // Taint: even if callee isn't inlinable, check if it's a call-based sink.
-          if (taintEnabled && _classifyCallSinkViaDB(DEFAULT_TYPE_DB, t.text, typedScope)) {
+          if (taintEnabled && _classifyCallSinkViaDB(_activeDB, t.text, typedScope)) {
             var sinkArgs = await readCallArgBindings(i + 1, stop);
             if (sinkArgs) {
               checkSinkCall(t.text, sinkArgs.bindings, t);
@@ -9522,7 +9530,7 @@
           // Taint: check for sink property assignments on non-tracked elements.
           if (taintEnabled && parts.length >= 2) {
             const sinkProp = parts[parts.length - 1];
-            if (_propIsEverASink(DEFAULT_TYPE_DB, sinkProp)) {
+            if (_propIsEverASink(_activeDB, sinkProp)) {
               const r = await readValue(i + 2, stop, TERMS_TOP);
               const val = r ? r.binding : null;
               var _labels = getBindingLabels(val);
@@ -9613,7 +9621,7 @@
                   // yielding precise per-prop taint (no bulk
                   // label union).
                   var _evParamBindings = [];
-                  var _evTypeName = _evTypeStr ? DEFAULT_TYPE_DB.eventMap[_evTypeStr] : null;
+                  var _evTypeName = _evTypeStr ? (_activeDB.eventMap && _activeDB.eventMap[_evTypeStr]) : null;
                   if (_evHandler.params && _evHandler.params.length > 0) {
                     var _pn = _evHandler.params[0].name;
                     var _evRef = exprRef(_pn);
@@ -9640,7 +9648,7 @@
               }
             }
             // Taint: detect call-based sinks (eval, document.write, etc.).
-            if (taintEnabled && _classifyCallSinkViaDB(DEFAULT_TYPE_DB, t.text, typedScope)) {
+            if (taintEnabled && _classifyCallSinkViaDB(_activeDB, t.text, typedScope)) {
               const argResult = await readCallArgBindings(i + 1, stop);
               if (argResult) {
                 checkSinkCall(t.text, argResult.bindings, t);
