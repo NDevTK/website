@@ -5309,6 +5309,32 @@
             else if (prop === 'length' && bind.kind === 'chain') {
               const s = chainAsKnownString(bind);
               bind = s === null ? null : chainBinding([makeSynthStr(String(s.length))]);
+            } else if (bind.kind === 'chain' && bind.typeName) {
+              // Typed opaque chain: look up `prop` on the
+              // receiver's type via the TypeDB, the same way
+              // the `.prop` (non-optional) path does. Handles
+              // `window?.location`, `fr?.result`, etc.
+              var _ocPd = _lookupProp(_activeDB, bind.typeName, prop);
+              var _ocMd = _ocPd ? null : _lookupMethod(_activeDB, bind.typeName, prop);
+              if (_ocPd || _ocMd) {
+                var _ocLabel = (_ocPd && _ocPd.source) || (_ocMd && _ocMd.source) || null;
+                var _ocType = _ocPd ? _ocPd.readType : (_ocMd && typeof _ocMd.returnType === 'string' ? _ocMd.returnType : null);
+                var _ocBaseText = bind.toks && bind.toks.length === 1 && bind.toks[0].type === 'other'
+                  ? bind.toks[0].text : 'opt';
+                var _ocRef = deriveExprRef(_ocBaseText + '?.' + prop, bind.toks);
+                var _ocLabels = getBindingLabels(bind);
+                var _ocMerged = _ocLabels ? new Set(_ocLabels) : null;
+                if (_ocLabel) {
+                  if (!_ocMerged) _ocMerged = new Set();
+                  _ocMerged.add(_ocLabel);
+                }
+                if (_ocMerged && _ocMerged.size) _ocRef.taint = _ocMerged;
+                bind = chainBinding([_ocRef]);
+                if (_ocType) bind.typeName = _ocType;
+                if (_ocMerged) bind.labels = _ocMerged;
+              } else {
+                bind = null;
+              }
             } else bind = null;
             next += 2;
             continue;

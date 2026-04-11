@@ -3940,6 +3940,10 @@ await (async function () {
   // --- Precision on destructured event ---
   await checkTaint('destructure via var from event.data', { 'a.js': 'window.addEventListener("message", function(e) { var d = e.data; document.getElementById("o").innerHTML = d; });' }, 1, { sources: ['postMessage'] });
 
+  // --- Optional chaining with typed chains ---
+  await checkTaint('optional chain window.location', { 'a.js': 'var loc = window?.location; document.getElementById("o").innerHTML = loc?.hash;' }, 1, { sources: ['url'] });
+  await checkTaint('optional chain FileReader', { 'a.js': 'var fr = new FileReader(); document.getElementById("o").innerHTML = fr?.result;' }, 1, { sources: ['file'] });
+
   // --- ES6 shorthand methods on object literals ---
   await checkTaint('obj shorthand method this', { 'a.js': 'var o = { u: location.hash, show() { document.getElementById("o").innerHTML = this.u; } }; o.show();' }, 1, { sources: ['url'] });
   await checkTaint('obj shorthand method arg', { 'a.js': 'var o = { show(x) { document.getElementById("o").innerHTML = x; } }; o.show(location.hash);' }, 1, { sources: ['url'] });
