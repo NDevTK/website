@@ -4567,6 +4567,16 @@
       // other opaque chain). The synthesized chain carries the same
       // taint labels as the source PLUS any label attached to the
       // specific dotted path.
+      // Resolve the source's typeName for type-aware child
+      // synthesis. Destructured entries on a typed source
+      // (e.g. `({data}) => …` on a MessageEvent param) are
+      // typed via the source's TypeDB descriptor for the key.
+      var _sourceTypeName = null;
+      if (source && source.typeName) _sourceTypeName = source.typeName;
+      else if (source && source.kind === 'chain' && source.toks && source.toks.length === 1 &&
+               source.toks[0] && source.toks[0].type === 'other' && source.toks[0].text) {
+        _sourceTypeName = _resolveExprTypeViaDB(_activeDB, source.toks[0].text, typedScope);
+      }
       const _synthesizeChild = (keyText) => {
         if (!source) return null;
         const pathText = srcPathPrefix ? (srcPathPrefix + '.' + keyText) : keyText;
@@ -4580,9 +4590,32 @@
           if (!labels) labels = new Set();
           labels.add(pathLabel);
         }
+        // Type-aware synthesis: when the source has a known
+        // typeName, look up the key on that type and apply
+        // its `source` / `readType` directly, so destructured
+        // entries pick up their precise label and type.
+        var _childTypeName = null;
+        if (_sourceTypeName) {
+          var _childPd = _lookupProp(_activeDB, _sourceTypeName, keyText);
+          if (_childPd) {
+            if (_childPd.source) {
+              if (!labels) labels = new Set();
+              labels.add(_childPd.source);
+            }
+            if (_childPd.readType) _childTypeName = _childPd.readType;
+          }
+        }
         if (labels && labels.size > 0) {
           ref.taint = labels;
-          return chainBinding([ref]);
+          var _result = chainBinding([ref]);
+          if (_childTypeName) _result.typeName = _childTypeName;
+          _result.labels = labels;
+          return _result;
+        }
+        if (_childTypeName) {
+          var _result2 = chainBinding([ref]);
+          _result2.typeName = _childTypeName;
+          return _result2;
         }
         // No taint at all — return null so the caller falls back to
         // its default-value handling (or leaves the binding null,
@@ -4835,6 +4868,41 @@
         return null;
       }
       while (i < stop) {
+        // Destructured parameter: `({a}) => …` / `([x,y]) => …`.
+        // readDestructurePattern is in scope here (inside
+        // buildScopeState) so the walker's destructuring
+        // machinery is reused for both variable declarations
+        // AND arrow / function parameters.
+        var _arrPt = tks[i];
+        if (_arrPt && _arrPt.type === 'open' && (_arrPt.char === '{' || _arrPt.char === '[')) {
+          var _arrPat = readDestructurePattern(i, stop);
+          if (!_arrPat) return null;
+          var _arrParam = {
+            name: '__destructure_' + params.length + '__',
+            pattern: _arrPat.pattern,
+          };
+          i = _arrPat.next;
+          // Optional default: `({a} = {}) => …`.
+          if (tks[i] && tks[i].type === 'sep' && tks[i].char === '=') {
+            var _arrDd = i + 1;
+            var _arrDep = 0;
+            while (_arrDd < stop) {
+              var _arrDt = tks[_arrDd];
+              if (_arrDt.type === 'open') _arrDep++;
+              else if (_arrDt.type === 'close') { if (_arrDep === 0) break; _arrDep--; }
+              else if (_arrDep === 0 && _arrDt.type === 'sep' && _arrDt.char === ',') break;
+              _arrDd++;
+            }
+            _arrParam.defaultStart = i + 1;
+            _arrParam.defaultEnd = _arrDd;
+            i = _arrDd;
+          }
+          params.push(_arrParam);
+          const _arrSep = tks[i];
+          if (_arrSep && _arrSep.type === 'close' && _arrSep.char === ')') { i++; break; }
+          if (_arrSep && _arrSep.type === 'sep' && _arrSep.char === ',') { i++; continue; }
+          return null;
+        }
         const pt = parseParamWithDefault(tks, i, stop);
         if (!pt) return null;
         params.push(pt.param);
@@ -4907,6 +4975,38 @@
           if (IDENT_RE.test(_restName)) {
             params.push({ name: _restName, rest: true });
             fj++;
+            if (tks[fj] && tks[fj].type === 'sep' && tks[fj].char === ',') fj++;
+            continue;
+          }
+        }
+        // Destructured parameter: `function({a, b}) { ... }` /
+        // `function([x, y]) { ... }`. Re-use the variable
+        // destructuring parser (readDestructurePattern) so
+        // patterns and nested patterns flow through the same
+        // binding code. The param is stored as
+        // `{ name: '__destructure_N__', pattern }`; at
+        // instantiateFunction time the arg binding is walked
+        // via applyPatternBindings to bind the real names.
+        if (pt && pt.type === 'open' && (pt.char === '{' || pt.char === '[')) {
+          var _pat = readDestructurePattern(fj, stop);
+          if (_pat) {
+            var _destructureParam = {
+              name: '__destructure_' + params.length + '__',
+              pattern: _pat.pattern,
+            };
+            fj = _pat.next;
+            // Optional default: `function({a} = {}) { ... }`.
+            if (tks[fj] && tks[fj].type === 'sep' && tks[fj].char === '=') {
+              _destructureParam.defaultStart = fj + 1;
+              var _dd = fj + 1;
+              while (_dd < stop && !(tks[_dd].type === 'sep' && tks[_dd].char === ',') && !(tks[_dd].type === 'close' && tks[_dd].char === ')')) {
+                if (tks[_dd].type === 'open') { var _dep = 1; _dd++; while (_dd < stop && _dep > 0) { if (tks[_dd].type === 'open') _dep++; if (tks[_dd].type === 'close') _dep--; _dd++; } continue; }
+                _dd++;
+              }
+              _destructureParam.defaultEnd = _dd;
+              fj = _dd;
+            }
+            params.push(_destructureParam);
             if (tks[fj] && tks[fj].type === 'sep' && tks[fj].char === ',') fj++;
             continue;
           }
@@ -6593,6 +6693,27 @@
           break;
         }
         const a = argBindings[p];
+        if (pi.pattern) {
+          // Destructured parameter: `function({a, b}) { … }` /
+          // `function([x, y]) { … }`. Walk the pattern against
+          // the arg binding via applyPatternBindings which
+          // handles the same object / array / opaque-chain
+          // extraction the variable-destructuring path uses.
+          // The synthetic `__destructure_N__` slot remembers
+          // the raw arg for reference.
+          var _destructureArg = a;
+          if (!_destructureArg && pi.defaultStart != null) {
+            const _ddr = await readConcatExpr(pi.defaultStart, pi.defaultEnd, TERMS_NONE);
+            if (_ddr && _ddr.next === pi.defaultEnd) _destructureArg = chainBinding(_ddr.toks);
+          }
+          frame.bindings[pi.name] = _destructureArg || null;
+          if (_destructureArg) {
+            await applyPatternBindings(pi.pattern, _destructureArg, function (n, v) {
+              frame.bindings[n] = v;
+            });
+          }
+          continue;
+        }
         if (a) {
           frame.bindings[pi.name] = a;
         } else if (pi.defaultStart != null) {

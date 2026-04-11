@@ -3940,6 +3940,14 @@ await (async function () {
   // --- Precision on destructured event ---
   await checkTaint('destructure via var from event.data', { 'a.js': 'window.addEventListener("message", function(e) { var d = e.data; document.getElementById("o").innerHTML = d; });' }, 1, { sources: ['postMessage'] });
 
+  // --- Destructured function parameters ---
+  await checkTaint('destructured fn {data}', { 'a.js': 'window.addEventListener("message", function({data}) { document.getElementById("o").innerHTML = data; });' }, 1, { sources: ['postMessage'] });
+  await checkTaint('destructured arrow {data}', { 'a.js': 'window.addEventListener("message", ({data}) => { document.getElementById("o").innerHTML = data; });' }, 1, { sources: ['postMessage'] });
+  await checkTaint('destructured origin', { 'a.js': 'window.addEventListener("message", ({origin}) => { document.getElementById("o").innerHTML = origin; });' }, 1, { sources: ['postMessage'] });
+  await checkTaint('destructured with rename', { 'a.js': 'window.addEventListener("message", function({data: d}) { document.getElementById("o").innerHTML = d; });' }, 1, { sources: ['postMessage'] });
+  await checkTaint('destructure error filename', { 'a.js': 'window.addEventListener("error", ({filename}) => { document.getElementById("o").innerHTML = filename; });' }, 1, { sources: ['url'] });
+  await checkTaint('nested destructure dataTransfer', { 'a.js': 'window.addEventListener("drop", ({dataTransfer}) => { document.getElementById("o").innerHTML = dataTransfer.files; });' }, 1, { sources: ['file'] });
+
   console.log(`  (${pass + fail - before} cases)`);
 })();
 
