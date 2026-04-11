@@ -5488,14 +5488,45 @@
       // variables resolve through the closure. We push only
       // previously-popped frames to avoid duplicates when a closure
       // is called synchronously within its defining scope.
+      //
+      // The "already-live" check used to be `stack.indexOf(capFr)`,
+      // which is O(stack_depth) per captured frame. For helpers
+      // declared deep inside an outer function and called hundreds
+      // of times, this collapses into the dominant per-call cost
+      // (closure with 10 captured frames × stack depth 20 = 200
+      // comparisons per call × thousands of calls = a real chunk
+      // of wall time). Use a Set lookup instead — O(1) per frame —
+      // and only build the Set when there's actually something to
+      // push, so the no-closure case stays free.
       var _pushedCaptureFrames = [];
-      if (fn.capturedScope) {
-        for (var _ci = 0; _ci < fn.capturedScope.length; _ci++) {
-          var capFr = fn.capturedScope[_ci];
-          if (!capFr) continue;
-          if (stack.indexOf(capFr) >= 0) continue; // already live
-          stack.push(capFr);
-          _pushedCaptureFrames.push(capFr);
+      if (fn.capturedScope && fn.capturedScope.length > 0) {
+        // Use a Set for O(1) "is this captured frame already live?"
+        // checks when there's enough work to amortise the Set
+        // construction. Below the threshold, the linear stack.indexOf
+        // is faster because the set construction would dominate.
+        // The threshold is chosen so that the break-even point sits
+        // around `capturedScope.length * stack.length ≈ 32`, which
+        // is roughly where Map insertion overhead crosses linear
+        // scan in V8 micro-benchmarks.
+        if (fn.capturedScope.length * stack.length >= 32) {
+          var _liveSet = new Set();
+          for (var _li = 0; _li < stack.length; _li++) _liveSet.add(stack[_li]);
+          for (var _ci = 0; _ci < fn.capturedScope.length; _ci++) {
+            var capFr = fn.capturedScope[_ci];
+            if (!capFr) continue;
+            if (_liveSet.has(capFr)) continue;
+            stack.push(capFr);
+            _liveSet.add(capFr);
+            _pushedCaptureFrames.push(capFr);
+          }
+        } else {
+          for (var _ci2 = 0; _ci2 < fn.capturedScope.length; _ci2++) {
+            var capFr2 = fn.capturedScope[_ci2];
+            if (!capFr2) continue;
+            if (stack.indexOf(capFr2) >= 0) continue;
+            stack.push(capFr2);
+            _pushedCaptureFrames.push(capFr2);
+          }
         }
       }
       stack.push({ bindings: Object.create(null), isFunction: true });
