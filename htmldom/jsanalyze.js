@@ -2584,28 +2584,41 @@
 
   // Core boundary: walker binding → public Value.
   //
-  // `options` is `{ file, provenanceKind, maxDepth }`. The file
-  // name is stamped on generated Source entries. provenanceKind
-  // defaults to 'inline-literal' for leaf sources and 'branch-merge'
-  // for merged branches. maxDepth guards against cyclic object
-  // bindings (rare but possible with self-referential structures).
+  // `options` is `{ file, provenanceKind }`. The file name is
+  // stamped on generated Source entries. provenanceKind defaults
+  // to 'inline-literal' for leaf sources and 'branch-merge' for
+  // merged branches. Cycles in object / array / element
+  // bindings (rare but possible with self-referential structures)
+  // are handled via per-call cycle detection — see the `_seen`
+  // WeakSet threaded through recursive calls. There is NO
+  // arbitrary depth cap: non-cyclic nested structures serialize
+  // to full depth regardless of how deep they are.
   function bindingToValue(binding, options) {
     var S = _schemas();
     options = options || {};
-    var depth = options._depth || 0;
-    var maxDepth = options.maxDepth || 32;
-    if (depth >= maxDepth) {
-      return S.value.unknown(S.UNKNOWN_REASONS.RECURSION_CAP, null, []);
-    }
     var file = options.file || '<anonymous>';
-
+    // Cycle-based termination: use a WeakSet of bindings
+    // already on the current conversion path so cyclic
+    // references (`var o = {}; o.self = o;`) terminate
+    // without a depth cap. Non-cyclic nested structures are
+    // serialized to full depth — no arbitrary 32-level limit.
+    var seen = options._seen || new WeakSet();
     if (!binding) {
       return S.value.unknown(S.UNKNOWN_REASONS.UNRESOLVED_IDENTIFIER, null, []);
+    }
+    // Primitives don't need cycle tracking (chain bindings are
+    // leaf values). Only object/array/element bindings can
+    // participate in cycles.
+    if (typeof binding === 'object' && binding.kind !== 'chain' && binding.kind !== 'function') {
+      if (seen.has(binding)) {
+        return S.value.unknown(S.UNKNOWN_REASONS.RECURSION_CAP, null, []);
+      }
+      seen.add(binding);
     }
 
     // --- chain binding ---
     if (binding.kind === 'chain') {
-      return _chainBindingToValue(binding, { file: file, _depth: depth + 1, maxDepth: maxDepth });
+      return _chainBindingToValue(binding, { file: file, _seen: seen });
     }
 
     // --- object binding ---
@@ -2613,7 +2626,7 @@
       var props = Object.create(null);
       for (var k in binding.props) {
         if (k.indexOf('__') === 0 || k.indexOf('_') === 0) continue;
-        props[k] = bindingToValue(binding.props[k], { file: file, _depth: depth + 1, maxDepth: maxDepth });
+        props[k] = bindingToValue(binding.props[k], { file: file, _seen: seen });
       }
       var anyTok = null;
       // Try to find a provenance token from any prop
@@ -2629,7 +2642,7 @@
     if (binding.kind === 'array') {
       var elems = [];
       for (var i = 0; i < binding.elems.length; i++) {
-        elems.push(bindingToValue(binding.elems[i], { file: file, _depth: depth + 1, maxDepth: maxDepth }));
+        elems.push(bindingToValue(binding.elems[i], { file: file, _seen: seen }));
       }
       return S.value.array(elems, []);
     }
@@ -2654,7 +2667,7 @@
       if (binding.attrs) {
         var attrProps = Object.create(null);
         for (var an in binding.attrs) {
-          attrProps[an] = bindingToValue(binding.attrs[an], { file: file, _depth: depth + 1, maxDepth: maxDepth });
+          attrProps[an] = bindingToValue(binding.attrs[an], { file: file, _seen: seen });
         }
         elProps['attrs'] = S.value.object(attrProps, []);
       }
