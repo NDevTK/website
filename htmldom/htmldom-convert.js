@@ -1341,7 +1341,15 @@
 
           // --- Navigation sinks ---
           if (PATH_RE.test(t.text) || IDENT_RE.test(t.text)) {
-            var navType = isNavSink(t.text, scope.declaredNames);
+            // Wrap scope.declaredNames (a Set) into the
+            // flow-sensitive typedScope resolver that the new
+            // isNavSink expects: return `{shadowed:true}` for
+            // any user-declared local name (they hide globals)
+            // and null for everything else (unshadowed globals).
+            var _convScope = function (n) {
+              return scope.declaredNames && scope.declaredNames.has(n) ? { shadowed: true } : null;
+            };
+            var navType = isNavSink(t.text, _convScope);
             if (navType) {
               var eq = tokens[i + 1];
               // location.href = expr / location = expr

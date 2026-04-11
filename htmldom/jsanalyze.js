@@ -341,15 +341,23 @@
   //     `location.assign(url)`, `location.replace(url)`,
   //     `window.open(url)`, `navigation.navigate(url)`).
   //
-  // The `declaredSet` parameter lets callers pass the set of
-  // locally declared names so user-shadowed globals (e.g. `var
-  // location = x`) don't match.
-  function _isNavSinkViaDB(db, expr, declaredSet) {
+  // The `scope` parameter (when provided) makes the check
+  // flow-sensitive: if the root name resolves to a typed local
+  // binding, the walk starts from that type; if it resolves to
+  // an untyped local binding the walk aborts (user shadowed).
+  function _isNavSinkViaDB(db, expr, scope) {
     if (!db || !expr) return false;
     var parts = expr.split('.');
     var rootName = parts[0];
-    if (declaredSet && declaredSet.has(rootName)) return false;
-    var typeName = db.roots[rootName];
+    var typeName = null;
+    if (scope) {
+      var rootHit = scope(rootName);
+      if (rootHit) {
+        if (rootHit.typeName) typeName = rootHit.typeName;
+        else if (rootHit.shadowed) return false;
+      }
+    }
+    if (!typeName) typeName = db.roots[rootName];
     if (!typeName) return false;
     for (var i = 1; i < parts.length; i++) {
       var seg = parts[i];
@@ -389,11 +397,19 @@
   // `encodeURIComponent`) via `.call.sanitizer` AND dotted
   // method calls (`DOMPurify.sanitize`) via per-method
   // descriptors.
-  function _isSanitizerCallViaDB(db, callExpr) {
+  function _isSanitizerCallViaDB(db, callExpr, scope) {
     if (!db || !callExpr) return false;
     var parts = callExpr.split('.');
     var rootName = parts[0];
-    var typeName = db.roots[rootName];
+    var typeName = null;
+    if (scope) {
+      var rootHit = scope(rootName);
+      if (rootHit) {
+        if (rootHit.typeName) typeName = rootHit.typeName;
+        else if (rootHit.shadowed) return false;
+      }
+    }
+    if (!typeName) typeName = db.roots[rootName];
     if (!typeName) return false;
     var typeDesc = db.types[typeName];
     // Dotted method call: walk per-segment.
@@ -473,11 +489,19 @@
   // `.construct.sink` if one is defined (for bare global
   // callables like `eval`). Preserves the legacy
   // TAINT_CALL_SINKS behaviour without a flat lookup table.
-  function _classifyCallSinkViaDB(db, callExpr) {
+  function _classifyCallSinkViaDB(db, callExpr, scope) {
     if (!db || !callExpr) return null;
     var parts = callExpr.split('.');
     var rootName = parts[0];
-    var typeName = db.roots[rootName];
+    var typeName = null;
+    if (scope) {
+      var rootHit = scope(rootName);
+      if (rootHit) {
+        if (rootHit.typeName) typeName = rootHit.typeName;
+        else if (rootHit.shadowed) return null;
+      }
+    }
+    if (!typeName) typeName = db.roots[rootName];
     if (!typeName) return null;
     var currentSink = null;
     var currentSeverity = null;
@@ -632,14 +656,29 @@
   // label" — this preserves the legacy behaviour where bare
   // `localStorage` / `sessionStorage` carried the `storage`
   // label without any further property access.
-  function _walkPathInDB(db, expr) {
+  // `scope`, when provided, is a resolver `(name) => { typeName?,
+  // shadowed? }` consulted for the ROOT segment. It gives callers
+  // flow-sensitive type tracking: if the root name resolves to a
+  // typed local binding, walking starts from that type instead of
+  // `db.roots`. If it resolves to an untyped local binding
+  // (`shadowed: true`) the walk aborts entirely — the user has
+  // shadowed any global of the same name with a user variable.
+  function _walkPathInDB(db, expr, scope) {
     if (!db || !expr) return null;
     var parts = expr.split('.');
     if (parts.length === 0) return null;
     var rootName = parts[0];
     var parenIdx0 = rootName.indexOf('(');
     if (parenIdx0 >= 0) rootName = rootName.slice(0, parenIdx0);
-    var typeName = db.roots[rootName];
+    var typeName = null;
+    if (scope) {
+      var rootHit = scope(rootName);
+      if (rootHit) {
+        if (rootHit.typeName) typeName = rootHit.typeName;
+        else if (rootHit.shadowed) return null;
+      }
+    }
+    if (!typeName) typeName = db.roots[rootName];
     if (!typeName) return null;
     var currentSource = null;
     var typeDesc = db.types[typeName];
@@ -701,8 +740,8 @@
   // match behaviour for patterns like `location.hash.slice(1)`
   // where the final `slice(1)` doesn't itself resolve on the
   // TypeDB but `location.hash` does.
-  function getTaintSource(expr) {
-    return _walkPathInDB(DEFAULT_TYPE_DB, expr);
+  function getTaintSource(expr, scope) {
+    return _walkPathInDB(DEFAULT_TYPE_DB, expr, scope);
   }
 
   // Check if an expression is a known call-based taint source.
@@ -714,8 +753,8 @@
   // covers bare global callables like `decodeURIComponent`,
   // `fetch`, `atob`, and dotted call sources like `localStorage.
   // getItem` and `location.toString`.
-  function getTaintSourceCall(callExpr) {
-    return _walkPathInDB(DEFAULT_TYPE_DB, callExpr);
+  function getTaintSourceCall(callExpr, scope) {
+    return _walkPathInDB(DEFAULT_TYPE_DB, callExpr, scope);
   }
 
   // Classify a property sink given the element type. Returns
@@ -728,9 +767,10 @@
   // Check if a function name is a known sanitizer. Thin wrapper
   // over `_isSanitizerCallViaDB` which walks the call expression
   // through DEFAULT_TYPE_DB looking for descriptors that carry
-  // `sanitizer: true`.
-  function isSanitizer(name) {
-    return _isSanitizerCallViaDB(DEFAULT_TYPE_DB, name);
+  // `sanitizer: true`. The `scope` parameter is an optional
+  // flow-sensitive resolver consulted for the root segment.
+  function isSanitizer(name, scope) {
+    return _isSanitizerCallViaDB(DEFAULT_TYPE_DB, name, scope);
   }
 
   // Extract the element tag from a binding's origin (for element type tracking).
@@ -760,9 +800,10 @@
 
   // Check if an expression addresses a navigation sink (either
   // as an assignment target OR as a callable). Thin wrapper
-  // over `_isNavSinkViaDB`.
-  function isNavSink(expr, declaredSet) {
-    return _isNavSinkViaDB(DEFAULT_TYPE_DB, expr, declaredSet);
+  // over `_isNavSinkViaDB`. The `scope` parameter is an optional
+  // flow-sensitive resolver consulted for the root segment.
+  function isNavSink(expr, scope) {
+    return _isNavSinkViaDB(DEFAULT_TYPE_DB, expr, scope);
   }
 
   // Protocol filter code for safe navigation: validates URL is http(s).
@@ -3508,21 +3549,40 @@
     // template-literal expression that was re-tokenized) while sharing the
     // current scope stack.
     let tks = tokens;
+    // Flow-sensitive scope resolver consulted by the TypeDB
+    // walkers. Returns `{typeName}` when a name resolves to a
+    // typed local binding, `{shadowed: true}` when it resolves
+    // to an untyped local binding (user var shadowing any
+    // global), or null when the name isn't locally declared
+    // (walker falls back to `db.roots` for unshadowed globals).
+    //
+    // A binding's `typeName` is set at assignment time — e.g.
+    // `var loc = window.location` stashes `Location` on `loc`'s
+    // binding — so subsequent reads resolve through type lookups
+    // instead of re-matching the original expression text. This
+    // is what makes aliasing work:
+    //
+    //     var loc = window.location;
+    //     x.innerHTML = loc.hash;   // detected as `url` source
+    //
+    // The walker sees `loc` in scope → uses typeName=Location →
+    // looks up `hash` on Location → source='url'.
+    const typedScope = (name) => {
+      if (!declaredNames.has(name)) return null;
+      var b = resolve(name);
+      if (b && b.typeName) return { typeName: b.typeName };
+      return { shadowed: true };
+    };
     // Taint checking helpers (no-ops when taintEnabled is false).
     const checkTaintSource = (exprText) => {
       if (!taintEnabled) return null;
-      // Don't flag as taint source if the root is a declared local variable.
-      var root = exprText.split('.')[0];
-      if (root !== 'window' && root !== 'self' && root !== 'globalThis' && declaredNames.has(root)) return null;
-      var label = getTaintSource(exprText);
+      var label = getTaintSource(exprText, typedScope);
       if (label) return new Set([label]);
       return null;
     };
     const checkTaintSourceCall = (callExpr) => {
       if (!taintEnabled) return null;
-      var root = callExpr.split('.')[0];
-      if (root !== 'window' && root !== 'self' && root !== 'globalThis' && declaredNames.has(root)) return null;
-      var label = getTaintSourceCall(callExpr);
+      var label = getTaintSourceCall(callExpr, typedScope);
       if (label) return new Set([label]);
       return null;
     };
@@ -3578,7 +3638,7 @@
     };
     const checkSinkCall = (callExpr, argBindings, tok) => {
       if (!taintEnabled || !argBindings) return;
-      var sinkInfo = _classifyCallSinkViaDB(DEFAULT_TYPE_DB, callExpr);
+      var sinkInfo = _classifyCallSinkViaDB(DEFAULT_TYPE_DB, callExpr, typedScope);
       if (!sinkInfo) return;
       for (var ai = 0; ai < argBindings.length; ai++) {
         var ab = argBindings[ai];
@@ -4159,7 +4219,7 @@
         let labels = null;
         if (srcTaint) labels = new Set(srcTaint);
         // getTaintSource returns a single label string (or null).
-        const pathLabel = getTaintSource(pathText);
+        const pathLabel = getTaintSource(pathText, typedScope);
         if (pathLabel) {
           if (!labels) labels = new Set();
           labels.add(pathLabel);
@@ -5744,7 +5804,7 @@
         const b = await resolvePath(t.text);
         // Taint: check call-based sinks even in expression position
         // (e.g. var x = eval(tainted)).
-        if (taintEnabled && isCall && _classifyCallSinkViaDB(DEFAULT_TYPE_DB, t.text) && !declaredNames.has(t.text.split('.')[0])) {
+        if (taintEnabled && isCall && _classifyCallSinkViaDB(DEFAULT_TYPE_DB, t.text, typedScope)) {
           var _sinkCallArgs = await readCallArgBindings(k + 1, stop);
           if (_sinkCallArgs) checkSinkCall(t.text, _sinkCallArgs.bindings, t);
         }
@@ -5811,7 +5871,7 @@
           for (var _fp = k + 1; _fp < end; _fp++) {
             if (tks[_fp] && tks[_fp].type === 'open' && tks[_fp].char === '(') { _firstParen = _fp; break; }
           }
-          if (_firstParen >= 0 && taintEnabled && !isSanitizer(t.text)) {
+          if (_firstParen >= 0 && taintEnabled && !isSanitizer(t.text, typedScope)) {
             var _opaqueArgs = await readConcatArgs(_firstParen, stop);
             if (_opaqueArgs) {
               var _opaqueArgTaint = null;
@@ -5856,7 +5916,7 @@
               const last = tks[args.next - 1];
               var _callRef = exprRef(first._src.slice(first.start, last.end));
               // Taint: check if this is a sanitizer (clears taint) or propagates it.
-              if (taintEnabled && !isSanitizer(t.text)) {
+              if (taintEnabled && !isSanitizer(t.text, typedScope)) {
                 var _argTaint = null;
                 for (var _ai = 0; _ai < args.args.length; _ai++) {
                   var _at = collectChainTaint(args.args[_ai]);
@@ -5867,7 +5927,7 @@
               return { bind: chainBinding([_callRef]), next: args.next };
             }
             // Taint: for inlined functions, check if it's a sanitizer.
-            if (taintEnabled && isSanitizer(t.text)) {
+            if (taintEnabled && isSanitizer(t.text, typedScope)) {
               return { bind: chainBinding(toks.map(function(tk) { var c = Object.assign({}, tk); delete c.taint; return c; })), next: args.next };
             }
             return { bind: chainBinding(toks), next: args.next };
@@ -8591,7 +8651,7 @@
       if (IDENT_RE.test(t.text)) {
         const eqTok = tokens[i + 1];
         // Navigation sink: bare assignment to a navigation global (location = expr).
-        if (taintEnabled && eqTok && eqTok.type === 'sep' && eqTok.char === '=' && isNavSink(t.text, declaredNames)) {
+        if (taintEnabled && eqTok && eqTok.type === 'sep' && eqTok.char === '=' && isNavSink(t.text, typedScope)) {
           var _bNavR = await readValue(i + 2, stop, TERMS_TOP);
           if (_bNavR && _bNavR.binding && _bNavR.binding.kind === 'chain') {
             var _bNavTaint = collectChainTaint(_bNavR.binding.toks);
@@ -8923,7 +8983,7 @@
                 }
               }
               i = callArgs.next - 1;
-              if (taintEnabled && _classifyCallSinkViaDB(DEFAULT_TYPE_DB, t.text) && !declaredNames.has(t.text.split('.')[0])) {
+              if (taintEnabled && _classifyCallSinkViaDB(DEFAULT_TYPE_DB, t.text, typedScope)) {
                 checkSinkCall(t.text, callArgs.bindings, t);
               }
               continue;
@@ -8950,7 +9010,7 @@
             }
           }
           // Taint: even if callee isn't inlinable, check if it's a call-based sink.
-          if (taintEnabled && _classifyCallSinkViaDB(DEFAULT_TYPE_DB, t.text) && !declaredNames.has(t.text.split('.')[0])) {
+          if (taintEnabled && _classifyCallSinkViaDB(DEFAULT_TYPE_DB, t.text, typedScope)) {
             var sinkArgs = await readCallArgBindings(i + 1, stop);
             if (sinkArgs) {
               checkSinkCall(t.text, sinkArgs.bindings, t);
@@ -9032,7 +9092,7 @@
       // Navigation sink detection: location.href = expr, location = expr,
       // location.assign(expr), opener.location = expr, etc.
       if (t.type === 'other' && (PATH_RE.test(t.text) || IDENT_RE.test(t.text))) {
-        var _navType = isNavSink(t.text, declaredNames);
+        var _navType = isNavSink(t.text, typedScope);
         // Check for navigation property assignment: location.href = expr, location = expr
         if (_navType) {
           var _navEq = tokens[i + 1];
@@ -9285,7 +9345,7 @@
               }
             }
             // Taint: detect call-based sinks (eval, document.write, etc.).
-            if (taintEnabled && _classifyCallSinkViaDB(DEFAULT_TYPE_DB, t.text) && !declaredNames.has(t.text.split('.')[0])) {
+            if (taintEnabled && _classifyCallSinkViaDB(DEFAULT_TYPE_DB, t.text, typedScope)) {
               const argResult = await readCallArgBindings(i + 1, stop);
               if (argResult) {
                 checkSinkCall(t.text, argResult.bindings, t);
