@@ -132,6 +132,102 @@
   // Taint Analysis Infrastructure
   // -----------------------------------------------------------------------
 
+  // ---------------------------------------------------------------
+  // TypeDB — the declarative database that drives every source/sink
+  // decision the walker makes. Pure data, no behaviour; the engine
+  // applies the entries below uniformly through a single set of
+  // lookup helpers (lookupProp / lookupMethod / resolveReturnType)
+  // and has no hardcoded name literals of its own.
+  //
+  // Shape:
+  //
+  //   TypeDB = {
+  //     types:    { [typeName]: TypeDescriptor },
+  //     roots:    { [globalName]: typeName },   // unshadowed globals
+  //     tagMap:   { [lowercaseTag]: typeName }, // createElement → subtype
+  //     eventMap: { [eventName]: typeName },    // handler first-param type
+  //   }
+  //
+  //   TypeDescriptor = {
+  //     extends?: typeName,                  // inheritance chain
+  //     props?:   { [name]: PropDescriptor },
+  //     methods?: { [name]: MethodDescriptor },
+  //     call?:    MethodDescriptor,          // callable singletons (eval/fetch)
+  //     construct?: MethodDescriptor,        // `new T(...)` semantics
+  //   }
+  //
+  //   PropDescriptor = {
+  //     source?:   string,                   // read → binding gets this label
+  //     sink?:     string,                   // write → finding with this kind
+  //     readType?: typeName,                 // type of the value read
+  //     writeType?: typeName,                // type refinement on write
+  //   }
+  //
+  //   MethodDescriptor = {
+  //     args?:        ArgDescriptor[],       // per-position arg metadata
+  //     returnType?:  typeName |             // static return type
+  //                   { fromArg: number,     // dynamic: pick by arg string
+  //                     map: { [argValue]: typeName },
+  //                     default?: typeName },
+  //     source?:                    string,  // return value gets this label
+  //     sink?:                      string,  // call-site sink kind
+  //     preservesLabelsFromArg?:    number,  // e.g. decodeURIComponent(arg0)
+  //     preservesLabelsFromReceiver?: boolean, // e.g. String.slice preserves
+  //   }
+  //
+  //   ArgDescriptor = {
+  //     sink?: string,                       // passing a labeled value → finding
+  //     sinkIfArgEquals?: {                  // e.g. setAttribute('onX', …) is code
+  //       arg: number,
+  //       values: { [argValue]: string },
+  //     },
+  //   }
+  //
+  // The preset DEFAULT_TYPE_DB at the bottom of this file holds the
+  // browser type descriptors. Consumers can replace or extend it by
+  // passing their own DB as options.taintConfig.typeDB.
+  function _lookupProp(db, typeName, propName) {
+    var t = typeName;
+    while (t) {
+      var desc = db.types[t];
+      if (!desc) return null;
+      if (desc.props && Object.prototype.hasOwnProperty.call(desc.props, propName)) {
+        return desc.props[propName];
+      }
+      t = desc.extends || null;
+    }
+    return null;
+  }
+  function _lookupMethod(db, typeName, methodName) {
+    var t = typeName;
+    while (t) {
+      var desc = db.types[t];
+      if (!desc) return null;
+      if (desc.methods && Object.prototype.hasOwnProperty.call(desc.methods, methodName)) {
+        return desc.methods[methodName];
+      }
+      t = desc.extends || null;
+    }
+    return null;
+  }
+  // Resolve a method's return type given call-site information.
+  // Handles the static `returnType: 'X'` form and the dynamic
+  // `returnType: { fromArg: N, map: {...}, default: 'X' }` form
+  // used for createElement-style APIs.
+  function _resolveReturnType(methodDesc, argStrings) {
+    var rt = methodDesc && methodDesc.returnType;
+    if (!rt) return null;
+    if (typeof rt === 'string') return rt;
+    if (typeof rt === 'object' && typeof rt.fromArg === 'number') {
+      var key = argStrings[rt.fromArg];
+      if (key != null && rt.map && Object.prototype.hasOwnProperty.call(rt.map, key)) {
+        return rt.map[key];
+      }
+      return rt.default || null;
+    }
+    return null;
+  }
+
   // Known taint sources — expressions or patterns that introduce untrusted data.
   const TAINT_SOURCES = {
     // URL-derived
@@ -10067,6 +10163,549 @@
 
   // convertProject: moved to htmldom-convert.js
 
+  // ---------------------------------------------------------------
+  // DEFAULT_TYPE_DB — the preset TypeDB shipped with the engine.
+  //
+  // This is pure data. Every source / sink / sanitizer / event-type
+  // decision the walker makes is expressed as a TypeDescriptor on a
+  // named type. The walker's lookup helpers (_lookupProp /
+  // _lookupMethod / _resolveReturnType) apply the same generic
+  // logic to every entry — there are no hardcoded name literals
+  // in the walker itself, only the TypeDB.
+  //
+  // Consumers who want to add, remove, or replace types can pass a
+  // custom db as options.taintConfig.typeDB to analyze(). The engine
+  // treats it identically to this preset.
+  //
+  // Label vocabulary used below (sources and sink kinds):
+  //   sources: 'url', 'cookie', 'referrer', 'window.name', 'storage',
+  //            'network', 'postMessage', 'file', 'dragdrop', 'clipboard'
+  //   sinks:   'html', 'code', 'url', 'navigation', 'css', 'text'
+  //
+  // Inheritance: every HTMLxElement extends HTMLElement which
+  // extends Element which extends EventTarget. String methods live
+  // on String. Event subtypes extend Event. Promise.then/.catch
+  // live on Promise. And so on — the chain gives each subtype
+  // access to its parent's props/methods automatically.
+  const DEFAULT_TYPE_DB = {
+    types: {
+      // --- Base types ---
+      EventTarget: {
+        methods: {
+          addEventListener: { args: [{}, {}] },
+          removeEventListener: { args: [{}, {}] },
+          dispatchEvent: { args: [{}] },
+        },
+      },
+      Event: {
+        extends: 'EventTarget',
+        props: {
+          // Generic Event has no taint-relevant props; subtypes override.
+        },
+      },
+      MessageEvent: {
+        extends: 'Event',
+        props: {
+          data:   { source: 'postMessage' },
+          origin: { source: 'postMessage' },
+        },
+      },
+      HashChangeEvent: {
+        extends: 'Event',
+        props: {
+          newURL: { source: 'url' },
+          oldURL: { source: 'url' },
+        },
+      },
+      PopStateEvent: {
+        extends: 'Event',
+        props: {
+          state: { source: 'url' },
+        },
+      },
+      ErrorEvent: {
+        extends: 'Event',
+        props: {
+          message:  { source: 'network' },
+          filename: { source: 'url' },
+        },
+      },
+      StorageEvent: {
+        extends: 'Event',
+        props: {
+          newValue: { source: 'storage' },
+          oldValue: { source: 'storage' },
+          url:      { source: 'url' },
+        },
+      },
+      DataTransfer: {
+        props: {
+          files: { source: 'file' },
+        },
+        methods: {
+          getData: { source: 'dragdrop', returnType: 'String' },
+        },
+      },
+      DragEvent: {
+        extends: 'Event',
+        props: {
+          dataTransfer: { readType: 'DataTransfer' },
+        },
+      },
+      ClipboardData: {
+        methods: {
+          getData: { source: 'clipboard', returnType: 'String' },
+        },
+      },
+      ClipboardEvent: {
+        extends: 'Event',
+        props: {
+          clipboardData: { readType: 'ClipboardData' },
+        },
+      },
+      FileReader: {
+        extends: 'EventTarget',
+        props: {
+          result:       { source: 'file' },
+          response:     { source: 'network' },
+          responseText: { source: 'network' },
+        },
+      },
+      ProgressEvent: {
+        extends: 'Event',
+        props: {
+          target: { readType: 'FileReader' },
+        },
+      },
+
+      // --- DOM structural types ---
+      Location: {
+        props: {
+          search:   { source: 'url', readType: 'String' },
+          hash:     { source: 'url', readType: 'String' },
+          href:     { source: 'url', readType: 'String', sink: 'navigation' },
+          pathname: { source: 'url', readType: 'String' },
+          host:     { source: 'url', readType: 'String' },
+          hostname: { source: 'url', readType: 'String' },
+          origin:   { source: 'url', readType: 'String' },
+          port:     { source: 'url', readType: 'String' },
+          protocol: { source: 'url', readType: 'String' },
+        },
+        methods: {
+          assign:   { args: [{ sink: 'navigation' }] },
+          replace:  { args: [{ sink: 'navigation' }] },
+          reload:   {},
+          toString: { source: 'url', returnType: 'String' },
+        },
+      },
+      History: {
+        methods: {
+          pushState:    {},
+          replaceState: {},
+          back:         {},
+          forward:      {},
+          go:           {},
+        },
+      },
+      Navigation: {
+        methods: {
+          navigate: { args: [{ sink: 'navigation' }] },
+        },
+      },
+      Storage: {
+        methods: {
+          getItem:    { source: 'storage', returnType: 'String' },
+          setItem:    {},
+          removeItem: {},
+          clear:      {},
+          key:        {},
+        },
+      },
+      Document: {
+        extends: 'EventTarget',
+        props: {
+          URL:         { source: 'url',      readType: 'String' },
+          documentURI: { source: 'url',      readType: 'String' },
+          baseURI:     { source: 'url',      readType: 'String' },
+          cookie:      { source: 'cookie',   readType: 'String' },
+          referrer:    { source: 'referrer', readType: 'String' },
+          domain:      { source: 'referrer', readType: 'String', sink: 'origin' },
+          location:    { readType: 'Location' },
+          body:        { readType: 'HTMLElement' },
+          documentElement: { readType: 'HTMLElement' },
+        },
+        methods: {
+          createElement: {
+            returnType: { fromArg: 0, map: {}, default: 'HTMLElement' },
+          },
+          createTextNode:    { returnType: 'Node' },
+          createDocumentFragment: { returnType: 'DocumentFragment' },
+          getElementById:    { returnType: 'HTMLElement' },
+          getElementsByTagName: { returnType: 'HTMLCollection' },
+          getElementsByClassName: { returnType: 'HTMLCollection' },
+          querySelector:     { returnType: 'HTMLElement' },
+          querySelectorAll:  { returnType: 'NodeList' },
+          write:             { args: [{ sink: 'html' }] },
+          writeln:           { args: [{ sink: 'html' }] },
+        },
+      },
+      Window: {
+        extends: 'EventTarget',
+        props: {
+          location:       { readType: 'Location' },
+          name:           { source: 'window.name', readType: 'String' },
+          document:       { readType: 'Document' },
+          history:        { readType: 'History' },
+          navigation:     { readType: 'Navigation' },
+          localStorage:   { readType: 'Storage' },
+          sessionStorage: { readType: 'Storage' },
+          top:            { readType: 'Window' },
+          parent:         { readType: 'Window' },
+          opener:         { readType: 'Window' },
+          self:           { readType: 'Window' },
+          frames:         { readType: 'Window' },
+        },
+        methods: {
+          open: { args: [{ sink: 'navigation' }] },
+          postMessage: {},
+          setTimeout:  { args: [{ sink: 'code' }] },
+          setInterval: { args: [{ sink: 'code' }] },
+          clearTimeout:  {},
+          clearInterval: {},
+        },
+      },
+
+      // --- Element hierarchy ---
+      Node: {
+        extends: 'EventTarget',
+        props: {
+          textContent: {},
+        },
+        methods: {
+          appendChild:  { args: [{}] },
+          insertBefore: { args: [{}, {}] },
+          removeChild:  { args: [{}] },
+          replaceChild: { args: [{}, {}] },
+        },
+      },
+      DocumentFragment: {
+        extends: 'Node',
+      },
+      Element: {
+        extends: 'Node',
+        props: {
+          innerHTML: { sink: 'html' },
+          outerHTML: { sink: 'html' },
+        },
+        methods: {
+          insertAdjacentHTML: { args: [{}, { sink: 'html' }] },
+          setAttribute: {
+            args: [{
+              sinkIfArgEquals: {
+                arg: 1,
+                values: {
+                  onclick: 'code', onload: 'code', onerror: 'code',
+                  onmouseover: 'code', onfocus: 'code', onblur: 'code',
+                  onsubmit: 'code', onchange: 'code', oninput: 'code',
+                  onkeydown: 'code', onkeyup: 'code', onkeypress: 'code',
+                  onmousedown: 'code', onmouseup: 'code', onmousemove: 'code',
+                  ondblclick: 'code', oncontextmenu: 'code', ondrag: 'code',
+                  ondrop: 'code', onscroll: 'code', onwheel: 'code',
+                  ontouchstart: 'code', ontouchend: 'code', ontouchmove: 'code',
+                  onanimationend: 'code', ontransitionend: 'code',
+                  style: 'css',
+                },
+              },
+            }, {}],
+          },
+          removeAttribute: { args: [{}] },
+          getAttribute:    { args: [{}], returnType: 'String' },
+        },
+      },
+      HTMLElement: { extends: 'Element' },
+      HTMLIFrameElement: {
+        extends: 'HTMLElement',
+        props: {
+          src:    { sink: 'url' },
+          srcdoc: { sink: 'html' },
+        },
+      },
+      HTMLScriptElement: {
+        extends: 'HTMLElement',
+        props: {
+          src:         { sink: 'url' },
+          textContent: { sink: 'code' },
+          text:        { sink: 'code' },
+          innerText:   { sink: 'code' },
+        },
+      },
+      HTMLEmbedElement: {
+        extends: 'HTMLElement',
+        props: { src: { sink: 'url' } },
+      },
+      HTMLObjectElement: {
+        extends: 'HTMLElement',
+        props: { data: { sink: 'url' } },
+      },
+      HTMLFrameElement: {
+        extends: 'HTMLElement',
+        props: { src: { sink: 'url' } },
+      },
+      HTMLAnchorElement: {
+        extends: 'HTMLElement',
+        props: { href: { sink: 'url' } },
+      },
+      HTMLAreaElement: {
+        extends: 'HTMLElement',
+        props: { href: { sink: 'url' } },
+      },
+      HTMLBaseElement: {
+        extends: 'HTMLElement',
+        props: { href: { sink: 'url' } },
+      },
+      HTMLLinkElement: {
+        extends: 'HTMLElement',
+        props: { href: { sink: 'url' } },
+      },
+      HTMLFormElement: {
+        extends: 'HTMLElement',
+        props: { action: { sink: 'url' } },
+      },
+      HTMLInputElement: {
+        extends: 'HTMLElement',
+        props: { formAction: { sink: 'url' } },
+      },
+      HTMLButtonElement: {
+        extends: 'HTMLElement',
+        props: { formAction: { sink: 'url' } },
+      },
+      HTMLStyleElement: {
+        extends: 'HTMLElement',
+        props: {
+          textContent: { sink: 'css' },
+          innerText:   { sink: 'css' },
+        },
+      },
+      HTMLImageElement: { extends: 'HTMLElement' },
+      HTMLVideoElement: { extends: 'HTMLElement' },
+      HTMLAudioElement: { extends: 'HTMLElement' },
+      HTMLSourceElement: { extends: 'HTMLElement' },
+      HTMLTrackElement: { extends: 'HTMLElement' },
+      HTMLCollection: {},
+      NodeList: {},
+
+      // --- Network types ---
+      Response: {
+        methods: {
+          json:      { source: 'network', returnType: 'Promise' },
+          text:      { source: 'network', returnType: 'Promise' },
+          blob:      { source: 'network', returnType: 'Promise' },
+          arrayBuffer: { source: 'network', returnType: 'Promise' },
+          formData:  { source: 'network', returnType: 'Promise' },
+        },
+      },
+      Promise: {
+        methods: {
+          then:    { args: [{}, {}] },
+          catch:   { args: [{}] },
+          finally: { args: [{}] },
+        },
+      },
+      XMLHttpRequest: {
+        extends: 'EventTarget',
+        props: {
+          responseText: { source: 'network', readType: 'String' },
+          response:     { source: 'network' },
+          responseXML:  { source: 'network' },
+          status:       {},
+          statusText:   {},
+        },
+        methods: {
+          open:            { args: [{}, {}] },
+          send:            { args: [{}] },
+          setRequestHeader:{ args: [{}, {}] },
+          getResponseHeader: { args: [{}], returnType: 'String' },
+          abort:           {},
+        },
+      },
+      WebSocket: {
+        extends: 'EventTarget',
+        methods: {
+          send:  { args: [{}] },
+          close: {},
+        },
+      },
+      EventSource: {
+        extends: 'EventTarget',
+        methods: {
+          close: {},
+        },
+      },
+
+      // --- String (for label-preserving string methods) ---
+      String: {
+        methods: {
+          slice:       { returnType: 'String', preservesLabelsFromReceiver: true },
+          substring:   { returnType: 'String', preservesLabelsFromReceiver: true },
+          substr:      { returnType: 'String', preservesLabelsFromReceiver: true },
+          toLowerCase: { returnType: 'String', preservesLabelsFromReceiver: true },
+          toUpperCase: { returnType: 'String', preservesLabelsFromReceiver: true },
+          trim:        { returnType: 'String', preservesLabelsFromReceiver: true },
+          trimStart:   { returnType: 'String', preservesLabelsFromReceiver: true },
+          trimEnd:     { returnType: 'String', preservesLabelsFromReceiver: true },
+          charAt:      { returnType: 'String', preservesLabelsFromReceiver: true },
+          concat:      { returnType: 'String', preservesLabelsFromReceiver: true },
+          repeat:      { returnType: 'String', preservesLabelsFromReceiver: true },
+          replace:     { returnType: 'String', preservesLabelsFromReceiver: true },
+          replaceAll:  { returnType: 'String', preservesLabelsFromReceiver: true },
+          padStart:    { returnType: 'String', preservesLabelsFromReceiver: true },
+          padEnd:      { returnType: 'String', preservesLabelsFromReceiver: true },
+          normalize:   { returnType: 'String', preservesLabelsFromReceiver: true },
+          split:       { preservesLabelsFromReceiver: true },
+          indexOf:     {},
+          lastIndexOf: {},
+          includes:    {},
+          startsWith:  {},
+          endsWith:    {},
+          toString:    { returnType: 'String', preservesLabelsFromReceiver: true },
+        },
+        props: {
+          length: {},
+        },
+      },
+
+      // --- Global callables ---
+      GlobalEval: {
+        call: { args: [{ sink: 'code' }] },
+      },
+      GlobalFunctionCtor: {
+        construct: { args: [{ sink: 'code' }, { sink: 'code' }] },
+        call:      { args: [{ sink: 'code' }, { sink: 'code' }] },
+      },
+      GlobalSetTimeout: {
+        call: { args: [{ sink: 'code' }, {}] },
+      },
+      GlobalSetInterval: {
+        call: { args: [{ sink: 'code' }, {}] },
+      },
+      GlobalFetch: {
+        call: { returnType: 'Promise' },
+      },
+      GlobalDecodeURIComponent: {
+        call: { source: 'url', returnType: 'String', preservesLabelsFromArg: 0 },
+      },
+      GlobalDecodeURI: {
+        call: { source: 'url', returnType: 'String', preservesLabelsFromArg: 0 },
+      },
+      GlobalAtob: {
+        call: { source: 'url', returnType: 'String', preservesLabelsFromArg: 0 },
+      },
+      // Sanitizers: functions whose return type has no
+      // preservesLabelsFrom* field, so labels do not flow from
+      // the argument to the return. The engine treats a function
+      // without a preserve hint as label-stripping automatically.
+      GlobalEncodeURIComponent: { call: { returnType: 'String' } },
+      GlobalEncodeURI:          { call: { returnType: 'String' } },
+      GlobalEscape:             { call: { returnType: 'String' } },
+      GlobalBtoa:               { call: { returnType: 'String' } },
+      GlobalParseInt:           { call: {} },
+      GlobalParseFloat:         { call: {} },
+      GlobalNumber:             { call: {} },
+      GlobalBoolean:            { call: {} },
+    },
+
+    // Root name → type. Applied when the name is not shadowed by an
+    // in-scope user declaration.
+    roots: {
+      location:       'Location',
+      window:         'Window',
+      document:       'Document',
+      navigator:      'Window',     // coarse; refine if needed
+      history:        'History',
+      navigation:     'Navigation',
+      localStorage:   'Storage',
+      sessionStorage: 'Storage',
+      top:            'Window',
+      parent:         'Window',
+      opener:         'Window',
+      self:           'Window',
+      frames:         'Window',
+
+      // Global callables modeled as singletons
+      eval:        'GlobalEval',
+      Function:    'GlobalFunctionCtor',
+      setTimeout:  'GlobalSetTimeout',
+      setInterval: 'GlobalSetInterval',
+      fetch:       'GlobalFetch',
+      decodeURIComponent: 'GlobalDecodeURIComponent',
+      decodeURI:          'GlobalDecodeURI',
+      atob:               'GlobalAtob',
+      encodeURIComponent: 'GlobalEncodeURIComponent',
+      encodeURI:          'GlobalEncodeURI',
+      escape:             'GlobalEscape',
+      btoa:               'GlobalBtoa',
+      parseInt:           'GlobalParseInt',
+      parseFloat:         'GlobalParseFloat',
+      Number:             'GlobalNumber',
+      Boolean:            'GlobalBoolean',
+    },
+
+    // createElement(tag) and similar → specific HTMLxElement type.
+    tagMap: {
+      iframe: 'HTMLIFrameElement',
+      script: 'HTMLScriptElement',
+      embed:  'HTMLEmbedElement',
+      object: 'HTMLObjectElement',
+      frame:  'HTMLFrameElement',
+      a:      'HTMLAnchorElement',
+      area:   'HTMLAreaElement',
+      base:   'HTMLBaseElement',
+      link:   'HTMLLinkElement',
+      form:   'HTMLFormElement',
+      input:  'HTMLInputElement',
+      button: 'HTMLButtonElement',
+      style:  'HTMLStyleElement',
+      img:    'HTMLImageElement',
+      video:  'HTMLVideoElement',
+      audio:  'HTMLAudioElement',
+      source: 'HTMLSourceElement',
+      track:  'HTMLTrackElement',
+    },
+
+    // addEventListener(eventName, fn) → the fn's first param gets this type.
+    eventMap: {
+      message:      'MessageEvent',
+      messageerror: 'MessageEvent',
+      hashchange:   'HashChangeEvent',
+      popstate:     'PopStateEvent',
+      error:        'ErrorEvent',
+      storage:      'StorageEvent',
+      drop:         'DragEvent',
+      dragover:     'DragEvent',
+      dragenter:    'DragEvent',
+      dragleave:    'DragEvent',
+      dragstart:    'DragEvent',
+      dragend:      'DragEvent',
+      paste:        'ClipboardEvent',
+      copy:         'ClipboardEvent',
+      cut:          'ClipboardEvent',
+      load:         'ProgressEvent',
+      loadend:      'ProgressEvent',
+      loadstart:    'ProgressEvent',
+      progress:     'ProgressEvent',
+      open:         'MessageEvent', // WebSocket 'open' carries data
+    },
+  };
+  // Populate createElement's dynamic return-type map from tagMap
+  // so the two stay in sync. Keyed here (not inline in the Document
+  // descriptor above) so tagMap remains the single source of truth.
+  (function () {
+    var map = DEFAULT_TYPE_DB.types.Document.methods.createElement.returnType.map;
+    for (var tag in DEFAULT_TYPE_DB.tagMap) {
+      map[tag] = DEFAULT_TYPE_DB.tagMap[tag];
+    }
+  })();
+
   // -----------------------------------------------------------------------
   // Public API
   // -----------------------------------------------------------------------
@@ -10164,6 +10803,12 @@
       TAINT_SANITIZERS: TAINT_SANITIZERS,
       ELEMENT_SINK_TYPES: ELEMENT_SINK_TYPES,
       EVENT_TAINT_SOURCES: EVENT_TAINT_SOURCES,
+      // New declarative type database. See the big comment block
+      // above DEFAULT_TYPE_DB for the shape.
+      DEFAULT_TYPE_DB: DEFAULT_TYPE_DB,
+      _lookupProp: _lookupProp,
+      _lookupMethod: _lookupMethod,
+      _resolveReturnType: _resolveReturnType,
     },
   };
 
