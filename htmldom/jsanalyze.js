@@ -5493,19 +5493,6 @@
       // pathological graphs from unbounding the analyser without
       // polluting the output with synthetic tokens.
       if (_fnKey && _callStack.indexOf(_fnKey) >= 0) return null;
-      // Definition-time call optimization: when this instantiateFunction
-      // call is itself nested inside a def-time body walk (taintFnDepth
-      // > 0), the callee's body has ALREADY been walked at its own
-      // declaration site. Walking it AGAIN here would re-register
-      // exactly the same inner declarations, re-record the same call
-      // sites, and re-emit the same (suppressed) findings — pure
-      // redundant work. Return null so the caller falls back to
-      // opaque-call handling, which still records the call site for
-      // dead-code call-graph coverage but skips the cascade of
-      // recursive body walks. The function's body will be walked
-      // properly when its FIRST live call site reaches it from
-      // taintFnDepth === 0 context.
-      if (taintFnDepth > 0) return null;
       if (_fnKey) _callStack.push(_fnKey);
       // Closure capture: push any captured-scope frames (by reference)
       // that aren't already on the live stack, so reads of outer
@@ -6072,19 +6059,7 @@
       if (start >= end) return null;
       var condVal = await readValue(start, end, null);
       var concrete = condVal ? evalTruthiness(condVal.binding) : null;
-      // SMT branch refutation is only consulted when its result can
-      // actually be observed by a finding emission. Inside a function
-      // body walked at definition time (taintFnDepth > 0), every
-      // potential finding is suppressed by recordTaintFinding, so
-      // pruning a branch here would be invisible work — we'd pay the
-      // full Z3 round-trip just to skip walking a body whose findings
-      // we'd suppress anyway. Walk both branches symbolically instead
-      // and let the call-time walk repeat the SMT check with proper
-      // context. This preserves dead-code-call-graph coverage (we
-      // still record call sites in unreachable branches) while
-      // eliminating the dominant cost of definition-time walks on
-      // function-heavy inputs.
-      if (taintEnabled && taintFnDepth === 0) {
+      if (taintEnabled) {
         var condToks = [];
         for (var ci = start; ci < end; ci++) condToks.push(tokens[ci]);
         var smtResult = await smtCheckCondition(condToks, resolve, resolvePath, pathConstraints);
