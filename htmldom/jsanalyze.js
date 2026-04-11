@@ -3847,31 +3847,87 @@
     // Used to distinguish `var location = x` (local) from `location = x` (global write).
     const declaredNames = new Set();
     // Resolve an array of chain tokens to a TypeDB type, or
-    // null if the shape isn't a single typed value. Handles:
+    // null if the shape isn't typable. Handles:
     //
     //  - `[{type:'other', text:'window.location'}]` →
-    //    walk via `_resolveExprTypeViaDB`.
+    //    walk via `_resolveExprTypeViaDB` for the single opaque
+    //    ref case.
     //  - `[{type:'cond', ifTrue, ifFalse}]` → recursively type
     //    each arm; when they join to the same type, return it.
     //    (Simple lattice join: T ⊔ T = T, T ⊔ U = ⊥.)
-    //  - Everything else → null.
+    //  - `[{type:'str'}, ...]` or any chain of string-producing
+    //    tokens separated by `plus` → `String`. Covers string
+    //    concatenation (`var url = base + "/" + path`) and
+    //    template literals (`var s = \`...${x}...\``). Both
+    //    are String-typed results whose operand labels
+    //    propagate via the existing token-taint mechanism.
+    //  - `[{type:'tmpl', ...}]` → `String` (template literal
+    //    with interpolation).
+    //  - `[{type:'trycatch', ...}]`, `[{type:'switchjoin', ...}]`
+    //     → recursively type every branch; when they all join
+    //    to the same type, return it. Same join semantics as
+    //    cond.
+    //  - Everything else → null (untyped — falls back to
+    //    token-taint propagation).
+    //
+    // Returns the TypeDB type name the expression's VALUE has
+    // at runtime assuming the TypeDB matches the browser spec
+    // and no shadowing.
     const _typeOfChainToks = (toks) => {
-      if (!toks || toks.length !== 1) return null;
-      var t = toks[0];
-      if (!t) return null;
-      if (t.type === 'other' && t.text) {
-        return _resolveExprTypeViaDB(DEFAULT_TYPE_DB, t.text, typedScope);
-      }
-      if (t.type === 'cond' && t.ifTrue && t.ifFalse) {
-        var tA = _typeOfChainToks(t.ifTrue);
-        var tB = _typeOfChainToks(t.ifFalse);
-        // Both arms must resolve to the same type for the
-        // joined value to have a definite type. Arms with
-        // different types collapse to ⊥ (null).
-        if (tA && tA === tB) return tA;
+      if (!toks || toks.length === 0) return null;
+      // Single-token fast paths.
+      if (toks.length === 1) {
+        var t = toks[0];
+        if (!t) return null;
+        if (t.type === 'other' && t.text) {
+          return _resolveExprTypeViaDB(DEFAULT_TYPE_DB, t.text, typedScope);
+        }
+        if (t.type === 'str') return 'String';
+        if (t.type === 'tmpl') return 'String';
+        if (t.type === 'cond' && t.ifTrue && t.ifFalse) {
+          var tA = _typeOfChainToks(t.ifTrue);
+          var tB = _typeOfChainToks(t.ifFalse);
+          if (tA && tA === tB) return tA;
+          return null;
+        }
+        if (t.type === 'trycatch' && t.tryBody && t.catchBody) {
+          var tT = _typeOfChainToks(t.tryBody);
+          var tC = _typeOfChainToks(t.catchBody);
+          if (tT && tT === tC) return tT;
+          return null;
+        }
+        if ((t.type === 'switch' || t.type === 'switchjoin') && t.branches) {
+          var firstBranchType = null;
+          for (var bi = 0; bi < t.branches.length; bi++) {
+            var bt = _typeOfChainToks(t.branches[bi].chain);
+            if (!bt) return null;
+            if (firstBranchType == null) firstBranchType = bt;
+            else if (firstBranchType !== bt) return null;
+          }
+          return firstBranchType;
+        }
         return null;
       }
-      return null;
+      // Multi-token chain: classify as `String` iff every
+      // non-`plus` operand is string-producing (literal,
+      // template, concat, or a typed binding whose type is
+      // itself `String`). This turns binding construction
+      // through `+` concatenation into a typed String result
+      // without having to re-do the tokenizer's work.
+      for (var i = 0; i < toks.length; i++) {
+        var tk = toks[i];
+        if (!tk) return null;
+        if (tk.type === 'plus') continue;
+        if (tk.type === 'str' || tk.type === 'tmpl') continue;
+        if (tk.type === 'other' && tk.text) {
+          var refType = _resolveExprTypeViaDB(DEFAULT_TYPE_DB, tk.text, typedScope);
+          if (refType === 'String') continue;
+          // Non-String operand → chain isn't uniformly String.
+          return null;
+        }
+        return null;
+      }
+      return 'String';
     };
     // Infer a binding's TypeDB type at assignment time and tag
     // it with `typeName`. Returns a shallow copy with the
@@ -4022,6 +4078,42 @@
             ok = false; break;
           }
           b = ok ? chainBinding([makeSynthStr(String(n))]) : null;
+        } else if (b.kind === 'chain' && b.typeName) {
+          // Multi-token / template-literal / already-typed
+          // chain — resolve the next segment via the TypeDB,
+          // treating method names as implicit-call return
+          // types. Inherits taint from the receiver's tokens
+          // so labels carried through concat / templates /
+          // previous walks propagate into the result.
+          //
+          // Covers:
+          //   var url = "p:" + location.hash; url.slice(7)
+          //   var s = `x${location.hash}`; s.toUpperCase()
+          //   var loc = window.location; loc.hash.slice(1)
+          //       (where loc.hash was already walked to String)
+          var _propDesc = _lookupProp(DEFAULT_TYPE_DB, b.typeName, p);
+          var _methodDesc = _propDesc ? null : _lookupMethod(DEFAULT_TYPE_DB, b.typeName, p);
+          if (!_propDesc && !_methodDesc) return null;
+          var _nextType = null;
+          var _nextLabel = null;
+          if (_propDesc) {
+            _nextType = _propDesc.readType || null;
+            if (_propDesc.source) _nextLabel = _propDesc.source;
+          } else {
+            _nextType = (typeof _methodDesc.returnType === 'string') ? _methodDesc.returnType : null;
+            if (_methodDesc.source) _nextLabel = _methodDesc.source;
+          }
+          var _mtExtText = path.split('.').slice(0, i + 1).join('.');
+          var _mtRef = deriveExprRef(_mtExtText, b.toks);
+          if (_nextLabel) {
+            if (!_mtRef.taint) _mtRef.taint = new Set();
+            _mtRef.taint.add(_nextLabel);
+          }
+          b = chainBinding([_mtRef]);
+          if (_nextType) b.typeName = _nextType;
+          // Continue the loop: next segment walks through the
+          // new type.
+          continue;
         } else {
           return null;
         }
@@ -4104,6 +4196,15 @@
           const path = p.expr.replace(/\s+/g, '');
           const b = await resolvePath(path);
           if (b) { resolvedText = await bindingToText(b); if (b.kind === 'chain') _tmplChain = b.toks; }
+          // If resolvePath found nothing (path references an
+          // unshadowed global like `location.hash`), fall through
+          // to the general evalExprSrc path so the walker's
+          // source-label lookup runs and taint labels flow into
+          // the template part's `toks`.
+          if (!b) {
+            const chain = await evalExprSrc(p.expr);
+            if (chain) _tmplChain = chain;
+          }
         } else {
           const chain = await evalExprSrc(p.expr);
           _tmplChain = chain;
