@@ -634,6 +634,28 @@
     return result;
   }
 
+  // Return the taint labels attached to a binding as a Set, or
+  // null if empty.
+  //
+  // This is the unified per-binding label lookup. Every sink
+  // classifier and label consumer in the walker reads via this
+  // helper rather than walking tokens directly, so a future
+  // type-first refactor that stores labels at the binding level
+  // (instead of per-token) only has to update this function.
+  //
+  // Current implementation:
+  //  - chain: fall back to `collectChainTaint(binding.toks)` so
+  //    existing per-token propagation keeps working.
+  //  - element / object / array / function: no labels.
+  //
+  // Consumers should treat the returned Set as read-only.
+  function getBindingLabels(binding) {
+    if (!binding) return null;
+    if (binding.labels) return binding.labels;
+    if (binding.kind === 'chain') return collectChainTaint(binding.toks);
+    return null;
+  }
+
   // Create an exprRef that inherits taint from any number of source token
   // arrays. Every place that creates a derived opaque expression from
   // existing bindings should use this instead of bare exprRef().
@@ -3667,32 +3689,30 @@
     };
     const checkSinkAssignment = (el, propName, valBinding, tok) => {
       if (!taintEnabled || !valBinding) return;
-      var toks = valBinding.kind === 'chain' ? valBinding.toks : null;
-      var taint = toks ? collectChainTaint(toks) : null;
-      if (!taint || !taint.size) return;
+      var labels = getBindingLabels(valBinding);
+      if (!labels || !labels.size) return;
       var sinkInfo = _classifyBindingSink(el, propName);
       if (sinkInfo && sinkInfo.severity !== 'safe') {
         var tag = getElementTag(el);
         var loc = tok && tok._src ? { expr: tok.text || propName, line: countLines(tok._src, tok.start), pos: tok.start } : null;
-        recordTaintFinding(sinkInfo.type, sinkInfo.severity, propName, tag, taint, taintCondStack, loc);
+        recordTaintFinding(sinkInfo.type, sinkInfo.severity, propName, tag, labels, taintCondStack, loc);
       }
     };
     const checkSinkSetAttribute = (el, attrName, valBinding) => {
       if (!taintEnabled || !valBinding || !attrName) return;
-      var toks = valBinding.kind === 'chain' ? valBinding.toks : null;
-      var taint = toks ? collectChainTaint(toks) : null;
-      if (!taint || !taint.size) return;
+      var labels = getBindingLabels(valBinding);
+      if (!labels || !labels.size) return;
       var tag = getElementTag(el);
       // Attribute-name sinks (onclick, style, etc.) via db.attrSinks.
       var attrSinkInfo = _classifyAttrSinkViaDB(DEFAULT_TYPE_DB, attrName);
       if (attrSinkInfo) {
-        recordTaintFinding(attrSinkInfo.type, attrSinkInfo.severity, attrName, tag, taint, taintCondStack);
+        recordTaintFinding(attrSinkInfo.type, attrSinkInfo.severity, attrName, tag, labels, taintCondStack);
       }
       // Element-specific attribute sinks (iframe.src, a.href,
       // form.action) via the binding's typeName.
       var elSinkInfo = _classifyBindingSink(el, attrName);
       if (elSinkInfo && elSinkInfo.severity !== 'safe') {
-        recordTaintFinding(elSinkInfo.type, elSinkInfo.severity, attrName, tag, taint, taintCondStack);
+        recordTaintFinding(elSinkInfo.type, elSinkInfo.severity, attrName, tag, labels, taintCondStack);
       }
     };
     const checkSinkCall = (callExpr, argBindings, tok) => {
@@ -3702,11 +3722,10 @@
       for (var ai = 0; ai < argBindings.length; ai++) {
         var ab = argBindings[ai];
         if (!ab) continue;
-        var toks = ab.kind === 'chain' ? ab.toks : null;
-        var taint = toks ? collectChainTaint(toks) : null;
-        if (taint && taint.size) {
+        var labels = getBindingLabels(ab);
+        if (labels && labels.size) {
           var loc = tok && tok._src ? { expr: callExpr, line: countLines(tok._src, tok.start), pos: tok.start } : null;
-          recordTaintFinding(sinkInfo.type, sinkInfo.severity, callExpr, null, taint, taintCondStack, loc);
+          recordTaintFinding(sinkInfo.type, sinkInfo.severity, callExpr, null, labels, taintCondStack, loc);
           break;
         }
       }
@@ -9360,10 +9379,10 @@
             var _navR = await readValue(i + 2, stop, TERMS_TOP);
             var _navVal = _navR ? _navR.binding : null;
             // Record as navigation sink finding.
-            if (taintEnabled && _navVal && _navVal.kind === 'chain') {
-              var _navTaint = collectChainTaint(_navVal.toks);
-              if (_navTaint && _navTaint.size) {
-                recordTaintFinding('navigation', 'high', t.text, null, _navTaint, taintCondStack,
+            if (taintEnabled) {
+              var _navLabels = getBindingLabels(_navVal);
+              if (_navLabels && _navLabels.size) {
+                recordTaintFinding('navigation', 'high', t.text, null, _navLabels, taintCondStack,
                   { expr: t.text, line: countLines(t._src, t.start) });
               }
             }
@@ -9394,10 +9413,10 @@
               if (_cwEq && _cwEq.type === 'sep' && _cwEq.char === '=') {
                 var _cwR = await readValue(i + 2, stop, TERMS_TOP);
                 var _cwVal = _cwR ? _cwR.binding : null;
-                if (taintEnabled && _cwVal && _cwVal.kind === 'chain') {
-                  var _cwTaint = collectChainTaint(_cwVal.toks);
-                  if (_cwTaint && _cwTaint.size) {
-                    recordTaintFinding('navigation', 'high', t.text, _cwTag, _cwTaint, taintCondStack,
+                if (taintEnabled) {
+                  var _cwLabels = getBindingLabels(_cwVal);
+                  if (_cwLabels && _cwLabels.size) {
+                    recordTaintFinding('navigation', 'high', t.text, _cwTag, _cwLabels, taintCondStack,
                       { expr: t.text, line: countLines(t._src, t.start) });
                   }
                 }
@@ -9492,19 +9511,17 @@
             if (_propIsEverASink(DEFAULT_TYPE_DB, sinkProp)) {
               const r = await readValue(i + 2, stop, TERMS_TOP);
               const val = r ? r.binding : null;
-              if (val && val.kind === 'chain') {
-                var _taint = collectChainTaint(val.toks);
-                if (_taint && _taint.size) {
-                  // Type-first classification: if the base
-                  // binding carries a typeName, look up sink
-                  // on THAT type. Falls back to tag-based
-                  // (for element bindings) or null.
-                  var _elTag = baseBind ? getElementTag(baseBind) : null;
-                  var _sinkInfo = _classifyBindingSink(baseBind, sinkProp);
-                  if (_sinkInfo && _sinkInfo.severity !== 'safe') {
-                    recordTaintFinding(_sinkInfo.type, _sinkInfo.severity, sinkProp, _elTag, _taint, taintCondStack,
-                      { expr: t.text, line: countLines(t._src, t.start) });
-                  }
+              var _labels = getBindingLabels(val);
+              if (_labels && _labels.size) {
+                // Type-first classification: if the base
+                // binding carries a typeName, look up sink
+                // on THAT type. Falls back to tag-based
+                // (for element bindings) or null.
+                var _elTag = baseBind ? getElementTag(baseBind) : null;
+                var _sinkInfo = _classifyBindingSink(baseBind, sinkProp);
+                if (_sinkInfo && _sinkInfo.severity !== 'safe') {
+                  recordTaintFinding(_sinkInfo.type, _sinkInfo.severity, sinkProp, _elTag, _labels, taintCondStack,
+                    { expr: t.text, line: countLines(t._src, t.start) });
                 }
               }
               i = skipExpr(i + 2, stop) - 1;
