@@ -392,6 +392,17 @@
       return (value && value.typeName) || null;
     },
 
+    // --- innerType(value) ---
+    //
+    // Return the parametric inner type attached to the value
+    // (the `T` in `Promise<T>`, etc.), or null if the value
+    // isn't a parametric container. Used when a consumer wants
+    // to see "this is a Promise, and the wrapped value is a
+    // Response" without walking through a `.then` themselves.
+    innerType(value) {
+      return (value && value.innerType) || null;
+    },
+
     // --- callsOfType(trace, typeName, argIndex?) ---
     //
     // Filter calls whose argument at `argIndex` (default 0)

@@ -2784,6 +2784,10 @@
     // type to the returned Value so consumers can read it via
     // `value.typeName`.
     if (binding.typeName && S.value.withType) S.value.withType(out, binding.typeName);
+    // Propagate the parametric `innerType` (e.g. Promise<T> → T)
+    // to the public Value so consumers can read it via
+    // `query.innerType(value)`.
+    if (binding.innerType) out.innerType = binding.innerType;
     return out;
   }
 
