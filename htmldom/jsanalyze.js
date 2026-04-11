@@ -4076,6 +4076,10 @@
           b = chainBinding([_extRef]);
           if (!_extType) _extType = _resolveExprTypeViaDB(DEFAULT_TYPE_DB, _extText, typedScope);
           if (_extType) b.typeName = _extType;
+          // Store labels at the binding level too, so
+          // getBindingLabels is O(1) and downstream consumers
+          // don't have to walk tokens.
+          if (_extRef.taint) b.labels = _extRef.taint;
           break;
         } else if (p === 'length' && b.kind === 'array') {
           b = chainBinding([makeSynthStr(String(b.elems.length))]);
@@ -4123,13 +4127,23 @@
             if (_methodDesc.source) _nextLabel = _methodDesc.source;
           }
           var _mtExtText = path.split('.').slice(0, i + 1).join('.');
+          // Inherit binding-level labels from the receiver
+          // (propagation through the method / prop read),
+          // then add the type descriptor's own source label.
+          var _prevLabels = getBindingLabels(b);
           var _mtRef = deriveExprRef(_mtExtText, b.toks);
-          if (_nextLabel) {
-            if (!_mtRef.taint) _mtRef.taint = new Set();
-            _mtRef.taint.add(_nextLabel);
+          var _newLabels = null;
+          if (_prevLabels && _prevLabels.size) {
+            _newLabels = new Set(_prevLabels);
           }
+          if (_nextLabel) {
+            if (!_newLabels) _newLabels = new Set();
+            _newLabels.add(_nextLabel);
+          }
+          if (_newLabels) _mtRef.taint = new Set(_newLabels); // back-compat
           b = chainBinding([_mtRef]);
           if (_nextType) b.typeName = _nextType;
+          if (_newLabels) b.labels = _newLabels;
           // Continue the loop: next segment walks through the
           // new type.
           continue;
