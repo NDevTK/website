@@ -6443,6 +6443,23 @@
             }
             return { bind: _inst, next: _newJ };
           }
+          // `new Proxy(target, handler)` — model as a transparent
+          // pass-through to `target` (ignoring the handler). Both
+          // direct proxies and proxied dispatcher tables flow taint
+          // the same way a plain object reference would. When the
+          // handler is non-trivial this is an approximation — its
+          // get/set traps aren't walked — but the common empty or
+          // logging-only handler case is exact.
+          if (_newName.text === 'Proxy') {
+            var _pxJ = k + 2;
+            if (tks[_pxJ] && tks[_pxJ].type === 'open' && tks[_pxJ].char === '(') {
+              var _pxArgs = await readCallArgBindings(_pxJ, stop);
+              if (_pxArgs && _pxArgs.bindings.length >= 1) {
+                var _pxTarget = _pxArgs.bindings[0];
+                if (_pxTarget) return { bind: _pxTarget, next: _pxArgs.next };
+              }
+            }
+          }
           // `new Map()` / `new Set()` / `new WeakMap()` / `new WeakSet()` —
           // model as an empty object binding. The shared method-call path
           // at applyMethod / applySuffixes then treats `.set(k, v)` as a
@@ -6684,6 +6701,26 @@
                   chainBinding([makeSynthStr(k)]),
                   ob.props[k],
                 ]))), next: argRes.next };
+              }
+            }
+          }
+        }
+        // Reflect.get(target, key) / Reflect.set(target, key, value)
+        // — reflective prop read/write. Both dispatch through the
+        // target object binding's props directly so taint flows
+        // from the prop's stored value to the return.
+        if (isCall && (t.text === 'Reflect.get' || t.text === 'Reflect.set')) {
+          const _reArgs = await readCallArgBindings(k + 1, stop);
+          if (_reArgs && _reArgs.bindings.length >= 2) {
+            var _reTarget = _reArgs.bindings[0];
+            var _reKey = chainAsKnownString(_reArgs.bindings[1]);
+            if (_reTarget && _reTarget.kind === 'object' && _reKey !== null) {
+              if (t.text === 'Reflect.get') {
+                var _reVal = _reTarget.props[_reKey];
+                if (_reVal) return { bind: _reVal, next: _reArgs.next };
+              } else if (t.text === 'Reflect.set' && _reArgs.bindings.length >= 3) {
+                _reTarget.props[_reKey] = _reArgs.bindings[2];
+                return { bind: chainBinding([makeSynthStr('true')]), next: _reArgs.next };
               }
             }
           }
@@ -7929,9 +7966,23 @@
         if (tks[frame.i] && tks[frame.i].type === 'other' && tks[frame.i].text.startsWith('...')) {
           var _sn = tks[frame.i].text.slice(3);
           var _sb = IDENT_RE.test(_sn) ? await resolvePath(_sn) : null;
-          if (_sb && _sb.kind === 'array') { for (var _si = 0; _si < _sb.elems.length; _si++) if (_sb.elems[_si]) frame.bindings.push(_sb.elems[_si]); }
-          else frame.bindings.push(chainBinding([deriveExprRef(_sn, _sb && _sb.kind === 'chain' ? _sb.toks : null)]));
-          frame.i++; if (tks[frame.i] && tks[frame.i].type === 'sep' && tks[frame.i].char === ',') { frame.i++; continue; } break;
+          if (_sb && _sb.kind === 'array') { for (var _si = 0; _si < _sb.elems.length; _si++) if (_sb.elems[_si]) frame.bindings.push(_sb.elems[_si]); frame.i++; }
+          else if (_sn === '' && tks[frame.i + 1] && tks[frame.i + 1].type === 'open' && tks[frame.i + 1].char === '[') {
+            // Bare `...` followed by an array literal — spread the
+            // materialized elements directly into the arg list.
+            var _spArr = await readArrayLit(frame.i + 1, frame.stop);
+            if (_spArr && _spArr.binding && _spArr.binding.kind === 'array') {
+              for (var _spi = 0; _spi < _spArr.binding.elems.length; _spi++) {
+                if (_spArr.binding.elems[_spi]) frame.bindings.push(_spArr.binding.elems[_spi]);
+              }
+              frame.i = _spArr.next;
+            } else {
+              frame.bindings.push(chainBinding([exprRef('...[...]')]));
+              frame.i++;
+            }
+          }
+          else { frame.bindings.push(chainBinding([deriveExprRef(_sn, _sb && _sb.kind === 'chain' ? _sb.toks : null)])); frame.i++; }
+          if (tks[frame.i] && tks[frame.i].type === 'sep' && tks[frame.i].char === ',') { frame.i++; continue; } break;
         }
         _evalStack.push({ type: 'READ_VALUE', k: frame.i, stop: frame.stop, terms: TERMS_ARG, phase: 0 });
         return; // result consumed at top on next _evalLoop iteration
@@ -10326,6 +10377,16 @@
       if (t.type === 'other' && t.text === 'new') {
         var _newResult = await readValue(i, stop, TERMS_TOP);
         if (_newResult) { i = _newResult.next - 1; continue; }
+      }
+      // Statement-level Reflect.set(target, key, value) /
+      // Object.assign(target, ...sources). Both mutate `target`
+      // in place — routing through readValue ensures the
+      // expression handler fires and the side effect is
+      // recorded on the object binding.
+      if (t.type === 'other' && (t.text === 'Reflect.set' || t.text === 'Object.assign') &&
+          tokens[i + 1] && tokens[i + 1].type === 'open' && tokens[i + 1].char === '(') {
+        var _stSideResult = await readValue(i, stop, TERMS_TOP);
+        if (_stSideResult) { i = _stSideResult.next - 1; continue; }
       }
       // Bare function call as a statement: `render(input);` or `obj.method(args);`.
       // Resolve the callee; if it's a function binding, inline it for side effects.

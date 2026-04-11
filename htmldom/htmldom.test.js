@@ -3946,6 +3946,16 @@ await (async function () {
   // --- Object literal spread of a literal expression ---
   await checkTaint('object spread of literal', { 'a.js': 'var o = { ...{ u: location.hash } }; document.getElementById("o").innerHTML = o.u;' }, 1, { sources: ['url'] });
 
+  // --- Spread of literal array in call args ---
+  await checkTaint('spread literal array in call', { 'a.js': 'function f(x) { document.getElementById("o").innerHTML = x; } f(...[location.hash]);' }, 1, { sources: ['url'] });
+
+  // --- Reflect.get / Reflect.set ---
+  await checkTaint('Reflect.get taint', { 'a.js': 'var o = {u: location.hash}; document.getElementById("o").innerHTML = Reflect.get(o, "u");' }, 1, { sources: ['url'] });
+  await checkTaint('Reflect.set taint', { 'a.js': 'var o = {}; Reflect.set(o, "u", location.hash); document.getElementById("o").innerHTML = o.u;' }, 1, { sources: ['url'] });
+
+  // --- new Proxy transparent pass-through ---
+  await checkTaint('Proxy taint pass-through', { 'a.js': 'var p = new Proxy({u: location.hash}, {}); document.getElementById("o").innerHTML = p.u;' }, 1, { sources: ['url'] });
+
   // --- jQuery-style DOM factory bind aliasing ---
   await checkTaint('factoryRef: $ = querySelector.bind(document)', { 'a.js': 'var $ = document.querySelector.bind(document); $("#o").innerHTML = location.hash;' }, 1, { sources: ['url'] });
 
