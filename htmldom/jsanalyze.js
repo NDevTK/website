@@ -720,6 +720,40 @@
     return result;
   }
 
+  // Compute the Least Upper Bound (LUB) of two types in the
+  // TypeDB's `extends` lattice. Returns the most specific type
+  // that is an ancestor of both `a` and `b`, or null when no
+  // common ancestor exists. Used by `_typeOfChainToks` to join
+  // ternary / try-catch / switch branches whose arms have
+  // different-but-related types.
+  //
+  // Examples:
+  //   HTMLIFrameElement ⊔ HTMLScriptElement  → HTMLElement
+  //   HTMLAnchorElement ⊔ HTMLElement         → HTMLElement
+  //   Location          ⊔ Document            → EventTarget (both extend it)
+  //   Location          ⊔ String              → null (no common ancestor)
+  function _typeLUB(db, a, b) {
+    if (!db || !a || !b) return null;
+    if (a === b) return a;
+    // Walk `a`'s extends chain collecting ancestors (including `a`).
+    var ancestors = Object.create(null);
+    var cur = a;
+    while (cur) {
+      ancestors[cur] = true;
+      var td = db.types[cur];
+      cur = td && td.extends || null;
+    }
+    // Walk `b`'s extends chain; first hit wins (the most
+    // specific common ancestor).
+    cur = b;
+    while (cur) {
+      if (ancestors[cur]) return cur;
+      var td2 = db.types[cur];
+      cur = td2 && td2.extends || null;
+    }
+    return null;
+  }
+
   // Return the taint labels attached to a binding as a Set, or
   // null if empty.
   //
@@ -4002,24 +4036,27 @@
         if (t.type === 'cond' && t.ifTrue && t.ifFalse) {
           var tA = _typeOfChainToks(t.ifTrue);
           var tB = _typeOfChainToks(t.ifFalse);
-          if (tA && tA === tB) return tA;
-          return null;
+          if (!tA || !tB) return null;
+          return _typeLUB(_activeDB, tA, tB);
         }
         if (t.type === 'trycatch' && t.tryBody && t.catchBody) {
           var tT = _typeOfChainToks(t.tryBody);
           var tC = _typeOfChainToks(t.catchBody);
-          if (tT && tT === tC) return tT;
-          return null;
+          if (!tT || !tC) return null;
+          return _typeLUB(_activeDB, tT, tC);
         }
         if ((t.type === 'switch' || t.type === 'switchjoin') && t.branches) {
-          var firstBranchType = null;
+          var lubType = null;
           for (var bi = 0; bi < t.branches.length; bi++) {
             var bt = _typeOfChainToks(t.branches[bi].chain);
             if (!bt) return null;
-            if (firstBranchType == null) firstBranchType = bt;
-            else if (firstBranchType !== bt) return null;
+            if (lubType == null) lubType = bt;
+            else {
+              lubType = _typeLUB(_activeDB, lubType, bt);
+              if (!lubType) return null;
+            }
           }
-          return firstBranchType;
+          return lubType;
         }
         return null;
       }

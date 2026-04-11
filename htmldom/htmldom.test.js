@@ -3940,6 +3940,9 @@ await (async function () {
   // --- Precision on destructured event ---
   await checkTaint('destructure via var from event.data', { 'a.js': 'window.addEventListener("message", function(e) { var d = e.data; document.getElementById("o").innerHTML = d; });' }, 1, { sources: ['postMessage'] });
 
+  // --- LUB joins via extends chain ---
+  await checkTaint('iframe|script LUB sink', { 'a.js': 'var el = cond ? document.createElement("iframe") : document.createElement("script"); el.innerHTML = location.hash;' }, 1, { sources: ['url'] });
+
   // --- Parametric Promise<T> ---
   await checkTaint('fetch.then Response.url', { 'a.js': 'fetch("/api").then(r => document.getElementById("o").innerHTML = r.url);' }, 1);
   await checkTaint('fetch.then.json.then', { 'a.js': 'fetch("/api").then(r => r.json()).then(data => document.getElementById("o").innerHTML = data);' }, 1, { sources: ['network'] });
