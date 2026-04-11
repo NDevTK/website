@@ -325,6 +325,63 @@
     return false;
   }
 
+  // Answer "does this expression address a navigation sink?" —
+  // i.e. does assigning to it OR calling it trigger page
+  // navigation (and thus need javascript:-protocol filtering)?
+  //
+  // Implemented by walking the dotted expression through the
+  // TypeDB. An expression qualifies if ANY of:
+  //   - The terminal type is `Location` (direct `location = url`
+  //     assignment to a Location binding).
+  //   - The terminal prop's container type is `Location` and the
+  //     prop itself has `sink: 'navigation'` (covers
+  //     `location.href = url`).
+  //   - The terminal method has `sink: 'navigation'` or its
+  //     first arg carries `sink: 'navigation'` (covers
+  //     `location.assign(url)`, `location.replace(url)`,
+  //     `window.open(url)`, `navigation.navigate(url)`).
+  //
+  // The `declaredSet` parameter lets callers pass the set of
+  // locally declared names so user-shadowed globals (e.g. `var
+  // location = x`) don't match.
+  function _isNavSinkViaDB(db, expr, declaredSet) {
+    if (!db || !expr) return false;
+    var parts = expr.split('.');
+    var rootName = parts[0];
+    if (declaredSet && declaredSet.has(rootName)) return false;
+    var typeName = db.roots[rootName];
+    if (!typeName) return false;
+    for (var i = 1; i < parts.length; i++) {
+      var seg = parts[i];
+      var pd = _lookupProp(db, typeName, seg);
+      var md = pd ? null : _lookupMethod(db, typeName, seg);
+      if (!pd && !md) return false;
+      var prevType = typeName;
+      var isLast = (i === parts.length - 1);
+      if (pd) {
+        typeName = pd.readType || null;
+        if (isLast) {
+          // `container.prop = url` where container is Location
+          // and prop is a navigation sink (the `.href` case).
+          if (pd.sink === 'navigation') return true;
+          // Advanced through a chain whose tail is a Location
+          // reference (the `window.location = url`, `document.
+          // location = url` intermediate case).
+          return typeName === 'Location';
+        }
+        if (!typeName) return false;
+      } else {
+        // Method segment: check per-method + per-arg navigation
+        // sink labels. Method sinks terminate the walk.
+        if (md.sink === 'navigation') return true;
+        if (md.args && md.args.length > 0 && md.args[0].sink === 'navigation') return true;
+        return false;
+      }
+    }
+    // Bare root resolved directly to Location (e.g. `location`).
+    return typeName === 'Location';
+  }
+
   // Answer "is `callExpr` a known sanitizer?" by walking the
   // expression through the TypeDB. A descriptor carries
   // `sanitizer: true` if calling it neutralises taint on its
@@ -690,62 +747,22 @@
   // -----------------------------------------------------------------------
 
 
-  // Navigation sink patterns: property assignments or method calls that
-  // cause navigation and are vulnerable to javascript: protocol XSS.
-  // Each entry: { kind: 'assign'|'call', severity, check }.
-  const NAV_SINKS = {
-    // Direct location assignments
-    'location.href':     { kind: 'assign', severity: 'high' },
-    'location':          { kind: 'assign', severity: 'high' },  // location = url
-    // Location methods
-    'location.assign':   { kind: 'call', severity: 'high' },
-    'location.replace':  { kind: 'call', severity: 'high' },
-    // window.open
-    'window.open':       { kind: 'call', severity: 'medium' },
-    'open':              { kind: 'call', severity: 'medium' },
-    // Navigation API
-    'navigation.navigate': { kind: 'call', severity: 'high' },
-  };
+  // Legacy NAV_SINKS / FRAME_NAV_PROPS / LOCATION_NAV_PROPS /
+  // NAV_SINK_EXPRS flat tables were removed in phase 6 of the
+  // type-db refactor. Navigation-sink assignment detection is
+  // now driven by `_isNavSinkAssignViaDB` which walks the
+  // expression through DEFAULT_TYPE_DB and checks whether the
+  // terminal type is `Location` OR whether the terminal
+  // property descriptor carries `sink: 'navigation'` on a
+  // Location container. Navigation-sink method calls (eval /
+  // location.assign / window.open / navigation.navigate) are
+  // picked up by the general `_classifyCallSinkViaDB` path.
 
-  // Properties on frame/iframe elements that are navigation sinks.
-  const FRAME_NAV_PROPS = new Set(['src']);
-  // Properties on opener/parent/top.location that are navigation sinks.
-  const LOCATION_NAV_PROPS = new Set(['href', '']);  // '' = direct assignment
-
-  // Check if an expression is a known global navigation object.
-  // Returns the nav type or null. Only matches when the name isn't
-  // shadowed by a local binding in the provided resolve function.
-  // Check if an expression refers to a global navigation object.
-  // Only returns a match when the root identifier is NOT declared
-  // locally (var/let/const/function). Bare assignments to globals
-  // (location = x) don't count as declarations.
-  // declaredSet: a Set of names declared with var/let/const.
-  // Navigation sink expressions: these are the ONLY patterns that cause
-  // navigation and are vulnerable to javascript: protocol. Any other
-  // property on location (location.hash, location.search) is a SOURCE
-  // not a sink.
-  const NAV_SINK_EXPRS = new Set([
-    'location', 'location.href', 'location.assign', 'location.replace',
-    'window.location', 'window.location.href', 'window.location.assign', 'window.location.replace',
-    'document.location', 'document.location.href', 'document.location.assign', 'document.location.replace',
-    'self.location', 'self.location.href',
-    'opener', 'opener.location', 'opener.location.href',
-    'window.opener', 'window.opener.location', 'window.opener.location.href',
-    'parent', 'parent.location', 'parent.location.href',
-    'window.parent', 'window.parent.location', 'window.parent.location.href',
-    'top', 'top.location', 'top.location.href',
-    'window.top', 'window.top.location', 'window.top.location.href',
-    'navigation.navigate', 'window.navigation.navigate',
-  ]);
-
-  // Check if an expression is a navigation sink. Only matches actual
-  // sink patterns, not reads like location.hash or location.search.
+  // Check if an expression addresses a navigation sink (either
+  // as an assignment target OR as a callable). Thin wrapper
+  // over `_isNavSinkViaDB`.
   function isNavSink(expr, declaredSet) {
-    if (!NAV_SINK_EXPRS.has(expr)) return false;
-    var root = expr.split('.')[0];
-    if (root === 'window' || root === 'self' || root === 'globalThis' || root === 'document') return true;
-    if (declaredSet && declaredSet.has(root)) return false;
-    return true;
+    return _isNavSinkViaDB(DEFAULT_TYPE_DB, expr, declaredSet);
   }
 
   // Protocol filter code for safe navigation: validates URL is http(s).
@@ -9928,7 +9945,13 @@
     if (ATTR_TO_PROP[attrName]) return ATTR_TO_PROP[attrName];
     if (IDL_PROPS.has(attrName)) return attrName;
     if (attrName.startsWith('data-') || attrName.startsWith('aria-')) return null;
-    if (/^on[a-z]+$/.test(attrName)) return null;
+    // Event-handler attributes (onclick, onload, ...) can't be
+    // set as IDL string props — `el.onclick = "..."` doesn't
+    // execute. Resolved via the TypeDB's attrSinks map which
+    // names every attr whose value is a code sink, so this
+    // check stays in sync with sink classification.
+    var _attrSinkKind = DEFAULT_TYPE_DB.attrSinks && DEFAULT_TYPE_DB.attrSinks[attrName.toLowerCase()];
+    if (_attrSinkKind === 'code') return null;
     if (attrName.includes(':') || attrName.includes('-')) return null;
     return null;
   }
@@ -11083,6 +11106,7 @@
       _propIsEverASink: _propIsEverASink,
       _collectEventSourceLabels: _collectEventSourceLabels,
       _isSanitizerCallViaDB: _isSanitizerCallViaDB,
+      _isNavSinkViaDB: _isNavSinkViaDB,
     },
   };
 
