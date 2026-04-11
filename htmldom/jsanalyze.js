@@ -7312,6 +7312,25 @@
     // assignName writes to a frame other than the current
     // function's top frame.
     var _outerMutCount = 0;
+    // Path-sensitive multi-return capture (see ABSTRACT-DOMAIN.md
+    // §4.7.1). When non-null, the walker's `return` handler
+    // captures each return statement's value AND the current
+    // function-relative path-condition snapshot, so the
+    // function summary can fold the returns into a `cond` chain
+    // that the SMT layer can refute branch-by-branch.
+    //
+    // `entries`     — list of { binding, conds, formulas, position }
+    //                 captured at each return site, in source order
+    // `entryPCSize` — depth of pathConstraints / taintCondStack at
+    //                 the moment instantiateFunction set up the
+    //                 capture; the per-return snapshots slice from
+    //                 this index so they record only the function-
+    //                 internal branch conditions, not the caller's.
+    //
+    // instantiateFunction saves/restores _returnCapture across the
+    // body walk so a recursive instantiation gets its own slot
+    // and the outer one is undisturbed.
+    var _returnCapture = null;
     // Fingerprint an argument binding for the cache key.
     // Captures kind, typeName, innerType, label set — the
     // TYPE-level state that determines the body's behaviour.
@@ -7531,25 +7550,54 @@
         }
         buildVarDeclStart = -1; // reset so inner decls don't leak out
         const lvBefore = loopVars.length;
+        // Install a path-sensitive return capture for this function
+        // instantiation. The walker's `return` handler populates
+        // _returnCapture.entries as it processes return statements,
+        // recording the function-relative path-condition snapshot
+        // at the moment each return was reached. Saved/restored
+        // around the body walk so recursive instantiations get
+        // their own slot. See ABSTRACT-DOMAIN.md §4.7.1 for the
+        // formal target. The capture is the source-of-truth for
+        // PATH CONDITIONS; the source-of-truth for which return
+        // VALUES exist is still the syntactic post-walk scan
+        // below — this is a deliberate trade-off (see A3) so the
+        // recursion-precision shortcut on numeric-only returns
+        // continues to work.
+        var _savedReturnCapture = _returnCapture;
+        _returnCapture = {
+          entries: [],
+          entryPCSize: pathConstraints ? pathConstraints.length : 0,
+          entryTCSize: taintCondStack ? taintCondStack.length : 0,
+        };
         await walkRange(bodyStart, bodyEnd);
+        var _walkerReturns = _returnCapture.entries;
+        _returnCapture = _savedReturnCapture;
         fnLoopVars = loopVars.splice(lvBefore);
         trackBuildVar = savedTrackBuildVar;
         trackBuildVarDepth = savedTrackDepth;
         buildVarDeclStart = savedBuildVarDeclStart;
-        // Collect every top-level return statement in the function
-        // body and join their values. This handles the common
-        // early-return pattern:
-        //
-        //   function f() {
-        //     if (a) return safe;
-        //     return tainted;
-        //   }
-        //
-        // where the first return is guarded by `if(a)` (no braces)
-        // but both returns are reachable. Previously only the first
-        // encountered return was captured, losing the tainted path.
+        // Build a `position → path-condition list` map from the
+        // walker captures so the reduction below can annotate
+        // syntactically-scanned returns with their real conditions
+        // (when the walker actually reached that return on this
+        // call). For returns the walker did NOT reach (because a
+        // surrounding `if` was concretely refuted, e.g. the
+        // recursion-base case `if (n <= 0) return 0` when n is a
+        // concrete non-zero literal), no entry exists and the fold
+        // proceeds without a condition for that return.
+        var _returnConds = Object.create(null);
+        for (var _wri = 0; _wri < _walkerReturns.length; _wri++) {
+          var _wr = _walkerReturns[_wri];
+          if (_wr.position != null) _returnConds[_wr.position] = _wr.conds;
+        }
+        // Syntactic post-walk scan: enumerate every top-level
+        // return statement in the function body. This is the
+        // source of truth for which return VALUES exist
+        // (path-INsensitive); the walker capture above is the
+        // source of truth for path conditions (path-sensitive).
+        // The reduction combines them.
         var _returnBindings = [];
-        var _returnFnBindings = [];
+        var _returnPositions = [];
         let ri = bodyStart;
         while (ri < bodyEnd) {
           const t = tks[ri];
@@ -7557,12 +7605,14 @@
             const rv = await readValue(ri + 1, bodyEnd, TERMS_TOP);
             if (rv && rv.binding) {
               _returnBindings.push(rv.binding);
+              _returnPositions.push(ri);
               ri = rv.next;
               continue;
             }
             const r = await readConcatExpr(ri + 1, bodyEnd, TERMS_TOP);
             if (r) {
               _returnBindings.push(chainBinding(r.toks));
+              _returnPositions.push(ri);
               ri = r.next;
               continue;
             }
@@ -7580,16 +7630,21 @@
           }
           ri++;
         }
-        // Reduce the collected returns to a single result.
+        // Reduce the syntactically-scanned returns. Cases:
         //
-        // - Zero returns: leave `result` null (void function).
-        // - One return: use it directly (preserving non-chain
-        //   bindings like objects / arrays / functions).
-        // - Multiple returns: if they're all chains, concatenate
-        //   their tokens into one chain so the caller's taint
-        //   collection sees every path's contribution. Non-chain
-        //   returns from multiple paths fall back to the first
-        //   (rare; usually only one branch returns an object).
+        //   0 returns → leave result null (void function)
+        //   1 return  → use it directly (preserves non-chain kinds)
+        //   N returns, all chains, at least one tainted →
+        //               fold into a right-associative `cond` chain
+        //               (ABSTRACT-DOMAIN.md §4.7.1). Per-return
+        //               path conditions are taken from the walker
+        //               capture map (_returnConds[position]) when
+        //               available, else default to "true".
+        //   N returns, all chains, no taint →
+        //               first-return shortcut (assumption A3),
+        //               required for recursive-arithmetic SMT
+        //               refutation.
+        //   N returns, mixed kinds → first non-chain binding.
         if (_returnBindings.length === 1) {
           var _singleRb = _returnBindings[0];
           if (_singleRb.kind === 'chain') {
@@ -7604,11 +7659,6 @@
           for (var _rbi = 0; _rbi < _returnBindings.length; _rbi++) {
             if (_returnBindings[_rbi].kind !== 'chain') { _allChains = false; break; }
           }
-          // Merge returns only when at least one branch carries
-          // taint labels. Numeric-only returns (the common
-          // recursive-arithmetic case) would otherwise get joined
-          // into a chain expression whose SMT projection stops
-          // refuting dead branches, introducing false positives.
           var _anyTainted = false;
           if (_allChains) {
             for (var _rbT = 0; _rbT < _returnBindings.length; _rbT++) {
@@ -7617,15 +7667,37 @@
             }
           }
           if (_allChains && _anyTainted) {
-            // Merge all chain tokens into a single cond-style
-            // token pair so the caller sees every path's taint.
-            var _mergedToks = [];
-            for (var _rbi2 = 0; _rbi2 < _returnBindings.length; _rbi2++) {
-              var _rbCh = _returnBindings[_rbi2];
-              if (_rbi2 > 0) _mergedToks.push({ type: 'plus' });
-              for (var _rt of _rbCh.toks) _mergedToks.push(_rt);
+            // Right-associative cond fold (ABSTRACT-DOMAIN.md
+            // §4.7.1). Returns r₀@C₀, r₁@C₁, …, rₙ@Cₙ become
+            //   Cond(C₀, r₀, Cond(C₁, r₁, … Cond(Cₙ₋₁, rₙ₋₁, rₙ)))
+            // collectChainTaint recurses into cond tokens so labels
+            // from every reachable branch propagate via the
+            // standard ⊔_Λ rule. The condExpr on each cond is the
+            // captured path condition for that return when the
+            // walker reached it; otherwise "true" so the cond
+            // unconditionally favours the if-true arm.
+            var _condChain = null;
+            for (var _ci = _returnBindings.length - 1; _ci >= 0; _ci--) {
+              var _eRb = _returnBindings[_ci];
+              var _ePos = _returnPositions[_ci];
+              var _eToks = _eRb.toks;
+              if (_condChain === null) {
+                _condChain = _eToks;
+              } else {
+                var _eConds = _returnConds[_ePos];
+                var _condExpr = (_eConds && _eConds.length)
+                  ? _eConds.join(' && ')
+                  : 'true';
+                var _condTok = {
+                  type: 'cond',
+                  condExpr: _condExpr,
+                  ifTrue: _eToks,
+                  ifFalse: _condChain,
+                };
+                _condChain = [_condTok];
+              }
             }
-            result = _mergedToks;
+            result = _condChain;
             // Preserve typeName / innerType only when all return
             // branches agree on them.
             var _firstRb = _returnBindings[0];
@@ -7637,17 +7709,21 @@
               if (_typeMatch) result._typeName = _firstRb.typeName;
             }
           } else if (_allChains) {
-            // No-taint case: fall back to the first return so
-            // SMT refutation on numeric-only branches still
-            // works (recursion / constant-return patterns).
+            // No-taint shortcut (A3): take the first return so
+            // SMT refutation on numeric-only recursive arithmetic
+            // (`function f(n){if(n<=0)return 0; return f(n-1)+1;}`)
+            // still terminates. The path-sensitive cond fold above
+            // would lose this precision because the SMT layer
+            // doesn't yet symbolically evaluate cond tokens at
+            // call sites — that's a separate piece of future work.
             var _firstOnly = _returnBindings[0];
             result = _firstOnly.toks;
             if (_firstOnly.typeName) result._typeName = _firstOnly.typeName;
             if (_firstOnly.innerType) result._innerType = _firstOnly.innerType;
           } else {
-            // Mixed return kinds: pick the first non-chain (object /
-            // array / function) binding to keep precision on structured
-            // returns that come from at least one branch.
+            // Mixed return kinds: pick the first non-chain
+            // (object / array / function) binding to keep precision
+            // on structured returns from at least one branch.
             for (var _rbi4 = 0; _rbi4 < _returnBindings.length; _rbi4++) {
               if (_returnBindings[_rbi4].kind !== 'chain') { fnReturnBinding = _returnBindings[_rbi4]; break; }
             }
@@ -9076,6 +9152,41 @@
           i = stmtEnd - 1;
           continue;
         }
+      }
+
+      // Path-sensitive return capture (ABSTRACT-DOMAIN.md §4.7.1).
+      // When the surrounding instantiateFunction has installed a
+      // _returnCapture slot, every `return` keyword encountered
+      // during the body walk records ITS POSITION and the current
+      // function-relative path-condition snapshot (taintCondStack
+      // sliced from entryTCSize, plus the SMT formulas sliced from
+      // entryPCSize). The post-walk reduction in instantiateFunction
+      // matches these by position against the syntactic-scan return
+      // bindings to attach real path conditions to the cond fold.
+      //
+      // CRITICAL: this handler does NOT call readValue on the
+      // return expression. Doing so would consume the expression
+      // tokens and prevent the walker's statement-level handlers
+      // from seeing calls (like `fetch(...)`) embedded inside the
+      // return — those calls need to fire call watchers and
+      // record sinks via the normal statement loop. Capture is
+      // PATH-CONDITIONS-ONLY; the syntactic scan in
+      // instantiateFunction reads the binding values.
+      if (t.text === 'return' && _returnCapture) {
+        var _retConds = taintCondStack
+          ? taintCondStack.slice(_returnCapture.entryTCSize)
+          : [];
+        var _retFormulas = pathConstraints
+          ? pathConstraints.slice(_returnCapture.entryPCSize)
+          : [];
+        _returnCapture.entries.push({
+          conds: _retConds,
+          formulas: _retFormulas,
+          position: i,
+        });
+        // Fall through — don't skip the expression. The walker
+        // continues to process the rest of the return statement
+        // as it always did.
       }
 
       // `if (cond) { ... } [else { ... }]` — when the condition is

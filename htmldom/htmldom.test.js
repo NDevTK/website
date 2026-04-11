@@ -3967,6 +3967,16 @@ await (async function () {
 
   // --- Early return pattern: multiple return statements ---
   await checkTaint('early return tainted branch', { 'a.js': 'function f() { if (a) return "s"; return location.hash; } document.getElementById("o").innerHTML = f();' }, 1, { sources: ['url'] });
+  // Path-sensitive multi-return: opaque condition forces walker
+  // to take both branches, and the taint flows from the second
+  // return through the function summary's cond fold
+  // (ABSTRACT-DOMAIN.md §4.7.1).
+  await checkTaint('multi-return cond fold', { 'a.js': 'function f(a) { if (a > 5) return "safe"; return location.hash; } document.getElementById("o").innerHTML = f(opaque);' }, 1, { sources: ['url'] });
+  // Recursion-arithmetic precision shortcut (A3 no-taint case):
+  // a function whose returns carry no taint labels falls back to
+  // the first-return shortcut so SMT refutation on the call
+  // result still terminates.
+  await checkTaint('recursion shortcut still works', { 'a.js': 'function f(n){if(n<=0)return 0; return f(n-1)+1;} var x=f(3); if(x===99) document.getElementById("o").innerHTML=location.hash;' }, 0);
 
   // --- filter(...).map(...).join: chain on opaque filter result ---
   await checkTaint('filter map join chain', { 'a.js': 'document.getElementById("o").innerHTML = ["a", location.hash].filter(x => x).map(x => x).join("");' }, 1, { sources: ['url'] });

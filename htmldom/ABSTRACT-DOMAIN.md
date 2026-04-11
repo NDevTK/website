@@ -618,61 +618,88 @@ when present.
 
 ```
 ⟦return e⟧ α  inside a function frame =
-  push (⟦e⟧_expr α, snapshot(P)) onto _pendingReturns
-  mark the rest of the current range dead within this frame
+  capture (position, snapshot(P)) into _returnCapture.entries
+  -- the rest of the return statement is processed by the
+  -- statement walker as usual so call watchers / sink handlers
+  -- inside the return expression still fire
 ```
 
-Currently implemented as a **post-walk scan** at line 7556: after
-`walkRange` finishes, `instantiateFunction` re-scans `[bodyStart,
-bodyEnd)` for top-level `return` tokens and reads each return
-expression. The scan does **not** capture path conditions, so the
-multi-return merge (§4.7.1) currently uses a heuristic instead of a
-true path-sensitive join.
+Implemented as a **two-source reduction** in `instantiateFunction`:
 
-§4.7.1 below specifies the **target** semantics; the implementation
-matches it once the path-sensitive return capture refactor in §6.3
-lands. Until then, the return merge falls back to either "single
-return → use it directly" or "multiple returns, at least one tainted
-→ flat union of all return tokens" or "multiple returns, none tainted
-→ first return only".
+1. The walker's `return` handler (in `walkRange`, after the
+   `break`/`continue` handler) snapshots the path-condition stack
+   (function-relative slice) and the return statement's source
+   position into `_returnCapture.entries`. **The handler does not
+   consume the return expression** — the walker continues processing
+   the rest of the line so embedded calls like `return fetch(...)`
+   still fire the statement-level call watchers.
+2. After `walkRange`, `instantiateFunction` runs a syntactic
+   post-walk scan of the body to enumerate every top-level `return`
+   token and read each return value via `readValue`. This is the
+   source of truth for which return *bindings* exist
+   (path-INsensitive: the scan finds every syntactic return,
+   including ones a concrete walk would skip).
+3. The reduction matches each syntactic return against the walker
+   captures by source position. When both agree, the syntactic
+   binding is annotated with the captured path condition. Returns
+   the walker did **not** reach (because a surrounding `if` was
+   concretely refuted by the walker, e.g. `if (n <= 0) return 0;`
+   when n is a known non-zero literal) get no captured condition
+   and the cond fold defaults their `condExpr` to `"true"`.
 
-#### §4.7.1 Target semantics for multi-return
+The reduction itself follows the §4.7.1 fold below, with one
+documented precision shortcut for the no-taint case (assumption A3).
+
+#### §4.7.1 Multi-return reduction (implemented)
 
 ```
 ⟦return e⟧ α at body position p inside function f, with current
-            function-relative path constraint stack φ_p =
-                ⋀ pathConstraints[entryPCSize..] :
-  S[f].pendingReturns ⊔= {(φ_p, ⟦e⟧_expr α)}
+            function-relative taintCondStack slice φ_p =
+                taintCondStack[entryTCSize..] :
+  _returnCapture.entries ⊔= {(p, φ_p, snapshot(P))}
 
-instantiateFunction f returns:
-  case |pendingReturns| of
+After walkRange completes, instantiateFunction reduces the
+syntactically-scanned return bindings (r₀, r₁, …, rₙ) by matching
+each against _returnCapture.entries by position to produce
+(r₀@C₀, r₁@C₁, …, rₙ@Cₙ) where Cᵢ is "true" when the walker did
+not reach return i. Then:
+
+  case n of
     0 → ⊥                                     -- void function
-    1 → snd(pendingReturns[0])                 -- single return
-    n → fold₁ (λ acc (φᵢ, vᵢ).
-                Cond { condExpr := stringify(φᵢ)
-                     , ifTrue   := tokens(vᵢ)
-                     , ifFalse  := tokens(acc) })
-               (snd (head pendingReturns))
-               (tail pendingReturns)
+    1 → r₀                                    -- single return
+    ≥2 ∧ all chains ∧ ∃ tainted →             -- cond fold
+        fold-right
+          (λ (rᵢ, Cᵢ) acc.
+             [Cond { condExpr := Cᵢ
+                   , ifTrue   := tokens(rᵢ)
+                   , ifFalse  := acc }])
+          tokens(rₙ)        -- last return is the leaf
+          (init returns)    -- r₀..rₙ₋₁ wrap from outside in
+    ≥2 ∧ all chains ∧ no taint → r₀          -- A3 shortcut
+    ≥2 ∧ mixed kinds → first non-chain binding
 ```
 
-Properties of this target:
+Properties:
 
-- **Sound for taint** by §3.3.1: `labels(Cond) = labels(ifTrue) ∪
-  labels(ifFalse)` recursively, so any tainted branch contributes.
-- **Precise for SMT refutation** because each `Cond.condExpr` carries
-  the actual path formula reaching that return, allowing the SMT
-  layer to refute branches whose `condExpr` contradicts the caller's
-  path constraints.
-- **Fall-through compatible** with the recursion test:
-  `function f(n){if(n<=0)return 0; return f(n-1)+1;}` produces
-  `Cond(n<=0, 0, f(n-1)+1)` and the SMT layer can refute
-  `Cond(n<=0, 0, ...) === 99` only when **both** arms are
-  individually refutable. The recursive arm is opaque so the join
-  remains satisfiable, but in the concrete `var x = f(3)` site the
-  caller's `n=3` constant is propagated and the SMT layer can refute
-  `Cond(3<=0, 0, ...) === 99` by contradicting the condExpr of
-  the first branch.
+- **Sound for taint** by §3.3.1: `collectChainTaint` recurses into
+  the cond tokens and unions every reachable branch's labels.
+- **Structurally precise**: each `Cond.condExpr` carries the
+  actual taintCondStack slice captured at the return site, so a
+  future SMT pass that substitutes call-site arg values into the
+  function's cond chain can refute branches whose `condExpr`
+  contradicts the substituted argument constants. **This
+  substitution is not yet implemented at the call site** — the
+  current SMT layer treats chains containing cond tokens as
+  opaque values for refutation purposes. Closing this gap is the
+  natural follow-up to this refactor.
+- **No-taint shortcut (A3)**: when no return carries taint labels,
+  the cond fold would lose the recursion-arithmetic precision
+  shortcut. The reduction instead takes only the first return so
+  patterns like `function f(n){if(n<=0)return 0; return f(n-1)+1;}`
+  can be SMT-refuted at concrete call sites
+  (`if (f(3) === 99) sink(...)` is correctly classified
+  unreachable because `f(3)` reduces to `0`, not to a cond chain
+  containing an opaque recursive call).
 
 ### §4.8 Function call
 
@@ -815,37 +842,59 @@ fails. The recursion test
 `f(3) === 99` because the **first** return is concretely 0 — not
 because the analysis reasoned about the recursion.
 
-### A3. Multi-return merge is precision-driven (current heuristic)
+### A3. Multi-return reduction is path-sensitive in structure but not in SMT exploitation
 
-**Lines:** 7619–7654.
-**Class:** UNSAFE for the no-taint case.
-**Statement.** Today's implementation collects every top-level
-`return` in the body and joins them as follows:
+**Lines:** 7551–7711 (instantiateFunction reduction); 9105–9127
+(walker `return` capture handler).
+**Class:** SAFE in the tainted case (over-approximates: all
+reachable return branches contribute their labels via
+`collectChainTaint`); UNSAFE in the no-taint case (under-
+approximates: only the first return is propagated).
+**Statement.** The walker now installs a `_returnCapture` slot at
+the start of each `instantiateFunction` body walk. Every `return`
+keyword encountered records `(position, taintCondStack slice,
+pathConstraints slice)` into the slot — without consuming the
+return expression, so embedded calls (`return fetch(...)`) still
+fire the statement-level call watchers. After `walkRange`, a
+syntactic post-walk scan enumerates every top-level return
+binding and matches it against the captured entries by position
+to attach real path conditions. The reduction then produces:
 
-| # returns | Any tainted? | Result                                |
-|-----------|--------------|---------------------------------------|
-| 0         | n/a          | `⊥` (void function)                   |
-| 1         | n/a          | the single return                     |
-| ≥ 2       | yes          | flat union of all return tokens       |
-| ≥ 2       | no           | **first return only**                 |
+| # returns | Any tainted? | Result                                       |
+|-----------|--------------|----------------------------------------------|
+| 0         | n/a          | `⊥` (void function)                          |
+| 1         | n/a          | the single return                            |
+| ≥ 2       | yes          | right-associative `Cond` chain (§4.7.1)      |
+| ≥ 2       | no           | **first return only** (recursion shortcut)   |
 
-The "first return only" branch loses precision in any function whose
-non-tainted returns differ structurally — `if (a) return SAFE_OBJ;
-return OTHER_SAFE_OBJ;` reports only `SAFE_OBJ` to callers, hiding
-side effects that would have flowed from `OTHER_SAFE_OBJ`'s downstream
-methods.
+The any-tainted case is now **structurally** path-sensitive: each
+`Cond` token carries the captured per-branch condition expression
+in its `condExpr` field, so a future SMT pass that substitutes
+call-site argument values into the cond can refute individual
+branches. The current SMT layer does **not** yet perform this
+substitution — chains containing cond tokens are treated as opaque
+for refutation purposes — so the observable improvement over the
+old `plus`-join behaviour is structural only. Closing the SMT
+exploitation gap is the natural follow-up.
 
-**Condition.** Sound iff every return path that would contribute a
-new finding is also a return path that carries a source label. A
-counter-example exists: a function whose first return is constant
-but whose second return makes a tainted side-effect call would be
-mis-summarised under the current heuristic.
+The no-taint case still falls back to the first return so SMT
+refutation on numeric-only recursive arithmetic (`function f(n)
+{if(n<=0)return 0; return f(n-1)+1;}` followed by
+`if (f(3) === 99) sink(...)`) continues to terminate. Replacing
+this shortcut with a sound principled join requires either (a) the
+SMT layer to symbolically reduce cond chains at call sites with
+concrete argument substitution, or (b) per-call-site
+specialization of function summaries by argument constants. Both
+are open work items.
 
-**Target.** §4.7.1 specifies the principled replacement: capture the
-function-relative path condition at each `return` site during the
-body walk and fold all returns into a `Cond` chain. The refactor in
-§6.3 will land this; the heuristic is documented here so future
-auditors know it is currently a wart.
+**Condition.** Sound for taint flow whenever the syntactic post-
+walk scan finds every return statement (it does; the scan walks
+`[bodyStart, bodyEnd)` skipping nested `{}` blocks). UNSAFE in the
+specific case where a function has multiple non-tainted returns
+that differ structurally and the second return's structure carries
+a sink-relevant value the first return does not — e.g.
+`if (a) return EMPTY_OBJ; return obj_with_dom_handle;` would
+report only the empty object to callers, hiding the DOM handle.
 
 ### A4. Loop variables collapse to opaque post-loop
 
