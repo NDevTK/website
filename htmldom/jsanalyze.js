@@ -3742,6 +3742,62 @@
     // template-literal expression that was re-tokenized) while sharing the
     // current scope stack.
     let tks = tokens;
+    // Detect `typeof IDENT === 'TYPE'` / `IDENT instanceof
+    // Ctor` patterns in a condition token range. Returns an
+    // array of `{ name, refinedType }` refinements the walker
+    // should apply to the true branch. Used by the if-statement
+    // handler to narrow binding types inside the branch body.
+    //
+    // The refinement map:
+    //   typeof x === 'string'  → x: String
+    //   typeof x === 'number'  → x: Number
+    //   typeof x === 'boolean' → x: Boolean
+    //   typeof x === 'function'→ x: Function
+    //   typeof x === 'object'  → x: Object
+    //   x instanceof HTMLElement → x: HTMLElement
+    //   x instanceof FileReader  → x: FileReader
+    //     ... any type declared in the active TypeDB.
+    const _detectTypeRefinements = (toks, start, end) => {
+      var refinements = [];
+      var _typeofMap = {
+        'string':   'String',
+        'number':   'Number',
+        'boolean':  'Boolean',
+        'function': 'Function',
+        'object':   'Object',
+      };
+      for (var k = start; k < end; k++) {
+        var t = toks[k];
+        if (!t) continue;
+        // `typeof IDENT === 'STR'` / `typeof IDENT == 'STR'`
+        // (and the reverse order).
+        if (t.type === 'other' && t.text === 'typeof') {
+          var ntName = toks[k + 1];
+          if (!ntName || ntName.type !== 'other' || !IDENT_RE.test(ntName.text)) continue;
+          var eq = toks[k + 2];
+          if (!eq || eq.type !== 'sep' || (eq.char !== '===' && eq.char !== '==')) continue;
+          var strTok = toks[k + 3];
+          if (!strTok || strTok.type !== 'str') continue;
+          var _refined = _typeofMap[strTok.text];
+          if (_refined) refinements.push({ name: ntName.text, refinedType: _refined });
+          continue;
+        }
+        // `IDENT instanceof CTOR` — the ctor name must match a
+        // type in the active TypeDB.
+        if (t.type === 'other' && IDENT_RE.test(t.text)) {
+          var io = toks[k + 1];
+          if (!io || io.type !== 'other' || io.text !== 'instanceof') continue;
+          var ctor = toks[k + 2];
+          if (!ctor || ctor.type !== 'other' || !IDENT_RE.test(ctor.text)) continue;
+          if (_activeDB.types && _activeDB.types[ctor.text]) {
+            refinements.push({ name: t.text, refinedType: ctor.text });
+          }
+          continue;
+        }
+      }
+      return refinements;
+    };
+
     // Flow-sensitive scope resolver consulted by the TypeDB
     // walkers. Returns `{typeName}` when a name resolves to a
     // typed local binding, `{shadowed: true}` when it resolves
@@ -8410,6 +8466,39 @@
               _ws.push({ type: 'if_merge', ctx: _oCtx, snapshot });
               _ws.push({ type: 'if_restore', ctx: _oCtx, snapshot, elseStart: _elS, elseEnd: _elE });
               _pushPathConstraint(_pathFormula, condExpr);
+              // Type refinement: pattern-match `typeof X ===
+              // 'string'` / `X instanceof Ctor` in the
+              // condition and narrow X's binding type while
+              // walking the true branch. The existing
+              // if_restore snapshot/restore machinery reverts
+              // the refinement on branch exit automatically
+              // because the snapshot was taken before the
+              // refinements were applied.
+              var _refinements = _detectTypeRefinements(tokens, i + 2, j);
+              for (var _ri = 0; _ri < _refinements.length; _ri++) {
+                var _refName = _refinements[_ri].name;
+                var _refType = _refinements[_ri].refinedType;
+                var _refCur = resolve(_refName);
+                if (_refCur) {
+                  // Create a fresh chain binding with the
+                  // refined typeName, preserving any taint
+                  // the variable already carries.
+                  var _refRef = exprRef(_refName);
+                  var _refLabels = getBindingLabels(_refCur);
+                  if (_refLabels && _refLabels.size) _refRef.taint = new Set(_refLabels);
+                  var _refBinding = chainBinding([_refRef]);
+                  _refBinding.typeName = _refType;
+                  if (_refLabels) _refBinding.labels = _refLabels;
+                  // Assign via the scope stack so the frame
+                  // holding the original binding is updated.
+                  for (var _rsi = stack.length - 1; _rsi >= 0; _rsi--) {
+                    if (_refName in stack[_rsi].bindings) {
+                      stack[_rsi].bindings[_refName] = _refBinding;
+                      break;
+                    }
+                  }
+                }
+              }
               _rangeEnd = ifEnd; i = j; continue;
             }
             // Condition too complex to represent — preserve the entire

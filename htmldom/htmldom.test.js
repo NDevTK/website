@@ -3940,6 +3940,10 @@ await (async function () {
   // --- Precision on destructured event ---
   await checkTaint('destructure via var from event.data', { 'a.js': 'window.addEventListener("message", function(e) { var d = e.data; document.getElementById("o").innerHTML = d; });' }, 1, { sources: ['postMessage'] });
 
+  // --- SMT type refinement in typeof/instanceof branches ---
+  await checkTaint('typeof string narrows', { 'a.js': 'var x = location.hash; if (typeof x === "string") { document.getElementById("o").innerHTML = x.slice(1); }' }, 1, { sources: ['url'] });
+  await checkTaint('instanceof HTMLElement narrows', { 'a.js': 'var el = someFn(); if (el instanceof HTMLElement) { el.innerHTML = location.hash; }' }, 1, { sources: ['url'] });
+
   // --- Structural object literal typed props ---
   await checkTaint('obj literal element prop', { 'a.js': 'var o = { el: document.createElement("iframe") }; o.el.src = location.hash;' }, 1, { sources: ['url'] });
   await checkTaint('deep obj element', { 'a.js': 'var o = { inner: { el: document.createElement("iframe") } }; o.inner.el.src = location.hash;' }, 1, { sources: ['url'] });
