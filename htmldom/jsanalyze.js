@@ -3852,11 +3852,35 @@
       // re-running the walker. The formulas are internal SMT AST nodes
       // (see smtSym/smtCmp/smtAnd/...).
       var _formulaSnapshot = pathConstraints ? pathConstraints.slice() : [];
+      var _incomingSources = Array.from(taintLabels);
+      // Dedup against prior findings at the same sink+location+conditions:
+      // when interprocedural walks discover the same write under different
+      // argument-taint envelopes (e.g. nested async returning a subset of
+      // labels on a second pass), merge the source sets instead of
+      // emitting two reports for the same program point.
+      var _locKey = location ? (location.pos != null ? location.pos : (location.line + ':' + location.expr)) : null;
+      for (var _fi = 0; _fi < taintFindings.length; _fi++) {
+        var _ef = taintFindings[_fi];
+        if (_ef.type !== sinkType) continue;
+        if (_ef.sink.prop !== prop) continue;
+        if ((_ef.sink.elementTag || null) !== (elementTag || null)) continue;
+        var _eKey = _ef.location ? (_ef.location.pos != null ? _ef.location.pos : (_ef.location.line + ':' + _ef.location.expr)) : null;
+        if (_eKey !== _locKey) continue;
+        if (_ef.conditions.length !== (pathConditions ? pathConditions.length : 0)) continue;
+        // Same sink + location + condition count: treat as duplicate and
+        // union the source labels onto the existing finding.
+        var _merged = false;
+        for (var _si = 0; _si < _incomingSources.length; _si++) {
+          if (_ef.sources.indexOf(_incomingSources[_si]) < 0) { _ef.sources.push(_incomingSources[_si]); _merged = true; }
+        }
+        if (_merged) _ef.sources.sort();
+        return;
+      }
       taintFindings.push({
         type: sinkType,
         severity: severity,
         sink: { prop: prop, elementTag: elementTag || null },
-        sources: Array.from(taintLabels),
+        sources: _incomingSources,
         conditions: pathConditions ? pathConditions.slice() : [],
         formulas: _formulaSnapshot,
         location: location || null,
@@ -4897,6 +4921,31 @@
         if (tk.type === 'other' && tk.text.startsWith('...')) {
           const name = tk.text.slice(3);
           if (IDENT_OR_PATH_RE.test(name)) { const b = await resolvePath(name); if (b && b.kind === 'object') { for (const kk in b.props) props[kk] = b.props[kk]; frame.i++; const sep = tks[frame.i]; if (sep && sep.type === 'sep' && sep.char === ',') { frame.i++; continue; } break; } }
+          // Bare `...` followed by a `{` — spread of an object
+          // literal. Recursively parse the inner literal and
+          // merge its props into this one: `{ ...{u: v}, ...}`.
+          if (name === '' && tks[frame.i + 1] && tks[frame.i + 1].type === 'open' && tks[frame.i + 1].char === '{') {
+            var _innerObj = await readObjectLit(frame.i + 1, stop);
+            if (_innerObj && _innerObj.binding && _innerObj.binding.kind === 'object') {
+              for (var _kk in _innerObj.binding.props) props[_kk] = _innerObj.binding.props[_kk];
+              frame.i = _innerObj.next;
+              const sep = tks[frame.i];
+              if (sep && sep.type === 'sep' && sep.char === ',') { frame.i++; continue; }
+              break;
+            }
+          }
+          // Bare `...` followed by any other expression: evaluate
+          // it and merge if it resolves to an object binding.
+          if (name === '') {
+            var _sprExprResult = await readValue(frame.i + 1, stop, TERMS_OBJ);
+            if (_sprExprResult && _sprExprResult.binding && _sprExprResult.binding.kind === 'object') {
+              for (var _kk2 in _sprExprResult.binding.props) props[_kk2] = _sprExprResult.binding.props[_kk2];
+              frame.i = _sprExprResult.next;
+              const sep = tks[frame.i];
+              if (sep && sep.type === 'sep' && sep.char === ',') { frame.i++; continue; }
+              break;
+            }
+          }
           _completeFrame(null); return;
         }
         var keyName = frame._pendingKey || null; frame._pendingKey = null;
