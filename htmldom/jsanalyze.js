@@ -6603,6 +6603,76 @@
             }
           }
         }
+        // Promise.all / Promise.race / Promise.resolve / Promise.reject.
+        // Each returns a Promise chain whose innerType / labels
+        // are computed from the input promises.
+        //
+        // Promise.all([p1, p2, ...]) → Promise<Array> with the
+        //   union of every input promise's labels (since any of
+        //   them could resolve with tainted data).
+        // Promise.race(…) → same label union, innerType is the
+        //   LUB of each input's innerType (or null if they
+        //   disagree), because any input's resolution wins.
+        // Promise.resolve(x) → Promise<typeof x> wrapping the
+        //   arg's type / labels.
+        // Promise.reject(x) → Promise (no normal path to taint,
+        //   but propagate x's labels via the .catch callback).
+        if (isCall && (t.text === 'Promise.all' || t.text === 'Promise.race' ||
+                       t.text === 'Promise.resolve' || t.text === 'Promise.reject' ||
+                       t.text === 'Promise.allSettled' || t.text === 'Promise.any')) {
+          const _prArgs = await readCallArgBindings(k + 1, stop);
+          if (_prArgs && _prArgs.bindings.length > 0) {
+            var _prResult = chainBinding([exprRef(t.text + '(...)')]);
+            _prResult.typeName = 'Promise';
+            // Collect labels + inner-type join across the
+            // input promises.
+            var _prLabels = null;
+            var _prInner = null;
+            var _prSources;
+            if (t.text === 'Promise.all' || t.text === 'Promise.allSettled' || t.text === 'Promise.any' || t.text === 'Promise.race') {
+              // First arg should be an array of promises.
+              var _prArr = _prArgs.bindings[0];
+              _prSources = (_prArr && _prArr.kind === 'array') ? _prArr.elems : [_prArr];
+            } else {
+              // Promise.resolve(x) / Promise.reject(x).
+              _prSources = [_prArgs.bindings[0]];
+            }
+            for (var _pri = 0; _pri < _prSources.length; _pri++) {
+              var _prb = _prSources[_pri];
+              if (!_prb) continue;
+              var _prbLabels = getBindingLabels(_prb);
+              if (_prbLabels && _prbLabels.size) {
+                if (!_prLabels) _prLabels = new Set();
+                for (var _prl of _prbLabels) _prLabels.add(_prl);
+              }
+              var _prbInner = _prb.innerType;
+              // For Promise.resolve, the arg isn't wrapped in a
+              // Promise, so its typeName is the inner type.
+              if (!_prbInner && t.text === 'Promise.resolve') _prbInner = _prb.typeName;
+              if (_prbInner) {
+                if (_prInner == null) _prInner = _prbInner;
+                else _prInner = _typeLUB(_activeDB, _prInner, _prbInner) || null;
+              }
+            }
+            // Promise.all / .allSettled / .any wrap the resolution
+            // as an Array. innerType is left as the LUB element
+            // type (conservative) so a `.then(arr => arr[0].x)`
+            // callback sees the right per-element type.
+            if (t.text === 'Promise.all' || t.text === 'Promise.allSettled' || t.text === 'Promise.any') {
+              if (_prInner) _prResult.innerType = _prInner;
+              else _prResult.innerType = 'Array';
+            } else {
+              // Promise.race / resolve / reject: innerType is
+              // the single (LUB) source type directly.
+              if (_prInner) _prResult.innerType = _prInner;
+            }
+            if (_prLabels && _prLabels.size) {
+              _prResult.labels = _prLabels;
+              _prResult.toks[0].taint = new Set(_prLabels);
+            }
+            return { bind: _prResult, next: _prArgs.next };
+          }
+        }
         // Array.isArray / Array.from / Array.of on known bindings.
         if (isCall && t.text === 'Array.isArray') {
           const argRes = await readCallArgBindings(k + 1, stop);

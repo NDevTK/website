@@ -3940,6 +3940,11 @@ await (async function () {
   // --- Precision on destructured event ---
   await checkTaint('destructure via var from event.data', { 'a.js': 'window.addEventListener("message", function(e) { var d = e.data; document.getElementById("o").innerHTML = d; });' }, 1, { sources: ['postMessage'] });
 
+  // --- Promise static methods (Promise.all / race / resolve / any) ---
+  await checkTaint('Promise.all taint union', { 'a.js': 'Promise.all([fetch("/a"), fetch("/b")]).then(rs => document.getElementById("o").innerHTML = rs[0]);' }, 1, { sources: ['network'] });
+  await checkTaint('Promise.race inner-type LUB', { 'a.js': 'Promise.race([fetch("/a"), fetch("/b")]).then(r => document.getElementById("o").innerHTML = r.url);' }, 1);
+  await checkTaint('Promise.resolve wraps arg', { 'a.js': 'Promise.resolve(location.hash).then(v => document.getElementById("o").innerHTML = v);' }, 1, { sources: ['url'] });
+
   // --- Function summary cache soundness ---
   await checkTaint('pure fn called twice', { 'a.js': 'function add(a, b) { return a + b; } var x = add(1, 2); var y = add(1, 2); document.getElementById("o").innerHTML = y;' }, 0);
   await checkTaint('impure fn not cached', { 'a.js': 'function sink(x) { document.getElementById("o").innerHTML = x; } sink("safe"); sink(location.hash);' }, 1, { sources: ['url'] });
