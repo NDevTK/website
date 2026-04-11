@@ -493,6 +493,20 @@
 
   function _quoteSmtName(s) { return '|' + s.replace(/\|/g, '_') + '|'; }
   function _quoteSmtString(s) { return '"' + s.replace(/"/g, '""') + '"'; }
+  // True when `o`'s SMT expression denotes a String-sorted value:
+  // a string literal, a sym previously declared as String, or a
+  // composite result flagged `stringResult: true` by smtArith /
+  // smtStrProp. Used by smtCmp to upgrade a compared sym's declared
+  // sort when the other side is a String expression without an
+  // inspectable `.value`.
+  function _isStringSide(o) {
+    if (!o) return false;
+    if (o.value && o.value.kind === 'str') return true;
+    if (o.symName && o.sorts && o.sorts[o.symName] === 'String') return true;
+    if (o.stringResult) return true;
+    return false;
+  }
+
   function _mergeSorts(a, b) {
     var out = {};
     var conflict = false;
@@ -566,7 +580,7 @@
       return { expr: n, sorts: {}, isBool: false, value: { kind: 'int', val: value } };
     }
     if (typeof value === 'string') {
-      return { expr: _quoteSmtString(value), sorts: {}, isBool: false, value: { kind: 'str', val: value } };
+      return { expr: _quoteSmtString(value), sorts: {}, isBool: false, value: { kind: 'str', val: value }, stringResult: true };
     }
     return { expr: 'true', sorts: {}, isBool: true, value: { kind: 'bool', val: true } };
   }
@@ -601,24 +615,50 @@
   }
   function smtCmp(op, l, r) {
     if (!l || !r) return null;
-    // Compile-time fold for fully-concrete operands.
-    if (l.value && r.value && l.value.kind === r.value.kind) {
+    // Compile-time fold for fully-concrete operands. We intentionally
+    // do NOT gate this on `l.value.kind === r.value.kind`, because
+    // JavaScript's comparison operators are defined for mixed types
+    // via well-known coercion rules, and leaving cross-kind compares
+    // to flow into the SMT emitter produces sort-mismatched formulas
+    // like `(= false "svg")` which Z3 rejects as a parse error.
+    //
+    // Strict equality (===/!==) requires the kinds to match too, so
+    // we short-circuit cross-kind ===/!== to false/true respectively
+    // BEFORE letting JS evaluate — `false === "svg"` happens to
+    // evaluate to false in JS anyway, but this form is explicit and
+    // safe under any future value shape.
+    if (l.value && r.value) {
       var lv = l.value.val, rv = r.value.val, ok;
+      var sameKind = l.value.kind === r.value.kind;
       switch (op) {
         case '<':  ok = lv < rv; break;
         case '>':  ok = lv > rv; break;
         case '<=': ok = lv <= rv; break;
         case '>=': ok = lv >= rv; break;
-        case '==': case '===': ok = lv === rv; break;
-        case '!=': case '!==': ok = lv !== rv; break;
+        case '==': ok = lv == rv; break;
+        case '===': ok = sameKind && lv === rv; break;
+        case '!=': ok = lv != rv; break;
+        case '!==': ok = !sameKind || lv !== rv; break;
         default: ok = true;
       }
       return smtConst(ok);
     }
-    // Sort upgrade: a sym compared with a string literal becomes String.
+    // Sort upgrade: a sym compared with a String-sorted expression
+    // becomes String. "String-sorted" covers three cases:
+    //   (1) a string literal          -> o.value.kind === 'str'
+    //   (2) a sym already declared    -> o.sorts[o.symName] === 'String'
+    //   (3) a composite str-theory    -> str.++ / str.substr / str.at
+    //       result, detected by the `stringResult` tag set by smtArith
+    //       (and the String-literal / String-sym cases also set it).
+    // Without case (3), equating `|_expr|` (Int) against a `(str.++ …)`
+    // expression left `_expr` declared as Int while the assertion
+    // needed it as String — Z3 rejected the formula with a "sorts Int
+    // and String are incompatible" parse error.
     var sorts = _mergeSorts(l.sorts, r.sorts);
-    if (l.symName && r.value && r.value.kind === 'str') sorts[l.symName] = 'String';
-    if (r.symName && l.value && l.value.kind === 'str') sorts[r.symName] = 'String';
+    var lIsString = _isStringSide(l);
+    var rIsString = _isStringSide(r);
+    if (l.symName && rIsString) sorts[l.symName] = 'String';
+    if (r.symName && lIsString) sorts[r.symName] = 'String';
     var smtOp;
     if (op === '<')  smtOp = '<';
     else if (op === '>')  smtOp = '>';
@@ -659,7 +699,7 @@
     if (op === 'charAt' && l.symName && r.value && r.value.kind === 'int') {
       var sortsC = _mergeSorts(l.sorts, null);
       sortsC[l.symName] = 'String';
-      return { expr: '(str.at ' + l.expr + ' ' + r.expr + ')', sorts: sortsC, isBool: false };
+      return { expr: '(str.at ' + l.expr + ' ' + r.expr + ')', sorts: sortsC, isBool: false, stringResult: true };
     }
     if ((op === 'substring' || op === 'substr' || op === 'slice') &&
         l.symName && r.value && r.value.kind === 'int' && r2 && r2.value && r2.value.kind === 'int') {
@@ -672,7 +712,7 @@
       var lenV = (op === 'substr') ? secondV : (secondV - startV);
       if (lenV < 0) lenV = 0;
       return { expr: '(str.substr ' + l.expr + ' ' + startV + ' ' + lenV + ')',
-               sorts: sortsS, isBool: false };
+               sorts: sortsS, isBool: false, stringResult: true };
     }
     // String concatenation: + with at least one String operand. JS
     // overloads + for both numeric add and string concat; we detect
@@ -693,7 +733,7 @@
         var ccIncompat = false;
         if (l.incompatible || r.incompatible || sortsCat.__conflict) ccIncompat = true;
         var rcc = { expr: '(str.++ ' + l.expr + ' ' + r.expr + ')',
-                    sorts: sortsCat, isBool: false };
+                    sorts: sortsCat, isBool: false, stringResult: true };
         if (ccIncompat) rcc.incompatible = true;
         return rcc;
       }
@@ -825,6 +865,35 @@
   var _currentVarMayBe = null;
   var _currentMayBeKey = null;
 
+  // --- Memoization + solver reuse ---
+  //
+  // Each walker pass issues many smtSat calls with identical
+  // SMT-LIB strings: the callback fixpoint re-walks the same if
+  // statements across iterations, every call-site refuting the
+  // same guard regenerates the same formula, and helper functions
+  // called repeatedly emit the same constraints each time. Without
+  // memoization, each duplicate call incurs a full Z3 parse +
+  // check round-trip, which completely dominates the wall time on
+  // any non-trivial file.
+  //
+  // Two-layer defense:
+  //
+  //   1. `_smtCache` — a Map keyed by the exact SMT-LIB source
+  //      string. Every smtSat call checks the cache before
+  //      touching Z3. The cache is UNBOUNDED — entries are never
+  //      evicted — because the analyser must never skip a query
+  //      or pay for a re-run of a query it has already answered.
+  //      On real programs the distinct-formula count is small
+  //      relative to total call count, so the cache stays a
+  //      moderate size even for large files.
+  //
+  //   2. `_sharedSolver` — one Solver per Z3 context, reset()
+  //      between calls instead of `new z3.Solver()`. Stops
+  //      Solver-level state from accumulating and avoids the
+  //      per-call allocation overhead of fresh solver objects.
+  var _smtCache = new Map();
+  var _sharedSolver = null;
+
   async function smtSat(formula) {
     if (!formula) return true;
     // Compile-time fold for fully-concrete results.
@@ -834,7 +903,6 @@
     // conservatively reported as satisfiable: we don't know enough to
     // refute the branch.
     if (formula.incompatible) return true;
-    var z3 = await _initZ3();
     var decls = '';
     var extras = '';
     for (var name in formula.sorts) {
@@ -881,10 +949,20 @@
       }
     }
     var smtlib = decls + extras + '(assert ' + _toBool(formula) + ')\n';
-    var solver = new z3.Solver();
-    solver.fromString(smtlib);
-    var result = await solver.check();
-    return result !== 'unsat';
+
+    // Layer 1: memoization cache (unbounded).
+    if (_smtCache.has(smtlib)) return _smtCache.get(smtlib);
+
+    var z3 = await _initZ3();
+
+    // Layer 2: reuse one Solver across calls.
+    if (!_sharedSolver) _sharedSolver = new z3.Solver();
+    else _sharedSolver.reset();
+    _sharedSolver.fromString(smtlib);
+    var result = await _sharedSolver.check();
+    var answer = result !== 'unsat';
+    _smtCache.set(smtlib, answer);
+    return answer;
   }
   // --- Condition parser: raw JS tokens → SMT formula ---
   // Operator precedence: || < && < comparisons < atoms
@@ -2523,6 +2601,21 @@
   async function buildScopeState(tokens, stopAt, externallyMutable, trackBuildVarInit, taintConfig, options) {
     options = options || {};
     const stack = [{ bindings: Object.create(null), isFunction: true }];
+    // Find the token index of the `}` matching the `{` at index
+    // `openIdx`. Returns -1 if not found. Used by the IIFE
+    // wrapper fast-path in the `{` handler to detect whether a
+    // function body is wrapped in `()` followed by `(…)` — the
+    // IIFE call pattern.
+    function _matchingBrace(openIdx) {
+      if (!tokens[openIdx] || tokens[openIdx].type !== 'open' || tokens[openIdx].char !== '{') return -1;
+      var depth = 1;
+      for (var j = openIdx + 1; j < tokens.length; j++) {
+        var tk = tokens[j];
+        if (tk.type === 'open' && tk.char === '{') depth++;
+        else if (tk.type === 'close' && tk.char === '}') { depth--; if (depth === 0) return j; }
+      }
+      return -1;
+    }
     let pendingFunctionBrace = false;
     let pendingFunctionParams = null;
     // Taint tracking state (active when taintConfig is provided).
@@ -2655,11 +2748,6 @@
         if (!slot.fnIds[fkey]) {
           slot.fnIds[fkey] = true;
           slot.fns.push(binding);
-          if (slot.fns.length > 32) {
-            // Cap to prevent runaway re-walks. Beyond this many call
-            // targets the precision win is marginal anyway.
-            slot.fns = slot.fns.slice(0, 32);
-          }
         }
         return;
       }
@@ -2720,14 +2808,6 @@
       if (slot.keys[k]) return;
       slot.keys[k] = true;
       slot.vals.push({ lit: lit.lit, sort: lit.sort });
-      // Cap the lattice size as a performance guard. If the cap is hit
-      // we conservatively poison the slot rather than emitting a
-      // partial disjunction.
-      if (slot.vals.length > 32) {
-        slot.complete = false;
-        slot.vals = null;
-        slot.keys = null;
-      }
     }
     // Snapshot the scope chain (BY REFERENCE) visible at closure
     // creation time. The returned array holds references to the
@@ -5115,15 +5195,16 @@
     // Invoke a function binding with a list of argument chains (token lists).
     // Pushes a temporary scope with param→arg bindings, parses the body
     // expression in the original token array, then pops the scope.
-    // Recursion / depth guard for instantiateFunction. Each entry is
-    // the function body range `"<bodyStart>:<bodyEnd>"`. The analyser
-    // walks a function body symbolically once it sees the same body
-    // already live on the call stack and returns a conservative
-    // opaque chain so recursive calls (direct, indirect, or mutual)
-    // don't unbound the walker. An absolute depth cap catches
-    // non-recursive but pathologically deep call graphs.
+    // Recursion guard for instantiateFunction. Each entry is the
+    // function body range `"<bodyStart>:<bodyEnd>"`. The analyser
+    // walks a function body symbolically; if the same body is
+    // already live on the call stack we return a conservative
+    // opaque chain so direct, indirect, and mutual recursion
+    // terminate without polluting the output with synthetic tokens.
+    // The guard is strict-recursion only — there is no depth cap
+    // and no per-body walk-count cap, so distinct-lineage calls to
+    // the same helper all get their full walk.
     const _callStack = [];
-    const _CALL_STACK_MAX = 64;
     const instantiateFunction = async (fn, argBindings, thisBinding) => {
       var _fnKey = (fn && fn.bodyStart != null) ? (fn.bodyStart + ':' + fn.bodyEnd) : null;
       // Detect recursion: the same function body is already being
@@ -5134,7 +5215,6 @@
       // pathological graphs from unbounding the analyser without
       // polluting the output with synthetic tokens.
       if (_fnKey && _callStack.indexOf(_fnKey) >= 0) return null;
-      if (_callStack.length >= _CALL_STACK_MAX) return null;
       if (_fnKey) _callStack.push(_fnKey);
       // Closure capture: push any captured-scope frames (by reference)
       // that aren't already on the live stack, so reads of outer
@@ -6310,6 +6390,38 @@
       const t = tokens[i];
 
       if (t.type === 'open' && t.char === '{') {
+        // IIFE wrapper fast-path. When we're about to open a
+        // function body AND the matching `}` is immediately
+        // followed by `)` `(` … `)` — i.e. the pattern
+        // `(function(){})()` / `(() => {})()` — skip the phase-1
+        // statement walk of this body entirely. The IIFE handler
+        // at `})()` later calls instantiateFunction on the same
+        // body, which is the walk that actually emits taint
+        // findings (phase 1's def-time walk suppresses them via
+        // taintFnDepth). Walking the body twice — once suppressed,
+        // once emitting — is pure waste AND triggers combinatorial
+        // re-work on nested function definitions.
+        //
+        // Detection:
+        //   current token i = `{`
+        //   matching `}` at _bodyClose
+        //   next tokens: _bodyClose+1 is `)`, _bodyClose+2 is `(`
+        // That `)(` is the IIFE call pattern the IIFE handler
+        // below is looking for.
+        if (pendingFunctionBrace) {
+          var _iifeBodyClose = _matchingBrace(i);
+          if (_iifeBodyClose > 0 &&
+              tokens[_iifeBodyClose + 1] && tokens[_iifeBodyClose + 1].type === 'close' && tokens[_iifeBodyClose + 1].char === ')' &&
+              tokens[_iifeBodyClose + 2] && tokens[_iifeBodyClose + 2].type === 'open' && tokens[_iifeBodyClose + 2].char === '(') {
+            // Skip the body. The walker's next iteration will land
+            // on _iifeBodyClose + 1 (the outer `)`) and then the
+            // IIFE handler will fire on `)(`.
+            pendingFunctionBrace = false;
+            pendingFunctionParams = null;
+            i = _iifeBodyClose;  // for-loop will increment past `}`
+            continue;
+          }
+        }
         const frame = { bindings: Object.create(null), isFunction: pendingFunctionBrace };
         if (taintEnabled && pendingFunctionBrace) taintFnDepth++;
         if (pendingFunctionBrace && pendingFunctionParams) {
@@ -6349,6 +6461,10 @@
             if (_iifeArr) { var _iifeB = readArrowBody(_iifeArr.arrowNext, i); if (_iifeB) _iifeFn = functionBinding(_iifeArr.params, _iifeB.bodyStart, _iifeB.bodyEnd, _iifeB.isBlock); }
           }
           if (_iifeFn) {
+            // Phase 1's statement walker skips IIFE-wrapper bodies
+            // (via the `}` IIFE fast-path in the `{` handler above)
+            // so this is the ONLY walk of the body. It runs with
+            // call-time context, which is what emits taint findings.
             var _iifeA = await readCallArgBindings(i + 1, stop);
             if (_iifeA) { await instantiateFunction(_iifeFn, _iifeA.bindings); i = _iifeA.next - 1; continue; }
           }
@@ -7181,13 +7297,14 @@
                 var _cFormula = smtCmp(_ascending ? '>=' : '<=', _cSym, smtConst(_cInit));
                 _extraLoopFormulas.push(_cFormula);
                 _extraLoopExprs.push(_cName + ' ' + (_ascending ? '>=' : '<=') + ' ' + _cInit);
-                // BOUNDED UNROLLING as an SMT refinement: if the loop has
-                // a concrete upper bound AND the iteration count is ≤
-                // UNROLL_LIMIT, push a disjunction of concrete values
-                // `i === init || i === init±step || ...` so the theory
-                // solver can prove properties that depend on specific
-                // iteration values, not just the range [init, bound).
-                var UNROLL_LIMIT = 8;
+                // UNROLLING as an SMT refinement: if the loop has a
+                // concrete upper bound, push a disjunction of concrete
+                // values `i === init || i === init±step || ...` so the
+                // theory solver can prove properties that depend on
+                // specific iteration values, not just the range [init,
+                // bound). The disjunction length equals the concrete
+                // iteration count — no upper cap, because any cap
+                // would silently drop precision for larger loops.
                 var _boundTok = null;
                 var _boundOp = null;
                 // Condition parsed as `i OP LIT` or `LIT OP i`.
@@ -7219,7 +7336,7 @@
                     else if (_boundOp === '>=') _iterCount = Math.max(0, Math.floor((_cInit - _bound) / _step) + 1);
                     else return;
                   }
-                  if (_iterCount > 0 && _iterCount <= UNROLL_LIMIT) {
+                  if (_iterCount > 0) {
                     // Build disjunction: i === v_0 OR i === v_1 OR ...
                     var _disj = null;
                     var _disjExprs = [];
@@ -8520,21 +8637,32 @@
     // in, never leave) so adding it to the convergence signature
     // doesn't break termination.
     if (taintEnabled && _pendingCallbacks && _pendingCallbacks.length > 0) {
-      const _snapshotBindingsJson = function () {
-        var snap = Object.create(null);
-        for (var _si = stack.length - 1; _si >= 0; _si--) {
-          for (var _bn in stack[_si].bindings) {
-            if (!(_bn in snap)) {
-              try { snap[_bn] = JSON.stringify(stack[_si].bindings[_bn]); }
-              catch (e) { snap[_bn] = '<cyclic>'; }
-            }
-          }
-        }
-        var keys = Object.keys(snap).sort();
-        var out = '';
-        for (var _ki = 0; _ki < keys.length; _ki++) out += keys[_ki] + '=' + snap[keys[_ki]] + ';';
-        return out;
-      };
+      // Fixpoint convergence signature — monotone components only.
+      //
+      // The signature captures only lattice state that we can prove
+      // is monotone (never shrinks across iterations):
+      //
+      //   - `_varMayBe` — the may-be lattice. Each slot either adds
+      //     new values, upgrades to a bounded function set, or
+      //     collapses to "incomplete" (complete=false). None of
+      //     those transitions are reversible.
+      //   - `taintFindings` — deduped across the iteration, so a
+      //     finding emitted once stays in the set forever.
+      //
+      // Crucially we do NOT snapshot the raw binding chain tokens
+      // in the convergence key. The walker's cond-merge logic wraps
+      // a variable's prior value inside a fresh `cond` node on each
+      // iteration (`cond(P, new, cond(P, new, old))`), so stringified
+      // bindings grow exponentially and the signature would never
+      // repeat — the fixpoint would then run until JSON.stringify
+      // blew the native call stack. Restricting the signature to
+      // (may-be, findings) makes the convergence condition equivalent
+      // to "no callback can see any new information", which is the
+      // only outcome that can make a further iteration do new work.
+      // Termination is guaranteed because both components live in
+      // finite lattices (the may-be lattice is bounded by the set of
+      // distinct literals observed in the program, and findings are
+      // bounded by the set of distinct source locations).
       const _snapshotMayBe = function () {
         var keys = Object.keys(_varMayBe).sort();
         var out = '';
@@ -8546,13 +8674,13 @@
               out += '|' + slot.vals[_mvi].sort + ':' + slot.vals[_mvi].lit;
             }
           }
+          if (slot.fns) out += '|fns=' + slot.fns.length;
           out += ';';
         }
         return out;
       };
-      const FIXPOINT_MAX_ITERS = 16;
       var _prevSig = '';
-      for (var _fpIter = 0; _fpIter < FIXPOINT_MAX_ITERS; _fpIter++) {
+      while (true) {
         for (var _cbi = 0; _cbi < _pendingCallbacks.length; _cbi++) {
           var _cb = _pendingCallbacks[_cbi];
           var _prevInEH = inEventHandler;
@@ -8561,7 +8689,7 @@
           finally { inEventHandler = _prevInEH; }
         }
         _dedupeFindings();
-        var _sig = _snapshotBindingsJson() + '||MB:' + _snapshotMayBe() + '||' +
+        var _sig = 'MB:' + _snapshotMayBe() + '||' +
                    (taintFindings ? taintFindings.length + ':' + taintFindings.map(_findingKey).sort().join('|') : '');
         if (_sig === _prevSig) break;
         _prevSig = _sig;
