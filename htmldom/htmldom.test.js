@@ -3552,6 +3552,38 @@ await (async function () {
   await checkTaint('onX with untracked event type is still registered',
     { 'a.js': 'document.onclick = function(e) { /* click isn\'t in EVENT_TAINT_SOURCES, no taint */ e.preventDefault(); };' }, 0);
 
+  // --- Destructuring assignments propagate taint ---
+  //
+  // When the right-hand side of a destructuring assignment is an
+  // opaque reference to a known taint path (e.g. `location`,
+  // `e.data`, `window.location`) or a chain already carrying taint,
+  // each destructured name is semantically equivalent to reading
+  // that property off the same path and inherits the source's
+  // labels. The walker used to bind each destructured name to null
+  // when the source wasn't a materialised object binding, losing
+  // every flow through `const { search } = location` and friends.
+  await checkTaint('destructure search from location',
+    { 'a.js': 'const { search } = location; document.getElementById("o").innerHTML = search;' },
+    1, { sources: ['url'] });
+  await checkTaint('destructure search from window.location',
+    { 'a.js': 'let { search } = window.location; document.getElementById("o").innerHTML = search;' },
+    1, { sources: ['url'] });
+  await checkTaint('destructure with rename from location',
+    { 'a.js': 'const { search: s } = location; document.getElementById("o").innerHTML = s;' },
+    1, { sources: ['url'] });
+  await checkTaint('destructure from event data',
+    { 'a.js': 'window.addEventListener("message", function(e) { const { html } = e.data; document.getElementById("o").innerHTML = html; });' },
+    1, { sources: ['postMessage'] });
+  await checkTaint('destructure from event data with fallback',
+    { 'a.js': 'window.addEventListener("message", function(e) { const { html } = e.data || {}; document.getElementById("o").innerHTML = html; });' },
+    1, { sources: ['postMessage'] });
+  // Negative: destructuring a statically-materialised safe object
+  // must NOT produce a finding.
+  await checkTaint('destructure const-literal is safe',
+    { 'a.js': 'const { x } = { x: "safe" }; document.getElementById("o").innerHTML = x;' }, 0);
+  await checkTaint('destructure known-safe object var is safe',
+    { 'a.js': 'var obj = { search: "a", path: "b" }; const { search } = obj; document.getElementById("o").innerHTML = search;' }, 0);
+
   // --- Full-dotted-path sinks: document.domain ---
   //
   // Assigning to document.domain weakens the same-origin policy by

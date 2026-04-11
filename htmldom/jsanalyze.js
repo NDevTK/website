@@ -3816,14 +3816,70 @@
       return chainBinding(toks.length ? toks : [exprRef('undefined')]);
     };
 
+    // Extract the source's "path prefix" from an opaque chain binding.
+    // The walker often resolves a root like `location`, `e.data`, or
+    // `window.location` to a single-token chain carrying an exprRef
+    // with the original source text. When we then destructure that
+    // binding — `const { search } = location` — each destructured
+    // name is semantically equivalent to reading `<prefix>.<key>`
+    // off the same path, so recovering the prefix lets us check
+    // whether `<prefix>.<key>` is itself a known taint source AND
+    // synthesize a tainted opaque ref for the destructured binding.
+    // Returns null when the source isn't a single-token opaque ref.
+    const _pathPrefixFromSource = (source) => {
+      if (!source || source.kind !== 'chain' || !source.toks || source.toks.length !== 1) return null;
+      const tok = source.toks[0];
+      if (!tok || tok.type !== 'other') return null;
+      if (!IDENT_RE.test(tok.text) && tok.text.indexOf('.') < 0) return null;
+      return tok.text;
+    };
     // Bind names from `pattern` by walking into `source` (a binding).
+    // When `source` is an opaque taint-carrying ref or a known
+    // dotted path (e.g. `location`, `e.data`), each destructured
+    // entry inherits the taint AND — when its full path matches a
+    // TAINT_SOURCES entry — picks up the path's source label.
     const applyPatternBindings = async (pattern, source, bind) => {
+      // Compute per-source-wide helpers once: the set of taint
+      // labels already attached to the source chain (via earlier
+      // resolution / sink propagation) and, for opaque refs, the
+      // dotted path prefix we can append each destructured key to.
+      const srcTaint = source ? collectChainTaint(source.kind === 'chain' ? source.toks : null) : null;
+      const srcPathPrefix = _pathPrefixFromSource(source);
+      // Build a tainted opaque chain for a destructured entry whose
+      // value couldn't be resolved directly from the source (common
+      // when the source is an event param, a taint root, or any
+      // other opaque chain). The synthesized chain carries the same
+      // taint labels as the source PLUS any label attached to the
+      // specific dotted path.
+      const _synthesizeChild = (keyText) => {
+        if (!source) return null;
+        const pathText = srcPathPrefix ? (srcPathPrefix + '.' + keyText) : keyText;
+        const ref = exprRef(pathText);
+        // Attach the accumulated taint (source labels + path-specific).
+        let labels = null;
+        if (srcTaint) labels = new Set(srcTaint);
+        // getTaintSource returns a single label string (or null).
+        const pathLabel = getTaintSource(pathText);
+        if (pathLabel) {
+          if (!labels) labels = new Set();
+          labels.add(pathLabel);
+        }
+        if (labels && labels.size > 0) {
+          ref.taint = labels;
+          return chainBinding([ref]);
+        }
+        // No taint at all — return null so the caller falls back to
+        // its default-value handling (or leaves the binding null,
+        // same as the old behaviour).
+        return null;
+      };
       if (pattern.kind === 'obj-pattern') {
         const props = source && source.kind === 'object' ? source.props : null;
         const seen = Object.create(null);
         for (const entry of pattern.entries) {
           seen[entry.key] = true;
           let val = props ? (props[entry.key] || null) : null;
+          if (val === null) val = _synthesizeChild(entry.key);
           if (val === null && entry.dflt) val = await resolveDefault(entry.dflt);
           if (entry.nested) {
             // Nested destructuring: recursively apply pattern.
@@ -3840,7 +3896,10 @@
             }
             bind(pattern.rest, objectBinding(restProps));
           } else {
-            bind(pattern.rest, null);
+            // Opaque source rest: propagate the source's taint onto
+            // a synthesized rest-object ref so later reads don't
+            // lose the taint signal.
+            bind(pattern.rest, source || null);
           }
         }
         return;
@@ -3851,6 +3910,7 @@
           const entry = pattern.entries[i];
           if (entry === null) continue;
           let val = elems ? (elems[i] || null) : null;
+          if (val === null) val = _synthesizeChild(String(i));
           if (val === null && entry.dflt) val = await resolveDefault(entry.dflt);
           bind(entry.name, val);
         }
@@ -3858,7 +3918,7 @@
           if (elems) {
             bind(pattern.rest, arrayBinding(elems.slice(pattern.entries.length)));
           } else {
-            bind(pattern.rest, null);
+            bind(pattern.rest, source || null);
           }
         }
         return;
