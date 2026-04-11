@@ -3940,6 +3940,12 @@ await (async function () {
   // --- Precision on destructured event ---
   await checkTaint('destructure via var from event.data', { 'a.js': 'window.addEventListener("message", function(e) { var d = e.data; document.getElementById("o").innerHTML = d; });' }, 1, { sources: ['postMessage'] });
 
+  // --- Function.prototype.call / apply / bind ---
+  await checkTaint('fn.call dispatch', { 'a.js': 'function f(x) { document.getElementById("o").innerHTML = x; } f.call(null, location.hash);' }, 1, { sources: ['url'] });
+  await checkTaint('fn.apply dispatch', { 'a.js': 'function f(x) { document.getElementById("o").innerHTML = x; } f.apply(null, [location.hash]);' }, 1, { sources: ['url'] });
+  await checkTaint('fn.bind + call', { 'a.js': 'function f(x) { document.getElementById("o").innerHTML = x; } var g = f.bind(null); g(location.hash);' }, 1, { sources: ['url'] });
+  await checkTaint('fn.call this binding', { 'a.js': 'function f() { document.getElementById("o").innerHTML = this.u; } f.call({u: location.hash});' }, 1, { sources: ['url'] });
+
   // --- Setter dispatch ---
   await checkTaint('class setter sink', { 'a.js': 'class C { set u(v) { document.getElementById("o").innerHTML = v; } } var c = new C(); c.u = location.hash;' }, 1, { sources: ['url'] });
   await checkTaint('obj literal setter sink', { 'a.js': 'var o = { set u(v) { document.getElementById("o").innerHTML = v; } }; o.u = location.hash;' }, 1, { sources: ['url'] });

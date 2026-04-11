@@ -5584,6 +5584,49 @@
 
     // Apply a method call: .concat on chain, or .join on array.
     const applyMethod = async (bind, method, parenIdx, stop) => {
+      // Function.prototype.call / apply / bind: reflective
+      // invocation of a function binding. `call` and `apply`
+      // instantiate the function body with the explicit `this`
+      // and args; `bind` returns the function binding itself
+      // (taint of the bound args flows through the return).
+      if (bind && bind.kind === 'function' && method === 'bind') {
+        var _bindArgs = await readCallArgBindings(parenIdx, stop);
+        if (!_bindArgs) return null;
+        // Return the function itself so subsequent calls still
+        // dispatch via instantiateFunction. Arg taint bleeds
+        // into findings when the body is walked.
+        return { bind: bind, next: _bindArgs.next };
+      }
+      if (bind && bind.kind === 'function' && (method === 'call' || method === 'apply')) {
+        var _caArgs = await readCallArgBindings(parenIdx, stop);
+        if (!_caArgs) return null;
+        var _caThis = _caArgs.bindings[0] || null;
+        var _caParams;
+        if (method === 'call') {
+          _caParams = _caArgs.bindings.slice(1);
+        } else {
+          // `.apply`: second arg should be an array. If it's a
+          // materialized array binding, use its elements as
+          // individual args. Otherwise pass the second arg
+          // through as a single chain arg.
+          var _caArr = _caArgs.bindings[1];
+          if (_caArr && _caArr.kind === 'array') {
+            _caParams = _caArr.elems;
+          } else if (_caArr) {
+            _caParams = [_caArr];
+          } else {
+            _caParams = [];
+          }
+        }
+        var _caResult = await instantiateFunction(bind, _caParams, _caThis);
+        if (_caResult && _caResult.kind && _caResult.kind !== 'chain') {
+          return { bind: _caResult, next: _caArgs.next };
+        }
+        if (_caResult && Array.isArray(_caResult)) {
+          return { bind: chainBinding(_caResult), next: _caArgs.next };
+        }
+        return { bind: chainBinding([exprRef('fn.' + method + '(...)')]), next: _caArgs.next };
+      }
       // Map / Set / WeakMap / WeakSet — model key-indexed ops as plain
       // object prop reads/writes so dispatcher tables built via
       // `.set(key, fn)` / `.get(key)` flow through the same may-be
@@ -6675,6 +6718,20 @@
             }
             // Fall through to the opaque-ident handling below for unknown
             // methods or unresolved prefixes.
+          }
+        }
+        // `f.call(thisArg, args...)` / `f.apply(thisArg, [args])`
+        // / `f.bind(thisArg)` on a function binding: detect
+        // the reflective-call suffix, resolve the function,
+        // and dispatch via applyMethod's call/apply handler.
+        if (isCall) {
+          var _reflSuffix = t.text.match(/^(.+)\.(call|apply|bind)$/);
+          if (_reflSuffix) {
+            var _reflFn = await resolvePath(_reflSuffix[1]);
+            if (_reflFn && _reflFn.kind === 'function') {
+              var _reflResult = await applyMethod(_reflFn, _reflSuffix[2], k + 1, stop);
+              if (_reflResult) return { bind: _reflResult.bind, next: _reflResult.next };
+            }
           }
         }
         const b = await resolvePath(t.text);
@@ -9912,6 +9969,21 @@
               if (_bcAfter && _bcAfter.type === 'other' && /^\.(then|catch|finally)$/.test(_bcAfter.text)) {
                 var _bcResult = await readValue(i, stop, TERMS_TOP);
                 if (_bcResult) { i = _bcResult.next - 1; continue; }
+              }
+            }
+          }
+          // Reflective-call suffix on a function binding:
+          // `f.call(...)`, `f.apply(...)`, `f.bind(...)`. The
+          // statement walker dispatches these via applyMethod
+          // directly so the callee's body walks with the
+          // correct `this` + args.
+          {
+            var _stReflM = t.text.match(/^(.+)\.(call|apply|bind)$/);
+            if (_stReflM) {
+              var _stReflFn = await resolvePath(_stReflM[1]);
+              if (_stReflFn && _stReflFn.kind === 'function') {
+                var _stReflR = await applyMethod(_stReflFn, _stReflM[2], i + 1, stop);
+                if (_stReflR) { i = _stReflR.next - 1; continue; }
               }
             }
           }
