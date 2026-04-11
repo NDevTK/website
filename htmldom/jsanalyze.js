@@ -3127,13 +3127,13 @@
     // Reference-equality test first for the hot case where the
     // branch left the prefix untouched (all prefix tokens come from
     // the pre-branch snapshot and have the same object identity).
-    // Falls back to JSON.stringify per position for the rare case
+    // Falls back to the iterative deep comparator for the rare case
     // where the walker reconstructed structurally-equal tokens.
     const chainStartsWith = (full, prefix) => {
       if (full.length < prefix.length) return false;
       for (let s = 0; s < prefix.length; s++) {
         if (full[s] === prefix[s]) continue;
-        if (JSON.stringify(full[s]) !== JSON.stringify(prefix[s])) return false;
+        if (!_chainsDeepEqual(full[s], prefix[s])) return false;
       }
       return true;
     };
@@ -6196,6 +6196,68 @@
       }
       return true;
     }
+
+    // Iterative deep structural equality for chain-token arrays.
+    //
+    // The walker's cond-merge logic produces synthetic `cond` /
+    // `trycatch` / `switchjoin` tokens that wrap the previous value
+    // of a variable inside themselves. On large function-heavy
+    // inputs the same variable can pick up dozens of layers of
+    // wrapping over the course of a single phase-1 walk, and the
+    // resulting trees grow into the hundreds of thousands of nodes.
+    // The previous JSON.stringify-based equality check fell off a
+    // cliff at that scale: stringify is O(tree_size), it allocates
+    // a string proportional to the tree's serialized form, and
+    // beyond V8's ~512 MB max-string ceiling it throws
+    // "Invalid string length" outright.
+    //
+    // The iterative comparator below avoids both costs:
+    //
+    //   - It walks both structures in lockstep using an explicit
+    //     stack, so the native call stack stays at O(1) regardless
+    //     of how deep the cond nesting goes.
+    //   - It short-circuits on the first reference-equal subtree
+    //     OR the first structural difference, so the typical case
+    //     where the tree changed in just one place pays only for
+    //     the path to the change.
+    //   - It allocates nothing per leaf — primitive comparisons
+    //     happen in place, no temporary strings.
+    //
+    // Returns true iff the two values would JSON.stringify to the
+    // same output (modulo property order, which we explicitly
+    // canonicalise via Object.keys().sort() inside the loop).
+    function _chainsDeepEqual(a, b) {
+      var stack = [a, b];
+      while (stack.length) {
+        var y = stack.pop();
+        var x = stack.pop();
+        if (x === y) continue;
+        if (x === null || y === null || typeof x !== typeof y) return false;
+        if (typeof x !== 'object') {
+          if (x !== y) return false;
+          continue;
+        }
+        var xIsArr = Array.isArray(x);
+        var yIsArr = Array.isArray(y);
+        if (xIsArr !== yIsArr) return false;
+        if (xIsArr) {
+          if (x.length !== y.length) return false;
+          for (var i = 0; i < x.length; i++) { stack.push(x[i]); stack.push(y[i]); }
+          continue;
+        }
+        var xKeys = Object.keys(x);
+        var yKeys = Object.keys(y);
+        if (xKeys.length !== yKeys.length) return false;
+        xKeys.sort();
+        yKeys.sort();
+        for (var k = 0; k < xKeys.length; k++) {
+          if (xKeys[k] !== yKeys[k]) return false;
+          stack.push(x[xKeys[k]]);
+          stack.push(y[xKeys[k]]);
+        }
+      }
+      return true;
+    }
     const _expandBindWithLVs = (bind, branchLVs) => {
       if (!bind || bind.kind !== 'chain') return bind ? bind.toks : [];
       // Hot-path shortcut: branch had no captured loop vars, so
@@ -6447,7 +6509,7 @@
         // path finds a structural difference that MIGHT still be
         // equal under deep comparison.
         if (_chainToksRefEqual(ifFull, elFull)) { _mergedAsCond.add(name); continue; }
-        if (JSON.stringify(ifFull) === JSON.stringify(elFull)) { _mergedAsCond.add(name); continue; }
+        if (_chainsDeepEqual(ifFull, elFull)) { _mergedAsCond.add(name); continue; }
         const snapB = _task.snapshot[name];
         if (snapB && snapB.kind === 'chain') {
           const snapFull = snapB.toks;
@@ -6475,7 +6537,7 @@
         // above, avoids O(tree) stringify on hot walker paths.
         if (ifB && elB && ifB.kind === 'chain' && elB.kind === 'chain' &&
             _chainToksRefEqual(ifB.toks, elB.toks)) continue;
-        if (JSON.stringify(ifB) === JSON.stringify(elB)) continue;
+        if (_chainsDeepEqual(ifB, elB)) continue;
         assignName(name, chainBinding([deriveExprRef(name, ifB && ifB.kind === 'chain' ? ifB.toks : null, elB && elB.kind === 'chain' ? elB.toks : null)]));
       }
       continue;
@@ -6522,7 +6584,7 @@
         const tryFull = _expandBindWithLVs(tryB, ctx.tryLoopVars);
         const catchFull = _expandBindWithLVs(catchB, catchLoopVars);
         if (_chainToksRefEqual(tryFull, catchFull)) continue;
-        if (JSON.stringify(tryFull) === JSON.stringify(catchFull)) continue;
+        if (_chainsDeepEqual(tryFull, catchFull)) continue;
         const snapB = _task.snapshot[name];
         // Always emit a `trycatch` join token so the may-be lattice
         // can split it into both reachable branches. The build-var
@@ -6630,7 +6692,7 @@
         if (!b) continue;
         if (snap && (b === snap ||
             (b.kind === 'chain' && snap.kind === 'chain' && _chainToksRefEqual(b.toks, snap.toks)))) continue;
-        if (snap && JSON.stringify(b) === JSON.stringify(snap)) continue;
+        if (snap && _chainsDeepEqual(b, snap)) continue;
         switchChanged.add(name);
       }
       for (const name of switchChanged) {
