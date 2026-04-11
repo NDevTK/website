@@ -107,11 +107,7 @@
     const VOID_ELEMENTS           = W.VOID_ELEMENTS;
     const SVG_TAGS                = W.SVG_TAGS;
     const NAV_SAFE_FILTER         = W.NAV_SAFE_FILTER;
-    const TAINT_SOURCES           = W.TAINT_SOURCES;
-    const TAINT_SINKS             = W.TAINT_SINKS;
-    const TAINT_CALL_SINKS        = W.TAINT_CALL_SINKS;
     const TAINT_SANITIZERS        = W.TAINT_SANITIZERS;
-    const ELEMENT_SINK_TYPES      = W.ELEMENT_SINK_TYPES;
     const EVENT_TAINT_SOURCES     = W.EVENT_TAINT_SOURCES;
 
       async function convertHtmlBuilderFunctions(source) {

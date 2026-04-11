@@ -228,6 +228,169 @@
     return null;
   }
 
+  // Default severity for a sink kind. Sink descriptors may carry
+  // their own `severity` field which overrides this default.
+  function _defaultSinkSeverity(sinkKind) {
+    if (sinkKind === 'code')       return 'critical';
+    if (sinkKind === 'safe')       return 'safe';
+    if (sinkKind === 'text')       return 'safe';
+    if (sinkKind === 'navigation') return 'high';
+    if (sinkKind === 'html')       return 'high';
+    if (sinkKind === 'url')        return 'high';
+    if (sinkKind === 'css')        return 'medium';
+    return 'high';
+  }
+
+  // Shape a PropDescriptor's sink metadata into the {type,
+  // severity, prop, elementTag} object the legacy classifySink
+  // API returns. `desc.severity` overrides the sink-kind default;
+  // 'safe' sinks collapse to null so the caller treats them as
+  // non-sinks.
+  function _sinkInfoFromPropDescriptor(desc, propName, elementTag) {
+    if (!desc || !desc.sink) return null;
+    var severity = desc.severity || _defaultSinkSeverity(desc.sink);
+    if (severity === 'safe') return null;
+    var out = { type: desc.sink, severity: severity, prop: propName };
+    if (elementTag) out.elementTag = elementTag;
+    return out;
+  }
+
+  // Classify a property-write sink via the TypeDB, replacing the
+  // legacy `classifySink(propName, elementTag)` that consulted
+  // TAINT_SINKS + ELEMENT_SINK_TYPES.
+  //
+  // Semantics:
+  //
+  //   - When `elementTag` is a known tag, resolve it to its
+  //     concrete TypeDescriptor via `db.tagMap`, walk the
+  //     inheritance chain with `_lookupProp`, and return the
+  //     resulting PropDescriptor's sink info if any.
+  //   - When `elementTag` is unknown, check the base
+  //     HTMLElement chain first (covers innerHTML, outerHTML,
+  //     and anything else that applies to every element). If
+  //     that doesn't match, scan every subtype in the DB for the
+  //     same propName — if ANY subtype has it as a sink, report
+  //     it with elementTag='unknown'. This preserves the legacy
+  //     behaviour where an element-dependent sink on an
+  //     unresolved tag was reported conservatively.
+  function _classifySinkViaDB(db, propName, elementTag) {
+    if (!db || !propName) return null;
+    if (elementTag) {
+      var typeName = (db.tagMap && db.tagMap[elementTag.toLowerCase()]) || 'HTMLElement';
+      var desc = _lookupProp(db, typeName, propName);
+      return _sinkInfoFromPropDescriptor(desc, propName, elementTag);
+    }
+    // Unknown tag: check the base first.
+    var baseDesc = _lookupProp(db, 'HTMLElement', propName);
+    if (baseDesc && baseDesc.sink) {
+      return _sinkInfoFromPropDescriptor(baseDesc, propName, null);
+    }
+    // Otherwise scan subtypes for a matching sink.
+    for (var tn in db.types) {
+      var td = db.types[tn];
+      if (!td.props) continue;
+      var pd = td.props[propName];
+      if (pd && pd.sink) {
+        return _sinkInfoFromPropDescriptor(pd, propName, 'unknown');
+      }
+    }
+    return null;
+  }
+
+  // Classify a `setAttribute(attr, v)`-style attribute-name sink
+  // via `db.attrSinks`. Returns the same shape as
+  // `_classifySinkViaDB` — `{type, severity, prop}` — or null.
+  function _classifyAttrSinkViaDB(db, attrName) {
+    if (!db || !attrName || !db.attrSinks) return null;
+    var sinkKind = db.attrSinks[attrName.toLowerCase()];
+    if (!sinkKind) return null;
+    var severity = _defaultSinkSeverity(sinkKind);
+    if (severity === 'safe') return null;
+    return { type: sinkKind, severity: severity, prop: attrName };
+  }
+
+  // Answer "is `propName` a sink on ANY type in the DB?". This
+  // is the precheck used before entering the sink-classification
+  // branch for property writes on non-tracked bindings — it
+  // avoids walking every property write through the full
+  // classifier when the name can't possibly resolve to a sink.
+  // `safe`-severity sinks count as "yes" here so the caller can
+  // still look them up via `_classifySinkViaDB` with a known tag.
+  function _propIsEverASink(db, propName) {
+    if (!db || !propName) return false;
+    for (var tn in db.types) {
+      var td = db.types[tn];
+      if (td.props && td.props[propName] && td.props[propName].sink) return true;
+    }
+    return false;
+  }
+
+  // Look up a call-site sink for a global/dotted callable, e.g.
+  // `eval` / `document.write` / `location.assign`. Returns the
+  // same `{type, severity, prop}` shape callers expect.
+  //
+  // Implemented by walking the callExpr through the TypeDB.
+  // The deepest segment that carries a `sink` label in its
+  // method descriptor wins, or the final type's `.call.sink` /
+  // `.construct.sink` if one is defined (for bare global
+  // callables like `eval`). Preserves the legacy
+  // TAINT_CALL_SINKS behaviour without a flat lookup table.
+  function _classifyCallSinkViaDB(db, callExpr) {
+    if (!db || !callExpr) return null;
+    var parts = callExpr.split('.');
+    var rootName = parts[0];
+    var typeName = db.roots[rootName];
+    if (!typeName) return null;
+    var currentSink = null;
+    var currentSeverity = null;
+    var typeDesc = db.types[typeName];
+    // Walk per-segment method descriptors, preferring the
+    // deepest sink encountered. A descriptor's explicit
+    // `severity` overrides the sink-kind default.
+    var _adopt = function(sinkKind, explicitSev) {
+      currentSink = sinkKind;
+      currentSeverity = explicitSev || _defaultSinkSeverity(sinkKind);
+    };
+    for (var i = 1; i < parts.length; i++) {
+      var seg = parts[i];
+      var methodDesc = _lookupMethod(db, typeName, seg);
+      if (!methodDesc) break;
+      if (methodDesc.sink) _adopt(methodDesc.sink, methodDesc.severity);
+      // Also honour a per-arg sink on the first arg for this
+      // method — captures e.g. Location.assign which puts the
+      // sink on arg0.
+      if (!currentSink && methodDesc.args && methodDesc.args.length > 0 && methodDesc.args[0].sink) {
+        _adopt(methodDesc.args[0].sink, methodDesc.args[0].severity);
+      }
+      if (typeof methodDesc.returnType === 'string') {
+        typeName = methodDesc.returnType;
+        typeDesc = db.types[typeName];
+      } else {
+        break;
+      }
+    }
+    // If the walk consumed every segment without finding a
+    // method-level sink, fall back to the current type's
+    // `.call.sink` / `.construct.sink` / `.call.args[0].sink`.
+    // This catches bare-name callables like eval, setTimeout,
+    // and `new Function(...)`.
+    if (!currentSink && typeDesc) {
+      var callDesc = typeDesc.call || typeDesc.construct;
+      if (callDesc) {
+        if (callDesc.sink) _adopt(callDesc.sink, callDesc.severity);
+        else if (callDesc.args && callDesc.args.length > 0 && callDesc.args[0].sink) {
+          _adopt(callDesc.args[0].sink, callDesc.args[0].severity);
+        }
+      }
+    }
+    if (!currentSink || currentSeverity === 'safe') return null;
+    return {
+      type: currentSink,
+      severity: currentSeverity,
+      prop: callExpr.split('.').pop(),
+    };
+  }
+
   // Legacy TAINT_SOURCES / TAINT_SOURCE_CALLS tables were removed
   // in phase 2 of the type-db refactor. Source detection is now
   // driven entirely by `_walkPathInDB` walking expression texts
@@ -257,70 +420,13 @@
     'storage':            { 'newValue': 'storage', 'oldValue': 'storage', 'url': 'url' },
   };
 
-  // Sink classification: property → {type, severity, elementDependent}.
-  // When elementDependent is true, the sink only applies to certain element types.
-  const TAINT_SINKS = {
-    'innerHTML':          { type: 'html',   severity: 'high',   elementDependent: false },
-    'outerHTML':          { type: 'html',   severity: 'high',   elementDependent: false },
-    'insertAdjacentHTML': { type: 'html',   severity: 'high',   elementDependent: false },
-    'srcdoc':             { type: 'html',   severity: 'high',   elementDependent: true, elements: new Set(['iframe']) },
-    'src':                { type: 'url',    severity: 'high',   elementDependent: true, elements: new Set(['iframe', 'script', 'embed', 'object', 'frame']) },
-    'href':               { type: 'url',    severity: 'high',   elementDependent: true, elements: new Set(['a', 'base', 'area']) },
-    'action':             { type: 'url',    severity: 'high',   elementDependent: true, elements: new Set(['form']) },
-    'formAction':         { type: 'url',    severity: 'medium', elementDependent: true, elements: new Set(['input', 'button']) },
-    'data':               { type: 'url',    severity: 'high',   elementDependent: true, elements: new Set(['object']) },
-    'textContent':        { type: 'text',   severity: 'safe',   elementDependent: true, elements: new Set(['script', 'style']) },
-    // Safe by default on non-script/style elements — only a sink on script/style
-  };
-  // Global call sinks (not property-based).
-  const TAINT_CALL_SINKS = {
-    'eval':                   { type: 'code', severity: 'high' },
-    'Function':               { type: 'code', severity: 'high' },
-    'setTimeout':             { type: 'code', severity: 'high' },
-    'setInterval':            { type: 'code', severity: 'high' },
-    'document.write':         { type: 'html', severity: 'high' },
-    'document.writeln':       { type: 'html', severity: 'high' },
-    'window.open':            { type: 'navigation', severity: 'medium' },
-    'location.assign':        { type: 'navigation', severity: 'high' },
-    'location.replace':       { type: 'navigation', severity: 'high' },
-    'navigation.navigate':    { type: 'navigation', severity: 'high' },
-  };
-  // setAttribute sinks: attr name → classification.
-  const ATTR_SINKS = {
-    'onclick': 'code', 'onload': 'code', 'onerror': 'code',
-    'onmouseover': 'code', 'onfocus': 'code', 'onblur': 'code',
-    'onsubmit': 'code', 'onchange': 'code', 'oninput': 'code',
-    'onkeydown': 'code', 'onkeyup': 'code', 'onkeypress': 'code',
-    'onmousedown': 'code', 'onmouseup': 'code', 'onmousemove': 'code',
-    'ondblclick': 'code', 'oncontextmenu': 'code', 'ondrag': 'code',
-    'ondrop': 'code', 'onscroll': 'code', 'onwheel': 'code',
-    'ontouchstart': 'code', 'ontouchend': 'code', 'ontouchmove': 'code',
-    'onanimationend': 'code', 'ontransitionend': 'code',
-    'style': 'css',
-  };
-
-  // Element type classification for property sinks.
-  // Maps element tag → property → whether it's a sink.
-  const ELEMENT_SINK_TYPES = {
-    'iframe':  { src: 'url', srcdoc: 'html', sandbox: 'safe', allow: 'safe', name: 'safe' },
-    'script':  { src: 'url', textContent: 'code', text: 'code', innerText: 'code' },
-    'embed':   { src: 'url' },
-    'object':  { data: 'url', type: 'safe' },
-    'frame':   { src: 'url' },
-    'a':       { href: 'url' },
-    'area':    { href: 'url' },
-    'base':    { href: 'url' },
-    'form':    { action: 'url' },
-    'input':   { formAction: 'url', value: 'safe' },
-    'button':  { formAction: 'url' },
-    'link':    { href: 'url' }, // rel=stylesheet, rel=import, etc.
-    'style':   { textContent: 'css', innerText: 'css' },
-    'img':     { src: 'safe', srcset: 'safe' },
-    'video':   { src: 'safe' },
-    'audio':   { src: 'safe' },
-    'source':  { src: 'safe', srcset: 'safe' },
-    'track':   { src: 'safe' },
-  };
+  // Legacy flat-table sink classification was removed in phase 3
+  // of the type-db refactor. Property, element-specific, call, and
+  // attribute-name sinks are now driven entirely by DEFAULT_TYPE_DB
+  // via `_classifySinkViaDB`, `_classifyCallSinkViaDB`, and
+  // `_classifyAttrSinkViaDB`. See `classifySink` / `checkSinkCall`
+  // / `checkSinkSetAttribute` for the thin API the rest of the
+  // walker still calls.
 
   // Known sanitizer functions that neutralize taint.
   const TAINT_SANITIZERS = new Set([
@@ -493,31 +599,11 @@
     return _walkPathInDB(DEFAULT_TYPE_DB, callExpr);
   }
 
-  // Classify a property sink given the element type. Returns sink info or null.
+  // Classify a property sink given the element type. Returns
+  // sink info or null. Thin wrapper over `_classifySinkViaDB`
+  // that walks the preset TypeDB.
   function classifySink(propName, elementTag) {
-    // Direct sink lookup (non-element-dependent)
-    var sink = TAINT_SINKS[propName];
-    if (sink && !sink.elementDependent) {
-      return { type: sink.type, severity: sink.severity, prop: propName };
-    }
-    // Element-dependent: check if this property is a sink on this element type
-    if (elementTag) {
-      var elSinks = ELEMENT_SINK_TYPES[elementTag.toLowerCase()];
-      if (elSinks && elSinks[propName]) {
-        var sinkType = elSinks[propName];
-        if (sinkType === 'safe') return null;
-        return { type: sinkType, severity: sinkType === 'code' ? 'critical' : 'high', prop: propName, elementTag: elementTag };
-      }
-      // If element type is known and property isn't listed, it's safe.
-      if (sink && sink.elementDependent && !sink.elements.has(elementTag.toLowerCase())) {
-        return null; // e.g. img.src is safe
-      }
-    }
-    // Element-dependent sink but element type unknown — report as potential
-    if (sink && sink.elementDependent) {
-      return { type: sink.type, severity: sink.severity, prop: propName, elementTag: elementTag || 'unknown' };
-    }
-    return null;
+    return _classifySinkViaDB(DEFAULT_TYPE_DB, propName, elementTag);
   }
 
   // Check if a function name is a known sanitizer.
@@ -3395,23 +3481,22 @@
       var toks = valBinding.kind === 'chain' ? valBinding.toks : null;
       var taint = toks ? collectChainTaint(toks) : null;
       if (!taint || !taint.size) return;
-      var sinkType = ATTR_SINKS[attrName.toLowerCase()];
-      if (sinkType) {
-        var sev = sinkType === 'code' ? 'critical' : sinkType === 'css' ? 'medium' : 'high';
-        recordTaintFinding(sinkType, sev, attrName, getElementTag(el), taint, taintCondStack);
-      }
-      // Also check if it's a URL attribute on a sensitive element
       var tag = getElementTag(el);
-      if (tag && (attrName === 'src' || attrName === 'href' || attrName === 'action')) {
-        var sinkInfo = classifySink(attrName, tag);
-        if (sinkInfo) {
-          recordTaintFinding(sinkInfo.type, sinkInfo.severity, attrName, tag, taint, taintCondStack);
-        }
+      // Attribute-name sinks (onclick, style, etc.) via db.attrSinks.
+      var attrSinkInfo = _classifyAttrSinkViaDB(DEFAULT_TYPE_DB, attrName);
+      if (attrSinkInfo) {
+        recordTaintFinding(attrSinkInfo.type, attrSinkInfo.severity, attrName, tag, taint, taintCondStack);
+      }
+      // Element-specific attribute sinks (iframe.src, a.href, form.action).
+      // classifySink walks the TypeDB for (attr, tag) pairs.
+      var elSinkInfo = classifySink(attrName, tag);
+      if (elSinkInfo && elSinkInfo.severity !== 'safe') {
+        recordTaintFinding(elSinkInfo.type, elSinkInfo.severity, attrName, tag, taint, taintCondStack);
       }
     };
     const checkSinkCall = (callExpr, argBindings, tok) => {
       if (!taintEnabled || !argBindings) return;
-      var sinkInfo = TAINT_CALL_SINKS[callExpr];
+      var sinkInfo = _classifyCallSinkViaDB(DEFAULT_TYPE_DB, callExpr);
       if (!sinkInfo) return;
       for (var ai = 0; ai < argBindings.length; ai++) {
         var ab = argBindings[ai];
@@ -5577,7 +5662,7 @@
         const b = await resolvePath(t.text);
         // Taint: check call-based sinks even in expression position
         // (e.g. var x = eval(tainted)).
-        if (taintEnabled && isCall && TAINT_CALL_SINKS[t.text] && !declaredNames.has(t.text.split('.')[0])) {
+        if (taintEnabled && isCall && _classifyCallSinkViaDB(DEFAULT_TYPE_DB, t.text) && !declaredNames.has(t.text.split('.')[0])) {
           var _sinkCallArgs = await readCallArgBindings(k + 1, stop);
           if (_sinkCallArgs) checkSinkCall(t.text, _sinkCallArgs.bindings, t);
         }
@@ -8756,7 +8841,7 @@
                 }
               }
               i = callArgs.next - 1;
-              if (taintEnabled && TAINT_CALL_SINKS[t.text] && !declaredNames.has(t.text.split('.')[0])) {
+              if (taintEnabled && _classifyCallSinkViaDB(DEFAULT_TYPE_DB, t.text) && !declaredNames.has(t.text.split('.')[0])) {
                 checkSinkCall(t.text, callArgs.bindings, t);
               }
               continue;
@@ -8783,7 +8868,7 @@
             }
           }
           // Taint: even if callee isn't inlinable, check if it's a call-based sink.
-          if (taintEnabled && TAINT_CALL_SINKS[t.text] && !declaredNames.has(t.text.split('.')[0])) {
+          if (taintEnabled && _classifyCallSinkViaDB(DEFAULT_TYPE_DB, t.text) && !declaredNames.has(t.text.split('.')[0])) {
             var sinkArgs = await readCallArgBindings(i + 1, stop);
             if (sinkArgs) {
               checkSinkCall(t.text, sinkArgs.bindings, t);
@@ -9002,7 +9087,7 @@
           // Taint: check for sink property assignments on non-tracked elements.
           if (taintEnabled && parts.length >= 2) {
             const sinkProp = parts[parts.length - 1];
-            if (TAINT_SINKS[sinkProp] || sinkProp === 'src' || sinkProp === 'href' || sinkProp === 'action' || sinkProp === 'srcdoc') {
+            if (_propIsEverASink(DEFAULT_TYPE_DB, sinkProp)) {
               const r = await readValue(i + 2, stop, TERMS_TOP);
               const val = r ? r.binding : null;
               if (val && val.kind === 'chain') {
@@ -9113,7 +9198,7 @@
               }
             }
             // Taint: detect call-based sinks (eval, document.write, etc.).
-            if (taintEnabled && TAINT_CALL_SINKS[t.text] && !declaredNames.has(t.text.split('.')[0])) {
+            if (taintEnabled && _classifyCallSinkViaDB(DEFAULT_TYPE_DB, t.text) && !declaredNames.has(t.text.split('.')[0])) {
               const argResult = await readCallArgBindings(i + 1, stop);
               if (argResult) {
                 checkSinkCall(t.text, argResult.bindings, t);
@@ -10433,7 +10518,7 @@
           frames:         { readType: 'Window' },
         },
         methods: {
-          open: { args: [{ sink: 'navigation' }] },
+          open: { args: [{ sink: 'navigation', severity: 'medium' }] },
           postMessage: {},
           setTimeout:  { args: [{ sink: 'code' }] },
           setInterval: { args: [{ sink: 'code' }] },
@@ -10446,7 +10531,11 @@
       Node: {
         extends: 'EventTarget',
         props: {
-          textContent: {},
+          // Baseline safe read/write. Subtypes (HTMLScriptElement,
+          // HTMLStyleElement) override with stronger sinks. Carrying
+          // sink:'text' here means unknown-tag writes resolve to the
+          // safe baseline rather than scanning every subtype.
+          textContent: { sink: 'text', severity: 'safe' },
         },
         methods: {
           appendChild:  { args: [{}] },
@@ -10467,23 +10556,14 @@
         methods: {
           insertAdjacentHTML: { args: [{}, { sink: 'html' }] },
           setAttribute: {
-            args: [{
-              sinkIfArgEquals: {
-                arg: 1,
-                values: {
-                  onclick: 'code', onload: 'code', onerror: 'code',
-                  onmouseover: 'code', onfocus: 'code', onblur: 'code',
-                  onsubmit: 'code', onchange: 'code', oninput: 'code',
-                  onkeydown: 'code', onkeyup: 'code', onkeypress: 'code',
-                  onmousedown: 'code', onmouseup: 'code', onmousemove: 'code',
-                  ondblclick: 'code', oncontextmenu: 'code', ondrag: 'code',
-                  ondrop: 'code', onscroll: 'code', onwheel: 'code',
-                  ontouchstart: 'code', ontouchend: 'code', ontouchmove: 'code',
-                  onanimationend: 'code', ontransitionend: 'code',
-                  style: 'css',
-                },
-              },
-            }, {}],
+            // arg[0] is the attribute name, arg[1] is its value. The
+            // per-attr sink classification lives on db.attrSinks so
+            // it's reusable from both the call-site sinkIfArgEquals
+            // handler AND the checkSinkSetAttribute (direct attr
+            // write) code path. The sinkIfArgEquals.values object is
+            // wired to db.attrSinks at DB finalisation time below,
+            // so there's one source of truth.
+            args: [{ sinkIfArgEquals: { arg: 1, values: null } }, {}],
           },
           removeAttribute: { args: [{}] },
           getAttribute:    { args: [{}], returnType: 'String' },
@@ -10540,11 +10620,11 @@
       },
       HTMLInputElement: {
         extends: 'HTMLElement',
-        props: { formAction: { sink: 'url' } },
+        props: { formAction: { sink: 'url', severity: 'medium' } },
       },
       HTMLButtonElement: {
         extends: 'HTMLElement',
-        props: { formAction: { sink: 'url' } },
+        props: { formAction: { sink: 'url', severity: 'medium' } },
       },
       HTMLStyleElement: {
         extends: 'HTMLElement',
@@ -10643,17 +10723,17 @@
 
       // --- Global callables ---
       GlobalEval: {
-        call: { args: [{ sink: 'code' }] },
+        call: { args: [{ sink: 'code', severity: 'high' }] },
       },
       GlobalFunctionCtor: {
-        construct: { args: [{ sink: 'code' }, { sink: 'code' }] },
-        call:      { args: [{ sink: 'code' }, { sink: 'code' }] },
+        construct: { args: [{ sink: 'code', severity: 'high' }, { sink: 'code', severity: 'high' }] },
+        call:      { args: [{ sink: 'code', severity: 'high' }, { sink: 'code', severity: 'high' }] },
       },
       GlobalSetTimeout: {
-        call: { args: [{ sink: 'code' }, {}] },
+        call: { args: [{ sink: 'code', severity: 'high' }, {}] },
       },
       GlobalSetInterval: {
-        call: { args: [{ sink: 'code' }, {}] },
+        call: { args: [{ sink: 'code', severity: 'high' }, {}] },
       },
       GlobalFetch: {
         // `fetch(...)` is tagged as a network source at the call
@@ -10764,6 +10844,23 @@
       track:  'HTMLTrackElement',
     },
 
+    // Attribute-name sinks: writing these attributes (via
+    // `setAttribute(attr, v)` OR a direct attribute-write path)
+    // classifies the value under the named sink kind regardless
+    // of the concrete element type.
+    attrSinks: {
+      onclick: 'code', onload: 'code', onerror: 'code',
+      onmouseover: 'code', onfocus: 'code', onblur: 'code',
+      onsubmit: 'code', onchange: 'code', oninput: 'code',
+      onkeydown: 'code', onkeyup: 'code', onkeypress: 'code',
+      onmousedown: 'code', onmouseup: 'code', onmousemove: 'code',
+      ondblclick: 'code', oncontextmenu: 'code', ondrag: 'code',
+      ondrop: 'code', onscroll: 'code', onwheel: 'code',
+      ontouchstart: 'code', ontouchend: 'code', ontouchmove: 'code',
+      onanimationend: 'code', ontransitionend: 'code',
+      style: 'css',
+    },
+
     // addEventListener(eventName, fn) → the fn's first param gets this type.
     eventMap: {
       message:      'MessageEvent',
@@ -10796,6 +10893,12 @@
     for (var tag in DEFAULT_TYPE_DB.tagMap) {
       map[tag] = DEFAULT_TYPE_DB.tagMap[tag];
     }
+    // Wire Element.setAttribute's sinkIfArgEquals.values to
+    // db.attrSinks so attribute classification has exactly one
+    // source of truth — the values object — shared by both the
+    // call-site sinkIfArgEquals evaluator AND the direct
+    // setAttribute(attr, v) sink checker.
+    DEFAULT_TYPE_DB.types.Element.methods.setAttribute.args[0].sinkIfArgEquals.values = DEFAULT_TYPE_DB.attrSinks;
   })();
 
   // -----------------------------------------------------------------------
@@ -10834,13 +10937,10 @@
     parseStyleDecls: parseStyleDecls,
     serializeHtmlTokens: serializeHtmlTokens,
     makeVar: makeVar,
-    // Classification data (for custom analysis). Sources are now
-    // driven by the DEFAULT_TYPE_DB exposed via _walkerInternals
-    // below; the remaining legacy tables are being migrated in
-    // follow-up phases.
-    TAINT_SINKS: TAINT_SINKS,
-    TAINT_CALL_SINKS: TAINT_CALL_SINKS,
-    ELEMENT_SINK_TYPES: ELEMENT_SINK_TYPES,
+    // Classification data (for custom analysis). Sources AND sinks
+    // (property, call, attribute-name) are driven by the
+    // DEFAULT_TYPE_DB exposed via _walkerInternals below; legacy
+    // flat tables were removed in phase 3 of the type-db refactor.
     TAINT_SANITIZERS: TAINT_SANITIZERS,
     EVENT_TAINT_SOURCES: EVENT_TAINT_SOURCES,
     // jsanalyze public surface (stage 1 — seam only, stable shape)
@@ -10891,10 +10991,7 @@
       VOID_ELEMENTS: VOID_ELEMENTS,
       SVG_TAGS: SVG_TAGS,
       NAV_SAFE_FILTER: NAV_SAFE_FILTER,
-      TAINT_SINKS: TAINT_SINKS,
-      TAINT_CALL_SINKS: TAINT_CALL_SINKS,
       TAINT_SANITIZERS: TAINT_SANITIZERS,
-      ELEMENT_SINK_TYPES: ELEMENT_SINK_TYPES,
       EVENT_TAINT_SOURCES: EVENT_TAINT_SOURCES,
       // New declarative type database. See the big comment block
       // above DEFAULT_TYPE_DB for the shape.
@@ -10903,6 +11000,10 @@
       _lookupMethod: _lookupMethod,
       _resolveReturnType: _resolveReturnType,
       _walkPathInDB: _walkPathInDB,
+      _classifySinkViaDB: _classifySinkViaDB,
+      _classifyCallSinkViaDB: _classifyCallSinkViaDB,
+      _classifyAttrSinkViaDB: _classifyAttrSinkViaDB,
+      _propIsEverASink: _propIsEverASink,
     },
   };
 
