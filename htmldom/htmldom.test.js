@@ -3940,6 +3940,11 @@ await (async function () {
   // --- Precision on destructured event ---
   await checkTaint('destructure via var from event.data', { 'a.js': 'window.addEventListener("message", function(e) { var d = e.data; document.getElementById("o").innerHTML = d; });' }, 1, { sources: ['postMessage'] });
 
+  // --- Function summary cache soundness ---
+  await checkTaint('pure fn called twice', { 'a.js': 'function add(a, b) { return a + b; } var x = add(1, 2); var y = add(1, 2); document.getElementById("o").innerHTML = y;' }, 0);
+  await checkTaint('impure fn not cached', { 'a.js': 'function sink(x) { document.getElementById("o").innerHTML = x; } sink("safe"); sink(location.hash);' }, 1, { sources: ['url'] });
+  await checkTaint('pure then impure distinct sigs', { 'a.js': 'function id(x) { return x; } var a = id("safe"); document.getElementById("o").innerHTML = id(location.hash);' }, 1, { sources: ['url'] });
+
   // --- Parametric return type preservation across call boundary ---
   await checkTaint('async fn returns fetch', { 'a.js': 'async function load() { return fetch("/api"); } async function show() { var r = await load(); document.getElementById("o").innerHTML = r.url; } show();' }, 1);
   await checkTaint('nested typed returns', { 'a.js': 'function a() { return fetch("/x"); } function b() { return a(); } b().then(r => document.getElementById("o").innerHTML = r.url);' }, 1);

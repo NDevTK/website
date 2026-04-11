@@ -4177,13 +4177,22 @@
     };
     const assignName = (name, value) => {
       var tv = _withInferredType(value);
+      // Find the topmost function frame — assignments to
+      // anything below it are outer-scope mutations (for
+      // summary cache purity detection).
+      var _topFnIdx = -1;
+      for (var _tfi = stack.length - 1; _tfi >= 0; _tfi--) {
+        if (stack[_tfi].isFunction) { _topFnIdx = _tfi; break; }
+      }
       for (let i = stack.length - 1; i >= 0; i--) {
         if (name in stack[i].bindings) {
+          if (_topFnIdx >= 0 && i < _topFnIdx) _outerMutCount++;
           stack[i].bindings[name] = asRef(name, tv);
           _trackMayBeAssign(name, tv);
           return;
         }
       }
+      if (_topFnIdx >= 0 && _topFnIdx > 0) _outerMutCount++;
       stack[0].bindings[name] = asRef(name, tv); // implicit global
       _trackMayBeAssign(name, tv);
     };
@@ -6938,6 +6947,65 @@
     // and no per-body walk-count cap, so distinct-lineage calls to
     // the same helper all get their full walk.
     const _callStack = [];
+    // Function summary cache: memoizes the result of a function
+    // invocation keyed by (body range, argument fingerprint,
+    // this fingerprint). Only side-effect-free invocations are
+    // cached — a prior walk of the same function with the same
+    // signature is only replayed when we can PROVE the body
+    // didn't emit findings, mutate domOps, or write to any
+    // outer-scope binding. This gives context-sensitive
+    // interprocedural memoization without sacrificing soundness.
+    //
+    // Academic framing: this is demand-driven inter-procedural
+    // summarisation. Each cache entry is a summary keyed by the
+    // call-site's abstract input state; pure-for-this-input
+    // summaries are valid across all call sites sharing that
+    // state. Impure summaries (any side effect) are never
+    // cached, so each impure call site gets its own walk.
+    const _fnSummaryCache = new Map();
+    // Per-walk counters for detecting outer-scope mutations
+    // during a function body walk. Incremented whenever
+    // assignName writes to a frame other than the current
+    // function's top frame.
+    var _outerMutCount = 0;
+    // Fingerprint an argument binding for the cache key.
+    // Captures kind, typeName, innerType, label set — the
+    // TYPE-level state that determines the body's behaviour.
+    // Non-chain bindings (object/array/function/element) use
+    // their identity so distinct instances are distinguishable.
+    const _fingerprintArg = (b) => {
+      if (!b) return 'null';
+      if (b.kind === 'chain') {
+        var parts = ['c'];
+        if (b.typeName) parts.push('T:' + b.typeName);
+        if (b.innerType) parts.push('I:' + b.innerType);
+        var labels = getBindingLabels(b);
+        if (labels && labels.size) parts.push('L:' + [...labels].sort().join(','));
+        // When there's no type / no labels, fall back to the
+        // token text for single-opaque chains — two string
+        // literals with different content should be
+        // distinguishable.
+        if (parts.length === 1 && b.toks && b.toks.length === 1) {
+          var tt = b.toks[0];
+          if (tt.type === 'str') parts.push('s:' + tt.text);
+          else if (tt.type === 'other') parts.push('o:' + tt.text);
+        }
+        return parts.join('|');
+      }
+      if (b.kind === 'object' || b.kind === 'array' || b.kind === 'function') {
+        return b.kind + '#' + (b.__objId != null ? b.__objId : ('body:' + b.bodyStart + ':' + b.bodyEnd));
+      }
+      if (b.kind === 'element') return 'el#' + (b.elementId != null ? b.elementId : '?');
+      return (b.kind || 'raw');
+    };
+    const _fingerprintCall = (fnKey, argBindings, thisBinding) => {
+      var parts = [fnKey];
+      for (var _fpi = 0; _fpi < argBindings.length; _fpi++) {
+        parts.push(_fingerprintArg(argBindings[_fpi]));
+      }
+      parts.push('this:' + _fingerprintArg(thisBinding));
+      return parts.join('/');
+    };
     const instantiateFunction = async (fn, argBindings, thisBinding) => {
       var _fnKey = (fn && fn.bodyStart != null) ? (fn.bodyStart + ':' + fn.bodyEnd) : null;
       // Detect recursion: the same function body is already being
@@ -6948,6 +7016,26 @@
       // pathological graphs from unbounding the analyser without
       // polluting the output with synthetic tokens.
       if (_fnKey && _callStack.indexOf(_fnKey) >= 0) return null;
+      // Summary cache lookup: if this function has previously
+      // been walked with the same argument fingerprint AND the
+      // walk was pure (no findings, no domOps, no outer
+      // mutations), replay the cached return value without
+      // re-walking. Impure calls are never cached so they
+      // always re-walk.
+      var _summaryKey = null;
+      if (_fnKey && taintEnabled) {
+        _summaryKey = _fingerprintCall(_fnKey, argBindings || [], thisBinding);
+        var _cached = _fnSummaryCache.get(_summaryKey);
+        if (_cached) {
+          return _cached.result;
+        }
+      }
+      // Snapshot side-effect observables before the walk so
+      // we can decide afterwards whether this invocation is
+      // cacheable.
+      var _preFindings = taintFindings ? taintFindings.length : 0;
+      var _preDomOps = domOps ? domOps.length : 0;
+      var _preOuterMut = _outerMutCount;
       if (_fnKey) _callStack.push(_fnKey);
       // Closure capture: push any captured-scope frames (by reference)
       // that aren't already on the live stack, so reads of outer
@@ -7175,8 +7263,24 @@
         result = expandLoopVars(result, lvByName);
       }
       // Return non-chain binding directly (object/array from return statement).
-      if (!result && fnReturnBinding) return fnReturnBinding;
-      return result;
+      var _finalResult = result;
+      if (!result && fnReturnBinding) _finalResult = fnReturnBinding;
+      // Summary cache store: the walk is "pure for this input"
+      // iff it didn't add findings, push domOps, or mutate
+      // any outer-scope binding. Cache only such invocations
+      // so replaying the cached result doesn't lose side
+      // effects that a re-walk would produce.
+      if (_summaryKey && taintEnabled) {
+        var _postFindings = taintFindings ? taintFindings.length : 0;
+        var _postDomOps = domOps ? domOps.length : 0;
+        var _puresig = (_postFindings === _preFindings &&
+                        _postDomOps === _preDomOps &&
+                        _outerMutCount === _preOuterMut);
+        if (_puresig) {
+          _fnSummaryCache.set(_summaryKey, { result: _finalResult });
+        }
+      }
+      return _finalResult;
     };
 
     // Locate the end of an operand expression: the next `+` at depth 0 or
@@ -10867,6 +10971,13 @@
       };
       var _prevSig = '';
       while (true) {
+        // Clear the summary cache each fixpoint iteration:
+        // mutations made by sibling callbacks may invalidate
+        // the "pure" classification of a function that walked
+        // side-effect-free the first time around. Without
+        // this, the fixpoint would skip re-walks of callbacks
+        // that should see new state from other callbacks.
+        _fnSummaryCache.clear();
         for (var _cbi = 0; _cbi < _pendingCallbacks.length; _cbi++) {
           var _cb = _pendingCallbacks[_cbi];
           var _prevInEH = inEventHandler;
