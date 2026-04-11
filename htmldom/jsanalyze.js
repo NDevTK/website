@@ -339,35 +339,50 @@
   // root segment the same way `_walkPathInDB` does.
   function _resolveExprTypeViaDB(db, expr, scope) {
     if (!db || !expr) return null;
+    // Strip a leading `new ` so `new FileReader()` resolves the
+    // same way as `FileReader()` — both go through the type's
+    // .construct / .call descriptor.
+    if (/^new\s+/.test(expr)) expr = expr.replace(/^new\s+/, '');
     var parts = expr.split('.');
     if (parts.length === 0) return null;
-    var rootName = parts[0];
-    var parenIdx0 = rootName.indexOf('(');
-    if (parenIdx0 >= 0) rootName = rootName.slice(0, parenIdx0);
     var typeName = null;
-    if (scope) {
-      var rootHit = scope(rootName);
-      if (rootHit) {
-        if (rootHit.typeName) typeName = rootHit.typeName;
-        else if (rootHit.shadowed) return null;
-      }
-    }
-    if (!typeName) typeName = db.roots[rootName];
-    if (!typeName) return null;
-    for (var i = 1; i < parts.length; i++) {
+    for (var i = 0; i < parts.length; i++) {
       var seg = parts[i];
       var parenIdx = seg.indexOf('(');
       var isCall = parenIdx >= 0;
       if (isCall) seg = seg.slice(0, parenIdx);
-      var propDesc = _lookupProp(db, typeName, seg);
-      var methodDesc = propDesc ? null : _lookupMethod(db, typeName, seg);
-      if (!propDesc && !methodDesc) return null;
-      if (methodDesc) {
-        if (typeof methodDesc.returnType === 'string') typeName = methodDesc.returnType;
-        else return null;
+      if (i === 0) {
+        // Root segment: resolve via scope first, then db.roots.
+        if (scope) {
+          var rootHit = scope(seg);
+          if (rootHit) {
+            if (rootHit.typeName) typeName = rootHit.typeName;
+            else if (rootHit.shadowed) return null;
+          }
+        }
+        if (!typeName) typeName = db.roots[seg];
+        if (!typeName) return null;
+        // Bare-call root (e.g. `fetch(x)`, `new FileReader()`):
+        // advance through the type's .call / .construct return
+        // type when static. Non-static returnTypes yield null —
+        // we don't try to parse args here.
+        if (isCall) {
+          var rootDesc = db.types[typeName];
+          var cd = rootDesc ? (rootDesc.call || rootDesc.construct) : null;
+          if (!cd || typeof cd.returnType !== 'string') return null;
+          typeName = cd.returnType;
+        }
+        continue;
+      }
+      // Non-root segment: method (if isCall) or prop (otherwise).
+      if (isCall) {
+        var methodDesc = _lookupMethod(db, typeName, seg);
+        if (!methodDesc || typeof methodDesc.returnType !== 'string') return null;
+        typeName = methodDesc.returnType;
       } else {
-        if (propDesc.readType) typeName = propDesc.readType;
-        else return null;
+        var propDesc = _lookupProp(db, typeName, seg);
+        if (!propDesc || !propDesc.readType) return null;
+        typeName = propDesc.readType;
       }
     }
     return typeName;
@@ -3098,19 +3113,37 @@
   const makeElementFactory = () => {
     let nextElementId = 0;
     return {
-      element: (origin) => ({
-        kind: 'element',
-        elementId: nextElementId++,
-        origin,
-        attrs: Object.create(null),
-        props: Object.create(null),
-        styles: Object.create(null),
-        classList: [],
-        children: [],
-        text: null,
-        html: null,
-        attached: false,
-      }),
+      element: (origin) => {
+        // Resolve the element's concrete HTMLxElement type via
+        // the TypeDB tagMap so the binding is flow-sensitively
+        // typed from the moment of creation. Bindings created
+        // via `document.createElement('iframe')` get
+        // `typeName: 'HTMLIFrameElement'`, and subsequent reads
+        // / writes on them resolve sinks through the type
+        // chain instead of scanning every HTML subtype.
+        var _typeName = null;
+        if (origin && origin.kind === 'create' && origin.tag) {
+          _typeName = DEFAULT_TYPE_DB.tagMap[origin.tag.toLowerCase()] || 'HTMLElement';
+        } else if (origin && origin.kind === 'lookup') {
+          // getElementById / querySelector results: unknown
+          // concrete subtype at analysis time → HTMLElement.
+          _typeName = 'HTMLElement';
+        }
+        return {
+          kind: 'element',
+          elementId: nextElementId++,
+          origin,
+          typeName: _typeName,
+          attrs: Object.create(null),
+          props: Object.create(null),
+          styles: Object.create(null),
+          classList: [],
+          children: [],
+          text: null,
+          html: null,
+          attached: false,
+        };
+      },
       textNode: (chain) => ({
         kind: 'textNode',
         elementId: nextElementId++,
@@ -3835,25 +3868,35 @@
     // Track names explicitly declared with var/let/const/function.
     // Used to distinguish `var location = x` (local) from `location = x` (global write).
     const declaredNames = new Set();
-    // Infer a chain binding's TypeDB type from its opaque-ref
-    // content at assignment time. When the binding is a chain
-    // whose single token is an `other`-kind reference carrying
-    // a dotted path text (e.g. `window.location`), walk that
-    // text through the TypeDB with `typedScope` as the root
-    // resolver and tag the binding with the terminal type.
+    // Infer a binding's TypeDB type at assignment time and tag
+    // it with `typeName`.
     //
-    // This is what turns `var loc = window.location` into a
-    // typed local: `loc`'s binding acquires `typeName: 'Location'`,
-    // and subsequent `loc.hash` / `loc.href` reads resolve via
-    // the scope's typeName rather than via string matching of
-    // the original path.
+    // Three cases:
     //
-    // Returns a shallow copy of the binding with `typeName`
-    // set (never mutates the input) so shared bindings stay
-    // safe. Bindings that already carry a typeName pass
-    // through unchanged.
+    //  1. **Chain binding with single opaque ref** (most common):
+    //     walk the token text through the TypeDB. Covers
+    //     `var loc = window.location`, `var f = eval`,
+    //     `var resp = fetch("/api")`, `var fr = new FileReader()`.
+    //
+    //  2. **Element binding from a tracked `createElement`**:
+    //     resolve the tag via `db.tagMap` to the concrete
+    //     HTMLxElement type. Covers
+    //     `var el = document.createElement("iframe")` →
+    //     HTMLIFrameElement.
+    //
+    //  3. Everything else passes through unchanged.
+    //
+    // Returns a shallow copy with `typeName` set (never mutates
+    // the input) so shared bindings stay safe. Bindings that
+    // already carry a typeName pass through unchanged.
     const _withInferredType = (value) => {
-      if (!value || value.kind !== 'chain' || value.typeName) return value;
+      if (!value || value.typeName) return value;
+      // Note: element bindings have their `typeName` set at
+      // creation time by the element factory, not here. Mutating
+      // or copying them would break the identity-based tracking
+      // that underlies `applyElementSet` / `applyElementMethod`.
+      // Case 1: chain with a single opaque ref.
+      if (value.kind !== 'chain') return value;
       if (!value.toks || value.toks.length !== 1) return value;
       var t = value.toks[0];
       if (!t || t.type !== 'other' || !t.text) return value;
@@ -3918,25 +3961,41 @@
         } else if (b.kind === 'chain' && b.toks.length === 1 && b.toks[0].type === 'other') {
           // Opaque chain (e.g. parameter bound to exprRef) — extend the
           // path so `column.title` becomes `store.columns[i].title`.
-          var _extText = b.toks[0].text + '.' + parts.slice(i).join('.');
+          //
+          // Type-based resolution: if the chain binding carries
+          // a typeName (set at assignment time by
+          // `_withInferredType`), walk the remaining path on
+          // that type. This is what makes `fr.result` resolve
+          // to `file` even though `fr`'s original RHS text was
+          // `new FileReader()` — the binding remembers the
+          // return type directly instead of relying on
+          // expression-text concatenation.
+          var _remainingPath = parts.slice(i).join('.');
+          var _extText = b.toks[0].text + '.' + _remainingPath;
           var _extRef = deriveExprRef(_extText, b.toks);
-          // Re-check source/sink/sanitizer labels on the NEW
-          // extended path text. Without this, aliasing like
-          // `var w = window; w.document.cookie` would keep
-          // whatever taint the ORIGINAL `w` binding had (none)
-          // instead of picking up `cookie` from the extended
-          // path. This makes type tracking work for paths that
-          // grow beyond a declared alias.
-          var _extLabel = checkTaintSource(_extText);
+          // Prefer type-based lookup via the binding's
+          // typeName; fall back to text-based walking otherwise.
+          var _extLabel = null;
+          var _extType = null;
+          if (b.typeName) {
+            var _typedRootName = '__t' + (Math.random() * 1e9 | 0) + '__';
+            var _typedRootScope = (function (rootName, rootType) {
+              return function (n) { return n === rootName ? { typeName: rootType } : typedScope(n); };
+            })(_typedRootName, b.typeName);
+            var _syntheticExpr = _typedRootName + '.' + _remainingPath;
+            _extLabel = getTaintSource(_syntheticExpr, _typedRootScope);
+            _extType = _resolveExprTypeViaDB(DEFAULT_TYPE_DB, _syntheticExpr, _typedRootScope);
+          }
+          if (_extLabel == null) {
+            _extLabel = checkTaintSource(_extText);
+          }
           if (_extLabel) {
             if (!_extRef.taint) _extRef.taint = new Set();
-            for (var _extL of _extLabel) _extRef.taint.add(_extL);
+            if (typeof _extLabel === 'string') _extRef.taint.add(_extLabel);
+            else for (var _extL of _extLabel) _extRef.taint.add(_extL);
           }
           b = chainBinding([_extRef]);
-          // Also tag the extended binding with its terminal
-          // TypeDB type so further extensions can keep walking
-          // through it.
-          var _extType = _resolveExprTypeViaDB(DEFAULT_TYPE_DB, _extText, typedScope);
+          if (!_extType) _extType = _resolveExprTypeViaDB(DEFAULT_TYPE_DB, _extText, typedScope);
           if (_extType) b.typeName = _extType;
           break;
         } else if (p === 'length' && b.kind === 'array') {
@@ -10994,6 +11053,37 @@
       GlobalXMLHttpRequestCtor: {
         construct: { source: 'network', returnType: 'XMLHttpRequest' },
       },
+      // Constructor singletons for common instance types. These
+      // let `new FileReader()` / `new WebSocket(url)` / etc.
+      // resolve to their instance type at binding-tag time.
+      GlobalFileReaderCtor: {
+        construct: { returnType: 'FileReader' },
+      },
+      GlobalWebSocketCtor: {
+        construct: { source: 'network', returnType: 'WebSocket' },
+      },
+      GlobalEventSourceCtor: {
+        construct: { source: 'network', returnType: 'EventSource' },
+      },
+      GlobalURLCtor: {
+        construct: { returnType: 'URL' },
+      },
+      // URL instances — props carry the `url` label because
+      // constructing a URL from any string doesn't sanitize it.
+      URL: {
+        props: {
+          href:     { source: 'url', readType: 'String' },
+          hash:     { source: 'url', readType: 'String' },
+          search:   { source: 'url', readType: 'String' },
+          pathname: { source: 'url', readType: 'String' },
+          host:     { source: 'url', readType: 'String' },
+          hostname: { source: 'url', readType: 'String' },
+          origin:   { source: 'url', readType: 'String' },
+          port:     { source: 'url', readType: 'String' },
+          protocol: { source: 'url', readType: 'String' },
+          searchParams: { source: 'url' },
+        },
+      },
       IDBObjectStore: {
         methods: {
           get: { source: 'storage' },
@@ -11067,6 +11157,10 @@
       setInterval: 'GlobalSetInterval',
       fetch:          'GlobalFetch',
       XMLHttpRequest: 'GlobalXMLHttpRequestCtor',
+      FileReader:     'GlobalFileReaderCtor',
+      WebSocket:      'GlobalWebSocketCtor',
+      EventSource:    'GlobalEventSourceCtor',
+      URL:            'GlobalURLCtor',
       caches:         'CacheStorage',
       decodeURIComponent: 'GlobalDecodeURIComponent',
       decodeURI:          'GlobalDecodeURI',
@@ -11256,6 +11350,7 @@
       _lookupMethod: _lookupMethod,
       _resolveReturnType: _resolveReturnType,
       _walkPathInDB: _walkPathInDB,
+      _resolveExprTypeViaDB: _resolveExprTypeViaDB,
       _classifySinkViaDB: _classifySinkViaDB,
       _classifyCallSinkViaDB: _classifyCallSinkViaDB,
       _classifyAttrSinkViaDB: _classifyAttrSinkViaDB,
