@@ -6630,6 +6630,26 @@
             }
           }
         }
+        // Object.assign(target, ...sources) — merges source
+        // props into target and returns target. Every source's
+        // props are copied (last-write-wins), so the result
+        // carries the union of all source labels at every
+        // merged key.
+        if (isCall && t.text === 'Object.assign') {
+          const _oaArgs = await readCallArgBindings(k + 1, stop);
+          if (_oaArgs && _oaArgs.bindings.length >= 1) {
+            var _oaTarget = _oaArgs.bindings[0];
+            if (_oaTarget && _oaTarget.kind === 'object') {
+              for (var _oai = 1; _oai < _oaArgs.bindings.length; _oai++) {
+                var _oaSrc = _oaArgs.bindings[_oai];
+                if (_oaSrc && _oaSrc.kind === 'object') {
+                  for (var _oak in _oaSrc.props) _oaTarget.props[_oak] = _oaSrc.props[_oak];
+                }
+              }
+              return { bind: _oaTarget, next: _oaArgs.next };
+            }
+          }
+        }
         // Promise.all / Promise.race / Promise.resolve / Promise.reject.
         // Each returns a Promise chain whose innerType / labels
         // are computed from the input promises.

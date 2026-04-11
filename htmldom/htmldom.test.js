@@ -3940,6 +3940,9 @@ await (async function () {
   // --- Precision on destructured event ---
   await checkTaint('destructure via var from event.data', { 'a.js': 'window.addEventListener("message", function(e) { var d = e.data; document.getElementById("o").innerHTML = d; });' }, 1, { sources: ['postMessage'] });
 
+  // --- Object.assign taint merge ---
+  await checkTaint('Object.assign taint', { 'a.js': 'var o = Object.assign({}, { u: location.hash }); document.getElementById("o").innerHTML = o.u;' }, 1, { sources: ['url'] });
+
   // --- IIFE inline dispatch ---
   await checkTaint('IIFE call identity', { 'a.js': 'document.getElementById("o").innerHTML = (function(x) { return x; })(location.hash);' }, 1, { sources: ['url'] });
   await checkTaint('IIFE arrow', { 'a.js': 'document.getElementById("o").innerHTML = ((x) => x)(location.hash);' }, 1, { sources: ['url'] });
