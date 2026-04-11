@@ -230,16 +230,43 @@
 
   // === Helpers ===
 
+  // Cached line-start index for the most-recently-seen source string.
+  // The walker hands makeSource a stream of tokens that all share
+  // the same `_src` reference across a single analyze() call, so
+  // caching only the most recent source hits 100% within any one
+  // walk while staying O(1) in memory across calls. Without this,
+  // each makeSource was scanning from byte 0 to the token's byte
+  // offset, making trace construction quadratic in source length.
+  let _lineSrc = null;
+  let _lineStarts = null;
+  function _getLineStarts(src) {
+    if (src === _lineSrc) return _lineStarts;
+    const starts = [0];
+    for (let i = 0; i < src.length; i++) {
+      if (src.charCodeAt(i) === 10) starts.push(i + 1);
+    }
+    _lineSrc = src;
+    _lineStarts = starts;
+    return starts;
+  }
+  function _lineColFromPos(src, pos) {
+    const starts = _getLineStarts(src);
+    let lo = 0, hi = starts.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >>> 1;
+      if (starts[mid] <= pos) lo = mid;
+      else hi = mid - 1;
+    }
+    return { line: lo + 1, col: pos - starts[lo] };
+  }
+
   function makeSource(tok, file, kind, schemas) {
     if (!tok || !tok._src) return schemas.mkSource(file || '<anonymous>', 1, 0, kind);
-    let line = 1, col = 0;
-    const src = tok._src, pos = tok.start | 0;
-    for (let i = 0; i < pos && i < src.length; i++) {
-      if (src.charCodeAt(i) === 10) { line++; col = 0; }
-      else col++;
-    }
-    const snippet = src.slice(tok.start, Math.min(tok.end || tok.start + 40, src.length));
-    return schemas.mkSource(file || '<anonymous>', line, col, kind, snippet);
+    const src = tok._src;
+    const pos = tok.start | 0;
+    const lc = _lineColFromPos(src, pos);
+    const snippet = src.slice(pos, Math.min(tok.end || pos + 40, src.length));
+    return schemas.mkSource(file || '<anonymous>', lc.line, lc.col, kind, snippet);
   }
 
   function taintFindingToFlow(finding, file, schemas) {

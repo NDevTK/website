@@ -1990,15 +1990,45 @@
 
   // Utility: compute (line, col) for a token start position inside
   // its owning source. Returns { line, col }. 1-indexed.
+  // Cached line-start index for the most-recently-seen source string.
+  // Without caching, every _tokLineCol / _provFromTok call did an
+  // O(pos) scan from byte 0 to the token's position, turning trace
+  // construction into a quadratic walk of the source on any file
+  // with thousands of recorded findings / call sites. With the index
+  // in place, each lookup is O(log lines) and the per-token cost
+  // becomes independent of how far into the file we are.
+  //
+  // The cache is a single "last source" slot rather than a full Map
+  // because (a) WeakMap keys have to be objects and source text is
+  // a primitive string, and (b) buildScopeState walks a single
+  // merged source per analyze() call, so the most-recent slot hits
+  // 100% of the time for every token inside that walk. When a new
+  // analyze() call passes a different source string, the first
+  // _tokLineCol rebuilds the index once and every subsequent
+  // lookup on the new source reuses it.
+  var _walkerLineSrc = null;
+  var _walkerLineStarts = null;
+  function _walkerLineStartsFor(src) {
+    if (src === _walkerLineSrc) return _walkerLineStarts;
+    var starts = [0];
+    for (var i = 0; i < src.length; i++) {
+      if (src.charCodeAt(i) === 10) starts.push(i + 1);
+    }
+    _walkerLineSrc = src;
+    _walkerLineStarts = starts;
+    return starts;
+  }
   function _tokLineCol(tok) {
     if (!tok || !tok._src || tok.start == null) return { line: 1, col: 0 };
-    var src = tok._src, pos = tok.start;
-    var line = 1, col = 0;
-    for (var i = 0; i < pos && i < src.length; i++) {
-      if (src.charCodeAt(i) === 10) { line++; col = 0; }
-      else col++;
+    var src = tok._src, pos = tok.start | 0;
+    var starts = _walkerLineStartsFor(src);
+    var lo = 0, hi = starts.length - 1;
+    while (lo < hi) {
+      var mid = (lo + hi + 1) >>> 1;
+      if (starts[mid] <= pos) lo = mid;
+      else hi = mid - 1;
     }
-    return { line: line, col: col };
+    return { line: lo + 1, col: pos - starts[lo] };
   }
 
   // Build a Source (provenance entry) from a walker token and a
@@ -6335,11 +6365,27 @@
       };
       return expand(bind.toks);
     };
+    // Per-snapshot frame-index map: alongside the usual name→value
+    // object, we record which stack frame each name lives in at
+    // snapshot time. Restoration then becomes an O(1) frame lookup
+    // per name instead of an O(stack_depth) top-down scan. The index
+    // is stored on the snap object under a symbol so normal
+    // `name in snap` iteration still sees only the binding names.
+    const _SNAP_FRAMES = typeof Symbol !== 'undefined' ? Symbol('snapFrames') : '__snapFrames__';
     const _snapshotBindings = () => {
       const snap = Object.create(null);
-      for (let si = stack.length - 1; si >= 0; si--)
-        for (const name in stack[si].bindings)
-          if (!(name in snap)) snap[name] = stack[si].bindings[name];
+      const frames = Object.create(null);
+      for (let si = stack.length - 1; si >= 0; si--) {
+        const frame = stack[si];
+        const frameBindings = frame.bindings;
+        for (const name in frameBindings) {
+          if (!(name in snap)) {
+            snap[name] = frameBindings[name];
+            frames[name] = frame;
+          }
+        }
+      }
+      snap[_SNAP_FRAMES] = frames;
       return snap;
     };
     // Restore a variable's binding from a snapshot without feeding the
@@ -6348,7 +6394,21 @@
     // re-running _trackMayBeAssign on an opaque synthetic restoration
     // chain (e.g. the post-loop deriveExprRef) would poison the slot
     // and destroy refutation power for every branch that follows.
-    const _restoreBinding = (name, value) => {
+    //
+    // Takes an optional `snap` parameter: when provided, the pre-
+    // recorded frame index is used to restore the binding in place
+    // on the exact frame it came from (O(1)). When omitted, falls
+    // back to the top-down scan used by callers that don't have a
+    // snapshot around (loop restore paths, catch-parameter binding).
+    const _restoreBinding = (name, value, snap) => {
+      if (snap) {
+        const frames = snap[_SNAP_FRAMES];
+        const frame = frames && frames[name];
+        if (frame && stack.indexOf(frame) >= 0) {
+          frame.bindings[name] = value;
+          return;
+        }
+      }
       for (let si = stack.length - 1; si >= 0; si--) {
         if (name in stack[si].bindings) {
           stack[si].bindings[name] = value;
@@ -6512,7 +6572,7 @@
       _task.ctx.ifLoopVars = loopVars.splice(_task.ctx.lvBefore);
       _popPathConstraint(_task.ctx.pathFormula, _task.ctx.condExpr);
       _task.ctx.ifBindings = _snapshotBindings();
-      for (const name in _task.snapshot) _restoreBinding(name, _task.snapshot[name]);
+      for (const name in _task.snapshot) _restoreBinding(name, _task.snapshot[name], _task.snapshot);
       _pushPathConstraint(smtNot(_task.ctx.pathFormula), '!(' + _task.ctx.condExpr + ')');
       _task.ctx.negPushed = true;
       _task.ctx.lvBefore2 = loopVars.length;
@@ -6588,7 +6648,7 @@
     if (_task.type === 'try_restore') {
       const tryLoopVars = loopVars.splice(_task.lvBefore);
       const tryBindings = _snapshotBindings();
-      for (const name in _task.snapshot) _restoreBinding(name, _task.snapshot[name]);
+      for (const name in _task.snapshot) _restoreBinding(name, _task.snapshot[name], _task.snapshot);
       _task.ctx.tryBindings = tryBindings;
       _task.ctx.tryLoopVars = tryLoopVars;
       _task.ctx.lvBefore2 = loopVars.length;
@@ -6656,7 +6716,7 @@
     //     formula onto P/T while walking the body, and queue switch_capture
     //     to pop P/T and record the resulting bindings. ---
     if (_task.type === 'switch_case') {
-      for (const name in _task.snapshot) _restoreBinding(name, _task.snapshot[name]);
+      for (const name in _task.snapshot) _restoreBinding(name, _task.snapshot[name], _task.snapshot);
       var _cs = _task.cs;
       var _caseFormula = null;
       var _caseCondExpr = null;
