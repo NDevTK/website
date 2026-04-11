@@ -228,46 +228,12 @@
     return null;
   }
 
-  // Known taint sources — expressions or patterns that introduce untrusted data.
-  const TAINT_SOURCES = {
-    // URL-derived
-    'location.search':    'url',
-    'location.hash':      'url',
-    'location.href':      'url',
-    'location.pathname':  'url',
-    'document.URL':       'url',
-    'document.documentURI': 'url',
-    'document.baseURI':   'url',
-    'window.location':    'url',
-    'window.location.search': 'url',
-    'window.location.hash':   'url',
-    'window.location.href':   'url',
-    // Document properties
-    'document.cookie':    'cookie',
-    'document.referrer':  'referrer',
-    'document.domain':    'referrer',
-    // Window properties
-    'window.name':        'window.name',
-    // Storage
-    'localStorage':       'storage',
-    'sessionStorage':     'storage',
-  };
-  // Patterns matched against full expressions (method calls, etc.).
-  // The walker matches by the call's NAME prefix (the part before `(`).
-  const TAINT_SOURCE_CALLS = {
-    'localStorage.getItem':    'storage',
-    'sessionStorage.getItem':  'storage',
-    'location.toString':       'url',
-    'decodeURIComponent':      'url', // preserves taint, not a sanitizer
-    'decodeURI':               'url',
-    'atob':                    'url', // often used to decode tainted base64
-    // Network — any data flowing back from a server is attacker-influenced.
-    'fetch':                   'network',
-    // XHR + IndexedDB + Cache API — server/storage payload.
-    'XMLHttpRequest':          'network',
-    'IDBObjectStore.get':      'storage',
-    'caches.match':            'storage',
-  };
+  // Legacy TAINT_SOURCES / TAINT_SOURCE_CALLS tables were removed
+  // in phase 2 of the type-db refactor. Source detection is now
+  // driven entirely by `_walkPathInDB` walking expression texts
+  // against the DEFAULT_TYPE_DB at the bottom of this file. See
+  // `getTaintSource` / `getTaintSourceCall` for the API the rest
+  // of the walker still calls.
   // Event handler parameter sources: addEventListener type → param.property → label.
   const EVENT_TAINT_SOURCES = {
     // postMessage
@@ -415,27 +381,116 @@
     return ref;
   }
 
-  // Check if an expression text matches a known taint source. Returns label or null.
-  // Matches exact, suffix (window.location.search), and prefix with method calls
-  // (location.hash.slice(1) starts with taint source location.hash).
-  function getTaintSource(expr) {
-    if (TAINT_SOURCES[expr]) return TAINT_SOURCES[expr];
-    for (var src in TAINT_SOURCES) {
-      // Suffix match: "window.location.search" contains "location.search"
-      if (expr.endsWith(src) && (expr.length === src.length || expr[expr.length - src.length - 1] === '.')) {
-        return TAINT_SOURCES[src];
+  // Walk a dotted expression text through the TypeDB and return
+  // the source label (if any) produced by the final — or last
+  // resolvable — segment along the path.
+  //
+  // This is the type-based replacement for the legacy flat-table
+  // `getTaintSource(expr)`: instead of string-matching `expr`
+  // against a pre-enumerated list of source paths, it resolves
+  // the root name to a type via `db.roots`, walks each subsequent
+  // segment via `_lookupProp` / `_lookupMethod` chaining through
+  // the `readType` / `returnType` advancement, and returns the
+  // source label at the deepest segment that had one. Segments
+  // that end with `(` are treated as method calls; their return
+  // type (when static) continues the walk.
+  //
+  // Prefix-match semantics: if a segment can't be resolved on the
+  // current type, the walk stops and returns whatever source
+  // label was accumulated earlier. That matches the legacy
+  // behaviour where `location.hash.slice(1)` produced the `url`
+  // label from `location.hash` even though `slice(1)` isn't itself
+  // enumerated as a taint source.
+  //
+  // A type descriptor may also carry a `selfSource` field,
+  // meaning "reading a binding of this type directly yields this
+  // label" — this preserves the legacy behaviour where bare
+  // `localStorage` / `sessionStorage` carried the `storage`
+  // label without any further property access.
+  function _walkPathInDB(db, expr) {
+    if (!db || !expr) return null;
+    var parts = expr.split('.');
+    if (parts.length === 0) return null;
+    var rootName = parts[0];
+    var parenIdx0 = rootName.indexOf('(');
+    if (parenIdx0 >= 0) rootName = rootName.slice(0, parenIdx0);
+    var typeName = db.roots[rootName];
+    if (!typeName) return null;
+    var currentSource = null;
+    var typeDesc = db.types[typeName];
+    if (typeDesc && typeDesc.selfSource) currentSource = typeDesc.selfSource;
+    for (var i = 1; i < parts.length; i++) {
+      var seg = parts[i];
+      var parenIdx = seg.indexOf('(');
+      var isCall = parenIdx >= 0;
+      if (isCall) seg = seg.slice(0, parenIdx);
+      var propDesc = _lookupProp(db, typeName, seg);
+      var methodDesc = propDesc ? null : _lookupMethod(db, typeName, seg);
+      if (!propDesc && !methodDesc) return currentSource;
+      var desc = propDesc || methodDesc;
+      if (desc.source) currentSource = desc.source;
+      var nextType = null;
+      if (methodDesc) {
+        if (typeof methodDesc.returnType === 'string') nextType = methodDesc.returnType;
+      } else {
+        nextType = propDesc.readType || null;
       }
-      // Prefix match: "location.hash.slice(1)" starts with "location.hash"
-      if (expr.startsWith(src) && expr.length > src.length && (expr[src.length] === '.' || expr[src.length] === '(')) {
-        return TAINT_SOURCES[src];
+      if (!nextType) return currentSource;
+      typeName = nextType;
+      // After advancing to a new type along the walk, honour the
+      // new type's `selfSource` if we haven't already picked up a
+      // stronger per-segment source along the way. This catches
+      // the case where a prop read advances to a type whose
+      // own-identity carries a label (e.g. `window.location`
+      // advances to `Location` which has `selfSource: 'url'`).
+      if (!currentSource) {
+        var newDesc = db.types[typeName];
+        if (newDesc && newDesc.selfSource) currentSource = newDesc.selfSource;
       }
     }
-    return null;
+    // After consuming all path segments, honour the current
+    // type's `.call.source` / `.construct.source` if one is
+    // defined — this models global callable singletons like
+    // `decodeURIComponent()` (call-style) and `new
+    // XMLHttpRequest()` (construct-style) whose bare-name
+    // reference is its own call-site source.
+    if (!currentSource) {
+      var finalDesc = db.types[typeName];
+      if (finalDesc) {
+        if (finalDesc.call && finalDesc.call.source) currentSource = finalDesc.call.source;
+        else if (finalDesc.construct && finalDesc.construct.source) currentSource = finalDesc.construct.source;
+      }
+    }
+    return currentSource;
+  }
+
+  // Check if an expression text matches a known taint source. Returns label or null.
+  //
+  // Implemented by walking the dotted expression through the
+  // TypeDB via `_walkPathInDB`: each segment advances the current
+  // type via `_lookupProp` / `_lookupMethod` chaining, and the
+  // deepest segment that carries a `source` label (or the deepest
+  // type whose `selfSource` applies) determines the returned
+  // label. Unresolvable tail segments fall back to whatever source
+  // was accumulated earlier, which preserves the legacy prefix-
+  // match behaviour for patterns like `location.hash.slice(1)`
+  // where the final `slice(1)` doesn't itself resolve on the
+  // TypeDB but `location.hash` does.
+  function getTaintSource(expr) {
+    return _walkPathInDB(DEFAULT_TYPE_DB, expr);
   }
 
   // Check if an expression is a known call-based taint source.
+  //
+  // Implemented via the same TypeDB path walker `getTaintSource`
+  // uses: the callee's dotted name is walked through the TypeDB,
+  // and both per-segment `source` labels AND the final type's
+  // `.call.source` / `.construct.source` are considered. That
+  // covers bare global callables like `decodeURIComponent`,
+  // `fetch`, `atob`, and dotted call sources like `localStorage.
+  // getItem` and `location.toString`.
   function getTaintSourceCall(callExpr) {
-    return TAINT_SOURCE_CALLS[callExpr] || null;
+    return _walkPathInDB(DEFAULT_TYPE_DB, callExpr);
   }
 
   // Classify a property sink given the element type. Returns sink info or null.
@@ -10280,6 +10335,14 @@
 
       // --- DOM structural types ---
       Location: {
+        // Reading a bare Location binding — e.g. `document.body.
+        // innerHTML = window.location` — produces a URL string via
+        // the implicit toString() the consumer performs, so the
+        // binding itself carries the `url` label. Matches the
+        // legacy behaviour of the `'window.location': 'url'` and
+        // `'location': …` entries that over-tagged intermediate
+        // Location references.
+        selfSource: 'url',
         props: {
           search:   { source: 'url', readType: 'String' },
           hash:     { source: 'url', readType: 'String' },
@@ -10313,6 +10376,10 @@
         },
       },
       Storage: {
+        // Reading a bare `localStorage` / `sessionStorage`
+        // binding directly yields the `storage` label — matches
+        // the legacy TAINT_SOURCES entries for those roots.
+        selfSource: 'storage',
         methods: {
           getItem:    { source: 'storage', returnType: 'String' },
           setItem:    {},
@@ -10589,7 +10656,30 @@
         call: { args: [{ sink: 'code' }, {}] },
       },
       GlobalFetch: {
-        call: { returnType: 'Promise' },
+        // `fetch(...)` is tagged as a network source at the call
+        // site in addition to returning a Promise — matches the
+        // legacy TAINT_SOURCE_CALLS behaviour that treats the
+        // call result as attacker-influenced data.
+        call: { source: 'network', returnType: 'Promise' },
+      },
+      GlobalXMLHttpRequestCtor: {
+        construct: { source: 'network', returnType: 'XMLHttpRequest' },
+      },
+      IDBObjectStore: {
+        methods: {
+          get: { source: 'storage' },
+          put: {},
+          add: {},
+          delete: {},
+        },
+      },
+      CacheStorage: {
+        methods: {
+          match: { source: 'storage' },
+          open: {},
+          has: {},
+          delete: {},
+        },
       },
       GlobalDecodeURIComponent: {
         call: { source: 'url', returnType: 'String', preservesLabelsFromArg: 0 },
@@ -10636,7 +10726,9 @@
       Function:    'GlobalFunctionCtor',
       setTimeout:  'GlobalSetTimeout',
       setInterval: 'GlobalSetInterval',
-      fetch:       'GlobalFetch',
+      fetch:          'GlobalFetch',
+      XMLHttpRequest: 'GlobalXMLHttpRequestCtor',
+      caches:         'CacheStorage',
       decodeURIComponent: 'GlobalDecodeURIComponent',
       decodeURI:          'GlobalDecodeURI',
       atob:               'GlobalAtob',
@@ -10742,8 +10834,10 @@
     parseStyleDecls: parseStyleDecls,
     serializeHtmlTokens: serializeHtmlTokens,
     makeVar: makeVar,
-    // Classification data (for custom analysis)
-    TAINT_SOURCES: TAINT_SOURCES,
+    // Classification data (for custom analysis). Sources are now
+    // driven by the DEFAULT_TYPE_DB exposed via _walkerInternals
+    // below; the remaining legacy tables are being migrated in
+    // follow-up phases.
     TAINT_SINKS: TAINT_SINKS,
     TAINT_CALL_SINKS: TAINT_CALL_SINKS,
     ELEMENT_SINK_TYPES: ELEMENT_SINK_TYPES,
@@ -10797,7 +10891,6 @@
       VOID_ELEMENTS: VOID_ELEMENTS,
       SVG_TAGS: SVG_TAGS,
       NAV_SAFE_FILTER: NAV_SAFE_FILTER,
-      TAINT_SOURCES: TAINT_SOURCES,
       TAINT_SINKS: TAINT_SINKS,
       TAINT_CALL_SINKS: TAINT_CALL_SINKS,
       TAINT_SANITIZERS: TAINT_SANITIZERS,
@@ -10809,6 +10902,7 @@
       _lookupProp: _lookupProp,
       _lookupMethod: _lookupMethod,
       _resolveReturnType: _resolveReturnType,
+      _walkPathInDB: _walkPathInDB,
     },
   };
 
