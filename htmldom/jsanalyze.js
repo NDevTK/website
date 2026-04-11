@@ -5433,6 +5433,15 @@
           next = j + 1;
           continue;
         }
+        // Bare trailing call on a factory alias — `document.querySelector.bind(document)("#x")`.
+        if (t.type === 'open' && t.char === '(' && bind && bind.kind === 'factoryRef' && DOM_FACTORIES[bind.factoryKey]) {
+          var _fraArgs2 = await readConcatArgs(next, stop);
+          if (_fraArgs2) {
+            var _fraResult2 = DOM_FACTORIES[bind.factoryKey](_fraArgs2.args, next, _fraArgs2.next, t);
+            if (_fraResult2) { bind = _fraResult2.bind; next = _fraResult2.next; continue; }
+          }
+          break;
+        }
         // Bare trailing call on a function-valued result:
         // `outer()()`, `a()()()`, `(cond ? f : g)()`, `obj.factory()()`.
         // Without this the second `(` is unreachable and the returned
@@ -6858,6 +6867,16 @@
               var _reflResult = await applyMethod(_reflFn, _reflSuffix[2], k + 1, stop);
               if (_reflResult) return { bind: _reflResult.bind, next: _reflResult.next };
             }
+            // `<DOMFactoryKey>.bind(thisArg)` — return a factoryRef
+            // binding so subsequent `$(arg)` call sites dispatch
+            // through the DOM_FACTORIES entry (e.g., `var $ =
+            // document.querySelector.bind(document); $("#x")`).
+            if (_reflSuffix[2] === 'bind' && DOM_FACTORIES[_reflSuffix[1]]) {
+              var _fbArgs = await readCallArgBindings(k + 1, stop);
+              if (_fbArgs) {
+                return { bind: { kind: 'factoryRef', factoryKey: _reflSuffix[1] }, next: _fbArgs.next };
+              }
+            }
           }
         }
         const b = await resolvePath(t.text);
@@ -6988,6 +7007,14 @@
                 var _tmResult = await applyMethod(_tmReceiver, _tmMethodName, k + 1, stop);
                 if (_tmResult) return { bind: _tmResult.bind, next: _tmResult.next };
               }
+            }
+          }
+          // Call on a DOM factory alias: `var $ = document.querySelector.bind(document); $("#x")`.
+          if (b.kind === 'factoryRef' && isCall && DOM_FACTORIES[b.factoryKey]) {
+            var _fraArgs = await readConcatArgs(k + 1, stop);
+            if (_fraArgs) {
+              var _fraResult = DOM_FACTORIES[b.factoryKey](_fraArgs.args, k, _fraArgs.next, t);
+              if (_fraResult) return _fraResult;
             }
           }
           // Call syntax: `name(args)` where name resolves to a function binding.
@@ -10418,6 +10445,18 @@
         }
       }
 
+      // Factory alias call as a statement: `$("#x").prop = value`
+      // where `$` resolves to `{ kind: 'factoryRef', factoryKey }`.
+      // Dispatch the same way the DOM_FACTORIES block below does
+      // but using the resolved factory key.
+      var _farKey = null;
+      if (t.type === 'other' && IDENT_RE.test(t.text)) {
+        var _farResolved = resolve(t.text);
+        if (_farResolved && _farResolved.kind === 'factoryRef' && DOM_FACTORIES[_farResolved.factoryKey]) {
+          _farKey = _farResolved.factoryKey;
+        }
+      }
+
       // DOM factory call as a statement: `document.getElementById("x").prop = value`
       // or `document.createElement("div").method(...)`. Resolve the call,
       // then handle trailing property assignment or method call on the result.
@@ -10426,12 +10465,13 @@
       // trailing chain contains non-DOM_METHOD method calls
       // (e.g. `document.querySelector(".x").closest(".y").innerHTML = v`)
       // so the method-chain sink handler can pick them up.
-      if (t.type === 'other' && DOM_FACTORIES[t.text]) {
+      if ((t.type === 'other' && DOM_FACTORIES[t.text]) || _farKey) {
+        var _factoryDispatchKey = _farKey || t.text;
         const factoryParen = tokens[i + 1];
         if (factoryParen && factoryParen.type === 'open' && factoryParen.char === '(') {
           const factoryArgs = await readConcatArgs(i + 1, stop);
           if (factoryArgs) {
-            const factoryResult = DOM_FACTORIES[t.text](factoryArgs.args, i, factoryArgs.next, t);
+            const factoryResult = DOM_FACTORIES[_factoryDispatchKey](factoryArgs.args, i, factoryArgs.next, t);
             if (factoryResult && factoryResult.bind) {
               var afterCall = factoryResult.next;
               var trailTok = tokens[afterCall];
