@@ -84,6 +84,7 @@ trace cheaply.
 | `query.enumerate(value)` | Every concrete primitive a `Value` can take, or `null` if unenumerable. |
 | `query.asConcrete(value)` | The single concrete primitive if the `Value` is `kind: 'concrete'`, else `null`. |
 | `query.typeName(value)` | The flow-sensitively resolved TypeDB type name attached to this value (e.g. `'Location'`, `'HTMLIFrameElement'`, `'FileReader'`), or `null`. |
+| `query.innerType(value)` | The parametric inner type (the `T` in `Promise<T>`, etc.), or `null`. |
 | `query.callsOfType(trace, typeName, argIndex?)` | Calls whose argument at `argIndex` has the given TypeDB typeName. For type-driven queries over the trace. |
 | `query.innerHtmlAssignments(trace)` | Every `innerHTML` / `outerHTML` / `document.write` site. |
 | `query.taintFlows(trace, { severity?, source?, sinkProp? })` | Taint flows with source + sink + path conditions. |
@@ -265,6 +266,7 @@ A **MethodDescriptor** carries:
 |---|---|
 | `args: [ArgDescriptor, …]` | Per-positional-arg sink labels. |
 | `returnType: 'T'` | Static return type for `_resolveExprTypeViaDB`. |
+| `innerType: 'T'` | For parametric containers like `Promise<T>`: the wrapped type. The walker uses this to type `.then(cb)` callback params and `await` results. |
 | `source: 'label'` | Calling the method yields the label on its result. |
 | `sink: 'kind'` | The call itself is a sink (e.g. `document.write`). |
 | `sanitizer: true` | The call neutralises taint on its return value (e.g. `encodeURIComponent`, `DOMPurify.sanitize`). |
@@ -287,8 +289,11 @@ Every variable binding the walker produces carries an optional
 - String concatenation chains (`var url = base + '/' + path` →
   String when every operand is string-producing).
 - Template literals (`` `pre${x}post` `` → String).
-- Ternary / try-catch / switch expressions with same-type
-  branches (simple lattice join: `T ⊔ T = T`, `T ⊔ U = ⊥`).
+- Ternary / try-catch / switch expressions with a proper
+  Least Upper Bound (LUB) over the `extends` chain.
+  `cond ? createElement('iframe') : createElement('script')`
+  joins to `HTMLElement`; arms with no common ancestor fall
+  back to untyped.
 - String concatenation and template literals
   (`"/api/" + id` → `String`).
 - Method-call return types (`var resp = fetch(…)` → `Promise`;
@@ -310,6 +315,31 @@ Every variable binding the walker produces carries an optional
   resolves the chain through TypeDB method dispatch and runs
   the sink classifier on the terminal property using the
   chain's resolved typeName.
+- Parametric `Promise<T>` via `innerType`. Method descriptors
+  that return a Promise declare `innerType: 'T'` (e.g.
+  `GlobalFetch.call.innerType = 'Response'`,
+  `Response.methods.json.innerType = 'Object'`). The walker
+  attaches `innerType` to the result chain binding and uses
+  it to type the `.then(cb)` callback's first param, and to
+  unwrap `await p` to `T`.
+- Structural object literal properties: `var o = { el:
+  document.createElement('iframe') }; o.el.src = v;` walks
+  through the stored element binding and runs the sink
+  classifier against the nested type.
+- SMT-narrowed branch types: inside `if (typeof x === 'string')`
+  / `if (x instanceof HTMLElement)`, the walker applies the
+  narrower type to `x` while walking the true branch. Pattern
+  recognition for `typeof` / `instanceof` conditions, paired
+  with the existing SMT path-constraint snapshot/restore
+  machinery so the refinement reverts on branch exit.
+- Destructured function parameters: `function({data}) { … }` /
+  `({data}) => …`. The walker parses destructuring patterns in
+  param lists, walks the arg binding via the same
+  `applyPatternBindings` used for variable destructuring, and
+  looks up each destructured key against the source's
+  TypeDB descriptor so precise per-prop labels flow:
+  `({filename}) => …` on an error event has `filename: String`
+  with label `url` only, not the bulk `{url, network}` union.
 
 Once typed, **every subsequent property read on the binding**
 resolves through `_lookupProp` / `_lookupMethod` on its
@@ -562,7 +592,7 @@ node htmldom/htmldom.test.js
 ```
 
 The harness loads `jsanalyze.js` and every consumer with minimal
-DOM stubs and runs inline assertions. 949+ tests covering:
+DOM stubs and runs inline assertions. 967+ tests covering:
 
 - **Engine**: tokenizer, scope walker, virtual DOM extraction,
   SMT-refuted taint reachability, cross-file inter-procedural flow
