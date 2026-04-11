@@ -273,28 +273,30 @@
   //     it with elementTag='unknown'. This preserves the legacy
   //     behaviour where an element-dependent sink on an
   //     unresolved tag was reported conservatively.
+  // Type-first variant: given a concrete receiver typeName,
+  // look up the prop on that type and return the sink info.
+  // No scanning, no fallback — when the walker has a real type
+  // for the receiver this answer is definitive.
+  function _classifySinkByTypeViaDB(db, typeName, propName) {
+    if (!db || !typeName || !propName) return null;
+    var desc = _lookupProp(db, typeName, propName);
+    return _sinkInfoFromPropDescriptor(desc, propName, null);
+  }
+
+  // Legacy variant that takes an element tag string. Used by
+  // callers that only know the tag (e.g. element bindings
+  // tagged via getElementTag). Internally it resolves the tag
+  // to a concrete type via `db.tagMap` and delegates to
+  // `_classifySinkByTypeViaDB`. When the tag is unknown (or
+  // null), falls through to the base `HTMLElement` chain —
+  // there's no subtype scan; the type system already has the
+  // answer via the flow-sensitive binding typeName.
   function _classifySinkViaDB(db, propName, elementTag) {
     if (!db || !propName) return null;
-    if (elementTag) {
-      var typeName = (db.tagMap && db.tagMap[elementTag.toLowerCase()]) || 'HTMLElement';
-      var desc = _lookupProp(db, typeName, propName);
-      return _sinkInfoFromPropDescriptor(desc, propName, elementTag);
-    }
-    // Unknown tag: check the base first.
-    var baseDesc = _lookupProp(db, 'HTMLElement', propName);
-    if (baseDesc && baseDesc.sink) {
-      return _sinkInfoFromPropDescriptor(baseDesc, propName, null);
-    }
-    // Otherwise scan subtypes for a matching sink.
-    for (var tn in db.types) {
-      var td = db.types[tn];
-      if (!td.props) continue;
-      var pd = td.props[propName];
-      if (pd && pd.sink) {
-        return _sinkInfoFromPropDescriptor(pd, propName, 'unknown');
-      }
-    }
-    return null;
+    var typeName = elementTag && db.tagMap && db.tagMap[elementTag.toLowerCase()];
+    if (!typeName) typeName = 'HTMLElement';
+    var desc = _lookupProp(db, typeName, propName);
+    return _sinkInfoFromPropDescriptor(desc, propName, elementTag);
   }
 
   // Classify a `setAttribute(attr, v)`-style attribute-name sink
@@ -3687,14 +3689,29 @@
         location: location || null,
       });
     };
+    // Type-first sink classifier for property writes on a
+    // binding. Prefers the binding's `typeName` (set at
+    // creation/assignment) over the legacy tag-based
+    // resolution, falling back only when the binding has no
+    // type yet. This is what turns the TypeDB from a name
+    // lookup into real flow-sensitive type tracking.
+    const _classifyBindingSink = (bind, propName) => {
+      if (bind && bind.typeName) {
+        return _classifySinkByTypeViaDB(DEFAULT_TYPE_DB, bind.typeName, propName);
+      }
+      // Untyped binding — fall back to tag-based lookup for
+      // element bindings whose origin tag is known.
+      var tag = getElementTag(bind);
+      return classifySink(propName, tag);
+    };
     const checkSinkAssignment = (el, propName, valBinding, tok) => {
       if (!taintEnabled || !valBinding) return;
       var toks = valBinding.kind === 'chain' ? valBinding.toks : null;
       var taint = toks ? collectChainTaint(toks) : null;
       if (!taint || !taint.size) return;
-      var tag = getElementTag(el);
-      var sinkInfo = classifySink(propName, tag);
+      var sinkInfo = _classifyBindingSink(el, propName);
       if (sinkInfo && sinkInfo.severity !== 'safe') {
+        var tag = getElementTag(el);
         var loc = tok && tok._src ? { expr: tok.text || propName, line: countLines(tok._src, tok.start), pos: tok.start } : null;
         recordTaintFinding(sinkInfo.type, sinkInfo.severity, propName, tag, taint, taintCondStack, loc);
       }
@@ -3710,9 +3727,9 @@
       if (attrSinkInfo) {
         recordTaintFinding(attrSinkInfo.type, attrSinkInfo.severity, attrName, tag, taint, taintCondStack);
       }
-      // Element-specific attribute sinks (iframe.src, a.href, form.action).
-      // classifySink walks the TypeDB for (attr, tag) pairs.
-      var elSinkInfo = classifySink(attrName, tag);
+      // Element-specific attribute sinks (iframe.src, a.href,
+      // form.action) via the binding's typeName.
+      var elSinkInfo = _classifyBindingSink(el, attrName);
       if (elSinkInfo && elSinkInfo.severity !== 'safe') {
         recordTaintFinding(elSinkInfo.type, elSinkInfo.severity, attrName, tag, taint, taintCondStack);
       }
@@ -9390,9 +9407,12 @@
               if (val && val.kind === 'chain') {
                 var _taint = collectChainTaint(val.toks);
                 if (_taint && _taint.size) {
-                  // Try to resolve element type from the base binding.
+                  // Type-first classification: if the base
+                  // binding carries a typeName, look up sink
+                  // on THAT type. Falls back to tag-based
+                  // (for element bindings) or null.
                   var _elTag = baseBind ? getElementTag(baseBind) : null;
-                  var _sinkInfo = classifySink(sinkProp, _elTag);
+                  var _sinkInfo = _classifyBindingSink(baseBind, sinkProp);
                   if (_sinkInfo && _sinkInfo.severity !== 'safe') {
                     recordTaintFinding(_sinkInfo.type, _sinkInfo.severity, sinkProp, _elTag, _taint, taintCondStack,
                       { expr: t.text, line: countLines(t._src, t.start) });
@@ -11352,6 +11372,7 @@
       _walkPathInDB: _walkPathInDB,
       _resolveExprTypeViaDB: _resolveExprTypeViaDB,
       _classifySinkViaDB: _classifySinkViaDB,
+      _classifySinkByTypeViaDB: _classifySinkByTypeViaDB,
       _classifyCallSinkViaDB: _classifyCallSinkViaDB,
       _classifyAttrSinkViaDB: _classifyAttrSinkViaDB,
       _propIsEverASink: _propIsEverASink,
