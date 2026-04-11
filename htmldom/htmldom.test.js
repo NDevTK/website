@@ -3940,6 +3940,11 @@ await (async function () {
   // --- Precision on destructured event ---
   await checkTaint('destructure via var from event.data', { 'a.js': 'window.addEventListener("message", function(e) { var d = e.data; document.getElementById("o").innerHTML = d; });' }, 1, { sources: ['postMessage'] });
 
+  // --- Structural object literal typed props ---
+  await checkTaint('obj literal element prop', { 'a.js': 'var o = { el: document.createElement("iframe") }; o.el.src = location.hash;' }, 1, { sources: ['url'] });
+  await checkTaint('deep obj element', { 'a.js': 'var o = { inner: { el: document.createElement("iframe") } }; o.inner.el.src = location.hash;' }, 1, { sources: ['url'] });
+  await checkTaint('obj chain through typed prop', { 'a.js': 'var o = { loc: window.location }; document.getElementById("o").innerHTML = o.loc.hash;' }, 1, { sources: ['url'] });
+
   // --- LUB joins via extends chain ---
   await checkTaint('iframe|script LUB sink', { 'a.js': 'var el = cond ? document.createElement("iframe") : document.createElement("script"); el.innerHTML = location.hash;' }, 1, { sources: ['url'] });
 

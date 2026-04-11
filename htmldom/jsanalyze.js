@@ -10089,10 +10089,27 @@
             // Walk to the leaf container.
             var _container = baseBind;
             var _walkOk = true;
+            var _hitElement = null;
+            var _elementRemainder = null;
             for (var _pi = 1; _pi < parts.length - 1; _pi++) {
               var _next = _container.props[parts[_pi]];
+              if (_next && _next.kind === 'element') {
+                // Intermediate segment is a stored element
+                // binding — hand off the rest of the path to
+                // applyElementSet below (fires sink checks).
+                _hitElement = _next;
+                _elementRemainder = parts.slice(_pi + 1);
+                break;
+              }
               if (!_next || _next.kind !== 'object') { _walkOk = false; break; }
               _container = _next;
+            }
+            if (_hitElement) {
+              const _eR = await readValue(i + 2, stop, TERMS_TOP);
+              const _eVal = _eR ? _eR.binding : null;
+              applyElementSet(_hitElement, _elementRemainder, _eVal, t);
+              i = skipExpr(i + 2, stop) - 1;
+              continue;
             }
             if (_walkOk) {
               const r = await readValue(i + 2, stop, TERMS_TOP);
