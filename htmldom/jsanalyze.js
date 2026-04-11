@@ -4925,8 +4925,33 @@
           } else { _completeFrame(null); return; }
         }
         if (tks[frame.i] && tks[frame.i].type === 'open' && tks[frame.i].char === '(') {
-          let d = 1; frame.i++; while (frame.i < stop && d > 0) { if (tks[frame.i].type === 'open' && tks[frame.i].char === '(') d++; if (tks[frame.i].type === 'close' && tks[frame.i].char === ')') d--; frame.i++; }
-          if (tks[frame.i] && tks[frame.i].type === 'open' && tks[frame.i].char === '{') { let bd = 1; frame.i++; while (frame.i < stop && bd > 0) { if (tks[frame.i].type === 'open' && tks[frame.i].char === '{') bd++; if (tks[frame.i].type === 'close' && tks[frame.i].char === '}') bd--; frame.i++; } }
+          // ES6 shorthand method syntax: `{ name(params) { body } }`.
+          // Parse the param list and body into a proper
+          // functionBinding so method calls on this object
+          // walk the body with `this` bound to the receiver.
+          var _smParams = [];
+          var _smJ = frame.i + 1;
+          while (_smJ < stop) {
+            if (tks[_smJ] && tks[_smJ].type === 'close' && tks[_smJ].char === ')') { _smJ++; break; }
+            var _smPwd = parseParamWithDefault(tks, _smJ, stop);
+            if (_smPwd) { _smParams.push(_smPwd.param); _smJ = _smPwd.next; } else _smJ++;
+            if (tks[_smJ] && tks[_smJ].type === 'sep' && tks[_smJ].char === ',') _smJ++;
+          }
+          if (tks[_smJ] && tks[_smJ].type === 'open' && tks[_smJ].char === '{') {
+            var _smBD = 1, _smBE = _smJ + 1;
+            while (_smBE < stop && _smBD > 0) {
+              if (tks[_smBE].type === 'open' && tks[_smBE].char === '{') _smBD++;
+              else if (tks[_smBE].type === 'close' && tks[_smBE].char === '}') _smBD--;
+              if (_smBD === 0) break;
+              _smBE++;
+            }
+            var _smFnBind = functionBinding(_smParams, _smJ, _smBE, true);
+            _smFnBind.capturedScope = _snapshotClosureForCapture();
+            props[keyName] = _smFnBind;
+            frame.i = _smBE + 1;
+          } else {
+            frame.i = _smJ;
+          }
           const sep = tks[frame.i]; if (sep && sep.type === 'sep' && sep.char === ',') { frame.i++; continue; } break;
         }
         if (tks[frame.i] && (tks[frame.i].type === 'sep' && (tks[frame.i].char === ',' || tks[frame.i].char === ';') || tks[frame.i].type === 'close' && tks[frame.i].char === '}')) {
