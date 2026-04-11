@@ -6048,7 +6048,19 @@
       if (start >= end) return null;
       var condVal = await readValue(start, end, null);
       var concrete = condVal ? evalTruthiness(condVal.binding) : null;
-      if (taintEnabled) {
+      // SMT branch refutation is only consulted when its result can
+      // actually be observed by a finding emission. Inside a function
+      // body walked at definition time (taintFnDepth > 0), every
+      // potential finding is suppressed by recordTaintFinding, so
+      // pruning a branch here would be invisible work — we'd pay the
+      // full Z3 round-trip just to skip walking a body whose findings
+      // we'd suppress anyway. Walk both branches symbolically instead
+      // and let the call-time walk repeat the SMT check with proper
+      // context. This preserves dead-code-call-graph coverage (we
+      // still record call sites in unreachable branches) while
+      // eliminating the dominant cost of definition-time walks on
+      // function-heavy inputs.
+      if (taintEnabled && taintFnDepth === 0) {
         var condToks = [];
         for (var ci = start; ci < end; ci++) condToks.push(tokens[ci]);
         var smtResult = await smtCheckCondition(condToks, resolve, resolvePath, pathConstraints);
