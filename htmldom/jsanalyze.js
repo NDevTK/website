@@ -497,53 +497,6 @@
     return false;
   }
 
-  // Collect every `source` label reachable from an Event subtype
-  // via its props/methods (and transitively via readType /
-  // returnType refs, and via the `extends` chain). Used to
-  // compute the flat taint-label set an addEventListener handler
-  // should attach to its event-parameter binding.
-  //
-  // Example: MessageEvent → {data: postMessage, origin:
-  // postMessage} → {'postMessage'}.
-  //
-  // Example: DragEvent → {dataTransfer: DataTransfer} →
-  // DataTransfer.{files: file, getData(): dragdrop} →
-  // {'file', 'dragdrop'}.
-  function _collectEventSourceLabels(db, typeName, seen) {
-    var labels = new Set();
-    if (!db || !typeName) return labels;
-    seen = seen || new Set();
-    if (seen.has(typeName)) return labels;
-    seen.add(typeName);
-    var cur = typeName;
-    while (cur) {
-      var td = db.types[cur];
-      if (!td) break;
-      if (td.props) {
-        for (var p in td.props) {
-          var pd = td.props[p];
-          if (pd.source) labels.add(pd.source);
-          if (pd.readType) {
-            var sub = _collectEventSourceLabels(db, pd.readType, seen);
-            sub.forEach(function (l) { labels.add(l); });
-          }
-        }
-      }
-      if (td.methods) {
-        for (var m in td.methods) {
-          var md = td.methods[m];
-          if (md.source) labels.add(md.source);
-          if (typeof md.returnType === 'string') {
-            var sub2 = _collectEventSourceLabels(db, md.returnType, seen);
-            sub2.forEach(function (l) { labels.add(l); });
-          }
-        }
-      }
-      cur = td.extends || null;
-    }
-    return labels;
-  }
-
   // Look up a call-site sink for a global/dotted callable, e.g.
   // `eval` / `document.write` / `location.assign`. Returns the
   // same `{type, severity, prop}` shape callers expect.
@@ -625,12 +578,13 @@
   // `getTaintSource` / `getTaintSourceCall` for the API the rest
   // of the walker still calls.
   // Legacy EVENT_TAINT_SOURCES table was removed in phase 4 of
-  // the type-db refactor. Event-handler parameter taint is now
+  // the type-db refactor. Event-handler parameter typing is now
   // resolved via `DEFAULT_TYPE_DB.eventMap[eventName]` → Event
-  // subtype → `_collectEventSourceLabels` which walks the
-  // subtype's props/methods (and transitive readType/returnType
-  // refs) for `source` fields. See the addEventListener branch
-  // in statement walking for the consumer.
+  // subtype → typeName stored on the event param binding.
+  // Property reads inside the handler body walk the TypeDB from
+  // that typeName and pick up the specific `source` labels on
+  // each prop descriptor, yielding precise per-access taint.
+  // See the addEventListener branch in statement walking.
 
   // Legacy flat-table sink classification was removed in phase 3
   // of the type-db refactor. Property, element-specific, call, and
@@ -3892,39 +3846,47 @@
     // Track names explicitly declared with var/let/const/function.
     // Used to distinguish `var location = x` (local) from `location = x` (global write).
     const declaredNames = new Set();
+    // Resolve an array of chain tokens to a TypeDB type, or
+    // null if the shape isn't a single typed value. Handles:
+    //
+    //  - `[{type:'other', text:'window.location'}]` →
+    //    walk via `_resolveExprTypeViaDB`.
+    //  - `[{type:'cond', ifTrue, ifFalse}]` → recursively type
+    //    each arm; when they join to the same type, return it.
+    //    (Simple lattice join: T ⊔ T = T, T ⊔ U = ⊥.)
+    //  - Everything else → null.
+    const _typeOfChainToks = (toks) => {
+      if (!toks || toks.length !== 1) return null;
+      var t = toks[0];
+      if (!t) return null;
+      if (t.type === 'other' && t.text) {
+        return _resolveExprTypeViaDB(DEFAULT_TYPE_DB, t.text, typedScope);
+      }
+      if (t.type === 'cond' && t.ifTrue && t.ifFalse) {
+        var tA = _typeOfChainToks(t.ifTrue);
+        var tB = _typeOfChainToks(t.ifFalse);
+        // Both arms must resolve to the same type for the
+        // joined value to have a definite type. Arms with
+        // different types collapse to ⊥ (null).
+        if (tA && tA === tB) return tA;
+        return null;
+      }
+      return null;
+    };
     // Infer a binding's TypeDB type at assignment time and tag
-    // it with `typeName`.
+    // it with `typeName`. Returns a shallow copy with the
+    // typeName set (never mutates the input) so shared
+    // bindings stay safe. Bindings that already carry a
+    // typeName pass through unchanged.
     //
-    // Three cases:
-    //
-    //  1. **Chain binding with single opaque ref** (most common):
-    //     walk the token text through the TypeDB. Covers
-    //     `var loc = window.location`, `var f = eval`,
-    //     `var resp = fetch("/api")`, `var fr = new FileReader()`.
-    //
-    //  2. **Element binding from a tracked `createElement`**:
-    //     resolve the tag via `db.tagMap` to the concrete
-    //     HTMLxElement type. Covers
-    //     `var el = document.createElement("iframe")` →
-    //     HTMLIFrameElement.
-    //
-    //  3. Everything else passes through unchanged.
-    //
-    // Returns a shallow copy with `typeName` set (never mutates
-    // the input) so shared bindings stay safe. Bindings that
-    // already carry a typeName pass through unchanged.
+    // Element bindings have their `typeName` set at creation
+    // time by the element factory, not here — mutating or
+    // copying them would break the identity-based tracking
+    // that applyElementSet / applyElementMethod rely on.
     const _withInferredType = (value) => {
       if (!value || value.typeName) return value;
-      // Note: element bindings have their `typeName` set at
-      // creation time by the element factory, not here. Mutating
-      // or copying them would break the identity-based tracking
-      // that underlies `applyElementSet` / `applyElementMethod`.
-      // Case 1: chain with a single opaque ref.
       if (value.kind !== 'chain') return value;
-      if (!value.toks || value.toks.length !== 1) return value;
-      var t = value.toks[0];
-      if (!t || t.type !== 'other' || !t.text) return value;
-      var typeName = _resolveExprTypeViaDB(DEFAULT_TYPE_DB, t.text, typedScope);
+      var typeName = _typeOfChainToks(value.toks);
       if (!typeName) return value;
       return { kind: 'chain', toks: value.toks, typeName: typeName };
     };
@@ -11402,7 +11364,6 @@
       _classifyCallSinkViaDB: _classifyCallSinkViaDB,
       _classifyAttrSinkViaDB: _classifyAttrSinkViaDB,
       _propIsEverASink: _propIsEverASink,
-      _collectEventSourceLabels: _collectEventSourceLabels,
       _isSanitizerCallViaDB: _isSanitizerCallViaDB,
       _isNavSinkViaDB: _isNavSinkViaDB,
     },
