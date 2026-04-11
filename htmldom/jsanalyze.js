@@ -2863,9 +2863,15 @@
     // Check if a token array starts with a given prefix (snapshot).
     // Used by if-else, try-catch, and switch handlers to detect
     // whether a branch appended to the snapshot (+=) or replaced it (=).
+    // Reference-equality test first for the hot case where the
+    // branch left the prefix untouched (all prefix tokens come from
+    // the pre-branch snapshot and have the same object identity).
+    // Falls back to JSON.stringify per position for the rare case
+    // where the walker reconstructed structurally-equal tokens.
     const chainStartsWith = (full, prefix) => {
       if (full.length < prefix.length) return false;
       for (let s = 0; s < prefix.length; s++) {
+        if (full[s] === prefix[s]) continue;
         if (JSON.stringify(full[s]) !== JSON.stringify(prefix[s])) return false;
       }
       return true;
@@ -5912,10 +5918,47 @@
 
     let stop = Math.min(stopAt, tokens.length);
     // Shared helpers for iterative walkRange state machine.
+    // Structural equality over chain-token arrays using reference
+    // equality on each element. The walker caches plus/paren/synthetic
+    // marker tokens by reference, and passes live source tokens by
+    // reference out of the tokenizer, so "both branches produced the
+    // same binding" collapses to "both arrays contain the same token
+    // references in the same order". Used by the if/else merge hot
+    // path to avoid the O(tree_size) JSON.stringify round-trip that
+    // used to dominate wall time on function-heavy files.
+    function _chainToksRefEqual(a, b) {
+      if (a === b) return true;
+      if (!a || !b) return false;
+      if (a.length !== b.length) return false;
+      for (let i = 0; i < a.length; i++) {
+        if (a[i] !== b[i]) return false;
+      }
+      return true;
+    }
     const _expandBindWithLVs = (bind, branchLVs) => {
       if (!bind || bind.kind !== 'chain') return bind ? bind.toks : [];
+      // Hot-path shortcut: branch had no captured loop vars, so
+      // expansion is a no-op and we can return the underlying token
+      // array by reference. The caller only READS the result (for
+      // structural equality checks and cond-token construction), so
+      // returning the shared array is safe. Saves an O(len) allocation
+      // that the if/else merge loop pays once per visited variable on
+      // every merge — hundreds of thousands of allocations on large
+      // function-heavy files.
+      if (!branchLVs || branchLVs.length === 0) return bind.toks;
       const lvMap = Object.create(null);
       for (const lv of branchLVs) { if (!lvMap[lv.name]) lvMap[lv.name] = []; lvMap[lv.name].push(lv); }
+      // Second hot-path shortcut: even with branchLVs present, if
+      // none of the chain's tokens reference a captured loopvar name
+      // we still don't need to allocate a new array.
+      let needsExpand = false;
+      for (const t of bind.toks) {
+        if (t.type === 'other' && IDENT_RE.test(t.text) && lvMap[t.text] && lvMap[t.text].length) {
+          needsExpand = true;
+          break;
+        }
+      }
+      if (!needsExpand) return bind.toks;
       const expand = (toks) => {
         const out = [];
         for (const t of toks) {
@@ -6126,8 +6169,23 @@
         const ifB = ctx.ifBindings[name];
         const elB = elseBindings[name] || _task.snapshot[name];
         if (!ifB || ifB.kind !== 'chain' || !elB || elB.kind !== 'chain') continue;
+        // Reference-equal shortcut: neither branch touched this name,
+        // so both sides came from the same pre-branch snapshot entry.
+        // Avoids the O(tree) _expandBindWithLVs + JSON.stringify on
+        // the hot path.
+        if (ifB === elB) { _mergedAsCond.add(name); continue; }
         const ifFull = _expandBindWithLVs(ifB, ctx.ifLoopVars);
         const elFull = _expandBindWithLVs(elB, elseLoopVars);
+        // Fast structural equality: iterate both token arrays and
+        // check reference equality of each element. Walker-generated
+        // chain tokens are reused by reference when the walker
+        // produces semantically identical bindings, so this catches
+        // most "nothing changed" cases in O(n) instead of the
+        // O(tree_size) JSON.stringify round-trip it used to fall
+        // back to. Only fall back to JSON.stringify if the fast
+        // path finds a structural difference that MIGHT still be
+        // equal under deep comparison.
+        if (_chainToksRefEqual(ifFull, elFull)) { _mergedAsCond.add(name); continue; }
         if (JSON.stringify(ifFull) === JSON.stringify(elFull)) { _mergedAsCond.add(name); continue; }
         const snapB = _task.snapshot[name];
         if (snapB && snapB.kind === 'chain') {
@@ -6150,7 +6208,13 @@
         if (trackBuildVar && trackBuildVar.has(name)) continue;
         if (_mergedAsCond.has(name)) continue;
         const ifB = ctx.ifBindings[name], elB = elseBindings[name] || _task.snapshot[name];
-        if (ifB === elB || JSON.stringify(ifB) === JSON.stringify(elB)) continue;
+        if (ifB === elB) continue;
+        // Fast structural-equality fallback before the expensive
+        // JSON.stringify — same rationale as the cond-merge path
+        // above, avoids O(tree) stringify on hot walker paths.
+        if (ifB && elB && ifB.kind === 'chain' && elB.kind === 'chain' &&
+            _chainToksRefEqual(ifB.toks, elB.toks)) continue;
+        if (JSON.stringify(ifB) === JSON.stringify(elB)) continue;
         assignName(name, chainBinding([deriveExprRef(name, ifB && ifB.kind === 'chain' ? ifB.toks : null, elB && elB.kind === 'chain' ? elB.toks : null)]));
       }
       continue;
@@ -6193,8 +6257,10 @@
         if (!ctx.tryBindings[name] || ctx.tryBindings[name].kind !== 'chain') continue;
         const tryB = ctx.tryBindings[name], catchB = catchBindings[name] || _task.snapshot[name];
         if (!catchB || catchB.kind !== 'chain') continue;
+        if (tryB === catchB) continue;
         const tryFull = _expandBindWithLVs(tryB, ctx.tryLoopVars);
         const catchFull = _expandBindWithLVs(catchB, catchLoopVars);
+        if (_chainToksRefEqual(tryFull, catchFull)) continue;
         if (JSON.stringify(tryFull) === JSON.stringify(catchFull)) continue;
         const snapB = _task.snapshot[name];
         // Always emit a `trycatch` join token so the may-be lattice
@@ -6300,7 +6366,11 @@
       for (const cr2 of caseResults) for (const name in cr2.bindings) {
         if (trackBuildVar && trackBuildVar.has(name)) continue;
         const b = cr2.bindings[name], snap = snapshot[name];
-        if (b && (!snap || JSON.stringify(b) !== JSON.stringify(snap))) switchChanged.add(name);
+        if (!b) continue;
+        if (snap && (b === snap ||
+            (b.kind === 'chain' && snap.kind === 'chain' && _chainToksRefEqual(b.toks, snap.toks)))) continue;
+        if (snap && JSON.stringify(b) === JSON.stringify(snap)) continue;
+        switchChanged.add(name);
       }
       for (const name of switchChanged) {
         // Emit a `switchjoin` token with one entry per case's chain
