@@ -4998,7 +4998,21 @@
             const b = await resolvePath(name);
             if (b && b.kind === 'array') { for (const e of b.elems) frame.elems.push(e); frame.i++; const sep = tks[frame.i]; if (sep && sep.type === 'sep' && sep.char === ',') { frame.i++; continue; } break; }
           }
-          _completeFrame(null); return;
+          // Unknown spread source: push an opaque element that
+          // preserves any labels the source binding carries so
+          // spreads over unknown iterables don't silently
+          // drop the rest of the array.
+          const _spreadRef = exprRef('...' + name);
+          const _spreadBind = await resolvePath(name);
+          if (_spreadBind) {
+            const _spreadLabels = getBindingLabels(_spreadBind);
+            if (_spreadLabels && _spreadLabels.size) _spreadRef.taint = _spreadLabels;
+          }
+          frame.elems.push(chainBinding([_spreadRef]));
+          frame.i++;
+          const _spreadSep = tks[frame.i];
+          if (_spreadSep && _spreadSep.type === 'sep' && _spreadSep.char === ',') { frame.i++; continue; }
+          break;
         }
         // Push READ_VALUE child frame and yield.
         _evalStack.push({ type: 'READ_VALUE', k: frame.i, stop: frame.stop, terms: TERMS_ARR, phase: 0 });
