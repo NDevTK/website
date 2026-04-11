@@ -339,13 +339,45 @@
   // type yields null (unknown type); the caller treats the
   // binding as untyped. `scope`, when provided, overrides the
   // root segment the same way `_walkPathInDB` does.
+  // Split a dotted expression on `.` boundaries while
+  // respecting balanced parens / brackets / quotes. A naive
+  // `split('.')` on `document.querySelectorAll(".x").forEach`
+  // produces garbage because it splits inside the quoted arg
+  // and the `.x` class selector.
+  function _splitDottedExpr(expr) {
+    var parts = [];
+    var cur = '';
+    var depth = 0;
+    var quote = null;
+    for (var i = 0; i < expr.length; i++) {
+      var c = expr.charAt(i);
+      if (quote) {
+        cur += c;
+        if (c === '\\') { cur += expr.charAt(++i) || ''; continue; }
+        if (c === quote) quote = null;
+        continue;
+      }
+      if (c === '"' || c === "'" || c === '`') { quote = c; cur += c; continue; }
+      if (c === '(' || c === '[' || c === '{') { depth++; cur += c; continue; }
+      if (c === ')' || c === ']' || c === '}') { depth--; cur += c; continue; }
+      if (c === '.' && depth === 0) {
+        parts.push(cur);
+        cur = '';
+        continue;
+      }
+      cur += c;
+    }
+    parts.push(cur);
+    return parts;
+  }
+
   function _resolveExprTypeViaDB(db, expr, scope) {
     if (!db || !expr) return null;
     // Strip a leading `new ` so `new FileReader()` resolves the
     // same way as `FileReader()` — both go through the type's
     // .construct / .call descriptor.
     if (/^new\s+/.test(expr)) expr = expr.replace(/^new\s+/, '');
-    var parts = expr.split('.');
+    var parts = _splitDottedExpr(expr);
     if (parts.length === 0) return null;
     var typeName = null;
     for (var i = 0; i < parts.length; i++) {
@@ -412,7 +444,7 @@
   // an untyped local binding the walk aborts (user shadowed).
   function _isNavSinkViaDB(db, expr, scope) {
     if (!db || !expr) return false;
-    var parts = expr.split('.');
+    var parts = _splitDottedExpr(expr);
     var rootName = parts[0];
     var typeName = null;
     if (scope) {
@@ -464,7 +496,7 @@
   // descriptors.
   function _isSanitizerCallViaDB(db, callExpr, scope) {
     if (!db || !callExpr) return false;
-    var parts = callExpr.split('.');
+    var parts = _splitDottedExpr(callExpr);
     var rootName = parts[0];
     var typeName = null;
     if (scope) {
@@ -509,7 +541,7 @@
   // TAINT_CALL_SINKS behaviour without a flat lookup table.
   function _classifyCallSinkViaDB(db, callExpr, scope) {
     if (!db || !callExpr) return null;
-    var parts = callExpr.split('.');
+    var parts = _splitDottedExpr(callExpr);
     var rootName = parts[0];
     var typeName = null;
     if (scope) {
@@ -567,7 +599,7 @@
     return {
       type: currentSink,
       severity: currentSeverity,
-      prop: callExpr.split('.').pop(),
+      prop: (_splitDottedExpr(callExpr).pop() || '').replace(/\(.*$/, ''),
     };
   }
 
@@ -706,7 +738,7 @@
   // shadowed any global of the same name with a user variable.
   function _walkPathInDB(db, expr, scope) {
     if (!db || !expr) return null;
-    var parts = expr.split('.');
+    var parts = _splitDottedExpr(expr);
     if (parts.length === 0) return null;
     var rootName = parts[0];
     var parenIdx0 = rootName.indexOf('(');
@@ -4047,13 +4079,34 @@
           var _extType = null;
           var _typed = false;
           if (b.typeName) {
-            var _typedRootName = '__t' + (Math.random() * 1e9 | 0) + '__';
-            var _typedRootScope = (function (rootName, rootType) {
-              return function (n) { return n === rootName ? { typeName: rootType } : typedScope(n); };
-            })(_typedRootName, b.typeName);
-            var _syntheticExpr = _typedRootName + '.' + _remainingPath;
-            _extLabel = _walkPathInDB(_activeDB, _syntheticExpr, _typedRootScope);
-            _extType = _resolveExprTypeViaDB(_activeDB, _syntheticExpr, _typedRootScope);
+            // Walk the remaining path through the TypeDB
+            // directly from the receiver's type. Each segment
+            // is checked as a PROP first (no call) and falls
+            // back to METHOD (implicit-call via returnType)
+            // so bare `.querySelectorAll` resolves to its
+            // return type without needing a paren in the text.
+            var _tcType = b.typeName;
+            var _tcSegs = _remainingPath.split('.');
+            for (var _tcI = 0; _tcI < _tcSegs.length; _tcI++) {
+              var _tcSeg = _tcSegs[_tcI];
+              var _tcPd = _lookupProp(_activeDB, _tcType, _tcSeg);
+              if (_tcPd) {
+                if (_tcPd.source) _extLabel = _tcPd.source;
+                if (_tcPd.readType) { _tcType = _tcPd.readType; continue; }
+                _tcType = null;
+                break;
+              }
+              var _tcMd = _lookupMethod(_activeDB, _tcType, _tcSeg);
+              if (_tcMd) {
+                if (_tcMd.source) _extLabel = _tcMd.source;
+                if (typeof _tcMd.returnType === 'string') { _tcType = _tcMd.returnType; continue; }
+                _tcType = null;
+                break;
+              }
+              _tcType = null;
+              break;
+            }
+            _extType = _tcType;
             _typed = (_extLabel != null || _extType != null);
           }
           var _extRef;
@@ -5079,7 +5132,31 @@
           const isCall = paren && paren.type === 'open' && paren.char === '(';
           const segs = t.text.slice(1).split('.');
           const lastSeg = segs[segs.length - 1];
-          const isMethodCall = isCall && KNOWN_METHODS.has(lastSeg);
+          // A suffix method call is dispatched through
+          // applyMethod when the last segment is either a
+          // built-in known method (slice, forEach, etc.) OR a
+          // TypeDB method on the receiver's typeName. The
+          // second case is what makes typed-iterable chains
+          // like `o.querySelectorAll(".i").forEach(...)` work
+          // when `o` is an HTMLElement binding.
+          var _hasTypedMethod = false;
+          if (isCall && bind && bind.typeName && !KNOWN_METHODS.has(lastSeg)) {
+            // Walk any leading property segments through the
+            // TypeDB to find the receiver of the call. If we
+            // reach a type that has `lastSeg` as a method,
+            // dispatch via applyMethod.
+            var _tmCur = bind.typeName;
+            var _tmOk = true;
+            for (var _tpi = 0; _tpi < segs.length - 1; _tpi++) {
+              var _tpd = _lookupProp(_activeDB, _tmCur, segs[_tpi]);
+              if (_tpd && _tpd.readType) { _tmCur = _tpd.readType; continue; }
+              _tmOk = false; break;
+            }
+            if (_tmOk && _lookupMethod(_activeDB, _tmCur, lastSeg)) {
+              _hasTypedMethod = true;
+            }
+          }
+          const isMethodCall = isCall && (KNOWN_METHODS.has(lastSeg) || _hasTypedMethod);
           // Walk any leading property segments. Special-cases: `.length` on
           // a known array returns the element count; `.length` on a chain
           // whose operands are all string/template literals returns the
@@ -5510,6 +5587,72 @@
         }
       }
 
+      // Typed-iterable forEach / map / filter on a chain binding
+      // whose TypeDB type declares an `iteratesType`. This is
+      // what makes `document.querySelectorAll('.x').forEach(el
+      // => el.innerHTML = ...)` work: NodeList in the TypeDB
+      // declares `iteratesType: 'HTMLElement'`, so the callback's
+      // first param is bound to a typed HTMLElement chain and
+      // the body walks with that type in scope.
+      if (bind && bind.kind === 'chain' && bind.typeName &&
+          (method === 'forEach' || method === 'map' || method === 'filter')) {
+        var _iterType = _activeDB.types[bind.typeName];
+        var _elemType = _iterType && _iterType.iteratesType;
+        if (_elemType) {
+          const lp = tks[parenIdx];
+          if (!lp || lp.type !== 'open' || lp.char !== '(') return null;
+          var _iterFn = null, _iterFnNext = 0;
+          const _iterArrow = peekArrow(parenIdx + 1, stop);
+          if (_iterArrow) {
+            const _iterBody = readArrowBody(_iterArrow.arrowNext, stop);
+            if (_iterBody) {
+              _iterFn = functionBinding(_iterArrow.params, _iterBody.bodyStart, _iterBody.bodyEnd, _iterBody.isBlock);
+              _iterFn.capturedScope = _snapshotClosureForCapture();
+              _iterFnNext = _iterBody.next;
+            }
+          }
+          if (!_iterFn) {
+            var _iterFexpr = await readFunctionExpr(parenIdx + 1, stop);
+            if (_iterFexpr) { _iterFn = _iterFexpr.binding; _iterFnNext = _iterFexpr.next; }
+          }
+          if (!_iterFn) {
+            var _iterCbTok = tks[parenIdx + 1];
+            if (_iterCbTok && _iterCbTok.type === 'other' && IDENT_RE.test(_iterCbTok.text)) {
+              var _iterRefB = resolve(_iterCbTok.text);
+              if (_iterRefB && _iterRefB.kind === 'function') { _iterFn = _iterRefB; _iterFnNext = parenIdx + 2; }
+            }
+          }
+          if (_iterFn) {
+            const _iterRp = tks[_iterFnNext];
+            if (_iterRp && _iterRp.type === 'close' && _iterRp.char === ')') {
+              // Build a typed synthetic first-arg binding —
+              // the callback sees a chain whose typeName is
+              // the element type declared by the iterable.
+              // Property reads in the body resolve via the
+              // TypeDB walker against that type.
+              if (_iterFn.params && _iterFn.params.length > 0) {
+                var _iterPn = _iterFn.params[0].name;
+                var _iterRef = exprRef(_iterPn);
+                var _iterArgBind = chainBinding([_iterRef]);
+                _iterArgBind.typeName = _elemType;
+                await instantiateFunction(_iterFn, [_iterArgBind]);
+              } else {
+                await instantiateFunction(_iterFn, []);
+              }
+              if (method === 'forEach') {
+                return { bind: chainBinding([makeSynthStr('undefined')]), next: _iterFnNext + 1 };
+              }
+              // map / filter: return an opaque typed chain so
+              // further chained ops still have something to
+              // walk against.
+              var _iterResult = chainBinding([exprRef(bind.toks[0] && bind.toks[0].text ? bind.toks[0].text + '.' + method + '()' : method + '()')]);
+              if (method === 'map') _iterResult.typeName = 'Array';
+              return { bind: _iterResult, next: _iterFnNext + 1 };
+            }
+          }
+        }
+      }
+
       // .map(fn).join('') on an opaque iterable: extract the callback's
       // per-element return chain and produce an iter token that
       // The emitter converts map/join into a forEach loop.
@@ -5623,6 +5766,63 @@
           pResultToks = [pRTok0].concat(pResultToks.slice(1));
         }
         return { bind: chainBinding(pResultToks), next: pfnEnd + 1 };
+      }
+      // Generic typed-method dispatch: when the receiver is a
+      // chain binding with a typeName and the method exists
+      // on that type in the TypeDB, synthesize a typed result
+      // chain with the method's returnType. This is how method
+      // calls like `element.querySelectorAll(".x")` produce a
+      // NodeList chain so the trailing `.forEach(...)` in the
+      // caller routes through the typed-iterable handler.
+      if (bind && bind.kind === 'chain' && bind.typeName) {
+        var _gmMethod = _lookupMethod(_activeDB, bind.typeName, method);
+        if (_gmMethod) {
+          var _gmArgs = await readCallArgBindings(parenIdx, stop);
+          if (!_gmArgs) return null;
+          // Method-call sinks: per-arg sink labels or method.sink.
+          if (taintEnabled) {
+            if (_gmMethod.sink && _gmArgs.bindings.length > 0) {
+              var _gmArgLabels = getBindingLabels(_gmArgs.bindings[0]);
+              if (_gmArgLabels && _gmArgLabels.size) {
+                recordTaintFinding(_gmMethod.sink, _gmMethod.severity || _defaultSinkSeverity(_gmMethod.sink), method, null, _gmArgLabels, taintCondStack, null);
+              }
+            }
+            if (_gmMethod.args) {
+              for (var _gmi = 0; _gmi < _gmMethod.args.length && _gmi < _gmArgs.bindings.length; _gmi++) {
+                var _gmArgDesc = _gmMethod.args[_gmi];
+                if (_gmArgDesc && _gmArgDesc.sink) {
+                  var _gmLabels = getBindingLabels(_gmArgs.bindings[_gmi]);
+                  if (_gmLabels && _gmLabels.size) {
+                    recordTaintFinding(_gmArgDesc.sink, _gmArgDesc.severity || _defaultSinkSeverity(_gmArgDesc.sink), method, null, _gmLabels, taintCondStack, null);
+                  }
+                }
+              }
+            }
+          }
+          // Build the result chain. Its typeName comes from
+          // the method's returnType (when static). Source labels
+          // come from the method descriptor's `source` field
+          // AND — when `preservesLabelsFromReceiver` is set —
+          // from the receiver's labels.
+          var _gmResult = chainBinding([exprRef(method + '(...)')]);
+          if (typeof _gmMethod.returnType === 'string') {
+            _gmResult.typeName = _gmMethod.returnType;
+          }
+          var _gmLabels2 = null;
+          if (_gmMethod.source) { _gmLabels2 = new Set(); _gmLabels2.add(_gmMethod.source); }
+          if (_gmMethod.preservesLabelsFromReceiver) {
+            var _gmRecvLabels = getBindingLabels(bind);
+            if (_gmRecvLabels && _gmRecvLabels.size) {
+              if (!_gmLabels2) _gmLabels2 = new Set();
+              for (var _gmL of _gmRecvLabels) _gmLabels2.add(_gmL);
+            }
+          }
+          if (_gmLabels2 && _gmLabels2.size) {
+            _gmResult.labels = _gmLabels2;
+            _gmResult.toks[0].taint = new Set(_gmLabels2);
+          }
+          return { bind: _gmResult, next: _gmArgs.next };
+        }
       }
       return null;
     };
@@ -6144,11 +6344,14 @@
           while (end < stop) {
             const nx = tks[end];
             if (!nx) break;
-            // Stop before Promise continuation methods so applySuffixes
-            // can route them through applyMethod's .then/.catch/.finally
-            // handler. This is what makes \`fetch(...).then(d => sink(d))\`
-            // propagate taint into the callback.
-            if (nx.type === 'other' && /^\.(then|catch|finally)$/.test(nx.text)) {
+            // Stop before method continuations that applySuffixes
+            // needs to route through applyMethod: Promise
+            // continuations (`.then/.catch/.finally`) and
+            // typed-iterable iterators (`.forEach/.map/.filter/
+            // .reduce`). Absorbing these into the opaque text
+            // would lose the receiver's typeName and prevent
+            // callback walking with typed parameters.
+            if (nx.type === 'other' && /^\.(then|catch|finally|forEach|map|filter|reduce)$/.test(nx.text)) {
               break;
             }
             if (nx.type === 'open' && (nx.char === '(' || nx.char === '[')) {
@@ -6230,6 +6433,26 @@
           return { bind: _opaqueResult, next: end };
         }
         if (b) {
+          // Typed-method call: when resolvePath walked through
+          // the TypeDB to a typed chain AND the path is being
+          // invoked (`path(args)`), route the call through
+          // `applyMethod` on the receiver's type so the
+          // method's returnType + source/sink labels flow to
+          // the result. This is what makes
+          // `o.querySelectorAll(".i")` return a typed NodeList
+          // chain when `o` is an HTMLElement.
+          if (isCall && b.kind === 'chain' && b.typeName) {
+            var _dotIdx = t.text.lastIndexOf('.');
+            if (_dotIdx > 0) {
+              var _tmBasePath = t.text.slice(0, _dotIdx);
+              var _tmMethodName = t.text.slice(_dotIdx + 1);
+              var _tmReceiver = await resolvePath(_tmBasePath);
+              if (_tmReceiver && _tmReceiver.kind === 'chain' && _tmReceiver.typeName) {
+                var _tmResult = await applyMethod(_tmReceiver, _tmMethodName, k + 1, stop);
+                if (_tmResult) return { bind: _tmResult.bind, next: _tmResult.next };
+              }
+            }
+          }
           // Call syntax: `name(args)` where name resolves to a function binding.
           if (b.kind === 'function' && isCall) {
             const args = await readConcatArgs(k + 1, stop);
@@ -9374,7 +9597,12 @@
             }
             if (_peekContEnd > 0) {
               var _peekNext = tokens[_peekContEnd + 1];
-              if (_peekNext && _peekNext.type === 'other' && /^\.(then|catch|finally)$/.test(_peekNext.text)) {
+              // Route these chained-call continuations through
+              // readValue → applySuffixes so the trailing
+              // method's callback gets walked with proper
+              // typing. `.then/catch/finally` on promises,
+              // `.forEach/.map/.filter` on iterables.
+              if (_peekNext && _peekNext.type === 'other' && /^\.(then|catch|finally|forEach|map|filter)$/.test(_peekNext.text)) {
                 var _exprResult = await readValue(i, stop, TERMS_TOP);
                 if (_exprResult) { i = _exprResult.next - 1; continue; }
               }
@@ -11060,6 +11288,16 @@
           },
           removeAttribute: { args: [{}] },
           getAttribute:    { args: [{}], returnType: 'String' },
+          // DOM queries on an element return NodeList /
+          // HTMLCollection — same typed-iterable semantics as
+          // the Document-level equivalents.
+          querySelector:     { returnType: 'HTMLElement' },
+          querySelectorAll:  { returnType: 'NodeList' },
+          getElementsByTagName:   { returnType: 'HTMLCollection' },
+          getElementsByClassName: { returnType: 'HTMLCollection' },
+          closest:           { returnType: 'HTMLElement' },
+          matches:           { args: [{}] },
+          getBoundingClientRect: {},
         },
       },
       HTMLElement: { extends: 'Element' },
@@ -11131,8 +11369,26 @@
       HTMLAudioElement: { extends: 'HTMLElement' },
       HTMLSourceElement: { extends: 'HTMLElement' },
       HTMLTrackElement: { extends: 'HTMLElement' },
-      HTMLCollection: {},
-      NodeList: {},
+      HTMLCollection: {
+        // Element-typed iterable: `.forEach(el => ...)` binds
+        // `el` as an HTMLElement (see typed-iterable handler
+        // in applyMethod).
+        iteratesType: 'HTMLElement',
+        methods: {
+          item:         { returnType: 'HTMLElement' },
+          namedItem:    { returnType: 'HTMLElement' },
+        },
+      },
+      NodeList: {
+        iteratesType: 'HTMLElement',
+        methods: {
+          item:    { returnType: 'HTMLElement' },
+          forEach: { args: [{}] },
+          entries: {},
+          keys:    {},
+          values:  {},
+        },
+      },
 
       // --- Network types ---
       Response: {
@@ -11299,6 +11555,7 @@
         },
       },
       FileList: {
+        iteratesType: 'File',
         methods: {
           item: { returnType: 'File' },
         },
