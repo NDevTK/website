@@ -5852,7 +5852,31 @@
         var _newRef = exprRef(_newText);
         var _newTaint = checkTaintSource(_newText);
         if (_newTaint) _newRef.taint = _newTaint;
-        return { bind: chainBinding([_newRef]), next: j };
+        // Classify the constructor as a call-sink via the
+        // TypeDB. `new Worker(url)` and similar fire when the
+        // construct descriptor carries an arg sink.
+        if (taintEnabled && _newCtorTok) {
+          var _newSinkInfo = _classifyCallSinkViaDB(_activeDB, _newCtorTok.text, typedScope);
+          if (_newSinkInfo) {
+            // Parse arg bindings from the `(...)` we already
+            // skipped over, to feed checkSinkCall.
+            var _nsParenIdx = -1;
+            for (var _nsp = k + 1; _nsp < j; _nsp++) {
+              if (tks[_nsp] && tks[_nsp].type === 'open' && tks[_nsp].char === '(') { _nsParenIdx = _nsp; break; }
+            }
+            if (_nsParenIdx >= 0) {
+              var _nsArgs = await readCallArgBindings(_nsParenIdx, j);
+              if (_nsArgs) checkSinkCall(_newCtorTok.text, _nsArgs.bindings, _newCtorTok);
+            }
+          }
+        }
+        var _newResult = chainBinding([_newRef]);
+        // Attach the constructor's return type so typeName
+        // propagates to downstream reads (e.g. `new FileReader()`
+        // → FileReader, so `.result` resolves via the type).
+        var _newType = _resolveExprTypeViaDB(_activeDB, 'new ' + _newText.replace(/^new\s+/, ''), typedScope);
+        if (_newType) _newResult.typeName = _newType;
+        return { bind: _newResult, next: j };
       }
       if (t.type === 'str') return { bind: chainBinding([t]), next: k + 1 };
       if (t.type === 'tmpl') {
@@ -11242,8 +11266,103 @@
           origin:   { source: 'url', readType: 'String' },
           port:     { source: 'url', readType: 'String' },
           protocol: { source: 'url', readType: 'String' },
-          searchParams: { source: 'url' },
+          searchParams: { readType: 'URLSearchParams' },
         },
+      },
+      // URLSearchParams: iterating / reading query-string
+      // values produces url-labelled strings.
+      URLSearchParams: {
+        methods: {
+          get:    { source: 'url', returnType: 'String' },
+          getAll: { source: 'url' },
+          keys:   {},
+          values: { source: 'url' },
+          entries:{ source: 'url' },
+          has:    {},
+          toString: { source: 'url', returnType: 'String' },
+        },
+      },
+      // Blob / File: opaque file content.
+      Blob: {
+        methods: {
+          text:      { source: 'file', returnType: 'Promise' },
+          arrayBuffer: { source: 'file', returnType: 'Promise' },
+          stream:    { source: 'file' },
+          slice:     { returnType: 'Blob', preservesLabelsFromReceiver: true },
+        },
+      },
+      File: {
+        extends: 'Blob',
+        props: {
+          name:         { source: 'file', readType: 'String' },
+          lastModified: {},
+        },
+      },
+      FileList: {
+        methods: {
+          item: { returnType: 'File' },
+        },
+      },
+      // FormData: form submission payload.
+      FormData: {
+        methods: {
+          get:    { source: 'postMessage', returnType: 'String' },
+          getAll: { source: 'postMessage' },
+          has:    {},
+          keys:   {},
+          values: { source: 'postMessage' },
+          entries:{ source: 'postMessage' },
+          append: {}, set: {}, delete: {},
+        },
+      },
+      GlobalFormDataCtor: {
+        construct: { returnType: 'FormData' },
+      },
+      // Headers: HTTP header access. Response headers carry
+      // server-controlled data so they're network-labelled.
+      Headers: {
+        methods: {
+          get:    { source: 'network', returnType: 'String' },
+          has:    {},
+          keys:   {},
+          values: { source: 'network' },
+          entries:{ source: 'network' },
+          forEach:{ args: [{}] },
+        },
+      },
+      GlobalHeadersCtor: {
+        construct: { returnType: 'Headers' },
+      },
+      // BroadcastChannel: cross-tab messaging, equivalent to
+      // window.postMessage from a security standpoint.
+      BroadcastChannel: {
+        extends: 'EventTarget',
+        methods: {
+          postMessage: { args: [{}] },
+          close: {},
+        },
+      },
+      GlobalBroadcastChannelCtor: {
+        construct: { returnType: 'BroadcastChannel' },
+      },
+      // MessagePort: postMessage channel.
+      MessagePort: {
+        extends: 'EventTarget',
+        methods: {
+          postMessage: { args: [{}] },
+          start: {}, close: {},
+        },
+      },
+      // Worker / SharedWorker / ServiceWorker: postMessage channels.
+      Worker: {
+        extends: 'EventTarget',
+        methods: {
+          postMessage: { args: [{}] },
+          terminate: {},
+        },
+      },
+      GlobalWorkerCtor: {
+        construct: { args: [{ sink: 'url', severity: 'high' }], returnType: 'Worker' },
       },
       IDBObjectStore: {
         methods: {
@@ -11321,7 +11440,12 @@
       FileReader:     'GlobalFileReaderCtor',
       WebSocket:      'GlobalWebSocketCtor',
       EventSource:    'GlobalEventSourceCtor',
-      URL:            'GlobalURLCtor',
+      URL:              'GlobalURLCtor',
+      URLSearchParams:  'GlobalURLCtor',   // ctor also returns searchable
+      FormData:         'GlobalFormDataCtor',
+      Headers:          'GlobalHeadersCtor',
+      BroadcastChannel: 'GlobalBroadcastChannelCtor',
+      Worker:            'GlobalWorkerCtor',
       caches:         'CacheStorage',
       decodeURIComponent: 'GlobalDecodeURIComponent',
       decodeURI:          'GlobalDecodeURI',
