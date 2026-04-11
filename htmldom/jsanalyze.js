@@ -3959,6 +3959,19 @@
       if (!el || el.kind !== 'element') return;
       // Taint: check if assigning a tainted value to a sink property.
       if (path.length === 1) checkSinkAssignment(el, path[0], val, tok);
+      // `el.style.<prop> = value` — treat as a CSS sink when the
+      // assigned value carries taint. cssText is the most dangerous
+      // (full declaration replacement, allows legacy `expression()`
+      // injection); individual properties like background, content
+      // etc. can also leak data or inject `url(...)` references.
+      if (path.length === 2 && path[0] === 'style' && taintEnabled && val) {
+        var _styleLabels = getBindingLabels(val);
+        if (_styleLabels && _styleLabels.size) {
+          var _tag = getElementTag(el);
+          var _styleLoc = tok && tok._src ? { expr: 'style.' + path[1], line: countLines(tok._src, tok.start), pos: tok.start } : null;
+          recordTaintFinding('css', 'medium', 'style.' + path[1], _tag, _styleLabels, taintCondStack, _styleLoc);
+        }
+      }
       const seg = path[0];
       if (path.length === 1) {
         if (seg === 'innerHTML' || seg === 'outerHTML') { el.html = val; }
@@ -11066,6 +11079,69 @@
             applyElementSet(baseBind, parts.slice(1), val, t);
             i = skipExpr(i + 2, stop) - 1;
             continue;
+          }
+          // `<element>.style.<prop> = value` — CSS sink. Fires on
+          // any receiver whose last-but-one segment is `style` and
+          // whose base resolves to something element-like (tracked
+          // element binding OR a typed chain whose typeName extends
+          // HTMLElement / Element). `style.cssText` is the
+          // classical XSS-via-expression() vector, individual CSS
+          // properties can inject tracking URLs via `url(...)`.
+          if (taintEnabled && parts.length >= 3 && parts[parts.length - 2] === 'style') {
+            var _styleBase = baseBind;
+            // Walk the path to confirm the receiver is element-like.
+            var _styleElemLike = false;
+            if (_styleBase && _styleBase.kind === 'element') _styleElemLike = true;
+            else if (_styleBase && _styleBase.kind === 'chain' && _styleBase.typeName) {
+              var _styleTN = _styleBase.typeName;
+              while (_styleTN && _styleTN !== 'HTMLElement' && _styleTN !== 'Element') {
+                var _styleTypeDesc = _activeDB.types[_styleTN];
+                _styleTN = _styleTypeDesc && _styleTypeDesc.extends;
+              }
+              if (_styleTN) _styleElemLike = true;
+            }
+            // The base might walk through intermediate props
+            // (e.g. `document.body.style.X`) so also consider the
+            // trailing `.style.<prop>` pattern on a typed-chain
+            // path that we can resolve at the TypeDB level. This
+            // covers `document.body.style.X`, `frame.contentDocument.body.style.X`.
+            if (!_styleElemLike) {
+              // Walk the path through the TypeDB roots + props to
+              // find the static type of the receiver just before
+              // `.style.<prop>`. Handles unshadowed global roots
+              // like `document.body`, `window.document.body`,
+              // `frame.contentDocument.body`, etc.
+              var _styleRootType = _activeDB.roots && _activeDB.roots[parts[0]];
+              if (_styleRootType) {
+                var _styleWalkType = _styleRootType;
+                for (var _swi = 1; _swi < parts.length - 2 && _styleWalkType; _swi++) {
+                  var _swPd = _lookupProp(_activeDB, _styleWalkType, parts[_swi]);
+                  if (_swPd && _swPd.readType) { _styleWalkType = _swPd.readType; continue; }
+                  var _swMd = _lookupMethod(_activeDB, _styleWalkType, parts[_swi]);
+                  if (_swMd && typeof _swMd.returnType === 'string') { _styleWalkType = _swMd.returnType; continue; }
+                  _styleWalkType = null; break;
+                }
+                if (_styleWalkType) {
+                  var _styleChk = _styleWalkType;
+                  while (_styleChk && _styleChk !== 'HTMLElement' && _styleChk !== 'Element') {
+                    var _styleChkDesc = _activeDB.types[_styleChk];
+                    _styleChk = _styleChkDesc && _styleChkDesc.extends;
+                  }
+                  if (_styleChk) _styleElemLike = true;
+                }
+              }
+            }
+            if (_styleElemLike) {
+              var _styleR = await readValue(i + 2, stop, TERMS_TOP);
+              var _styleVal = _styleR ? _styleR.binding : null;
+              var _styleLabs = _styleVal ? getBindingLabels(_styleVal) : null;
+              if (_styleLabs && _styleLabs.size) {
+                recordTaintFinding('css', 'medium', 'style.' + parts[parts.length - 1], null, _styleLabs, taintCondStack,
+                  { expr: t.text, line: countLines(t._src, t.start) });
+              }
+              i = skipExpr(i + 2, stop) - 1;
+              continue;
+            }
           }
           // Taint: check for sink property assignments on non-tracked elements.
           if (taintEnabled && parts.length >= 2) {

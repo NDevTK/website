@@ -3971,6 +3971,10 @@ await (async function () {
   // --- filter(...).map(...).join: chain on opaque filter result ---
   await checkTaint('filter map join chain', { 'a.js': 'document.getElementById("o").innerHTML = ["a", location.hash].filter(x => x).map(x => x).join("");' }, 1, { sources: ['url'] });
 
+  // --- element.style.<prop> = tainted — CSS sink ---
+  await checkTaint('style.cssText sink', { 'a.js': 'document.body.style.cssText = location.hash;' }, 1, { sources: ['url'] });
+  await checkTaint('style.background sink', { 'a.js': 'document.body.style.background = location.hash;' }, 1, { sources: ['url'] });
+
   // --- jQuery-style DOM factory bind aliasing ---
   await checkTaint('factoryRef: $ = querySelector.bind(document)', { 'a.js': 'var $ = document.querySelector.bind(document); $("#o").innerHTML = location.hash;' }, 1, { sources: ['url'] });
 
