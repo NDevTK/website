@@ -3940,6 +3940,14 @@ await (async function () {
   // --- Precision on destructured event ---
   await checkTaint('destructure via var from event.data', { 'a.js': 'window.addEventListener("message", function(e) { var d = e.data; document.getElementById("o").innerHTML = d; });' }, 1, { sources: ['postMessage'] });
 
+  // --- Parametric Promise<T> ---
+  await checkTaint('fetch.then Response.url', { 'a.js': 'fetch("/api").then(r => document.getElementById("o").innerHTML = r.url);' }, 1);
+  await checkTaint('fetch.then.json.then', { 'a.js': 'fetch("/api").then(r => r.json()).then(data => document.getElementById("o").innerHTML = data);' }, 1, { sources: ['network'] });
+  await checkTaint('fetch.then response.text', { 'a.js': 'fetch("/api").then(r => r.text()).then(t => document.getElementById("o").innerHTML = t);' }, 1, { sources: ['network'] });
+  await checkTaint('fetch.then headers.get', { 'a.js': 'fetch("/api").then(r => document.getElementById("o").innerHTML = r.headers.get("x-foo"));' }, 1, { sources: ['network'] });
+  await checkTaint('await fetch.url', { 'a.js': 'async function f() { var r = await fetch("/x"); document.getElementById("o").innerHTML = r.url; } f();' }, 1);
+  await checkTaint('await fetch json', { 'a.js': 'async function f() { var r = await fetch("/x"); var d = await r.json(); document.getElementById("o").innerHTML = d; } f();' }, 1, { sources: ['network'] });
+
   // --- Destructured function parameters ---
   await checkTaint('destructured fn {data}', { 'a.js': 'window.addEventListener("message", function({data}) { document.getElementById("o").innerHTML = data; });' }, 1, { sources: ['postMessage'] });
   await checkTaint('destructured arrow {data}', { 'a.js': 'window.addEventListener("message", ({data}) => { document.getElementById("o").innerHTML = data; });' }, 1, { sources: ['postMessage'] });

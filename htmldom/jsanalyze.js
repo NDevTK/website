@@ -371,6 +371,60 @@
     return parts;
   }
 
+  // Resolve the `innerType` (the type parameter of a parametric
+  // container like Promise<T>) of an expression. Walks the same
+  // path as `_resolveExprTypeViaDB` but reads `innerType` from
+  // the terminal descriptor instead of `returnType` / `readType`.
+  // Returns the innerType string or null if the expression's
+  // result isn't parametric.
+  function _resolveInnerTypeViaDB(db, expr, scope) {
+    if (!db || !expr) return null;
+    if (/^new\s+/.test(expr)) expr = expr.replace(/^new\s+/, '');
+    var parts = _splitDottedExpr(expr);
+    if (parts.length === 0) return null;
+    var typeName = null;
+    var innerType = null;
+    for (var i = 0; i < parts.length; i++) {
+      var seg = parts[i];
+      var parenIdx = seg.indexOf('(');
+      var isCall = parenIdx >= 0;
+      if (isCall) seg = seg.slice(0, parenIdx);
+      if (i === 0) {
+        if (scope) {
+          var rootHit = scope(seg);
+          if (rootHit) {
+            if (rootHit.typeName) typeName = rootHit.typeName;
+            else if (rootHit.shadowed) return null;
+          }
+        }
+        if (!typeName) typeName = db.roots[seg];
+        if (!typeName) return null;
+        if (isCall) {
+          var rootDesc = db.types[typeName];
+          var cd = rootDesc ? (rootDesc.call || rootDesc.construct) : null;
+          if (!cd) return null;
+          if (cd.innerType) innerType = cd.innerType;
+          if (typeof cd.returnType !== 'string') return null;
+          typeName = cd.returnType;
+        }
+        continue;
+      }
+      if (isCall) {
+        var methodDesc = _lookupMethod(db, typeName, seg);
+        if (!methodDesc) return null;
+        innerType = methodDesc.innerType || null; // reset per-segment
+        if (typeof methodDesc.returnType !== 'string') return null;
+        typeName = methodDesc.returnType;
+      } else {
+        var propDesc = _lookupProp(db, typeName, seg);
+        if (!propDesc || !propDesc.readType) return null;
+        innerType = null; // property reads don't carry innerType
+        typeName = propDesc.readType;
+      }
+    }
+    return innerType;
+  }
+
   function _resolveExprTypeViaDB(db, expr, scope) {
     if (!db || !expr) return null;
     // Strip a leading `new ` so `new FileReader()` resolves the
@@ -4111,15 +4165,17 @@
           }
           var _extRef;
           if (_typed) {
-            // Type-precise extension: create a fresh ref
-            // carrying ONLY the label resolved via the type
-            // walk. This narrows a bulk-tainted parameter
-            // (e.g. an ErrorEvent param with both `network`
-            // and `url` labels) down to the specific prop's
-            // label when the user reads `e.filename`.
-            _extRef = exprRef(_extText);
+            // Typed extension: the new prop's label is the
+            // UNION of the receiver's labels (propagation)
+            // and the prop descriptor's own source label
+            // (new source). Event-param narrowing is no
+            // longer needed because destructure/typed-access
+            // already resolves each prop specifically via
+            // `_lookupProp`, so there's no bulk label set to
+            // narrow.
+            _extRef = deriveExprRef(_extText, b.toks);
             if (_extLabel) {
-              _extRef.taint = new Set();
+              if (!_extRef.taint) _extRef.taint = new Set();
               if (typeof _extLabel === 'string') _extRef.taint.add(_extLabel);
               else for (var _extL of _extLabel) _extRef.taint.add(_extL);
             }
@@ -5821,19 +5877,32 @@
         if (!pfn) return null;
         const prp = tks[pfnEnd];
         if (!prp || prp.type !== 'close' || prp.char !== ')') return null;
-        // The first arg of the callback receives the Promise's resolved
-        // value — which is just the receiver chain itself, because the
-        // analyzer doesn't distinguish a Promise<T> from its T. Pass the
-        // receiver as the first arg so any taint flows through.
+        // The first arg of the callback receives the Promise's
+        // resolved value. If the receiver chain carries an
+        // `innerType` (set when `fetch()` / `Response.json()` /
+        // etc. wrapped the value as Promise<T>), type the
+        // callback's first param as T. Otherwise fall back to
+        // the receiver-chain passthrough so taint still flows.
         var receiverTaint = collectChainTaint(bind.toks);
-        var firstArgChain = chainBinding(bind.toks.slice());
-        if (receiverTaint && firstArgChain.toks.length) {
-          // Tag the first token with the receiver's taint so the inlined
-          // body sees a tainted parameter.
-          var pTok0 = Object.assign({}, firstArgChain.toks[0]);
-          if (!pTok0.taint) pTok0.taint = new Set();
-          for (var ptl of receiverTaint) pTok0.taint.add(ptl);
-          firstArgChain.toks[0] = pTok0;
+        var firstArgChain;
+        if (method === 'then' && bind.innerType) {
+          // Typed Promise unwrap: callback arg is an opaque
+          // chain with the inner typeName. Carries the
+          // receiver's taint so upstream labels flow forward.
+          var _thenPName = (pfn.params[0] && pfn.params[0].name) || '__resolvedValue__';
+          var _thenRef = exprRef(_thenPName);
+          if (receiverTaint) _thenRef.taint = new Set(receiverTaint);
+          firstArgChain = chainBinding([_thenRef]);
+          firstArgChain.typeName = bind.innerType;
+          if (receiverTaint) firstArgChain.labels = new Set(receiverTaint);
+        } else {
+          firstArgChain = chainBinding(bind.toks.slice());
+          if (receiverTaint && firstArgChain.toks.length) {
+            var pTok0 = Object.assign({}, firstArgChain.toks[0]);
+            if (!pTok0.taint) pTok0.taint = new Set();
+            for (var ptl of receiverTaint) pTok0.taint.add(ptl);
+            firstArgChain.toks[0] = pTok0;
+          }
         }
         var pParamBinds = pfn.params.map(function (p, idx) {
           if (idx === 0) return firstArgChain;
@@ -5910,6 +5979,13 @@
           var _gmResult = chainBinding([exprRef(method + '(...)')]);
           if (typeof _gmMethod.returnType === 'string') {
             _gmResult.typeName = _gmMethod.returnType;
+          }
+          // Parametric `Promise<T>` support: if the method
+          // descriptor declares `innerType: 'T'`, attach it to
+          // the result chain. The `.then(cb)` handler uses this
+          // to type the callback's first param as T.
+          if (_gmMethod.innerType) {
+            _gmResult.innerType = _gmMethod.innerType;
           }
           var _gmLabels2 = null;
           if (_gmMethod.source) { _gmLabels2 = new Set(); _gmLabels2.add(_gmMethod.source); }
@@ -6022,13 +6098,19 @@
       for (var _pi = prefixes.length - 1; _pi >= 0; _pi--) {
         var _pf = prefixes[_pi];
         if (_pf.kind === 'keyword') {
-          // `await` and `yield` are unwrapping operations on Promises /
-          // generators — for taint analysis they're transparent: the
-          // result has the same taint as the inner expression. Pass the
-          // binding through unchanged so taint flows from `await fetch(...)`
-          // into the awaited value.
+          // `await` unwraps Promise<T> → T. When the awaited
+          // chain carries `innerType`, retype the result as
+          // the unwrapped type so downstream reads resolve
+          // against T's descriptors. Taint labels pass through
+          // unchanged. `yield` is handled the same way
+          // (generators are out of scope for type refinement).
           if (_pf.text === 'await' || _pf.text === 'yield') {
-            // baseResult unchanged — keep the binding's taint.
+            if (baseResult.bind && baseResult.bind.kind === 'chain' && baseResult.bind.innerType) {
+              var _unwrapped = chainBinding(baseResult.bind.toks.slice());
+              _unwrapped.typeName = baseResult.bind.innerType;
+              if (baseResult.bind.labels) _unwrapped.labels = baseResult.bind.labels;
+              baseResult = { bind: _unwrapped, next: baseResult.next };
+            }
             continue;
           }
           var _et = chainAsExprText(baseResult.bind);
@@ -6532,6 +6614,11 @@
           var _opaqueResult = chainBinding([_opaqueRef]);
           var _opaqueType = _resolveExprTypeViaDB(_activeDB, _opaqueText, typedScope);
           if (_opaqueType) _opaqueResult.typeName = _opaqueType;
+          // Propagate `innerType` from the terminal method /
+          // call descriptor so Promise<T> chains carry T for
+          // downstream `.then` / `await`.
+          var _opaqueInner = _resolveInnerTypeViaDB(_activeDB, _opaqueText, typedScope);
+          if (_opaqueInner) _opaqueResult.innerType = _opaqueInner;
           if (_opaqueTaint) _opaqueResult.labels = _opaqueTaint;
           return { bind: _opaqueResult, next: end };
         }
@@ -11601,21 +11688,45 @@
 
       // --- Network types ---
       Response: {
+        props: {
+          ok:         { readType: 'Boolean' },
+          status:     {},
+          statusText: {},
+          url:        { source: 'url', readType: 'String' },
+          headers:    { readType: 'Headers' },
+          body:       { source: 'network' },
+          bodyUsed:   {},
+          redirected: {},
+          type:       {},
+        },
         methods: {
-          json:      { source: 'network', returnType: 'Promise' },
-          text:      { source: 'network', returnType: 'Promise' },
-          blob:      { source: 'network', returnType: 'Promise' },
-          arrayBuffer: { source: 'network', returnType: 'Promise' },
-          formData:  { source: 'network', returnType: 'Promise' },
+          // Each body-reader method returns Promise<T> — the
+          // walker reads `innerType` when it sees a `.then(cb)`
+          // or `await` on the result chain so `cb` / the awaited
+          // value is typed correctly.
+          json:        { source: 'network', returnType: 'Promise', innerType: 'Object' },
+          text:        { source: 'network', returnType: 'Promise', innerType: 'String' },
+          blob:        { source: 'network', returnType: 'Promise', innerType: 'Blob' },
+          arrayBuffer: { source: 'network', returnType: 'Promise', innerType: 'ArrayBuffer' },
+          formData:    { source: 'network', returnType: 'Promise', innerType: 'FormData' },
+          clone:       { returnType: 'Response' },
         },
       },
+      // Promise<T>: `innerType` on the chain binding records T.
+      // `.then(cb)` dispatches the callback with a typed first
+      // arg whose typeName is the innerType. `.catch/finally`
+      // don't expose the resolved value's type the same way.
       Promise: {
         methods: {
-          then:    { args: [{}, {}] },
+          then:    { args: [{ usesReceiverInnerType: true }, {}] },
           catch:   { args: [{}] },
           finally: { args: [{}] },
         },
       },
+      // ArrayBuffer / Object placeholder types.
+      ArrayBuffer: {},
+      Object: {},
+      Boolean: {},
       XMLHttpRequest: {
         extends: 'EventTarget',
         props: {
@@ -11694,11 +11805,14 @@
         call: { args: [{ sink: 'code', severity: 'high' }, {}] },
       },
       GlobalFetch: {
-        // `fetch(...)` is tagged as a network source at the call
-        // site in addition to returning a Promise — matches the
-        // legacy TAINT_SOURCE_CALLS behaviour that treats the
-        // call result as attacker-influenced data.
-        call: { source: 'network', returnType: 'Promise' },
+        // `fetch(...)` returns Promise<Response>. The walker
+        // attaches `innerType: 'Response'` to the result chain
+        // so `.then(r => r.json())` types `r` as Response. The
+        // `source: 'network'` label is applied to the Promise
+        // itself (matches the legacy TAINT_SOURCE_CALLS
+        // behaviour that treats the call result as attacker-
+        // influenced data).
+        call: { source: 'network', returnType: 'Promise', innerType: 'Response' },
       },
       GlobalXMLHttpRequestCtor: {
         construct: { source: 'network', returnType: 'XMLHttpRequest' },
