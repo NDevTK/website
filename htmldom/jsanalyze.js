@@ -9382,9 +9382,13 @@
         if (_clsName && _clsName.type === 'other' && IDENT_RE.test(_clsName.text)) _clsIdx++;
         else _clsName = null;
         // Optional extends.
+        var _clsParent = null;
         if (tokens[_clsIdx] && tokens[_clsIdx].type === 'other' && tokens[_clsIdx].text === 'extends') {
           _clsIdx++; // skip extends
-          if (tokens[_clsIdx] && tokens[_clsIdx].type === 'other') _clsIdx++; // skip parent class name
+          if (tokens[_clsIdx] && tokens[_clsIdx].type === 'other') {
+            _clsParent = tokens[_clsIdx].text;
+            _clsIdx++;
+          }
         }
         _clsOpen = tokens[_clsIdx];
         if (_clsOpen && _clsOpen.type === 'open' && _clsOpen.char === '{') {
@@ -9396,7 +9400,20 @@
             _clsEnd++;
           }
           // Parse methods inside the class body.
+          // Inherit parent methods first (class B extends A {}
+          // copies A's method functions into B's prop map so
+          // `new B().method()` dispatches to the inherited
+          // body). Parent is resolved from the current scope;
+          // if not found, B gets an empty base.
           var _clsProps = Object.create(null);
+          if (_clsParent) {
+            var _parentBind = resolve(_clsParent);
+            if (_parentBind && _parentBind.kind === 'object' && _parentBind._isClass) {
+              for (var _pck in _parentBind.props) {
+                _clsProps[_pck] = _parentBind.props[_pck];
+              }
+            }
+          }
           var _clsJ = _clsIdx + 1;
           while (_clsJ < _clsEnd - 1) {
             var _mTok = tokens[_clsJ];

@@ -3940,6 +3940,9 @@ await (async function () {
   // --- Precision on destructured event ---
   await checkTaint('destructure via var from event.data', { 'a.js': 'window.addEventListener("message", function(e) { var d = e.data; document.getElementById("o").innerHTML = d; });' }, 1, { sources: ['postMessage'] });
 
+  // --- Class extends inheritance ---
+  await checkTaint('class extends method inherit', { 'a.js': 'class A { fire() { document.getElementById("o").innerHTML = location.hash; } } class B extends A {} new B().fire();' }, 1, { sources: ['url'] });
+
   // --- Optional chaining with typed chains ---
   await checkTaint('optional chain window.location', { 'a.js': 'var loc = window?.location; document.getElementById("o").innerHTML = loc?.hash;' }, 1, { sources: ['url'] });
   await checkTaint('optional chain FileReader', { 'a.js': 'var fr = new FileReader(); document.getElementById("o").innerHTML = fr?.result;' }, 1, { sources: ['file'] });
