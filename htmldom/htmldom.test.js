@@ -3533,25 +3533,6 @@ await (async function () {
   await checkTaint('step=1 hits 5', { 'a.js': 'for (var i = 0; i < 10; i++) { if (i === 5) { document.getElementById("o").innerHTML = location.search; } }' }, 1);
   await checkTaint('step=1 out of range', { 'a.js': 'for (var i = 0; i < 10; i++) { if (i === 11) { document.getElementById("o").innerHTML = location.search; } }' }, 0);
 
-  // --- Event handler property assignment (obj.onX = fn) ---
-  //
-  // Setting a DOM event handler via direct property assignment has
-  // the same runtime effect as addEventListener(eventName, fn), and
-  // the walker registers it with the same taint-source semantics —
-  // the first parameter is marked with whatever EVENT_TAINT_SOURCES
-  // says for that event type.
-  await checkTaint('ws.onmessage = fn',
-    { 'a.js': 'var ws = new WebSocket("wss://x"); ws.onmessage = function(ev) { document.getElementById("o").innerHTML = ev.data; };' },
-    1, { sources: ['postMessage'] });
-  await checkTaint('window.onmessage = fn',
-    { 'a.js': 'window.onmessage = function(e) { document.getElementById("o").innerHTML = e.data; };' },
-    1, { sources: ['postMessage'] });
-  await checkTaint('arrow assigned to onmessage',
-    { 'a.js': 'var ws = new WebSocket("wss://x"); ws.onmessage = (ev) => { document.getElementById("o").innerHTML = ev.data; };' },
-    1, { sources: ['postMessage'] });
-  await checkTaint('onX with untracked event type is still registered',
-    { 'a.js': 'document.onclick = function(e) { /* click isn\'t in EVENT_TAINT_SOURCES, no taint */ e.preventDefault(); };' }, 0);
-
   // --- Destructuring assignments propagate taint ---
   //
   // When the right-hand side of a destructuring assignment is an
@@ -3583,20 +3564,6 @@ await (async function () {
     { 'a.js': 'const { x } = { x: "safe" }; document.getElementById("o").innerHTML = x;' }, 0);
   await checkTaint('destructure known-safe object var is safe',
     { 'a.js': 'var obj = { search: "a", path: "b" }; const { search } = obj; document.getElementById("o").innerHTML = search;' }, 0);
-
-  // --- Full-dotted-path sinks: document.domain ---
-  //
-  // Assigning to document.domain weakens the same-origin policy by
-  // relaxing the effective origin. Any attacker-controlled value
-  // reaching this sink is genuinely dangerous.
-  await checkTaint('document.domain = location.hash',
-    { 'a.js': 'document.domain = location.hash;' },
-    1, { sink: 'document.domain' });
-  await checkTaint('document.domain = const is safe',
-    { 'a.js': 'document.domain = "example.com";' }, 0);
-  // Guard: document.title is NOT flagged (not a code-injection sink).
-  await checkTaint('document.title assignment is not a sink',
-    { 'a.js': 'document.title = location.hash;' }, 0);
 
   // --- SMT integration: all branch types ---
   await checkTaint('while unsat path', { 'a.js': 'var x = location.search; if (x > 5) { while (x < 3) { document.getElementById("o").innerHTML = x; } }' }, 0);

@@ -210,24 +210,6 @@
     'textContent':        { type: 'text',   severity: 'safe',   elementDependent: true, elements: new Set(['script', 'style']) },
     // Safe by default on non-script/style elements — only a sink on script/style
   };
-  // Full-dotted-path sinks. Keyed by the complete dotted path because
-  // the leaf property alone would be ambiguous — a user-defined
-  // `obj.domain = x` is harmless, but `document.domain = x` weakens
-  // the same-origin policy by relaxing the effective origin to a
-  // parent DNS suffix. It's the only standard browser API that lets
-  // script silently change its own origin's SOP boundary, so any
-  // attacker-controlled value reaching it is genuinely dangerous
-  // (cross-frame access, cookie scope widening, etc.).
-  //
-  // We deliberately do NOT include `document.title` here: the browser
-  // treats the title as plain text, no markup parsing, no script
-  // execution, no origin changes. It surfaces to tab labels and
-  // screen readers, which is a phishing/UX concern, not a code-
-  // injection sink, and flagging it would false-positive on every
-  // normal `document.title = page.title` pattern.
-  const TAINT_PATH_SINKS = {
-    'document.domain': { type: 'origin', severity: 'high' },
-  };
   // Global call sinks (not property-based).
   const TAINT_CALL_SINKS = {
     'eval':                   { type: 'code', severity: 'high' },
@@ -8869,60 +8851,6 @@
           // Taint: check for sink property assignments on non-tracked elements.
           if (taintEnabled && parts.length >= 2) {
             const sinkProp = parts[parts.length - 1];
-            // Full-path sinks: `document.title = x`, `document.domain = x`,
-            // etc. These take precedence over leaf-keyed sinks when both
-            // would match, and they cover paths the leaf-keyed set can't
-            // distinguish from benign user-object assignments.
-            var _pathSinkInfo = TAINT_PATH_SINKS[t.text];
-            if (_pathSinkInfo) {
-              const r = await readValue(i + 2, stop, TERMS_TOP);
-              const val = r ? r.binding : null;
-              if (val && val.kind === 'chain') {
-                var _psTaint = collectChainTaint(val.toks);
-                if (_psTaint && _psTaint.size) {
-                  recordTaintFinding(_pathSinkInfo.type, _pathSinkInfo.severity, t.text, null, _psTaint, taintCondStack,
-                    { expr: t.text, line: countLines(t._src, t.start) });
-                }
-              }
-              i = skipExpr(i + 2, stop) - 1;
-              continue;
-            }
-            // Event handler property assignment: `xhr.onload = fn`,
-            // `ws.onmessage = fn`, `window.onmessage = fn`, etc. The
-            // semantics are identical to
-            // `obj.addEventListener(eventType, fn)` for `eventType`
-            // equal to the property name minus the `on` prefix — the
-            // browser invokes `fn` with an event object whose shape
-            // depends on the event type. We route these through the
-            // same taint-registration path as addEventListener so the
-            // handler body sees the per-event taint sources (e.g.
-            // `ev.data` for message events is postMessage-tainted).
-            if (/^on[a-z]+$/.test(sinkProp)) {
-              const _handlerRhs = await readValue(i + 2, stop, TERMS_TOP);
-              const _handlerBind = _handlerRhs ? _handlerRhs.binding : null;
-              if (_handlerBind && _handlerBind.kind === 'function') {
-                var _ohEventType = sinkProp.slice(2); // 'onmessage' → 'message'
-                var _ohParamBindings = [];
-                if (EVENT_TAINT_SOURCES[_ohEventType] && _handlerBind.params && _handlerBind.params.length > 0) {
-                  var _ohSources = EVENT_TAINT_SOURCES[_ohEventType];
-                  var _ohPn = _handlerBind.params[0].name;
-                  var _ohRef = exprRef(_ohPn);
-                  _ohRef.taint = new Set(Object.values(_ohSources));
-                  _ohParamBindings.push(chainBinding([_ohRef]));
-                } else if (_handlerBind.params && _handlerBind.params.length > 0) {
-                  _ohParamBindings.push(chainBinding([exprRef(_handlerBind.params[0].name)]));
-                }
-                var _ohPrevInEH = inEventHandler;
-                inEventHandler = true;
-                await instantiateFunction(_handlerBind, _ohParamBindings);
-                inEventHandler = _ohPrevInEH;
-                if (_pendingCallbacks) {
-                  _pendingCallbacks.push({ fn: _handlerBind, params: _ohParamBindings, isEventHandler: true });
-                }
-              }
-              i = skipExpr(i + 2, stop) - 1;
-              continue;
-            }
             if (TAINT_SINKS[sinkProp] || sinkProp === 'src' || sinkProp === 'href' || sinkProp === 'action' || sinkProp === 'srcdoc') {
               const r = await readValue(i + 2, stop, TERMS_TOP);
               const val = r ? r.binding : null;
