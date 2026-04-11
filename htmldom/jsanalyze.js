@@ -3636,7 +3636,7 @@
     // walkers. Returns `{typeName}` when a name resolves to a
     // typed local binding, `{shadowed: true}` when it resolves
     // to an untyped local binding (user var shadowing any
-    // global), or null when the name isn't locally declared
+    // global), or null when the name isn't locally in scope
     // (walker falls back to `db.roots` for unshadowed globals).
     //
     // A binding's `typeName` is set at assignment time — e.g.
@@ -3650,10 +3650,17 @@
     //
     // The walker sees `loc` in scope → uses typeName=Location →
     // looks up `hash` on Location → source='url'.
+    //
+    // Uses `resolve()` for lookup so function parameters,
+    // captured closures, and block-scoped locals all
+    // participate in the type resolution properly. The
+    // legacy `declaredNames.has(...)` hack was a file-wide
+    // over-approximation; `resolve` gives the actual active
+    // binding at this program point.
     const typedScope = (name) => {
-      if (!declaredNames.has(name)) return null;
       var b = resolve(name);
-      if (b && b.typeName) return { typeName: b.typeName };
+      if (!b) return null;
+      if (b.typeName) return { typeName: b.typeName };
       return { shadowed: true };
     };
     // Taint checking helpers (no-ops when taintEnabled is false).
@@ -3989,11 +3996,9 @@
           // expression-text concatenation.
           var _remainingPath = parts.slice(i).join('.');
           var _extText = b.toks[0].text + '.' + _remainingPath;
-          var _extRef = deriveExprRef(_extText, b.toks);
-          // Prefer type-based lookup via the binding's
-          // typeName; fall back to text-based walking otherwise.
           var _extLabel = null;
           var _extType = null;
+          var _typed = false;
           if (b.typeName) {
             var _typedRootName = '__t' + (Math.random() * 1e9 | 0) + '__';
             var _typedRootScope = (function (rootName, rootType) {
@@ -4002,14 +4007,34 @@
             var _syntheticExpr = _typedRootName + '.' + _remainingPath;
             _extLabel = getTaintSource(_syntheticExpr, _typedRootScope);
             _extType = _resolveExprTypeViaDB(DEFAULT_TYPE_DB, _syntheticExpr, _typedRootScope);
+            _typed = (_extLabel != null || _extType != null);
           }
-          if (_extLabel == null) {
-            _extLabel = checkTaintSource(_extText);
-          }
-          if (_extLabel) {
-            if (!_extRef.taint) _extRef.taint = new Set();
-            if (typeof _extLabel === 'string') _extRef.taint.add(_extLabel);
-            else for (var _extL of _extLabel) _extRef.taint.add(_extL);
+          var _extRef;
+          if (_typed) {
+            // Type-precise extension: create a fresh ref
+            // carrying ONLY the label resolved via the type
+            // walk. This narrows a bulk-tainted parameter
+            // (e.g. an ErrorEvent param with both `network`
+            // and `url` labels) down to the specific prop's
+            // label when the user reads `e.filename`.
+            _extRef = exprRef(_extText);
+            if (_extLabel) {
+              _extRef.taint = new Set();
+              if (typeof _extLabel === 'string') _extRef.taint.add(_extLabel);
+              else for (var _extL of _extLabel) _extRef.taint.add(_extL);
+            }
+          } else {
+            // No type info — inherit the old taint via
+            // deriveExprRef and re-check the extended text for
+            // source labels. This keeps untyped propagation
+            // working for opaque parameter chains.
+            _extRef = deriveExprRef(_extText, b.toks);
+            var _untypedLabel = checkTaintSource(_extText);
+            if (_untypedLabel) {
+              if (!_extRef.taint) _extRef.taint = new Set();
+              if (typeof _untypedLabel === 'string') _extRef.taint.add(_untypedLabel);
+              else for (var _untypedL of _untypedLabel) _extRef.taint.add(_untypedL);
+            }
           }
           b = chainBinding([_extRef]);
           if (!_extType) _extType = _resolveExprTypeViaDB(DEFAULT_TYPE_DB, _extText, typedScope);
@@ -9484,22 +9509,36 @@
                 var _evTypeStr = _evArgs.bindings[0] && _evArgs.bindings[0].kind === 'chain' ? chainAsKnownString(_evArgs.bindings[0]) : null;
                 var _evHandler = _evArgs.bindings[1];
                 if (_evHandler && _evHandler.kind === 'function') {
-                  // Build tainted param binding if this event type has known sources.
-                  // Resolved via db.eventMap[eventName] → Event
-                  // subtype → flat set of source labels reachable
-                  // via its props/methods (including via extends
-                  // and readType chains).
+                  // Build the event-param binding. When the
+                  // event name resolves to a known Event
+                  // subtype via db.eventMap, tag the param's
+                  // binding with that typeName — so inside the
+                  // handler body, `e.data` / `e.newURL` /
+                  // `e.dataTransfer.files` resolve through the
+                  // TypeDB properly rather than inheriting a
+                  // bulk set of taint labels.
+                  //
+                  // The legacy bulk-label approach (attaching
+                  // every reachable source label via
+                  // `_collectEventSourceLabels`) is kept as a
+                  // fallback for handlers where the body
+                  // processes the event through an opaque path
+                  // the walker can't resolve — it ensures the
+                  // finding still fires when a tainted prop is
+                  // forwarded to a sink without an explicit
+                  // typed read.
                   var _evParamBindings = [];
                   var _evTypeName = _evTypeStr ? DEFAULT_TYPE_DB.eventMap[_evTypeStr] : null;
-                  var _evLabels = _evTypeName ? _collectEventSourceLabels(DEFAULT_TYPE_DB, _evTypeName) : null;
-                  if (_evLabels && _evLabels.size > 0 && _evHandler.params && _evHandler.params.length > 0) {
+                  if (_evHandler.params && _evHandler.params.length > 0) {
                     var _pn = _evHandler.params[0].name;
                     var _evRef = exprRef(_pn);
-                    _evRef.taint = _evLabels;
-                    _evParamBindings.push(chainBinding([_evRef]));
-                  } else if (_evHandler.params && _evHandler.params.length > 0) {
-                    // Unknown event type: param is opaque, no taint.
-                    _evParamBindings.push(chainBinding([exprRef(_evHandler.params[0].name)]));
+                    if (_evTypeName) {
+                      var _evLabels = _collectEventSourceLabels(DEFAULT_TYPE_DB, _evTypeName);
+                      if (_evLabels && _evLabels.size > 0) _evRef.taint = _evLabels;
+                    }
+                    var _evParamBinding = chainBinding([_evRef]);
+                    if (_evTypeName) _evParamBinding.typeName = _evTypeName;
+                    _evParamBindings.push(_evParamBinding);
                   }
                   // Walk the handler body once. Convergence (re-walking
                   // until state stabilises) is handled at the OUTER
