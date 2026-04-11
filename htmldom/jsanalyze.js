@@ -6487,6 +6487,33 @@
       }
       if (t.type === 'regex') return { bind: chainBinding([exprRef(t.text)]), next: k + 1 };
       if (t.type === 'open' && t.char === '(') {
+        // Parenthesized function / arrow expression (often the
+        // head of an IIFE): `(function(x){…})(arg)` or
+        // `(x => x)(arg)`. Return the function binding
+        // directly so the caller's call-suffix handler can
+        // inline it with typed args. Without this the whole
+        // function expression is flattened to tokens by
+        // readConcatExpr and the IIFE loses its callable
+        // identity.
+        var _innerFn = null, _innerFnEnd = -1;
+        var _pfe = await readFunctionExpr(k + 1, stop);
+        if (_pfe) {
+          _innerFn = _pfe.binding;
+          _innerFnEnd = _pfe.next;
+        } else {
+          var _parr = peekArrow(k + 1, stop);
+          if (_parr) {
+            var _parrBody = readArrowBody(_parr.arrowNext, stop);
+            if (_parrBody) {
+              _innerFn = functionBinding(_parr.params, _parrBody.bodyStart, _parrBody.bodyEnd, _parrBody.isBlock);
+              _innerFn.capturedScope = _snapshotClosureForCapture();
+              _innerFnEnd = _parrBody.next;
+            }
+          }
+        }
+        if (_innerFn && tks[_innerFnEnd] && tks[_innerFnEnd].type === 'close' && tks[_innerFnEnd].char === ')') {
+          return { bind: _innerFn, next: _innerFnEnd + 1 };
+        }
         // Handle comma operator: (expr1, expr2, ..., exprN) → value is exprN.
         var _lastToks = null, _parenNext = k + 1;
         while (_parenNext < stop) {

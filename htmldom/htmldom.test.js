@@ -3940,6 +3940,10 @@ await (async function () {
   // --- Precision on destructured event ---
   await checkTaint('destructure via var from event.data', { 'a.js': 'window.addEventListener("message", function(e) { var d = e.data; document.getElementById("o").innerHTML = d; });' }, 1, { sources: ['postMessage'] });
 
+  // --- IIFE inline dispatch ---
+  await checkTaint('IIFE call identity', { 'a.js': 'document.getElementById("o").innerHTML = (function(x) { return x; })(location.hash);' }, 1, { sources: ['url'] });
+  await checkTaint('IIFE arrow', { 'a.js': 'document.getElementById("o").innerHTML = ((x) => x)(location.hash);' }, 1, { sources: ['url'] });
+
   // --- Promise static methods (Promise.all / race / resolve / any) ---
   await checkTaint('Promise.all taint union', { 'a.js': 'Promise.all([fetch("/a"), fetch("/b")]).then(rs => document.getElementById("o").innerHTML = rs[0]);' }, 1, { sources: ['network'] });
   await checkTaint('Promise.race inner-type LUB', { 'a.js': 'Promise.race([fetch("/a"), fetch("/b")]).then(r => document.getElementById("o").innerHTML = r.url);' }, 1);
