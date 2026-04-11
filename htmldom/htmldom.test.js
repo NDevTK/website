@@ -3940,6 +3940,11 @@ await (async function () {
   // --- Precision on destructured event ---
   await checkTaint('destructure via var from event.data', { 'a.js': 'window.addEventListener("message", function(e) { var d = e.data; document.getElementById("o").innerHTML = d; });' }, 1, { sources: ['postMessage'] });
 
+  // --- Higher-order function calls ---
+  await checkTaint('hof inline callback', { 'a.js': 'function apply(fn, v) { return fn(v); } document.getElementById("o").innerHTML = apply(function(x) { return x; }, location.hash);' }, 1, { sources: ['url'] });
+  await checkTaint('hof arrow callback', { 'a.js': 'function apply(fn, v) { return fn(v); } document.getElementById("o").innerHTML = apply(x => x, location.hash);' }, 1, { sources: ['url'] });
+  await checkTaint('hof wraps sink', { 'a.js': 'function call(fn, v) { fn(v); } call(x => document.getElementById("o").innerHTML = x, location.hash);' }, 1, { sources: ['url'] });
+
   // --- Class extends inheritance ---
   await checkTaint('class extends method inherit', { 'a.js': 'class A { fire() { document.getElementById("o").innerHTML = location.hash; } } class B extends A {} new B().fire();' }, 1, { sources: ['url'] });
 

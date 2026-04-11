@@ -6807,7 +6807,13 @@
           }
           // Call syntax: `name(args)` where name resolves to a function binding.
           if (b.kind === 'function' && isCall) {
-            const args = await readConcatArgs(k + 1, stop);
+            // Use readCallArgBindings instead of readConcatArgs
+            // so function-expression arguments preserve their
+            // function kind. Without this, passing a callback
+            // like `apply(function(x) { ... }, v)` would
+            // flatten the function arg to a chain of tokens and
+            // lose the callable inside the callee's body.
+            const args = await readCallArgBindings(k + 1, stop);
             if (!args) return null;
             // For method calls (dotted path), bind 'this' to the receiver object.
             var _thisBind = null;
@@ -6815,7 +6821,7 @@
             if (_dot > 0) {
               _thisBind = await resolvePath(t.text.slice(0, _dot));
             }
-            var _fnResult = await instantiateFunction(b, args.args.map((a) => chainBinding(a)), _thisBind);
+            var _fnResult = await instantiateFunction(b, args.bindings, _thisBind);
             // Non-chain return (object/array/function binding).
             if (_fnResult && _fnResult.kind && _fnResult.kind !== 'chain') {
               return { bind: _fnResult, next: args.next };
@@ -6831,8 +6837,9 @@
               // Taint: check if this is a sanitizer (clears taint) or propagates it.
               if (taintEnabled && !isSanitizer(t.text, typedScope)) {
                 var _argTaint = null;
-                for (var _ai = 0; _ai < args.args.length; _ai++) {
-                  var _at = collectChainTaint(args.args[_ai]);
+                for (var _ai = 0; _ai < args.bindings.length; _ai++) {
+                  var _ab = args.bindings[_ai];
+                  var _at = _ab ? getBindingLabels(_ab) : null;
                   if (_at) { if (!_argTaint) _argTaint = new Set(); for (var _l of _at) _argTaint.add(_l); }
                 }
                 if (_argTaint) _callRef.taint = _argTaint;
