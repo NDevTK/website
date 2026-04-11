@@ -3965,6 +3965,12 @@ await (async function () {
   // --- Optional chain call on unresolved receiver with tainted arg ---
   await checkTaint('opt-chain unresolved call taint', { 'a.js': 'document.getElementById("o").innerHTML = api?.fetch?.(location.hash);' }, 1, { sources: ['url'] });
 
+  // --- Early return pattern: multiple return statements ---
+  await checkTaint('early return tainted branch', { 'a.js': 'function f() { if (a) return "s"; return location.hash; } document.getElementById("o").innerHTML = f();' }, 1, { sources: ['url'] });
+
+  // --- filter(...).map(...).join: chain on opaque filter result ---
+  await checkTaint('filter map join chain', { 'a.js': 'document.getElementById("o").innerHTML = ["a", location.hash].filter(x => x).map(x => x).join("");' }, 1, { sources: ['url'] });
+
   // --- jQuery-style DOM factory bind aliasing ---
   await checkTaint('factoryRef: $ = querySelector.bind(document)', { 'a.js': 'var $ = document.querySelector.bind(document); $("#o").innerHTML = location.hash;' }, 1, { sources: ['url'] });
 

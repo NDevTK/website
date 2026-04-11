@@ -6099,6 +6099,68 @@
         }
       }
 
+      // Chain-kind .map / .filter / .forEach: a previous opaque
+      // iterable operation (e.g. `arr.filter(x=>x)` with a
+      // data-dependent predicate) produced a chain carrying all
+      // element labels. A downstream `.map/.filter/.forEach`
+      // should still walk its callback with the receiver's taint
+      // so taint flows through the full chain.
+      if (bind && bind.kind === 'chain' && !bind.typeName &&
+          (method === 'map' || method === 'filter' || method === 'forEach')) {
+        var _chLabels = getBindingLabels(bind);
+        if (_chLabels && _chLabels.size) {
+          const lp = tks[parenIdx];
+          if (lp && lp.type === 'open' && lp.char === '(') {
+            var _chFn = null, _chFnNext = 0;
+            var _chArrow = peekArrow(parenIdx + 1, stop);
+            if (_chArrow) {
+              var _chBody = readArrowBody(_chArrow.arrowNext, stop);
+              if (_chBody) {
+                _chFn = functionBinding(_chArrow.params, _chBody.bodyStart, _chBody.bodyEnd, _chBody.isBlock);
+                _chFn.capturedScope = _snapshotClosureForCapture();
+                _chFnNext = _chBody.next;
+              }
+            }
+            if (!_chFn) {
+              var _chFexpr = await readFunctionExpr(parenIdx + 1, stop);
+              if (_chFexpr) { _chFn = _chFexpr.binding; _chFnNext = _chFexpr.next; }
+            }
+            if (_chFn) {
+              var _chRp = tks[_chFnNext];
+              if (_chRp && _chRp.type === 'close' && _chRp.char === ')') {
+                // Synthesize an opaque parameter binding that
+                // carries the receiver's union-of-element labels,
+                // so the callback body walks with the same taint
+                // the receiver had.
+                var _chParamBinds = [];
+                for (var _chPi = 0; _chPi < _chFn.params.length; _chPi++) {
+                  var _chPn = _chFn.params[_chPi].name;
+                  var _chArgRef = exprRef(_chPn);
+                  if (_chPi === 0) _chArgRef.taint = new Set(_chLabels);
+                  _chParamBinds.push(chainBinding([_chArgRef]));
+                }
+                var _chToks = await instantiateFunction(_chFn, _chParamBinds);
+                if (method === 'forEach') {
+                  return { bind: chainBinding([makeSynthStr('undefined')]), next: _chFnNext + 1 };
+                }
+                // For map/filter return an opaque chain carrying
+                // the union of (original receiver labels) ∪
+                // (callback return labels) so further chained
+                // ops still have something to pick up.
+                var _chResLabels = new Set(_chLabels);
+                if (_chToks) {
+                  var _chCbLabels = getBindingLabels(chainBinding(_chToks));
+                  if (_chCbLabels) for (var _cbL of _chCbLabels) _chResLabels.add(_cbL);
+                }
+                var _chResRef = exprRef(method + '(...)');
+                _chResRef.taint = _chResLabels;
+                return { bind: chainBinding([_chResRef]), next: _chFnNext + 1 };
+              }
+            }
+          }
+        }
+      }
+
       // .map(fn).join('') on an opaque iterable: extract the callback's
       // per-element return chain and produce an iter token that
       // The emitter converts map/join into a forEach loop.
@@ -7461,31 +7523,38 @@
         trackBuildVar = savedTrackBuildVar;
         trackBuildVarDepth = savedTrackDepth;
         buildVarDeclStart = savedBuildVarDeclStart;
-        // Find the return value and resolve the returned expression.
+        // Collect every top-level return statement in the function
+        // body and join their values. This handles the common
+        // early-return pattern:
+        //
+        //   function f() {
+        //     if (a) return safe;
+        //     return tainted;
+        //   }
+        //
+        // where the first return is guarded by `if(a)` (no braces)
+        // but both returns are reachable. Previously only the first
+        // encountered return was captured, losing the tainted path.
+        var _returnBindings = [];
+        var _returnFnBindings = [];
         let ri = bodyStart;
         while (ri < bodyEnd) {
           const t = tks[ri];
           if (t && t.type === 'other' && t.text === 'return') {
-            // Use readValue to preserve object/array/function bindings.
             const rv = await readValue(ri + 1, bodyEnd, TERMS_TOP);
             if (rv && rv.binding) {
-              if (rv.binding.kind === 'chain') {
-                result = rv.binding.toks;
-                // Preserve parametric metadata (typeName /
-                // innerType / labels) through the return so
-                // typed Promise<T> values survive the call
-                // boundary without forcing the whole return
-                // to fnReturnBinding (which breaks legacy
-                // token-based callers).
-                if (rv.binding.typeName) result._typeName = rv.binding.typeName;
-                if (rv.binding.innerType) result._innerType = rv.binding.innerType;
-              }
-              else { fnReturnBinding = rv.binding; }
-            } else {
-              const r = await readConcatExpr(ri + 1, bodyEnd, TERMS_TOP);
-              if (r) result = r.toks;
+              _returnBindings.push(rv.binding);
+              ri = rv.next;
+              continue;
             }
-            break;
+            const r = await readConcatExpr(ri + 1, bodyEnd, TERMS_TOP);
+            if (r) {
+              _returnBindings.push(chainBinding(r.toks));
+              ri = r.next;
+              continue;
+            }
+            ri++;
+            continue;
           }
           if (t && t.type === 'open' && t.char === '{') {
             let depth = 1; ri++;
@@ -7497,6 +7566,79 @@
             continue;
           }
           ri++;
+        }
+        // Reduce the collected returns to a single result.
+        //
+        // - Zero returns: leave `result` null (void function).
+        // - One return: use it directly (preserving non-chain
+        //   bindings like objects / arrays / functions).
+        // - Multiple returns: if they're all chains, concatenate
+        //   their tokens into one chain so the caller's taint
+        //   collection sees every path's contribution. Non-chain
+        //   returns from multiple paths fall back to the first
+        //   (rare; usually only one branch returns an object).
+        if (_returnBindings.length === 1) {
+          var _singleRb = _returnBindings[0];
+          if (_singleRb.kind === 'chain') {
+            result = _singleRb.toks;
+            if (_singleRb.typeName) result._typeName = _singleRb.typeName;
+            if (_singleRb.innerType) result._innerType = _singleRb.innerType;
+          } else {
+            fnReturnBinding = _singleRb;
+          }
+        } else if (_returnBindings.length > 1) {
+          var _allChains = true;
+          for (var _rbi = 0; _rbi < _returnBindings.length; _rbi++) {
+            if (_returnBindings[_rbi].kind !== 'chain') { _allChains = false; break; }
+          }
+          // Merge returns only when at least one branch carries
+          // taint labels. Numeric-only returns (the common
+          // recursive-arithmetic case) would otherwise get joined
+          // into a chain expression whose SMT projection stops
+          // refuting dead branches, introducing false positives.
+          var _anyTainted = false;
+          if (_allChains) {
+            for (var _rbT = 0; _rbT < _returnBindings.length; _rbT++) {
+              var _rbTL = getBindingLabels(_returnBindings[_rbT]);
+              if (_rbTL && _rbTL.size) { _anyTainted = true; break; }
+            }
+          }
+          if (_allChains && _anyTainted) {
+            // Merge all chain tokens into a single cond-style
+            // token pair so the caller sees every path's taint.
+            var _mergedToks = [];
+            for (var _rbi2 = 0; _rbi2 < _returnBindings.length; _rbi2++) {
+              var _rbCh = _returnBindings[_rbi2];
+              if (_rbi2 > 0) _mergedToks.push({ type: 'plus' });
+              for (var _rt of _rbCh.toks) _mergedToks.push(_rt);
+            }
+            result = _mergedToks;
+            // Preserve typeName / innerType only when all return
+            // branches agree on them.
+            var _firstRb = _returnBindings[0];
+            if (_firstRb.typeName) {
+              var _typeMatch = true;
+              for (var _rbi3 = 1; _rbi3 < _returnBindings.length; _rbi3++) {
+                if (_returnBindings[_rbi3].typeName !== _firstRb.typeName) { _typeMatch = false; break; }
+              }
+              if (_typeMatch) result._typeName = _firstRb.typeName;
+            }
+          } else if (_allChains) {
+            // No-taint case: fall back to the first return so
+            // SMT refutation on numeric-only branches still
+            // works (recursion / constant-return patterns).
+            var _firstOnly = _returnBindings[0];
+            result = _firstOnly.toks;
+            if (_firstOnly.typeName) result._typeName = _firstOnly.typeName;
+            if (_firstOnly.innerType) result._innerType = _firstOnly.innerType;
+          } else {
+            // Mixed return kinds: pick the first non-chain (object /
+            // array / function) binding to keep precision on structured
+            // returns that come from at least one branch.
+            for (var _rbi4 = 0; _rbi4 < _returnBindings.length; _rbi4++) {
+              if (_returnBindings[_rbi4].kind !== 'chain') { fnReturnBinding = _returnBindings[_rbi4]; break; }
+            }
+          }
         }
       } else {
         // Expression-body arrow: `v => expr`. We run the statement
