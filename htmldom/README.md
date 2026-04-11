@@ -340,6 +340,45 @@ Every variable binding the walker produces carries an optional
   TypeDB descriptor so precise per-prop labels flow:
   `({filename}) => …` on an error event has `filename: String`
   with label `url` only, not the bulk `{url, network}` union.
+- Function summary cache: every inter-procedural call is keyed
+  by (body range, argument fingerprint, `this` fingerprint).
+  Walks that produce no findings, no `domOps`, and no
+  outer-scope mutations are cached as "pure summaries" —
+  subsequent calls with the same fingerprint skip the walk
+  and return the cached result. Impure calls are never
+  cached, preserving precision at every call site. The phase-2
+  callback fixpoint clears the cache each iteration so
+  sibling-mutation-driven re-walks still happen.
+- `Promise.all` / `Promise.race` / `Promise.resolve` /
+  `Promise.any` / `Promise.allSettled`: static methods on
+  Promise return a Promise chain whose `innerType` is the LUB
+  of each input's inner type and whose labels are the union
+  of every input's labels. `Promise.resolve(x)` wraps x's type
+  directly; `Promise.all([fetch(a), fetch(b)]).then(rs => …)`
+  sees the callback param carrying `network`.
+- `Object.assign(target, …sources)`: merges every source's
+  props into target, propagating each source's labels, and
+  returns the modified target. Matches the runtime's
+  last-write-wins semantics.
+- IIFE expressions: `(function(x){…})(arg)` and `((x) => x)(arg)`
+  preserve function identity through the paren, so the inlined
+  body walks with the actual arg binding instead of falling
+  back to opaque-token flattening.
+- Higher-order function calls: `apply(fn, v)` preserves
+  function-kind arguments across the call boundary so
+  callback bodies walk with typed args.
+- Class inheritance via `extends`: subclasses inherit parent
+  methods by copy, so `new Child().parentMethod()` dispatches
+  correctly.
+- Setters: `set name(v) { … }` on classes and object literals
+  dispatch to the setter body when the property is written.
+- Function.prototype.call / apply / bind: reflective calls on
+  function bindings inline the body with the explicit `this`
+  and args.
+- Parametric return type preservation: `Promise<T>` /
+  `Response` / etc. metadata survives the `return` boundary
+  so downstream `.then(r => …)` callbacks see the resolved
+  type.
 
 Once typed, **every subsequent property read on the binding**
 resolves through `_lookupProp` / `_lookupMethod` on its
@@ -592,7 +631,7 @@ node htmldom/htmldom.test.js
 ```
 
 The harness loads `jsanalyze.js` and every consumer with minimal
-DOM stubs and runs inline assertions. 967+ tests covering:
+DOM stubs and runs inline assertions. 992+ tests covering:
 
 - **Engine**: tokenizer, scope walker, virtual DOM extraction,
   SMT-refuted taint reachability, cross-file inter-procedural flow
