@@ -379,6 +379,54 @@ Every variable binding the walker produces carries an optional
   `Response` / etc. metadata survives the `return` boundary
   so downstream `.then(r => …)` callbacks see the resolved
   type.
+- jQuery-style DOM factory aliasing: `var $ = document.querySelector.bind(document)`
+  binds the `$` identifier to a `factoryRef` whose later call
+  sites dispatch through the original DOM factory, so
+  `$('#x').innerHTML = …` flows taint identically to a direct
+  `document.querySelector('#x').innerHTML = …`.
+- `Reflect.get` / `Reflect.set` / `new Proxy(target, {})`:
+  reflective property access dispatches through the underlying
+  object binding's props; Proxy is modeled as a transparent
+  pass-through to its target (an approximation when the handler
+  has non-trivial traps).
+- Multi-return function summaries: when a function body has
+  multiple `return` statements and at least one branch carries
+  taint, all returns are joined into a single chain so the
+  early-return idiom (`if (a) return safe; return tainted;`)
+  flows the tainted branch's labels to the caller. Numeric-only
+  returns still fall back to the first-return shortcut so SMT
+  refutation on recursive arithmetic continues to work.
+- Parenthesised LHS of assignment: `(expr).prop = value` and
+  `(cond ? a : b).<sink> = value` are routed through readValue
+  on the parenthesised expression, then dispatched to the nav-
+  sink classifier across every cond-arm receiver. Without this
+  the statement walker (gated on `t.type === 'other'`) silently
+  drops paren-prefixed assignments.
+- Object literal spread of literal expressions: `{ ...{u: x}, … }`
+  recursively parses the inner object literal and merges its
+  props. Unresolved spread sources (`{...opts, k: v}` where
+  `opts` isn't statically known) are silently skipped so
+  trailing tainted props still flow through the merged object.
+- Spread of literal arrays in call args: `f(...[tainted])`
+  materialises the array and pushes each element as its own
+  argument binding so the callee sees per-arg taint.
+- Optional chaining on unresolved receivers: `obj?.api?.(tainted)`
+  flows the argument's taint through the opaque chain;
+  `?.`-form taint sources (`window?.location?.hash`) are
+  normalized to their flat form so the source list still matches.
+- Chain `.map` / `.filter` / `.forEach`: a chain-kind receiver
+  carrying labels (e.g. produced by an opaque filter fallback)
+  walks its callback once with the labels propagating into the
+  param binding, and returns an opaque chain carrying the union
+  of receiver + callback labels.
+- `el.style.<prop>` CSS sink: writes to any style sub-property
+  on a tracked element OR a typed-chain path that resolves
+  through the TypeDB to an HTMLElement-extending type fire a
+  CSS sink finding (`style.cssText`, `style.background`, etc.).
+- `setTimeout` / `setInterval` non-function first arg: when the
+  callback slot is anything other than a function binding the
+  runtime evaluates it as code, so the walker classifies any
+  tainted first arg as a critical 'code' sink.
 
 Once typed, **every subsequent property read on the binding**
 resolves through `_lookupProp` / `_lookupMethod` on its
@@ -631,7 +679,7 @@ node htmldom/htmldom.test.js
 ```
 
 The harness loads `jsanalyze.js` and every consumer with minimal
-DOM stubs and runs inline assertions. 992+ tests covering:
+DOM stubs and runs inline assertions. 1010+ tests covering:
 
 - **Engine**: tokenizer, scope walker, virtual DOM extraction,
   SMT-refuted taint reachability, cross-file inter-procedural flow
