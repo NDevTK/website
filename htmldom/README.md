@@ -83,6 +83,8 @@ trace cheaply.
 | `query.property(value, path)` | Navigate into a nested `Value` via dotted path (`'headers.Content-Type'`). |
 | `query.enumerate(value)` | Every concrete primitive a `Value` can take, or `null` if unenumerable. |
 | `query.asConcrete(value)` | The single concrete primitive if the `Value` is `kind: 'concrete'`, else `null`. |
+| `query.typeName(value)` | The flow-sensitively resolved TypeDB type name attached to this value (e.g. `'Location'`, `'HTMLIFrameElement'`, `'FileReader'`), or `null`. |
+| `query.callsOfType(trace, typeName, argIndex?)` | Calls whose argument at `argIndex` has the given TypeDB typeName. For type-driven queries over the trace. |
 | `query.innerHtmlAssignments(trace)` | Every `innerHTML` / `outerHTML` / `document.write` site. |
 | `query.taintFlows(trace, { severity?, source?, sinkProp? })` | Taint flows with source + sink + path conditions. |
 | `query.stringLiterals(trace, { context })` | String literals in a given context (e.g. assigned to `script.src`). |
@@ -95,15 +97,21 @@ Defined in `jsanalyze-schemas.js`. Every binding the walker knows
 about converts to one of these shapes via the `bindingToValue`
 boundary function:
 
+Every shape also carries an optional `typeName?: string` — the
+flow-sensitively resolved TypeDB type of the underlying binding
+when the walker inferred one. Consumers read it via
+`query.typeName(value)` or filter call sites by argument type
+via `query.callsOfType(trace, typeName, argIndex)`.
+
 ```ts
 type Value =
-  | { kind: 'concrete',  value: string|number|boolean|null,          provenance: Source[] }
-  | { kind: 'oneOf',     values: ConcreteValue[], source: OneOfSource, provenance: Source[] }
-  | { kind: 'template',  parts: TemplatePart[],                       provenance: Source[] }
-  | { kind: 'object',    props: Record<string, Value>,                provenance: Source[] }
-  | { kind: 'array',     elems: Value[],                              provenance: Source[] }
-  | { kind: 'function',  name?, params, bodyRef,                      provenance: Source[] }
-  | { kind: 'unknown',   reason: UnknownReason, taint?: string[],     provenance: Source[] };
+  | { kind: 'concrete',  value: string|number|boolean|null,          provenance: Source[], typeName?: string }
+  | { kind: 'oneOf',     values: ConcreteValue[], source: OneOfSource, provenance: Source[], typeName?: string }
+  | { kind: 'template',  parts: TemplatePart[],                       provenance: Source[], typeName?: string }
+  | { kind: 'object',    props: Record<string, Value>,                provenance: Source[], typeName?: string }
+  | { kind: 'array',     elems: Value[],                              provenance: Source[], typeName?: string }
+  | { kind: 'function',  name?, params, bodyRef,                      provenance: Source[], typeName?: string }
+  | { kind: 'unknown',   reason: UnknownReason, taint?: string[],     provenance: Source[], typeName?: string };
 ```
 
 Every `Value` carries **provenance** — the source locations where

@@ -2597,18 +2597,10 @@
     var S = _schemas();
     options = options || {};
     var file = options.file || '<anonymous>';
-    // Cycle-based termination: use a WeakSet of bindings
-    // already on the current conversion path so cyclic
-    // references (`var o = {}; o.self = o;`) terminate
-    // without a depth cap. Non-cyclic nested structures are
-    // serialized to full depth — no arbitrary 32-level limit.
     var seen = options._seen || new WeakSet();
     if (!binding) {
       return S.value.unknown(S.UNKNOWN_REASONS.UNRESOLVED_IDENTIFIER, null, []);
     }
-    // Primitives don't need cycle tracking (chain bindings are
-    // leaf values). Only object/array/element bindings can
-    // participate in cycles.
     if (typeof binding === 'object' && binding.kind !== 'chain' && binding.kind !== 'function') {
       if (seen.has(binding)) {
         return S.value.unknown(S.UNKNOWN_REASONS.RECURSION_CAP, null, []);
@@ -2616,54 +2608,45 @@
       seen.add(binding);
     }
 
-    // --- chain binding ---
+    // Dispatch to the per-kind converter, then attach the
+    // binding's `typeName` (when present) so consumers can
+    // see the flow-sensitively resolved TypeDB type on the
+    // public Value.
+    var out;
     if (binding.kind === 'chain') {
-      return _chainBindingToValue(binding, { file: file, _seen: seen });
-    }
-
-    // --- object binding ---
-    if (binding.kind === 'object') {
+      out = _chainBindingToValue(binding, { file: file, _seen: seen });
+    } else if (binding.kind === 'object') {
       var props = Object.create(null);
       for (var k in binding.props) {
         if (k.indexOf('__') === 0 || k.indexOf('_') === 0) continue;
         props[k] = bindingToValue(binding.props[k], { file: file, _seen: seen });
       }
       var anyTok = null;
-      // Try to find a provenance token from any prop
       for (var k2 in binding.props) {
         anyTok = _anyTokFromBinding(binding.props[k2]);
         if (anyTok) break;
       }
       var objProv = anyTok ? [_provFromTok(anyTok, file, S.SOURCE_KINDS.INLINE_LITERAL)] : [];
-      return S.value.object(props, objProv);
-    }
-
-    // --- array binding ---
-    if (binding.kind === 'array') {
+      out = S.value.object(props, objProv);
+    } else if (binding.kind === 'array') {
       var elems = [];
       for (var i = 0; i < binding.elems.length; i++) {
         elems.push(bindingToValue(binding.elems[i], { file: file, _seen: seen }));
       }
-      return S.value.array(elems, []);
-    }
-
-    // --- function binding ---
-    if (binding.kind === 'function') {
+      out = S.value.array(elems, []);
+    } else if (binding.kind === 'function') {
       var paramNames = [];
       if (binding.params) for (var pi = 0; pi < binding.params.length; pi++) paramNames.push(binding.params[pi].name || ('arg' + pi));
-      return S.value.function(
+      out = S.value.function(
         binding.name || null,
         paramNames,
         { bodyStart: binding.bodyStart, bodyEnd: binding.bodyEnd },
         []
       );
-    }
-
-    // --- element binding (DOM virtual element) ---
-    if (binding.kind === 'element') {
+    } else if (binding.kind === 'element') {
       var elProps = Object.create(null);
       elProps['__element'] = S.value.concrete(true, []);
-      elProps['tag'] = S.value.concrete(binding.tag || 'unknown', []);
+      elProps['tag'] = S.value.concrete((binding.origin && binding.origin.tag) || 'unknown', []);
       if (binding.attrs) {
         var attrProps = Object.create(null);
         for (var an in binding.attrs) {
@@ -2671,11 +2654,17 @@
         }
         elProps['attrs'] = S.value.object(attrProps, []);
       }
-      return S.value.object(elProps, []);
+      out = S.value.object(elProps, []);
+    } else {
+      // Fallback for unknown binding kinds.
+      out = S.value.unknown(S.UNKNOWN_REASONS.OPAQUE_EXTERNAL, null, []);
     }
 
-    // Fallback for unknown binding kinds — surfaces as opaque-external.
-    return S.value.unknown(S.UNKNOWN_REASONS.OPAQUE_EXTERNAL, null, []);
+    // Attach the binding's flow-sensitively resolved TypeDB
+    // type to the returned Value so consumers can read it via
+    // `value.typeName`.
+    if (binding.typeName && S.value.withType) S.value.withType(out, binding.typeName);
+    return out;
   }
 
   // Chain binding → Value. Handles the common cases:
@@ -6203,7 +6192,18 @@
             }
           }
           if (_opaqueTaint) _opaqueRef.taint = _opaqueTaint;
-          return { bind: chainBinding([_opaqueRef]), next: end };
+          // Type inference on the opaque chain: walk the text
+          // through the TypeDB with the flow-sensitive scope
+          // resolver so the resulting chain carries a
+          // `typeName` when the root is a known global (or
+          // an aliased typed local). This exposes the type
+          // on the public `Value` for consumers reading via
+          // `query.typeName(value)`.
+          var _opaqueResult = chainBinding([_opaqueRef]);
+          var _opaqueType = _resolveExprTypeViaDB(_activeDB, _opaqueText, typedScope);
+          if (_opaqueType) _opaqueResult.typeName = _opaqueType;
+          if (_opaqueTaint) _opaqueResult.labels = _opaqueTaint;
+          return { bind: _opaqueResult, next: end };
         }
         if (b) {
           // Call syntax: `name(args)` where name resolves to a function binding.

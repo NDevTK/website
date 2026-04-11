@@ -232,6 +232,18 @@
     };
   }
 
+  // Attach a TypeDB type name to a Value. Consumers of the
+  // trace can read `value.typeName` to see the resolved type
+  // of the underlying binding (e.g. 'Location', 'FileReader',
+  // 'HTMLIFrameElement'). Null when the walker couldn't infer
+  // a type.
+  //
+  // Returns the same Value (mutated in place) for fluent use.
+  function valueWithType(value, typeName) {
+    if (value && typeName) value.typeName = typeName;
+    return value;
+  }
+
   // === Validation ===
   //
   // validateValue returns null if the value conforms to the schema,
@@ -430,6 +442,7 @@
       array: valueArray,
       function: valueFunction,
       unknown: valueUnknown,
+      withType: valueWithType,
     }),
 
     part: Object.freeze({

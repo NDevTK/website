@@ -380,6 +380,33 @@
       return loadSchemas().helpers.stringify(value);
     },
 
+    // --- typeName(value) ---
+    //
+    // Return the flow-sensitively resolved TypeDB type name
+    // attached to this value (e.g. `'Location'`,
+    // `'HTMLIFrameElement'`, `'FileReader'`), or null if the
+    // walker couldn't infer a type. Types come from the active
+    // TypeDB — consumers who pass a custom `options.typeDB` to
+    // `analyze(...)` see their own type names here.
+    typeName(value) {
+      return (value && value.typeName) || null;
+    },
+
+    // --- callsOfType(trace, typeName, argIndex?) ---
+    //
+    // Filter calls whose argument at `argIndex` (default 0)
+    // has the given TypeDB typeName. Useful for type-driven
+    // analyses: "find every call where a Location is passed
+    // into a sink-shaped function", etc.
+    callsOfType(trace, typeName, argIndex) {
+      if (!typeName) return [];
+      var idx = argIndex == null ? 0 : argIndex;
+      return trace.calls.filter(function (c) {
+        var arg = c.args && c.args[idx];
+        return arg && arg.typeName === typeName;
+      });
+    },
+
     // --- innerHtmlAssignments(trace) ---
     innerHtmlAssignments(trace) {
       return trace.innerHtmlAssignments.slice();
