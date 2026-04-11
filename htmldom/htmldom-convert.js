@@ -107,7 +107,6 @@
     const VOID_ELEMENTS           = W.VOID_ELEMENTS;
     const SVG_TAGS                = W.SVG_TAGS;
     const NAV_SAFE_FILTER         = W.NAV_SAFE_FILTER;
-    const TAINT_SANITIZERS        = W.TAINT_SANITIZERS;
 
       async function convertHtmlBuilderFunctions(source) {
         const result = { source: source, converted: new Set() };

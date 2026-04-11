@@ -325,6 +325,40 @@
     return false;
   }
 
+  // Answer "is `callExpr` a known sanitizer?" by walking the
+  // expression through the TypeDB. A descriptor carries
+  // `sanitizer: true` if calling it neutralises taint on its
+  // return value. Covers bare globals (`parseInt`,
+  // `encodeURIComponent`) via `.call.sanitizer` AND dotted
+  // method calls (`DOMPurify.sanitize`) via per-method
+  // descriptors.
+  function _isSanitizerCallViaDB(db, callExpr) {
+    if (!db || !callExpr) return false;
+    var parts = callExpr.split('.');
+    var rootName = parts[0];
+    var typeName = db.roots[rootName];
+    if (!typeName) return false;
+    var typeDesc = db.types[typeName];
+    // Dotted method call: walk per-segment.
+    if (parts.length > 1) {
+      var cur = typeName;
+      for (var i = 1; i < parts.length; i++) {
+        var md = _lookupMethod(db, cur, parts[i]);
+        if (!md) return false;
+        if (i === parts.length - 1) return md.sanitizer === true;
+        if (typeof md.returnType !== 'string') return false;
+        cur = md.returnType;
+      }
+      return false;
+    }
+    // Bare call: check .call / .construct descriptor.
+    if (typeDesc) {
+      var cd = typeDesc.call || typeDesc.construct;
+      if (cd && cd.sanitizer === true) return true;
+    }
+    return false;
+  }
+
   // Collect every `source` label reachable from an Event subtype
   // via its props/methods (and transitively via readType /
   // returnType refs, and via the `extends` chain). Used to
@@ -460,14 +494,10 @@
   // / `checkSinkSetAttribute` for the thin API the rest of the
   // walker still calls.
 
-  // Known sanitizer functions that neutralize taint.
-  const TAINT_SANITIZERS = new Set([
-    'encodeURIComponent', 'encodeURI',
-    'parseInt', 'parseFloat', 'Number', 'Boolean',
-    'DOMPurify.sanitize',
-    'escape',
-    'btoa',
-  ]);
+  // Legacy TAINT_SANITIZERS set was removed in phase 5 of the
+  // type-db refactor. Sanitizers are now declared in the TypeDB
+  // via `sanitizer: true` on `.call` / method descriptors, and
+  // looked up by `_isSanitizerCallViaDB`. See `isSanitizer`.
 
   // Collect taint from a chain token array. Returns a Set of source labels
   // or null if no taint. Recurses into structured tokens (cond, trycatch,
@@ -638,9 +668,12 @@
     return _classifySinkViaDB(DEFAULT_TYPE_DB, propName, elementTag);
   }
 
-  // Check if a function name is a known sanitizer.
+  // Check if a function name is a known sanitizer. Thin wrapper
+  // over `_isSanitizerCallViaDB` which walks the call expression
+  // through DEFAULT_TYPE_DB looking for descriptors that carry
+  // `sanitizer: true`.
   function isSanitizer(name) {
-    return TAINT_SANITIZERS.has(name);
+    return _isSanitizerCallViaDB(DEFAULT_TYPE_DB, name);
   }
 
   // Extract the element tag from a binding's origin (for element type tracking).
@@ -10811,14 +10844,24 @@
       // preservesLabelsFrom* field, so labels do not flow from
       // the argument to the return. The engine treats a function
       // without a preserve hint as label-stripping automatically.
-      GlobalEncodeURIComponent: { call: { returnType: 'String' } },
-      GlobalEncodeURI:          { call: { returnType: 'String' } },
-      GlobalEscape:             { call: { returnType: 'String' } },
-      GlobalBtoa:               { call: { returnType: 'String' } },
-      GlobalParseInt:           { call: {} },
-      GlobalParseFloat:         { call: {} },
-      GlobalNumber:             { call: {} },
-      GlobalBoolean:            { call: {} },
+      // Sanitizers: `sanitizer: true` on the call descriptor
+      // marks the result as label-free regardless of arg taint.
+      // The walker's opaque-call path consults this flag.
+      GlobalEncodeURIComponent: { call: { returnType: 'String', sanitizer: true } },
+      GlobalEncodeURI:          { call: { returnType: 'String', sanitizer: true } },
+      GlobalEscape:             { call: { returnType: 'String', sanitizer: true } },
+      GlobalBtoa:               { call: { returnType: 'String', sanitizer: true } },
+      GlobalParseInt:           { call: { sanitizer: true } },
+      GlobalParseFloat:         { call: { sanitizer: true } },
+      GlobalNumber:             { call: { sanitizer: true } },
+      GlobalBoolean:            { call: { sanitizer: true } },
+      // DOMPurify is an object whose .sanitize() method neutralises
+      // HTML taint labels, yielding a string safe for innerHTML.
+      DOMPurify: {
+        methods: {
+          sanitize: { returnType: 'String', sanitizer: true },
+        },
+      },
     },
 
     // Root name → type. Applied when the name is not shadowed by an
@@ -10857,6 +10900,7 @@
       parseFloat:         'GlobalParseFloat',
       Number:             'GlobalNumber',
       Boolean:            'GlobalBoolean',
+      DOMPurify:          'DOMPurify',
     },
 
     // createElement(tag) and similar → specific HTMLxElement type.
@@ -10973,11 +11017,11 @@
     parseStyleDecls: parseStyleDecls,
     serializeHtmlTokens: serializeHtmlTokens,
     makeVar: makeVar,
-    // Classification data (for custom analysis). Sources AND sinks
-    // (property, call, attribute-name) are driven by the
+    // Classification data (for custom analysis). Sources, sinks,
+    // event-handler taint AND sanitizers are all driven by the
     // DEFAULT_TYPE_DB exposed via _walkerInternals below; legacy
-    // flat tables were removed in phase 3 of the type-db refactor.
-    TAINT_SANITIZERS: TAINT_SANITIZERS,
+    // flat tables were removed in phases 2-5 of the type-db
+    // refactor.
     // jsanalyze public surface (stage 1 — seam only, stable shape)
     jsanalyze: {
       bindingToValue: bindingToValue,
@@ -11026,7 +11070,6 @@
       VOID_ELEMENTS: VOID_ELEMENTS,
       SVG_TAGS: SVG_TAGS,
       NAV_SAFE_FILTER: NAV_SAFE_FILTER,
-      TAINT_SANITIZERS: TAINT_SANITIZERS,
       // New declarative type database. See the big comment block
       // above DEFAULT_TYPE_DB for the shape.
       DEFAULT_TYPE_DB: DEFAULT_TYPE_DB,
@@ -11039,6 +11082,7 @@
       _classifyAttrSinkViaDB: _classifyAttrSinkViaDB,
       _propIsEverASink: _propIsEverASink,
       _collectEventSourceLabels: _collectEventSourceLabels,
+      _isSanitizerCallViaDB: _isSanitizerCallViaDB,
     },
   };
 
