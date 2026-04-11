@@ -10535,6 +10535,15 @@
               if (_pendingCallbacks && taintEnabled) {
                 _pendingCallbacks.push({ fn: _timerCb, params: [], isEventHandler: false });
               }
+            } else if (taintEnabled && _timerCb) {
+              // Non-function first arg — setTimeout/setInterval
+              // treats strings as code to eval. Fire a code sink
+              // when the arg carries any taint labels.
+              var _timerLabels = getBindingLabels(_timerCb);
+              if (_timerLabels && _timerLabels.size) {
+                recordTaintFinding('code', 'critical', t.text, null, _timerLabels, taintCondStack,
+                  { expr: t.text, line: countLines(t._src, t.start) });
+              }
             }
             i = _timerArgs.next - 1;
             continue;

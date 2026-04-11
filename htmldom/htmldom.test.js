@@ -3975,6 +3975,10 @@ await (async function () {
   await checkTaint('style.cssText sink', { 'a.js': 'document.body.style.cssText = location.hash;' }, 1, { sources: ['url'] });
   await checkTaint('style.background sink', { 'a.js': 'document.body.style.background = location.hash;' }, 1, { sources: ['url'] });
 
+  // --- setTimeout / setInterval with tainted-string first arg (code sink) ---
+  await checkTaint('setTimeout string code sink', { 'a.js': 'setTimeout(location.hash, 100);' }, 1, { sources: ['url'] });
+  await checkTaint('setInterval string code sink', { 'a.js': 'setInterval(location.hash, 100);' }, 1, { sources: ['url'] });
+
   // --- jQuery-style DOM factory bind aliasing ---
   await checkTaint('factoryRef: $ = querySelector.bind(document)', { 'a.js': 'var $ = document.querySelector.bind(document); $("#o").innerHTML = location.hash;' }, 1, { sources: ['url'] });
 
