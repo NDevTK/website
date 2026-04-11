@@ -3943,6 +3943,19 @@ await (async function () {
   // --- Object.assign taint merge ---
   await checkTaint('Object.assign taint', { 'a.js': 'var o = Object.assign({}, { u: location.hash }); document.getElementById("o").innerHTML = o.u;' }, 1, { sources: ['url'] });
 
+  // --- Object literal spread of a literal expression ---
+  await checkTaint('object spread of literal', { 'a.js': 'var o = { ...{ u: location.hash } }; document.getElementById("o").innerHTML = o.u;' }, 1, { sources: ['url'] });
+
+  // --- jQuery-style DOM factory bind aliasing ---
+  await checkTaint('factoryRef: $ = querySelector.bind(document)', { 'a.js': 'var $ = document.querySelector.bind(document); $("#o").innerHTML = location.hash;' }, 1, { sources: ['url'] });
+
+  // --- Parenthesised LHS of assignment (ternary sink receiver) ---
+  await checkTaint('parens LHS nav sink', { 'a.js': '(document).location.href = location.hash;' }, 1, { sources: ['url'] });
+  await checkTaint('ternary LHS nav sink', { 'a.js': '(cond ? document : window).location.href = location.hash;' }, 1, { sources: ['url'] });
+
+  // --- Finding dedup: same sink+location+conditions merges source labels ---
+  await checkTaint('finding dedup merge', { 'a.js': 'async function a() { return fetch("/x"); } async function b() { return a(); } b().then(p => p.then(r => document.getElementById("o").innerHTML = r.url));' }, 1);
+
   // --- IIFE inline dispatch ---
   await checkTaint('IIFE call identity', { 'a.js': 'document.getElementById("o").innerHTML = (function(x) { return x; })(location.hash);' }, 1, { sources: ['url'] });
   await checkTaint('IIFE arrow', { 'a.js': 'document.getElementById("o").innerHTML = ((x) => x)(location.hash);' }, 1, { sources: ['url'] });

@@ -8719,6 +8719,93 @@
         }
       }
 
+      // Parenthesized LHS of assignment: `(expr).prop = value` /
+      // `(cond ? a : b).sink = value`. Without this the statement
+      // walker (which is gated on `t.type === 'other'` below) would
+      // silently drop the whole assignment because the first token
+      // is `(`. Evaluate the parenthesized expression via readValue
+      // and dispatch the trailing `.prop... = rhs` to the nav-sink
+      // / typed-sink classifier.
+      if (taintEnabled && t.type === 'open' && t.char === '(') {
+        var _plDepth = 1, _plJ = i + 1;
+        while (_plJ < _rangeEnd && _plDepth > 0) {
+          if (tokens[_plJ].type === 'open' && tokens[_plJ].char === '(') _plDepth++;
+          else if (tokens[_plJ].type === 'close' && tokens[_plJ].char === ')') _plDepth--;
+          if (_plDepth === 0) break;
+          _plJ++;
+        }
+        if (_plDepth === 0) {
+          var _plAfter = tokens[_plJ + 1];
+          if (_plAfter && _plAfter.type === 'other' && /^(?:\.[A-Za-z_$][A-Za-z0-9_$]*)+$/.test(_plAfter.text)) {
+            var _plEq = tokens[_plJ + 2];
+            if (_plEq && _plEq.type === 'sep' && (_plEq.char === '=' || _plEq.char === '+=')) {
+              // Evaluate ONLY the parenthesised expression (i .. _plJ+1).
+              // Using the full _rangeEnd would cause readValue to walk
+              // through the trailing `.prop` chain as well, which loses
+              // the receiver / path split we need for sink classification.
+              var _plInner = await readValue(i, _plJ + 1, TERMS_TOP);
+              if (_plInner && _plInner.binding) {
+                var _plPath = _plAfter.text.slice(1);
+                var _plBind = _plInner.binding;
+                var _plRhs = await readValue(_plJ + 3, _rangeEnd, TERMS_TOP);
+                var _plVal = _plRhs ? _plRhs.binding : null;
+                var _plLabels = _plVal ? getBindingLabels(_plVal) : null;
+                // Flatten any cond tokens in the receiver chain to
+                // candidate receiver texts so both arms of a
+                // ternary feed the nav-sink classifier.
+                var _plReceivers = [];
+                var _collectReceivers = function(b) {
+                  if (!b) return;
+                  if (b.kind === 'chain') {
+                    for (var _tk of b.toks) {
+                      if (_tk.type === 'cond') {
+                        _collectReceivers({ kind: 'chain', toks: _tk.ifTrue });
+                        _collectReceivers({ kind: 'chain', toks: _tk.ifFalse });
+                      } else if (_tk.type === 'other' && _tk.text) {
+                        _plReceivers.push(_tk.text);
+                      }
+                    }
+                  }
+                };
+                _collectReceivers(_plBind);
+                var _plFired = false;
+                if (_plLabels && _plLabels.size) {
+                  // Any arm matching the nav sink classifier fires
+                  // a single finding. Multiple arms that all land
+                  // on nav sinks are collapsed into one — the
+                  // `(...).<path>` expression stands in for the
+                  // set since the dedup key is expression-based.
+                  for (var _pri = 0; _pri < _plReceivers.length; _pri++) {
+                    var _prText = _plReceivers[_pri];
+                    var _prFullPath = _prText + '.' + _plPath;
+                    if (isNavSink(_prFullPath, typedScope)) {
+                      recordTaintFinding('navigation', 'high', '(...).'+_plPath, null, _plLabels, taintCondStack,
+                        { expr: '(...).'+_plPath, line: countLines(t._src, t.start) });
+                      _plFired = true;
+                      break;
+                    }
+                  }
+                  if (!_plFired && _plBind) {
+                    var _plPropSegs = _plPath.split('.');
+                    var _plLeafProp = _plPropSegs[_plPropSegs.length - 1];
+                    var _plSinkInfo = _classifyBindingSink(_plBind, _plLeafProp);
+                    if (_plSinkInfo && _plSinkInfo.severity !== 'safe') {
+                      recordTaintFinding(_plSinkInfo.type, _plSinkInfo.severity, _plLeafProp, null, _plLabels, taintCondStack,
+                        { expr: '(...)' + _plAfter.text, line: countLines(t._src, t.start) });
+                      _plFired = true;
+                    }
+                  }
+                }
+                if (_plFired) {
+                  i = skipExpr(_plJ + 3, _rangeEnd) - 1;
+                  continue;
+                }
+              }
+            }
+          }
+        }
+      }
+
       if (t.type !== 'other') continue;
 
       // break / continue — preserve as runtime flow control so they
