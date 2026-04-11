@@ -5768,13 +5768,16 @@
         return { bind: chainBinding(pResultToks), next: pfnEnd + 1 };
       }
       // Generic typed-method dispatch: when the receiver is a
-      // chain binding with a typeName and the method exists
-      // on that type in the TypeDB, synthesize a typed result
-      // chain with the method's returnType. This is how method
-      // calls like `element.querySelectorAll(".x")` produce a
-      // NodeList chain so the trailing `.forEach(...)` in the
-      // caller routes through the typed-iterable handler.
-      if (bind && bind.kind === 'chain' && bind.typeName) {
+      // chain OR element binding with a typeName and the
+      // method exists on that type in the TypeDB, synthesize a
+      // typed result chain with the method's returnType. This
+      // is how method calls like `element.querySelectorAll(".x")`
+      // produce a NodeList chain so the trailing `.forEach(...)`
+      // in the caller routes through the typed-iterable
+      // handler. Applies to `element` kind too so direct
+      // factory chains like `document.querySelector(".x").
+      // closest(".y")` walk through the type system.
+      if (bind && bind.typeName && (bind.kind === 'chain' || bind.kind === 'element')) {
         var _gmMethod = _lookupMethod(_activeDB, bind.typeName, method);
         if (_gmMethod) {
           var _gmArgs = await readCallArgBindings(parenIdx, stop);
@@ -9606,6 +9609,64 @@
                 var _exprResult = await readValue(i, stop, TERMS_TOP);
                 if (_exprResult) { i = _exprResult.next - 1; continue; }
               }
+              // Trailing property assignment on a method call
+              // result: `obj.method(args).prop = value` or
+              // `obj.m1(a).m2(b).prop = value`. Walk through
+              // every trailing `.method(args)` chain segment
+              // and, if we land on a `.prop = value`, feed
+              // the typed-chain receiver to the sink
+              // classifier. This covers chained method calls
+              // whose final property write is a sink.
+              var _iBeforeChain = i;
+              if (taintEnabled) {
+                var _chJ = _peekContEnd + 1;
+                var _prevChainEnd = _peekContEnd + 1;
+                while (_chJ < stop) {
+                  var _chTok = tokens[_chJ];
+                  if (!_chTok || _chTok.type !== 'other') break;
+                  if (!/^\.[A-Za-z_$][A-Za-z0-9_$]*$/.test(_chTok.text)) break;
+                  var _chAfter = tokens[_chJ + 1];
+                  if (_chAfter && _chAfter.type === 'open' && _chAfter.char === '(') {
+                    // Skip balanced parens.
+                    var _chDepth = 1, _chK = _chJ + 2;
+                    while (_chK < stop && _chDepth > 0) {
+                      if (tokens[_chK].type === 'open' && tokens[_chK].char === '(') _chDepth++;
+                      else if (tokens[_chK].type === 'close' && tokens[_chK].char === ')') _chDepth--;
+                      if (_chDepth === 0) break;
+                      _chK++;
+                    }
+                    if (_chDepth !== 0) break;
+                    _chJ = _chK + 1;
+                    _prevChainEnd = _chJ;
+                    continue;
+                  }
+                  // It's a `.prop` without call. Check if next
+                  // is an assignment operator.
+                  var _chEq = tokens[_chJ + 1];
+                  if (_chEq && _chEq.type === 'sep' && (_chEq.char === '=' || _chEq.char === '+=')) {
+                    var _chExprResult = await readValue(i, _prevChainEnd, TERMS_TOP);
+                    var _chRecvBind = _chExprResult && _chExprResult.binding;
+                    if (_chRecvBind && _chRecvBind.kind === 'chain' && _chRecvBind.typeName) {
+                      var _chProp = _chTok.text.slice(1);
+                      var _chSinkInfo = _classifyBindingSink(_chRecvBind, _chProp);
+                      if (_chSinkInfo && _chSinkInfo.severity !== 'safe') {
+                        var _chRhs = await readValue(_chJ + 2, stop, TERMS_TOP);
+                        var _chLabels = _chRhs ? getBindingLabels(_chRhs.binding) : null;
+                        if (_chLabels && _chLabels.size) {
+                          recordTaintFinding(_chSinkInfo.type, _chSinkInfo.severity, _chProp, null, _chLabels, taintCondStack,
+                            { expr: t.text + '...' + _chProp, line: countLines(t._src, t.start) });
+                        }
+                        i = skipExpr(_chJ + 2, stop) - 1;
+                        break;
+                      }
+                    }
+                  }
+                  break;
+                }
+                // If we broke out with `i` advanced past the
+                // statement, continue to the next statement.
+                if (i !== _iBeforeChain) continue;
+              }
             }
           }
         }
@@ -9614,6 +9675,11 @@
       // DOM factory call as a statement: `document.getElementById("x").prop = value`
       // or `document.createElement("div").method(...)`. Resolve the call,
       // then handle trailing property assignment or method call on the result.
+      //
+      // Falls through to the general statement walker when the
+      // trailing chain contains non-DOM_METHOD method calls
+      // (e.g. `document.querySelector(".x").closest(".y").innerHTML = v`)
+      // so the method-chain sink handler can pick them up.
       if (t.type === 'other' && DOM_FACTORIES[t.text]) {
         const factoryParen = tokens[i + 1];
         if (factoryParen && factoryParen.type === 'open' && factoryParen.char === '(') {
@@ -9622,34 +9688,56 @@
             const factoryResult = DOM_FACTORIES[t.text](factoryArgs.args, i, factoryArgs.next, t);
             if (factoryResult && factoryResult.bind) {
               var afterCall = factoryResult.next;
-              // Check for trailing .prop = value or .method(args).
               var trailTok = tokens[afterCall];
+              // Peek to decide whether the handler can fully
+              // consume this statement: only simple `.prop =`
+              // or `.method(args)` on DOM_METHODS tracked
+              // elements. Anything else (e.g. method chains
+              // via `closest()`) falls through.
+              var _factoryFullyHandles = false;
               if (trailTok && trailTok.type === 'other' && trailTok.text[0] === '.') {
                 var trailProp = trailTok.text.slice(1);
                 var trailEq = tokens[afterCall + 1];
                 if (trailEq && trailEq.type === 'sep' && (trailEq.char === '=' || trailEq.char === '+=')) {
-                  // Property assignment on DOM factory result.
-                  var trailR = await readValue(afterCall + 2, stop, TERMS_TOP);
-                  var trailVal = trailR ? trailR.binding : null;
-                  if (factoryResult.bind.kind === 'element') {
-                    applyElementSet(factoryResult.bind, [trailProp], trailVal, trailTok);
-                  }
-                  i = skipExpr(afterCall + 2, stop) - 1;
-                  continue;
-                } else if (trailEq && trailEq.type === 'open' && trailEq.char === '(') {
-                  // Method call on DOM factory result.
-                  if (factoryResult.bind.kind === 'element' && DOM_METHODS.has(trailProp)) {
-                    var methodArgs = await readCallArgBindings(afterCall + 1, stop);
-                    if (methodArgs) {
-                      applyElementMethod(factoryResult.bind, trailProp, methodArgs.bindings);
-                      i = methodArgs.next - 1;
-                      continue;
+                  _factoryFullyHandles = true;
+                } else if (trailEq && trailEq.type === 'open' && trailEq.char === '(' &&
+                           factoryResult.bind.kind === 'element' && DOM_METHODS.has(trailProp)) {
+                  _factoryFullyHandles = true;
+                }
+              } else {
+                // No trailing chain — bare call statement.
+                _factoryFullyHandles = true;
+              }
+              if (_factoryFullyHandles) {
+                if (trailTok && trailTok.type === 'other' && trailTok.text[0] === '.') {
+                  var trailProp2 = trailTok.text.slice(1);
+                  var trailEq2 = tokens[afterCall + 1];
+                  if (trailEq2 && trailEq2.type === 'sep' && (trailEq2.char === '=' || trailEq2.char === '+=')) {
+                    var trailR = await readValue(afterCall + 2, stop, TERMS_TOP);
+                    var trailVal = trailR ? trailR.binding : null;
+                    if (factoryResult.bind.kind === 'element') {
+                      applyElementSet(factoryResult.bind, [trailProp2], trailVal, trailTok);
+                    }
+                    i = skipExpr(afterCall + 2, stop) - 1;
+                    continue;
+                  } else if (trailEq2 && trailEq2.type === 'open' && trailEq2.char === '(') {
+                    if (factoryResult.bind.kind === 'element' && DOM_METHODS.has(trailProp2)) {
+                      var methodArgs = await readCallArgBindings(afterCall + 1, stop);
+                      if (methodArgs) {
+                        applyElementMethod(factoryResult.bind, trailProp2, methodArgs.bindings);
+                        i = methodArgs.next - 1;
+                        continue;
+                      }
                     }
                   }
                 }
+                i = afterCall - 1;
+                continue;
               }
-              i = afterCall - 1;
-              continue;
+              // Fall through: the trailing chain has
+              // non-DOM_METHOD method calls. Let the general
+              // statement walker (including the method-chain
+              // sink handler below) take over.
             }
           }
         }
