@@ -865,34 +865,44 @@
   var _currentVarMayBe = null;
   var _currentMayBeKey = null;
 
-  // --- Memoization + solver reuse ---
+  // --- Memoization + solver reuse + persistent declarations ---
   //
-  // Each walker pass issues many smtSat calls with identical
-  // SMT-LIB strings: the callback fixpoint re-walks the same if
-  // statements across iterations, every call-site refuting the
-  // same guard regenerates the same formula, and helper functions
-  // called repeatedly emit the same constraints each time. Without
-  // memoization, each duplicate call incurs a full Z3 parse +
-  // check round-trip, which completely dominates the wall time on
-  // any non-trivial file.
-  //
-  // Two-layer defense:
+  // Each walker pass issues many smtSat calls with overlapping or
+  // identical formulas. Without help, each call would repeat the
+  // full Z3 round-trip: declare every symbol, re-parse the formula,
+  // run the solver. The walker is dominated by SMT wall time on any
+  // non-trivial file, so we layer three defenses on top of every
+  // call:
   //
   //   1. `_smtCache` — a Map keyed by the exact SMT-LIB source
-  //      string. Every smtSat call checks the cache before
-  //      touching Z3. The cache is UNBOUNDED — entries are never
-  //      evicted — because the analyser must never skip a query
-  //      or pay for a re-run of a query it has already answered.
-  //      On real programs the distinct-formula count is small
-  //      relative to total call count, so the cache stays a
-  //      moderate size even for large files.
+  //      string. Every smtSat call checks the cache before touching
+  //      Z3. The cache is UNBOUNDED — entries are never evicted —
+  //      because the analyser must never skip a query or pay for a
+  //      re-run of a query it has already answered. On real programs
+  //      the distinct-formula count is small relative to total call
+  //      count, so the cache stays a moderate size even for large
+  //      files.
   //
-  //   2. `_sharedSolver` — one Solver per Z3 context, reset()
-  //      between calls instead of `new z3.Solver()`. Stops
-  //      Solver-level state from accumulating and avoids the
-  //      per-call allocation overhead of fresh solver objects.
+  //   2. `_sharedSolver` — one Solver per Z3 context, isolated via
+  //      push()/pop() between calls instead of `new z3.Solver()`.
+  //      Stops Solver-level state from accumulating and avoids both
+  //      the per-call allocation of fresh solver objects AND the
+  //      cost of re-declaring every symbol on every call.
+  //
+  //   3. `_declaredSorts` — a Map of `<symName> -> <sortName>`
+  //      remembering which symbols have already been declared on
+  //      `_sharedSolver`. Z3's `(declare-const)` is permanent at the
+  //      solver level: once a symbol is declared we can keep using
+  //      it until the solver is destroyed. By emitting declarations
+  //      ONCE per symbol (instead of once per call), every smtSat
+  //      call past the first only has to feed Z3 the may-be lattice
+  //      extras + the actual assertion — the heavy lifting of
+  //      symbol-table setup is amortised across the whole walk. On
+  //      htmldom-convert.js this turns ~700 redeclarations of the
+  //      same handful of symbols into ~10 one-time declarations.
   var _smtCache = new Map();
   var _sharedSolver = null;
+  var _declaredSorts = new Map();
 
   async function smtSat(formula) {
     if (!formula) return true;
@@ -903,12 +913,40 @@
     // conservatively reported as satisfiable: we don't know enough to
     // refute the branch.
     if (formula.incompatible) return true;
-    var decls = '';
+
+    // Walk the formula's sort table to figure out which symbols need
+    // to be declared on the solver, and which ones need a may-be
+    // disjunction emitted into the formula's local push() frame.
+    //
+    // `pendingDecls`  — declarations to emit ONCE on the persistent
+    //                   solver (outside any push frame). Empty most
+    //                   of the time, since most syms have already
+    //                   been declared by an earlier smtSat call.
+    // `extras`        — may-be lattice constraints, emitted INSIDE
+    //                   the push frame so they don't leak into
+    //                   subsequent calls (the lattice can grow
+    //                   monotonically over the walk so today's
+    //                   emitted may-be might be tomorrow's stale).
+    var pendingDecls = '';
     var extras = '';
     for (var name in formula.sorts) {
       if (name === '__conflict') continue;
       var sort = formula.sorts[name] || 'Int';
-      decls += '(declare-const ' + _quoteSmtName(name) + ' ' + sort + ')\n';
+      var alreadyDeclared = _declaredSorts.get(name);
+      if (alreadyDeclared !== sort) {
+        // Either undeclared, or previously declared at a different
+        // sort (rare but possible — the walker can upgrade an Int
+        // sym to String mid-walk when it learns about a new use).
+        // The solver doesn't let us "redeclare" so we'd have to
+        // reset the entire solver state if the sort actually
+        // changed. To keep things simple AND correct we fall back
+        // to the legacy reset+fromString path on sort change. New
+        // declarations otherwise just append.
+        if (alreadyDeclared && alreadyDeclared !== sort) {
+          return await _smtSatFullReset(formula);
+        }
+        pendingDecls += '(declare-const ' + _quoteSmtName(name) + ' ' + sort + ')\n';
+      }
       // Emit a may-be disjunction if the variable's value space is
       // fully enumerated (every assignment was a literal we could
       // encode). The disjunction tells Z3 the sym CAN ONLY equal one
@@ -948,20 +986,113 @@
         }
       }
     }
-    var smtlib = decls + extras + '(assert ' + _toBool(formula) + ')\n';
+    var assertText = '(assert ' + _toBool(formula) + ')\n';
+    // The cache key combines the may-be extras and the assertion;
+    // pendingDecls is a function of which syms have been declared
+    // already, which is determined by the order of prior smtSat
+    // calls — not by the formula's semantics — so we exclude it
+    // from the cache key. Two formulas with identical extras +
+    // assertText have the same satisfiability regardless of which
+    // declarations the solver had pre-loaded.
+    var cacheKey = extras + assertText;
 
     // Layer 1: memoization cache (unbounded).
-    if (_smtCache.has(smtlib)) return _smtCache.get(smtlib);
+    if (_smtCache.has(cacheKey)) return _smtCache.get(cacheKey);
 
     var z3 = await _initZ3();
 
-    // Layer 2: reuse one Solver across calls.
+    // Layer 2: reuse one Solver across calls. The solver is created
+    // once per Z3 context and persists for the rest of the analysis.
     if (!_sharedSolver) _sharedSolver = new z3.Solver();
-    else _sharedSolver.reset();
-    _sharedSolver.fromString(smtlib);
+
+    // Layer 3: emit any new declarations ONCE on the persistent
+    // solver so they survive every push/pop. Declarations are
+    // permanent at the solver level — Z3's symbol table can be
+    // appended to but never restored — which is exactly what we
+    // want here.
+    if (pendingDecls) {
+      _sharedSolver.fromString(pendingDecls);
+      for (var pname in formula.sorts) {
+        if (pname === '__conflict') continue;
+        var psort = formula.sorts[pname] || 'Int';
+        if (_declaredSorts.get(pname) !== psort) _declaredSorts.set(pname, psort);
+      }
+    }
+
+    // Push an isolation frame so the may-be extras and the formula
+    // assertion don't leak into the next smtSat call. After check(),
+    // pop() restores the solver to its pre-call state.
+    _sharedSolver.push();
+    if (extras) _sharedSolver.fromString(extras);
+    _sharedSolver.fromString(assertText);
     var result = await _sharedSolver.check();
+    _sharedSolver.pop();
+
     var answer = result !== 'unsat';
-    _smtCache.set(smtlib, answer);
+    _smtCache.set(cacheKey, answer);
+    return answer;
+  }
+
+  // Slow-path fallback for the rare case where a symbol's sort
+  // changed mid-walk (e.g. an Int sym got upgraded to String after
+  // the walker discovered a string-context use). The solver-level
+  // declaration is permanent in Z3, so when a sort actually changes
+  // we have to discard the entire solver state and start fresh.
+  // The formula's may-be extras + assertion are then added inside a
+  // push/pop frame so they don't leak into the NEXT smtSat call —
+  // exactly the same isolation regime smtSat itself uses on the
+  // hot path. Without the push/pop here, the test suite would see
+  // the previous reset's formula remain permanently asserted and
+  // every subsequent call would silently incorporate it into its
+  // satisfiability check.
+  //
+  // The fresh solver is left as `_sharedSolver` so subsequent calls
+  // can keep amortising declarations against it.
+  async function _smtSatFullReset(formula) {
+    var z3 = await _initZ3();
+    _sharedSolver = new z3.Solver();
+    _declaredSorts.clear();
+    var decls = '';
+    var extras = '';
+    for (var name in formula.sorts) {
+      if (name === '__conflict') continue;
+      var sort = formula.sorts[name] || 'Int';
+      decls += '(declare-const ' + _quoteSmtName(name) + ' ' + sort + ')\n';
+      _declaredSorts.set(name, sort);
+      if (_currentVarMayBe) {
+        var lookupKey = _currentMayBeKey ? _currentMayBeKey(name) : name;
+        var slot = _currentVarMayBe[lookupKey];
+        if (slot && slot.complete && slot.vals && slot.vals.length >= 1) {
+          var sortOk = true;
+          for (var _vi = 0; _vi < slot.vals.length; _vi++) {
+            if (slot.vals[_vi].sort !== sort) { sortOk = false; break; }
+          }
+          if (sortOk) {
+            if (slot.vals.length === 1) {
+              extras += '(assert (= ' + _quoteSmtName(name) + ' ' + slot.vals[0].lit + '))\n';
+            } else {
+              var lits = [];
+              for (var _vj = 0; _vj < slot.vals.length; _vj++) {
+                lits.push('(= ' + _quoteSmtName(name) + ' ' + slot.vals[_vj].lit + ')');
+              }
+              extras += '(assert (or ' + lits.join(' ') + '))\n';
+            }
+          }
+        }
+      }
+    }
+    // Declarations live at level 0 (permanent on the new solver).
+    if (decls) _sharedSolver.fromString(decls);
+    // Push an isolation frame for the may-be extras and the formula
+    // assertion — same pattern as smtSat's hot path.
+    _sharedSolver.push();
+    var assertText = '(assert ' + _toBool(formula) + ')\n';
+    if (extras) _sharedSolver.fromString(extras);
+    _sharedSolver.fromString(assertText);
+    var result = await _sharedSolver.check();
+    _sharedSolver.pop();
+    var answer = result !== 'unsat';
+    _smtCache.set(extras + assertText, answer);
     return answer;
   }
   // --- Condition parser: raw JS tokens → SMT formula ---
