@@ -3956,6 +3956,15 @@ await (async function () {
   // --- new Proxy transparent pass-through ---
   await checkTaint('Proxy taint pass-through', { 'a.js': 'var p = new Proxy({u: location.hash}, {}); document.getElementById("o").innerHTML = p.u;' }, 1, { sources: ['url'] });
 
+  // --- Array.prototype.at returns element taint ---
+  await checkTaint('array.at taint', { 'a.js': 'document.getElementById("o").innerHTML = [location.hash].at(0);' }, 1, { sources: ['url'] });
+
+  // --- Object spread with unresolved source then tainted prop ---
+  await checkTaint('spread unresolved + tainted', { 'a.js': 'var o = {...opts, u: location.hash}; document.getElementById("o").innerHTML = o.u;' }, 1, { sources: ['url'] });
+
+  // --- Optional chain call on unresolved receiver with tainted arg ---
+  await checkTaint('opt-chain unresolved call taint', { 'a.js': 'document.getElementById("o").innerHTML = api?.fetch?.(location.hash);' }, 1, { sources: ['url'] });
+
   // --- jQuery-style DOM factory bind aliasing ---
   await checkTaint('factoryRef: $ = querySelector.bind(document)', { 'a.js': 'var $ = document.querySelector.bind(document); $("#o").innerHTML = location.hash;' }, 1, { sources: ['url'] });
 

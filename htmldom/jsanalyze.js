@@ -3179,7 +3179,7 @@
     'toUpperCase', 'toLowerCase', 'trim', 'trimStart', 'trimEnd', 'trimLeft', 'trimRight',
     'repeat', 'slice', 'substring', 'substr', 'charAt', 'indexOf', 'lastIndexOf',
     'includes', 'startsWith', 'endsWith', 'padStart', 'padEnd', 'toString',
-    'split', 'reverse', 'map', 'filter', 'forEach', 'reduce',
+    'split', 'reverse', 'map', 'filter', 'forEach', 'reduce', 'at',
     // Promise continuation — applyMethod's then/catch/finally handler
     // walks the callback with the receiver's taint as the first arg.
     'then', 'catch', 'finally',
@@ -4920,7 +4920,17 @@
         if (tk.type === 'close' && tk.char === '}') break;
         if (tk.type === 'other' && tk.text.startsWith('...')) {
           const name = tk.text.slice(3);
-          if (IDENT_OR_PATH_RE.test(name)) { const b = await resolvePath(name); if (b && b.kind === 'object') { for (const kk in b.props) props[kk] = b.props[kk]; frame.i++; const sep = tks[frame.i]; if (sep && sep.type === 'sep' && sep.char === ',') { frame.i++; continue; } break; } }
+          if (IDENT_OR_PATH_RE.test(name)) { const b = await resolvePath(name); if (b && b.kind === 'object') { for (const kk in b.props) props[kk] = b.props[kk]; frame.i++; const sep = tks[frame.i]; if (sep && sep.type === 'sep' && sep.char === ',') { frame.i++; continue; } break; }
+            // Unknown / opaque spread source (e.g. `...options`
+            // where `options` isn't statically known). Skip the
+            // spread silently and continue parsing — any known
+            // props after the spread still carry their taint to
+            // the merged object.
+            frame.i++;
+            const sep = tks[frame.i];
+            if (sep && sep.type === 'sep' && sep.char === ',') { frame.i++; continue; }
+            break;
+          }
           // Bare `...` followed by a `{` — spread of an object
           // literal. Recursively parse the inner literal and
           // merge its props into this one: `{ ...{u: v}, ...}`.
@@ -5994,6 +6004,12 @@
         if (method === 'slice' && argVals.length <= 2) {
           return { bind: arrayBinding(bind.elems.slice(...argVals)), next: args.next };
         }
+        if (method === 'at' && argVals.length === 1 && typeof argVals[0] === 'number') {
+          var _atIdx = argVals[0];
+          if (_atIdx < 0) _atIdx += bind.elems.length;
+          var _atEl = bind.elems[_atIdx];
+          return { bind: _atEl || chainBinding([exprRef('at(...)')]), next: args.next };
+        }
         if (method === 'indexOf' && argVals.length === 1) {
           const target = argVals[0];
           let idx = -1;
@@ -7009,6 +7025,23 @@
               end++;
               continue;
             }
+            // Optional chain operator: treat `a?.b` / `a?.()` as
+            // the non-optional form for purposes of opaque
+            // absorption so unresolved receivers still flow
+            // argument taint through `obj?.getData?.(tainted)`.
+            // This only runs when `b` is null — the unresolved
+            // ident case — so typed paths like `window?.location`
+            // are unaffected (they go through the resolved-ident
+            // branch which routes through applySuffixes's `?.`
+            // handler with the TypeDB walker).
+            if (nx.type === 'op' && nx.text === '?.') {
+              end++;
+              var _oaNext = tks[end];
+              if (_oaNext && _oaNext.type === 'other' && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(_oaNext.text)) {
+                end++;
+              }
+              continue;
+            }
             break;
           }
           const first = tks[k];
@@ -7016,7 +7049,13 @@
           var _opaqueText = first._src.slice(first.start, last.end);
           var _opaqueRef = exprRef(_opaqueText);
           // Path-based taint sources (TAINT_SOURCES + member paths).
+          // Also check the `?.`→`.` normalized form so optional
+          // chaining on a known taint source (`window?.location?.hash`)
+          // still matches the flat path.
           var _opaqueTaint = checkTaintSource(_opaqueText);
+          if (!_opaqueTaint && _opaqueText.indexOf('?.') >= 0) {
+            _opaqueTaint = checkTaintSource(_opaqueText.replace(/\?\./g, '.'));
+          }
           // Call-based taint sources: extract everything before the first
           // '(' and check it against TAINT_SOURCE_CALLS. Covers
           // fetch("/api"), new XMLHttpRequest(), IndexedDB / Cache reads.
