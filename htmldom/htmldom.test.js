@@ -3887,6 +3887,59 @@ await (async function () {
   // --- False positive: reassigned to safe ---
   await checkTaint('reassigned to safe', { 'a.js': 'var x = location.search; x = "safe"; document.getElementById("o").innerHTML = x;' }, 0);
 
+  // --- Flow-sensitive type tracking: aliased sources ---
+  await checkTaint('aliased window.location', { 'a.js': 'var loc = window.location; document.getElementById("o").innerHTML = loc.hash;' }, 1, { sources: ['url'] });
+  await checkTaint('aliased document', { 'a.js': 'var d = document; document.getElementById("o").innerHTML = d.cookie;' }, 1, { sources: ['cookie'] });
+  await checkTaint('aliased Window', { 'a.js': 'var w = window; document.getElementById("o").innerHTML = w.document.cookie;' }, 1, { sources: ['cookie'] });
+  await checkTaint('multi-hop alias', { 'a.js': 'var a = document; var b = a; document.getElementById("o").innerHTML = b.cookie;' }, 1, { sources: ['cookie'] });
+  await checkTaint('aliased localStorage', { 'a.js': 'var s = localStorage; document.getElementById("o").innerHTML = s.getItem("k");' }, 1, { sources: ['storage'] });
+
+  // --- Flow-sensitive type tracking: aliased sinks ---
+  await checkTaint('aliased eval sink', { 'a.js': 'var f = eval; f(location.hash);' }, 1, { sink: 'f' });
+  await checkTaint('aliased location.assign', { 'a.js': 'var l = location; l.assign(document.cookie);' }, 1);
+  await checkTaint('aliased sanitizer clears', { 'a.js': 'var san = encodeURIComponent; document.getElementById("o").innerHTML = san(location.hash);' }, 0);
+  await checkTaint('aliased DOMPurify clears', { 'a.js': 'var p = DOMPurify; document.getElementById("o").innerHTML = p.sanitize(location.hash);' }, 0);
+
+  // --- Return-type propagation on constructors ---
+  await checkTaint('new FileReader result', { 'a.js': 'var fr = new FileReader(); document.getElementById("o").innerHTML = fr.result;' }, 1, { sources: ['file'] });
+  await checkTaint('new XMLHttpRequest responseText', { 'a.js': 'var xhr = new XMLHttpRequest(); document.getElementById("o").innerHTML = xhr.responseText;' }, 1, { sources: ['network'] });
+  await checkTaint('new URL hash', { 'a.js': 'var u = new URL("/x"); document.getElementById("o").innerHTML = u.hash;' }, 1, { sources: ['url'] });
+  await checkTaint('URLSearchParams get', { 'a.js': 'var u = new URL("/x"); document.getElementById("o").innerHTML = u.searchParams.get("k");' }, 1, { sources: ['url'] });
+  await checkTaint('new Worker url sink', { 'a.js': 'new Worker(location.hash);' }, 1);
+  await checkTaint('new Function code sink', { 'a.js': 'new Function(location.hash);' }, 1);
+
+  // --- Typed event handler params ---
+  await checkTaint('message event.data precise', { 'a.js': 'window.addEventListener("message", function(e) { document.getElementById("o").innerHTML = e.data; });' }, 1, { sources: ['postMessage'] });
+  await checkTaint('error event.filename precise', { 'a.js': 'window.addEventListener("error", function(e) { document.getElementById("o").innerHTML = e.filename; });' }, 1, { sources: ['url'] });
+  await checkTaint('error event.message precise', { 'a.js': 'window.addEventListener("error", function(e) { document.getElementById("o").innerHTML = e.message; });' }, 1, { sources: ['network'] });
+  await checkTaint('drop dataTransfer files', { 'a.js': 'window.addEventListener("drop", function(e) { document.getElementById("o").innerHTML = e.dataTransfer.files; });' }, 1, { sources: ['file'] });
+
+  // --- Ternary / try-catch / switch type joins ---
+  await checkTaint('ternary same-type join', { 'a.js': 'var loc = cond ? window.location : document.location; document.getElementById("o").innerHTML = loc.hash;' }, 1, { sources: ['url'] });
+  await checkTaint('nested ternary join', { 'a.js': 'var l = a ? location : (b ? window.location : document.location); document.getElementById("o").innerHTML = l.hash;' }, 1, { sources: ['url'] });
+  await checkTaint('trycatch join', { 'a.js': 'var x; try { x = window.location; } catch(e) { x = document.location; } document.getElementById("o").innerHTML = x.hash;' }, 1, { sources: ['url'] });
+
+  // --- Typed-iterable forEach dispatch ---
+  await checkTaint('querySelectorAll forEach', { 'a.js': 'document.querySelectorAll(".x").forEach(function(el) { el.innerHTML = location.hash; });' }, 1, { sources: ['url'] });
+  await checkTaint('querySelectorAll arrow forEach', { 'a.js': 'document.querySelectorAll(".x").forEach(el => { el.innerHTML = location.hash; });' }, 1, { sources: ['url'] });
+  await checkTaint('getElementsByTagName forEach', { 'a.js': 'document.getElementsByTagName("div").forEach(el => { el.innerHTML = location.hash; });' }, 1, { sources: ['url'] });
+  await checkTaint('nested querySelectorAll forEach', { 'a.js': 'document.querySelectorAll(".o").forEach(o => { o.querySelectorAll(".i").forEach(i => { i.innerHTML = location.hash; }); });' }, 1, { sources: ['url'] });
+
+  // --- Typed method-chain sink assignment ---
+  await checkTaint('closest chain direct', { 'a.js': 'document.querySelector(".a").closest(".b").innerHTML = location.hash;' }, 1, { sources: ['url'] });
+  await checkTaint('closest chain via var', { 'a.js': 'var x = document.querySelector(".a"); x.closest(".b").innerHTML = location.hash;' }, 1, { sources: ['url'] });
+  await checkTaint('deep method chain', { 'a.js': 'document.querySelector(".a").closest(".b").querySelector(".c").innerHTML = location.hash;' }, 1, { sources: ['url'] });
+  await checkTaint('closest chain in forEach', { 'a.js': 'document.querySelectorAll(".x").forEach(el => { el.closest(".y").innerHTML = location.hash; });' }, 1, { sources: ['url'] });
+
+  // --- Element-type sink discrimination ---
+  await checkTaint('iframe.src is url sink', { 'a.js': 'var f = document.createElement("iframe"); f.src = location.hash;' }, 1);
+  await checkTaint('script.textContent is code sink', { 'a.js': 'var s = document.createElement("script"); s.textContent = location.hash;' }, 1);
+  await checkTaint('div.textContent is safe', { 'a.js': 'var d = document.createElement("div"); d.textContent = location.hash;' }, 0);
+  await checkTaint('form.action is url sink', { 'a.js': 'var f = document.createElement("form"); f.action = location.hash;' }, 1);
+
+  // --- Precision on destructured event ---
+  await checkTaint('destructure via var from event.data', { 'a.js': 'window.addEventListener("message", function(e) { var d = e.data; document.getElementById("o").innerHTML = d; });' }, 1, { sources: ['postMessage'] });
+
   console.log(`  (${pass + fail - before} cases)`);
 })();
 
