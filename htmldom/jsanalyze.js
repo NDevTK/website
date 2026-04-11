@@ -9512,30 +9512,17 @@
                   // Build the event-param binding. When the
                   // event name resolves to a known Event
                   // subtype via db.eventMap, tag the param's
-                  // binding with that typeName — so inside the
-                  // handler body, `e.data` / `e.newURL` /
-                  // `e.dataTransfer.files` resolve through the
-                  // TypeDB properly rather than inheriting a
-                  // bulk set of taint labels.
-                  //
-                  // The legacy bulk-label approach (attaching
-                  // every reachable source label via
-                  // `_collectEventSourceLabels`) is kept as a
-                  // fallback for handlers where the body
-                  // processes the event through an opaque path
-                  // the walker can't resolve — it ensures the
-                  // finding still fires when a tainted prop is
-                  // forwarded to a sink without an explicit
-                  // typed read.
+                  // binding with that typeName. Inside the
+                  // handler body, property reads on the param
+                  // walk through the TypeDB and pick up the
+                  // specific `source` label on each descriptor,
+                  // yielding precise per-prop taint (no bulk
+                  // label union).
                   var _evParamBindings = [];
                   var _evTypeName = _evTypeStr ? DEFAULT_TYPE_DB.eventMap[_evTypeStr] : null;
                   if (_evHandler.params && _evHandler.params.length > 0) {
                     var _pn = _evHandler.params[0].name;
                     var _evRef = exprRef(_pn);
-                    if (_evTypeName) {
-                      var _evLabels = _collectEventSourceLabels(DEFAULT_TYPE_DB, _evTypeName);
-                      if (_evLabels && _evLabels.size > 0) _evRef.taint = _evLabels;
-                    }
                     var _evParamBinding = chainBinding([_evRef]);
                     if (_evTypeName) _evParamBinding.typeName = _evTypeName;
                     _evParamBindings.push(_evParamBinding);
