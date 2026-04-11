@@ -1347,27 +1347,157 @@
   // condTokens: raw JS tokens of the condition expression
   // pathConstraintStack: array of SMT formulas from enclosing branches
   // Returns { sat, unsat } or null if purely concrete.
+  //
+  // The two queries (`pathConj ∧ formula` and `pathConj ∧ ¬formula`)
+  // share the entire path setup — same declarations, same may-be
+  // lattice extras, same path conjunction. We exploit that by
+  // routing both queries through `smtCheckBoth`, which parses the
+  // path on the solver ONCE inside a shared push() frame and only
+  // pushes the formula's assertion individually for each polarity.
+  // The walker still gets a `{ sat, unsat }` result back, but the
+  // Z3 round-trip cost drops from ~2× the parse work to ~1×.
   async function smtCheckCondition(condTokens, resolveFunc, resolvePathFunc, pathConstraintStack) {
     var formula = await smtParseExpr(condTokens, 0, condTokens.length, resolveFunc, resolvePathFunc);
     if (!formula) return null;
-    // Combine with path constraints: the full context is
-    // pathConstraint[0] ∧ pathConstraint[1] ∧ ... ∧ formula
-    var context = formula;
-    var negContext = smtNot(formula);
+    var pathConj = null;
     if (pathConstraintStack && pathConstraintStack.length > 0) {
-      // Build conjunction of all path constraints.
-      var pathConj = pathConstraintStack[0];
+      pathConj = pathConstraintStack[0];
       for (var i = 1; i < pathConstraintStack.length; i++) {
         pathConj = smtAnd(pathConj, pathConstraintStack[i]);
       }
-      // The true branch is reachable iff pathConj ∧ formula is satisfiable.
-      // The false branch is reachable iff pathConj ∧ ¬formula is satisfiable.
-      context = smtAnd(pathConj, formula);
-      negContext = smtAnd(pathConj, smtNot(formula));
     }
-    var sat = await smtSat(context);
-    var unsat = await smtSat(negContext);
-    return { sat: sat, unsat: unsat };
+    return await smtCheckBoth(pathConj, formula);
+  }
+
+  // Run a sat-and-unsat reachability check against `formula` under
+  // optional `pathConj`, sharing the path setup between the two
+  // Z3 round-trips. Returns `{ sat, unsat }` where `sat` is true
+  // when `pathConj ∧ formula` is satisfiable (true branch reachable)
+  // and `unsat` is true when `pathConj ∧ ¬formula` is satisfiable
+  // (false branch reachable).
+  //
+  // Cache short-circuiting: each polarity's result is independently
+  // memoised in `_smtCache` under the same `extras + assertText` key
+  // smtSat uses, so a previously-seen check skips Z3 entirely. The
+  // batched solver path is only entered when at least one polarity
+  // is a cache miss.
+  async function smtCheckBoth(pathConj, formula) {
+    var contextSat, contextUnsat;
+    if (pathConj) {
+      contextSat = smtAnd(pathConj, formula);
+      contextUnsat = smtAnd(pathConj, smtNot(formula));
+    } else {
+      contextSat = formula;
+      contextUnsat = smtNot(formula);
+    }
+    // Compile-time fold on either side short-circuits the whole
+    // batch. `smtSat` already does this fold for individual calls,
+    // so we delegate to it whenever the heavyweight batched path
+    // can't actually save work.
+    if (!contextSat || (contextSat.value && contextSat.value.kind === 'bool')
+        || contextSat.incompatible) {
+      var sat0 = await smtSat(contextSat);
+      var unsat0 = await smtSat(contextUnsat);
+      return { sat: sat0, unsat: unsat0 };
+    }
+    if (!contextUnsat || (contextUnsat.value && contextUnsat.value.kind === 'bool')
+        || contextUnsat.incompatible) {
+      var sat1 = await smtSat(contextSat);
+      var unsat1 = await smtSat(contextUnsat);
+      return { sat: sat1, unsat: unsat1 };
+    }
+    // Build the per-polarity SMT-LIB expression text and cache key
+    // exactly the way smtSat would, so cache lookups stay aligned
+    // with all the existing memoization.
+    var mergedSorts = contextSat.sorts; // both polarities share sorts
+    var pendingDecls = '';
+    var extras = '';
+    for (var name in mergedSorts) {
+      if (name === '__conflict') continue;
+      var sort = mergedSorts[name] || 'Int';
+      var alreadyDeclared = _declaredSorts.get(name);
+      if (alreadyDeclared !== sort) {
+        if (alreadyDeclared && alreadyDeclared !== sort) {
+          // Sort upgrade: fall back to per-call smtSat (which itself
+          // routes through _smtSatFullReset). Rare path.
+          var sat2 = await smtSat(contextSat);
+          var unsat2 = await smtSat(contextUnsat);
+          return { sat: sat2, unsat: unsat2 };
+        }
+        pendingDecls += '(declare-const ' + _quoteSmtName(name) + ' ' + sort + ')\n';
+      }
+      if (_currentVarMayBe) {
+        var lookupKey = _currentMayBeKey ? _currentMayBeKey(name) : name;
+        var slot = _currentVarMayBe[lookupKey];
+        if (slot && slot.complete && slot.vals && slot.vals.length >= 1) {
+          var sortOk = true;
+          for (var _vi = 0; _vi < slot.vals.length; _vi++) {
+            if (slot.vals[_vi].sort !== sort) { sortOk = false; break; }
+          }
+          if (sortOk) {
+            if (slot.vals.length === 1) {
+              extras += '(assert (= ' + _quoteSmtName(name) + ' ' + slot.vals[0].lit + '))\n';
+            } else {
+              var lits = [];
+              for (var _vj = 0; _vj < slot.vals.length; _vj++) {
+                lits.push('(= ' + _quoteSmtName(name) + ' ' + slot.vals[_vj].lit + ')');
+              }
+              extras += '(assert (or ' + lits.join(' ') + '))\n';
+            }
+          }
+        }
+      }
+    }
+    var satAssertText = '(assert ' + _toBool(contextSat) + ')\n';
+    var unsatAssertText = '(assert ' + _toBool(contextUnsat) + ')\n';
+    var satKey = extras + satAssertText;
+    var unsatKey = extras + unsatAssertText;
+
+    var satCached = _smtCache.has(satKey);
+    var unsatCached = _smtCache.has(unsatKey);
+    if (satCached && unsatCached) {
+      return { sat: _smtCache.get(satKey), unsat: _smtCache.get(unsatKey) };
+    }
+
+    // At least one polarity is a cache miss — go to Z3, sharing the
+    // path setup between both checks.
+    var z3 = await _initZ3();
+    if (!_sharedSolver) _sharedSolver = new z3.Solver();
+    if (pendingDecls) {
+      _sharedSolver.fromString(pendingDecls);
+      for (var pname in mergedSorts) {
+        if (pname === '__conflict') continue;
+        var psort = mergedSorts[pname] || 'Int';
+        if (_declaredSorts.get(pname) !== psort) _declaredSorts.set(pname, psort);
+      }
+    }
+    // Path frame: declarations stay at level 0; the may-be extras
+    // and the formula assertions live in this push so they get
+    // cleaned up at the end.
+    _sharedSolver.push();
+    if (extras) _sharedSolver.fromString(extras);
+
+    var satResult, unsatResult;
+    if (satCached) {
+      satResult = _smtCache.get(satKey);
+    } else {
+      _sharedSolver.push();
+      _sharedSolver.fromString(satAssertText);
+      satResult = (await _sharedSolver.check()) !== 'unsat';
+      _sharedSolver.pop();
+      _smtCache.set(satKey, satResult);
+    }
+    if (unsatCached) {
+      unsatResult = _smtCache.get(unsatKey);
+    } else {
+      _sharedSolver.push();
+      _sharedSolver.fromString(unsatAssertText);
+      unsatResult = (await _sharedSolver.check()) !== 'unsat';
+      _sharedSolver.pop();
+      _smtCache.set(unsatKey, unsatResult);
+    }
+    _sharedSolver.pop();
+    return { sat: satResult, unsat: unsatResult };
   }
 
   // -----------------------------------------------------------------------
