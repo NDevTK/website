@@ -4055,7 +4055,18 @@
     // Returns { binding: functionBinding, next } or null.
     const readFunctionExpr = async (k, stop) => {
       var ft = tks[k];
-      if (!ft || ft.type !== 'other' || ft.text !== 'function') return null;
+      if (!ft || ft.type !== 'other') return null;
+      // Optional `async` prefix: `async function (...) {...}`. Skip
+      // it so the IIFE handler can detect `(async function(){})()`
+      // patterns the same way it detects `(function(){})()`.
+      if (ft.text === 'async') {
+        var _afterAsync = tks[k + 1];
+        if (_afterAsync && _afterAsync.type === 'other' && _afterAsync.text === 'function') {
+          ft = _afterAsync;
+          k = k + 1;
+        }
+      }
+      if (ft.text !== 'function') return null;
       var fk = k + 1;
       // Optional function name.
       if (tks[fk] && tks[fk].type === 'other' && IDENT_RE.test(tks[fk].text) && tks[fk].text !== 'function') fk++;
@@ -5482,6 +5493,19 @@
       // pathological graphs from unbounding the analyser without
       // polluting the output with synthetic tokens.
       if (_fnKey && _callStack.indexOf(_fnKey) >= 0) return null;
+      // Definition-time call optimization: when this instantiateFunction
+      // call is itself nested inside a def-time body walk (taintFnDepth
+      // > 0), the callee's body has ALREADY been walked at its own
+      // declaration site. Walking it AGAIN here would re-register
+      // exactly the same inner declarations, re-record the same call
+      // sites, and re-emit the same (suppressed) findings — pure
+      // redundant work. Return null so the caller falls back to
+      // opaque-call handling, which still records the call site for
+      // dead-code call-graph coverage but skips the cascade of
+      // recursive body walks. The function's body will be walked
+      // properly when its FIRST live call site reaches it from
+      // taintFnDepth === 0 context.
+      if (taintFnDepth > 0) return null;
       if (_fnKey) _callStack.push(_fnKey);
       // Closure capture: push any captured-scope frames (by reference)
       // that aren't already on the live stack, so reads of outer
