@@ -325,6 +325,54 @@
     return false;
   }
 
+  // Walk a dotted expression text through the TypeDB and return
+  // the terminal type name — the type that the expression's
+  // VALUE has at runtime, assuming the browser spec is followed
+  // and the root isn't shadowed by a user variable.
+  //
+  // This is the type-tracking counterpart to `_walkPathInDB`:
+  // where that one accumulates source LABELS along the walk,
+  // this one returns the final TYPE for storage on bindings.
+  // An expression whose tail can't be resolved on the current
+  // type yields null (unknown type); the caller treats the
+  // binding as untyped. `scope`, when provided, overrides the
+  // root segment the same way `_walkPathInDB` does.
+  function _resolveExprTypeViaDB(db, expr, scope) {
+    if (!db || !expr) return null;
+    var parts = expr.split('.');
+    if (parts.length === 0) return null;
+    var rootName = parts[0];
+    var parenIdx0 = rootName.indexOf('(');
+    if (parenIdx0 >= 0) rootName = rootName.slice(0, parenIdx0);
+    var typeName = null;
+    if (scope) {
+      var rootHit = scope(rootName);
+      if (rootHit) {
+        if (rootHit.typeName) typeName = rootHit.typeName;
+        else if (rootHit.shadowed) return null;
+      }
+    }
+    if (!typeName) typeName = db.roots[rootName];
+    if (!typeName) return null;
+    for (var i = 1; i < parts.length; i++) {
+      var seg = parts[i];
+      var parenIdx = seg.indexOf('(');
+      var isCall = parenIdx >= 0;
+      if (isCall) seg = seg.slice(0, parenIdx);
+      var propDesc = _lookupProp(db, typeName, seg);
+      var methodDesc = propDesc ? null : _lookupMethod(db, typeName, seg);
+      if (!propDesc && !methodDesc) return null;
+      if (methodDesc) {
+        if (typeof methodDesc.returnType === 'string') typeName = methodDesc.returnType;
+        else return null;
+      } else {
+        if (propDesc.readType) typeName = propDesc.readType;
+        else return null;
+      }
+    }
+    return typeName;
+  }
+
   // Answer "does this expression address a navigation sink?" —
   // i.e. does assigning to it OR calling it trigger page
   // navigation (and thus need javascript:-protocol filtering)?
@@ -3787,31 +3835,60 @@
     // Track names explicitly declared with var/let/const/function.
     // Used to distinguish `var location = x` (local) from `location = x` (global write).
     const declaredNames = new Set();
+    // Infer a chain binding's TypeDB type from its opaque-ref
+    // content at assignment time. When the binding is a chain
+    // whose single token is an `other`-kind reference carrying
+    // a dotted path text (e.g. `window.location`), walk that
+    // text through the TypeDB with `typedScope` as the root
+    // resolver and tag the binding with the terminal type.
+    //
+    // This is what turns `var loc = window.location` into a
+    // typed local: `loc`'s binding acquires `typeName: 'Location'`,
+    // and subsequent `loc.hash` / `loc.href` reads resolve via
+    // the scope's typeName rather than via string matching of
+    // the original path.
+    //
+    // Returns a shallow copy of the binding with `typeName`
+    // set (never mutates the input) so shared bindings stay
+    // safe. Bindings that already carry a typeName pass
+    // through unchanged.
+    const _withInferredType = (value) => {
+      if (!value || value.kind !== 'chain' || value.typeName) return value;
+      if (!value.toks || value.toks.length !== 1) return value;
+      var t = value.toks[0];
+      if (!t || t.type !== 'other' || !t.text) return value;
+      var typeName = _resolveExprTypeViaDB(DEFAULT_TYPE_DB, t.text, typedScope);
+      if (!typeName) return value;
+      return { kind: 'chain', toks: value.toks, typeName: typeName };
+    };
     const declBlock = (name, value) => {
       declaredNames.add(name);
-      topBlock().bindings[name] = asRef(name, value);
-      _trackMayBeAssign(name, value);
+      var tv = _withInferredType(value);
+      topBlock().bindings[name] = asRef(name, tv);
+      _trackMayBeAssign(name, tv);
     };
     const declFunction = (name, value) => {
       declaredNames.add(name);
+      var tv = _withInferredType(value);
       for (let i = stack.length - 1; i >= 0; i--) {
         if (stack[i].isFunction) {
-          stack[i].bindings[name] = asRef(name, value);
-          _trackMayBeAssign(name, value);
+          stack[i].bindings[name] = asRef(name, tv);
+          _trackMayBeAssign(name, tv);
           return;
         }
       }
     };
     const assignName = (name, value) => {
+      var tv = _withInferredType(value);
       for (let i = stack.length - 1; i >= 0; i--) {
         if (name in stack[i].bindings) {
-          stack[i].bindings[name] = asRef(name, value);
-          _trackMayBeAssign(name, value);
+          stack[i].bindings[name] = asRef(name, tv);
+          _trackMayBeAssign(name, tv);
           return;
         }
       }
-      stack[0].bindings[name] = asRef(name, value); // implicit global
-      _trackMayBeAssign(name, value);
+      stack[0].bindings[name] = asRef(name, tv); // implicit global
+      _trackMayBeAssign(name, tv);
     };
     const resolve = (name) => {
       for (let i = stack.length - 1; i >= 0; i--) {
@@ -3841,7 +3918,26 @@
         } else if (b.kind === 'chain' && b.toks.length === 1 && b.toks[0].type === 'other') {
           // Opaque chain (e.g. parameter bound to exprRef) — extend the
           // path so `column.title` becomes `store.columns[i].title`.
-          b = chainBinding([deriveExprRef(b.toks[0].text + '.' + parts.slice(i).join('.'), b.toks)]);
+          var _extText = b.toks[0].text + '.' + parts.slice(i).join('.');
+          var _extRef = deriveExprRef(_extText, b.toks);
+          // Re-check source/sink/sanitizer labels on the NEW
+          // extended path text. Without this, aliasing like
+          // `var w = window; w.document.cookie` would keep
+          // whatever taint the ORIGINAL `w` binding had (none)
+          // instead of picking up `cookie` from the extended
+          // path. This makes type tracking work for paths that
+          // grow beyond a declared alias.
+          var _extLabel = checkTaintSource(_extText);
+          if (_extLabel) {
+            if (!_extRef.taint) _extRef.taint = new Set();
+            for (var _extL of _extLabel) _extRef.taint.add(_extL);
+          }
+          b = chainBinding([_extRef]);
+          // Also tag the extended binding with its terminal
+          // TypeDB type so further extensions can keep walking
+          // through it.
+          var _extType = _resolveExprTypeViaDB(DEFAULT_TYPE_DB, _extText, typedScope);
+          if (_extType) b.typeName = _extType;
           break;
         } else if (p === 'length' && b.kind === 'array') {
           b = chainBinding([makeSynthStr(String(b.elems.length))]);
