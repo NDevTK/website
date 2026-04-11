@@ -248,6 +248,7 @@ recognises:
 | `call: MethodDescriptor` | The type's value is a callable (e.g. `eval`). |
 | `construct: MethodDescriptor` | The type's value is a constructor (e.g. `FileReader`). |
 | `selfSource: 'label'` | A bare reference to this type carries this label (used for `Location`, `Storage`). |
+| `iteratesType: 'T'` | The type is iterable; `.forEach/.map/.filter` callbacks see their first param typed as `T`. Used for `NodeList`, `HTMLCollection`, `FileList`. |
 
 A **PropDescriptor** carries:
 
@@ -286,11 +287,29 @@ Every variable binding the walker produces carries an optional
 - String concatenation chains (`var url = base + '/' + path` →
   String when every operand is string-producing).
 - Template literals (`` `pre${x}post` `` → String).
-- Ternary expressions with same-type arms (simple lattice join).
-- Element bindings from `createElement` / `getElementById`
-  (tagged at factory-creation time via `db.tagMap`).
+- Ternary / try-catch / switch expressions with same-type
+  branches (simple lattice join: `T ⊔ T = T`, `T ⊔ U = ⊥`).
+- String concatenation and template literals
+  (`"/api/" + id` → `String`).
+- Method-call return types (`var resp = fetch(…)` → `Promise`;
+  `el.closest(".x")` → `HTMLElement` via `methods[name].returnType`).
+- Constructor return types (`new FileReader()` → `FileReader`
+  via `.construct.returnType`).
+- Element bindings from `createElement` / `getElementById` /
+  `querySelector` (tagged at factory-creation time via
+  `db.tagMap`).
 - Event-handler parameters typed via `db.eventMap`
   (`addEventListener('message', e => …)` → `e` is `MessageEvent`).
+- Typed-iterable callbacks: `.forEach/.map/.filter` on a
+  receiver whose type declares `iteratesType: 'T'` binds the
+  callback's first param to type `T`. Used by `NodeList` and
+  `HTMLCollection` to flow `HTMLElement` into forEach callbacks
+  (`document.querySelectorAll('.x').forEach(el => …)` →
+  `el` is `HTMLElement`).
+- Method-chain sink assignment: `obj.m1(a).m2(b).prop = v`
+  resolves the chain through TypeDB method dispatch and runs
+  the sink classifier on the terminal property using the
+  chain's resolved typeName.
 
 Once typed, **every subsequent property read on the binding**
 resolves through `_lookupProp` / `_lookupMethod` on its
@@ -305,6 +324,16 @@ f(userInput);                // code sink via GlobalEval.call.args[0].sink
 
 var fr = new FileReader();   // fr.typeName = 'FileReader'
 x.innerHTML = fr.result;     // FileReader.result → source='file'
+
+// Typed-iterable forEach
+document.querySelectorAll('.x').forEach(el => {
+  el.innerHTML = location.hash;        // HTMLElement.innerHTML, url → html sink
+});
+
+// Nested method-chain with sink assignment
+document.querySelectorAll('.o').forEach(o => {
+  o.closest('.parent').querySelector('.y').innerHTML = userInput;
+});
 
 var el = document.createElement('iframe');  // el.typeName = 'HTMLIFrameElement'
 el.src = userInput;                         // url sink on HTMLIFrameElement.src
@@ -533,7 +562,7 @@ node htmldom/htmldom.test.js
 ```
 
 The harness loads `jsanalyze.js` and every consumer with minimal
-DOM stubs and runs inline assertions. 899+ tests covering:
+DOM stubs and runs inline assertions. 949+ tests covering:
 
 - **Engine**: tokenizer, scope walker, virtual DOM extraction,
   SMT-refuted taint reachability, cross-file inter-procedural flow
