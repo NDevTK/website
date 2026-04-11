@@ -3519,6 +3519,20 @@ await (async function () {
   await checkTaint('expr: x+y>10 && x+y<5', { 'a.js': 'var x = location.search; var y = location.hash; if (x + y > 10 && x + y < 5) { document.getElementById("o").innerHTML = x; }' }, 0);
   await checkTaint('expr: x+y>3 && x+y<5 sat', { 'a.js': 'var x = location.search; var y = location.hash; if (x + y > 3 && x + y < 5) { document.getElementById("o").innerHTML = x; }' }, 1);
 
+  // --- SMT loop counter refinement: step parity / arithmetic progression ---
+  //
+  // When the walker sees `for (var i = init; i OP bound; i+=step)`
+  // with a concrete init and step, it pushes `(i - init) mod step == 0`
+  // onto the path constraint stack. This lets SMT refute body paths
+  // that require `i` to take a value the loop never visits — e.g.
+  // an odd value inside a `i += 2` loop.
+  await checkTaint('step=2 skips odd', { 'a.js': 'for (var i = 0; i < 10; i += 2) { if (i === 3) { document.getElementById("o").innerHTML = location.search; } }' }, 0);
+  await checkTaint('step=2 hits even', { 'a.js': 'for (var i = 0; i < 10; i += 2) { if (i === 4) { document.getElementById("o").innerHTML = location.search; } }' }, 1);
+  await checkTaint('step=3 init=1 skips 5', { 'a.js': 'for (var i = 1; i < 10; i += 3) { if (i === 5) { document.getElementById("o").innerHTML = location.search; } }' }, 0);
+  await checkTaint('step=3 init=1 hits 7', { 'a.js': 'for (var i = 1; i < 10; i += 3) { if (i === 7) { document.getElementById("o").innerHTML = location.search; } }' }, 1);
+  await checkTaint('step=1 hits 5', { 'a.js': 'for (var i = 0; i < 10; i++) { if (i === 5) { document.getElementById("o").innerHTML = location.search; } }' }, 1);
+  await checkTaint('step=1 out of range', { 'a.js': 'for (var i = 0; i < 10; i++) { if (i === 11) { document.getElementById("o").innerHTML = location.search; } }' }, 0);
+
   // --- SMT integration: all branch types ---
   await checkTaint('while unsat path', { 'a.js': 'var x = location.search; if (x > 5) { while (x < 3) { document.getElementById("o").innerHTML = x; } }' }, 0);
   await checkTaint('for unsat path', { 'a.js': 'var x = location.search; if (x > 5) { for (var i = 0; x < 3; i++) { document.getElementById("o").innerHTML = x; } }' }, 0);

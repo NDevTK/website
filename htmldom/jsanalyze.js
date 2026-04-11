@@ -7268,25 +7268,38 @@
                 //                     `i--` / `i-=N` → descending step N.
                 var _ascending = null;
                 var _step = 1;
+                // Detect `i++`, `i--`, `i += N`, `i -= N`, `++i`, `--i`.
+                // The tokenizer emits `++`/`--`/`+=`/`-=` as either
+                // type:'op' with a `text` property OR type:'sep'
+                // with a `char` property depending on context;
+                // treat both shapes as the same logical operator.
+                function _updTxt(tok) {
+                  if (!tok) return null;
+                  if (tok.type === 'op') return tok.text;
+                  if (tok.type === 'sep') return tok.char;
+                  return null;
+                }
                 for (var _uk = _sc2 + 1; _uk < j; _uk++) {
                   var _ut = tokens[_uk];
                   if (_ut.type === 'other' && _ut.text === _cName) {
                     var _un = tokens[_uk + 1];
-                    if (_un && _un.type === 'op' && _un.text === '++') { _ascending = true; _step = 1; break; }
-                    if (_un && _un.type === 'op' && _un.text === '--') { _ascending = false; _step = 1; break; }
-                    if (_un && _un.type === 'op' && (_un.text === '+=' || _un.text === '-=')) {
+                    var _unText = _updTxt(_un);
+                    if (_unText === '++') { _ascending = true; _step = 1; break; }
+                    if (_unText === '--') { _ascending = false; _step = 1; break; }
+                    if (_unText === '+=' || _unText === '-=') {
                       var _sTok = tokens[_uk + 2];
                       if (_sTok && _sTok.type === 'other' && /^\d+$/.test(_sTok.text)) {
-                        _ascending = _un.text === '+=';
+                        _ascending = _unText === '+=';
                         _step = parseInt(_sTok.text, 10);
                         break;
                       }
                     }
                   }
-                  if (_ut.type === 'op' && (_ut.text === '++' || _ut.text === '--')) {
+                  var _utText = _updTxt(_ut);
+                  if (_utText === '++' || _utText === '--') {
                     var _un2 = tokens[_uk + 1];
                     if (_un2 && _un2.type === 'other' && _un2.text === _cName) {
-                      _ascending = _ut.text === '++'; _step = 1;
+                      _ascending = _utText === '++'; _step = 1;
                       break;
                     }
                   }
@@ -7297,29 +7310,34 @@
                 var _cFormula = smtCmp(_ascending ? '>=' : '<=', _cSym, smtConst(_cInit));
                 _extraLoopFormulas.push(_cFormula);
                 _extraLoopExprs.push(_cName + ' ' + (_ascending ? '>=' : '<=') + ' ' + _cInit);
-                // Upper-bound SMT refinement: if the loop has a
-                // concrete upper bound, push `i OP bound` so the
-                // theory solver knows the counter's range inside
-                // the body. Combined with the `i >= init` bound
-                // pushed above, this gives Z3 a full interval
-                // constraint on the counter — and that's enough for
-                // the linear arithmetic solver to prove any bound-
-                // sensitive path condition that doesn't also depend
-                // on the step size.
+                // Upper-bound + step-parity SMT refinement. The goal
+                // is to pin the counter's value set exactly — i.e.
+                // capture what Z3 needs to prove any path condition
+                // on `i` that depends either on the bound OR on the
+                // step size. The encoding has three parts, each
+                // O(1) in the emitted SMT-LIB regardless of how many
+                // iterations the loop actually runs:
                 //
-                // We deliberately do NOT emit a full per-iteration
-                // disjunction `i === init || i === init+step || ...`
-                // here. The disjunction would be more precise for
-                // loops where step > 1 (since the range constraint
-                // admits non-step values the real loop never sees),
-                // but the per-value atoms cause the emitted SMT-LIB
-                // string to grow linearly with the concrete iteration
-                // count. For loops like `for (let i=0;i<200;i++)` we
-                // would otherwise feed a 200-term OR into every SMT
-                // query executed inside the body, blowing up both
-                // Z3's solver state and our smt-cache key space.
-                // The range constraint is O(1) regardless of how
-                // many times the loop runs.
+                //   (1) `i >= init`                       (already pushed above)
+                //   (2) `i OP bound`                      (emitted below)
+                //   (3) `(i - init) mod step === 0`       (step-parity, step>1 only)
+                //
+                // Parts 1 + 2 bound the interval. Part 3 restricts
+                // `i` to the arithmetic progression the loop actually
+                // visits, so step > 1 loops like
+                // `for (i = 0; i < 200; i += 2)` still refute
+                // `i === 3` inside the body.
+                //
+                // We deliberately do NOT emit a per-iteration
+                // disjunction `(or (= i 0) (= i 2) …)` even though
+                // it would also be sound, because that spelling
+                // grows linearly with the concrete iteration count
+                // and would blow up the emitted SMT-LIB string for
+                // any loop over a few dozen iterations — slowing
+                // Z3 on every query inside the body and exploding
+                // our smt-cache key space. The (range + mod) spelling
+                // has the same solution set in Z3's linear integer
+                // theory and stays O(1).
                 var _boundTok = null;
                 var _boundOp = null;
                 // Condition parsed as `i OP LIT` or `LIT OP i`.
@@ -7346,6 +7364,35 @@
                   var _bndFormula = smtCmp(_boundOp, _cSym, smtConst(parseInt(_boundTok.text, 10)));
                   _extraLoopFormulas.push(_bndFormula);
                   _extraLoopExprs.push(_cName + ' ' + _boundOp + ' ' + _boundTok.text);
+                }
+                // Step-parity refinement (step > 1 only). Emits
+                // `(i - init) mod step === 0` so the theory solver
+                // knows `i` is restricted to the arithmetic
+                // progression `init, init+step, init+2*step, …`
+                // (ascending) or `init, init-step, init-2*step, …`
+                // (descending). For step === 1 the congruence is
+                // trivially true and we skip the formula.
+                if (_step > 1) {
+                  var _diffExpr, _diffExprText;
+                  if (_ascending) {
+                    // (i - init)
+                    _diffExpr = smtArith('-', _cSym, smtConst(_cInit));
+                    _diffExprText = '(' + _cName + ' - ' + _cInit + ')';
+                  } else {
+                    // (init - i)
+                    _diffExpr = smtArith('-', smtConst(_cInit), _cSym);
+                    _diffExprText = '(' + _cInit + ' - ' + _cName + ')';
+                  }
+                  if (_diffExpr) {
+                    var _modExpr = smtArith('%', _diffExpr, smtConst(_step));
+                    if (_modExpr) {
+                      var _parityFormula = smtCmp('===', _modExpr, smtConst(0));
+                      if (_parityFormula) {
+                        _extraLoopFormulas.push(_parityFormula);
+                        _extraLoopExprs.push(_diffExprText + ' % ' + _step + ' === 0');
+                      }
+                    }
+                  }
                 }
               })();
             }
