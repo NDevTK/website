@@ -4909,7 +4909,9 @@
                   var _gsBD = 1, _gsBE = _gsJ + 1;
                   while (_gsBE < stop && _gsBD > 0) { if (tks[_gsBE].type === 'open' && tks[_gsBE].char === '{') _gsBD++; if (tks[_gsBE].type === 'close' && tks[_gsBE].char === '}') _gsBD--; _gsBE++; }
                   var _gsFnBind = functionBinding(_gsParams, _gsJ, _gsBE, true);
-                  if (_gsPrefix === 'get') props['__getter_' + keyName] = _gsFnBind; else props[keyName] = _gsFnBind;
+                  if (_gsPrefix === 'get') props['__getter_' + keyName] = _gsFnBind;
+                  else if (_gsPrefix === 'set') props['__setter_' + keyName] = _gsFnBind;
+                  else props[keyName] = _gsFnBind;
                   frame.i = _gsBE; if (tks[frame.i] && tks[frame.i].type === 'sep' && tks[frame.i].char === ',') frame.i++;
                   continue;
                 }
@@ -9467,6 +9469,12 @@
                   if (_isGetter) {
                     // Getter: store as a function, resolve when property is accessed.
                     _clsProps['__getter_' + _mName] = functionBinding(_mParams, _mJ, _mBE, true);
+                  } else if (_isSetter) {
+                    // Setter: store under a shadow key and
+                    // invoke at property-write time. The
+                    // instance's `_mName` slot stays available
+                    // for a paired getter.
+                    _clsProps['__setter_' + _mName] = functionBinding(_mParams, _mJ, _mBE, true);
                   } else {
                     _clsProps[_mName] = functionBinding(_mParams, _mJ, _mBE, true);
                   }
@@ -10297,21 +10305,27 @@
               const r = await readValue(i + 2, stop, TERMS_TOP);
               if (r && r.binding) {
                 var _leaf = parts[parts.length - 1];
-                if (eqTok.char === '+=') {
+                // Setter dispatch: if the container has a
+                // `__setter_<leaf>` function, invoke it with
+                // the RHS as its first arg and `this` bound to
+                // the container so mutations inside the setter
+                // flow through.
+                var _setterFn = _container.props['__setter_' + _leaf];
+                if (_setterFn && _setterFn.kind === 'function') {
+                  await instantiateFunction(_setterFn, [r.binding], _container);
+                  _trackMayBeAssign(t.text, r.binding);
+                } else if (eqTok.char === '+=') {
                   var prev = _container.props[_leaf];
                   if (prev && prev.kind === 'chain' && r.binding.kind === 'chain') {
                     _container.props[_leaf] = chainBinding([...prev.toks, SYNTH_PLUS, ...r.binding.toks]);
                   } else {
                     _container.props[_leaf] = r.binding;
                   }
+                  _trackMayBeAssign(t.text, _container.props[_leaf]);
                 } else {
                   _container.props[_leaf] = r.binding;
+                  _trackMayBeAssign(t.text, _container.props[_leaf]);
                 }
-                // May-be lattice: track the full path so smtSat can emit
-                // a (or (= |obj.prop| v1) (= |obj.prop| v2) ...) disjunction.
-                // _mayBeKey will canonicalise via __objId so any alias of
-                // the leaf container hits the same slot.
-                _trackMayBeAssign(t.text, _container.props[_leaf]);
               }
               i = skipExpr(i + 2, stop) - 1;
               continue;

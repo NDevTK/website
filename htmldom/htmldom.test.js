@@ -3940,6 +3940,10 @@ await (async function () {
   // --- Precision on destructured event ---
   await checkTaint('destructure via var from event.data', { 'a.js': 'window.addEventListener("message", function(e) { var d = e.data; document.getElementById("o").innerHTML = d; });' }, 1, { sources: ['postMessage'] });
 
+  // --- Setter dispatch ---
+  await checkTaint('class setter sink', { 'a.js': 'class C { set u(v) { document.getElementById("o").innerHTML = v; } } var c = new C(); c.u = location.hash;' }, 1, { sources: ['url'] });
+  await checkTaint('obj literal setter sink', { 'a.js': 'var o = { set u(v) { document.getElementById("o").innerHTML = v; } }; o.u = location.hash;' }, 1, { sources: ['url'] });
+
   // --- Higher-order function calls ---
   await checkTaint('hof inline callback', { 'a.js': 'function apply(fn, v) { return fn(v); } document.getElementById("o").innerHTML = apply(function(x) { return x; }, location.hash);' }, 1, { sources: ['url'] });
   await checkTaint('hof arrow callback', { 'a.js': 'function apply(fn, v) { return fn(v); } document.getElementById("o").innerHTML = apply(x => x, location.hash);' }, 1, { sources: ['url'] });
