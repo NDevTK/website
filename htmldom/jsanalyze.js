@@ -325,6 +325,53 @@
     return false;
   }
 
+  // Collect every `source` label reachable from an Event subtype
+  // via its props/methods (and transitively via readType /
+  // returnType refs, and via the `extends` chain). Used to
+  // compute the flat taint-label set an addEventListener handler
+  // should attach to its event-parameter binding.
+  //
+  // Example: MessageEvent → {data: postMessage, origin:
+  // postMessage} → {'postMessage'}.
+  //
+  // Example: DragEvent → {dataTransfer: DataTransfer} →
+  // DataTransfer.{files: file, getData(): dragdrop} →
+  // {'file', 'dragdrop'}.
+  function _collectEventSourceLabels(db, typeName, seen) {
+    var labels = new Set();
+    if (!db || !typeName) return labels;
+    seen = seen || new Set();
+    if (seen.has(typeName)) return labels;
+    seen.add(typeName);
+    var cur = typeName;
+    while (cur) {
+      var td = db.types[cur];
+      if (!td) break;
+      if (td.props) {
+        for (var p in td.props) {
+          var pd = td.props[p];
+          if (pd.source) labels.add(pd.source);
+          if (pd.readType) {
+            var sub = _collectEventSourceLabels(db, pd.readType, seen);
+            sub.forEach(function (l) { labels.add(l); });
+          }
+        }
+      }
+      if (td.methods) {
+        for (var m in td.methods) {
+          var md = td.methods[m];
+          if (md.source) labels.add(md.source);
+          if (typeof md.returnType === 'string') {
+            var sub2 = _collectEventSourceLabels(db, md.returnType, seen);
+            sub2.forEach(function (l) { labels.add(l); });
+          }
+        }
+      }
+      cur = td.extends || null;
+    }
+    return labels;
+  }
+
   // Look up a call-site sink for a global/dotted callable, e.g.
   // `eval` / `document.write` / `location.assign`. Returns the
   // same `{type, severity, prop}` shape callers expect.
@@ -397,28 +444,13 @@
   // against the DEFAULT_TYPE_DB at the bottom of this file. See
   // `getTaintSource` / `getTaintSourceCall` for the API the rest
   // of the walker still calls.
-  // Event handler parameter sources: addEventListener type → param.property → label.
-  const EVENT_TAINT_SOURCES = {
-    // postMessage
-    'message':            { 'data': 'postMessage', 'origin': 'postMessage' },
-    // URL changes
-    'hashchange':         { 'newURL': 'url', 'oldURL': 'url' },
-    'popstate':           { 'state': 'url' },
-    // BroadcastChannel cross-tab messages
-    'messageerror':       { 'data': 'postMessage' },
-    // WebSocket / EventSource: server-pushed data
-    'open':               { 'data': 'network' },
-    // FileReader / progress events: file contents
-    'load':               { 'target.result': 'file', 'target.responseText': 'network', 'target.response': 'network' },
-    'loadend':            { 'target.result': 'file', 'target.responseText': 'network', 'target.response': 'network' },
-    // Drag & drop: dataTransfer payload from another origin
-    'drop':               { 'dataTransfer.getData': 'dragdrop', 'dataTransfer.files': 'file' },
-    'paste':              { 'clipboardData.getData': 'clipboard' },
-    // Network errors that may carry tainted URLs
-    'error':              { 'message': 'network', 'filename': 'url' },
-    // Storage events fire when another tab writes — payload is attacker-influenced
-    'storage':            { 'newValue': 'storage', 'oldValue': 'storage', 'url': 'url' },
-  };
+  // Legacy EVENT_TAINT_SOURCES table was removed in phase 4 of
+  // the type-db refactor. Event-handler parameter taint is now
+  // resolved via `DEFAULT_TYPE_DB.eventMap[eventName]` → Event
+  // subtype → `_collectEventSourceLabels` which walks the
+  // subtype's props/methods (and transitive readType/returnType
+  // refs) for `source` fields. See the addEventListener branch
+  // in statement walking for the consumer.
 
   // Legacy flat-table sink classification was removed in phase 3
   // of the type-db refactor. Property, element-specific, call, and
@@ -9168,12 +9200,17 @@
                 var _evHandler = _evArgs.bindings[1];
                 if (_evHandler && _evHandler.kind === 'function') {
                   // Build tainted param binding if this event type has known sources.
+                  // Resolved via db.eventMap[eventName] → Event
+                  // subtype → flat set of source labels reachable
+                  // via its props/methods (including via extends
+                  // and readType chains).
                   var _evParamBindings = [];
-                  if (_evTypeStr && EVENT_TAINT_SOURCES[_evTypeStr] && _evHandler.params && _evHandler.params.length > 0) {
-                    var _evSources = EVENT_TAINT_SOURCES[_evTypeStr];
+                  var _evTypeName = _evTypeStr ? DEFAULT_TYPE_DB.eventMap[_evTypeStr] : null;
+                  var _evLabels = _evTypeName ? _collectEventSourceLabels(DEFAULT_TYPE_DB, _evTypeName) : null;
+                  if (_evLabels && _evLabels.size > 0 && _evHandler.params && _evHandler.params.length > 0) {
                     var _pn = _evHandler.params[0].name;
                     var _evRef = exprRef(_pn);
-                    _evRef.taint = new Set(Object.values(_evSources));
+                    _evRef.taint = _evLabels;
                     _evParamBindings.push(chainBinding([_evRef]));
                   } else if (_evHandler.params && _evHandler.params.length > 0) {
                     // Unknown event type: param is opaque, no taint.
@@ -10882,7 +10919,6 @@
       loadend:      'ProgressEvent',
       loadstart:    'ProgressEvent',
       progress:     'ProgressEvent',
-      open:         'MessageEvent', // WebSocket 'open' carries data
     },
   };
   // Populate createElement's dynamic return-type map from tagMap
@@ -10942,7 +10978,6 @@
     // DEFAULT_TYPE_DB exposed via _walkerInternals below; legacy
     // flat tables were removed in phase 3 of the type-db refactor.
     TAINT_SANITIZERS: TAINT_SANITIZERS,
-    EVENT_TAINT_SOURCES: EVENT_TAINT_SOURCES,
     // jsanalyze public surface (stage 1 — seam only, stable shape)
     jsanalyze: {
       bindingToValue: bindingToValue,
@@ -10992,7 +11027,6 @@
       SVG_TAGS: SVG_TAGS,
       NAV_SAFE_FILTER: NAV_SAFE_FILTER,
       TAINT_SANITIZERS: TAINT_SANITIZERS,
-      EVENT_TAINT_SOURCES: EVENT_TAINT_SOURCES,
       // New declarative type database. See the big comment block
       // above DEFAULT_TYPE_DB for the shape.
       DEFAULT_TYPE_DB: DEFAULT_TYPE_DB,
@@ -11004,6 +11038,7 @@
       _classifyCallSinkViaDB: _classifyCallSinkViaDB,
       _classifyAttrSinkViaDB: _classifyAttrSinkViaDB,
       _propIsEverASink: _propIsEverASink,
+      _collectEventSourceLabels: _collectEventSourceLabels,
     },
   };
 
