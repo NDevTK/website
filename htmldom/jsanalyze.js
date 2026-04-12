@@ -3186,7 +3186,11 @@
     // Map / Set / WeakMap / WeakSet key-indexed ops — applyMethod
     // dispatches these against a _mapLike object binding so dispatcher
     // tables and lookup caches flow through the may-be lattice.
+    // entries/values/keys materialise the stored props into a concrete
+    // array so for-of / destructuring iteration picks up per-entry
+    // taint; forEach walks its callback per entry.
     'set', 'get', 'has', 'add', 'delete', 'clear',
+    'entries', 'values', 'keys',
   ]);
 
   const MATH_CONSTANTS = {
@@ -5755,8 +5759,12 @@
                 if (!_msSlot.fnIds[_msFkey]) { _msSlot.fnIds[_msFkey] = true; _msSlot.fns.push(_msVal); }
               }
             } else {
-              // Opaque key — stash under a wildcard slot so indirect
-              // dispatch still sees the function.
+              // Opaque key — stash the full (key, value) pair on the
+              // `_opaqueEntries` list so subsequent iteration still
+              // sees the binding. Also preserve the legacy
+              // `__mapStar` wildcard for function-dispatch tables.
+              if (!bind._opaqueEntries) bind._opaqueEntries = [];
+              bind._opaqueEntries.push({ key: _msArgs.bindings[0], value: _msVal });
               if (_msVal && _msVal.kind === 'function') {
                 var _mswKey = '#' + bind.__objId + '.*';
                 if (!bind.props['__mapStar']) bind.props['__mapStar'] = [];
@@ -5783,17 +5791,128 @@
           var _mhArgs = await readCallArgBindings(parenIdx, stop);
           if (_mhArgs) return { bind: chainBinding([exprRef('map.has(*)')]), next: _mhArgs.next };
         }
-        if (method === 'add' && bind._mapLike === 'Set') {
+        if (method === 'add' && (bind._mapLike === 'Set' || bind._mapLike === 'WeakSet')) {
           var _maArgs = await readCallArgBindings(parenIdx, stop);
           if (_maArgs && _maArgs.bindings.length >= 1) {
             var _maKey = chainAsKnownString(_maArgs.bindings[0]);
-            if (_maKey !== null) bind.props[_maKey] = chainBinding([makeSynthStr('true')]);
+            if (_maKey !== null) {
+              bind.props[_maKey] = chainBinding([makeSynthStr('true')]);
+            } else {
+              // Opaque add: stash the binding itself as both key
+              // and value of the opaque entry so Set.values() /
+              // Set.forEach() iterate the actual tainted binding.
+              if (!bind._opaqueEntries) bind._opaqueEntries = [];
+              bind._opaqueEntries.push({ key: _maArgs.bindings[0], value: _maArgs.bindings[0] });
+            }
             return { bind: bind, next: _maArgs.next };
           }
         }
         if (method === 'delete' || method === 'clear') {
           var _mdArgs = await readCallArgBindings(parenIdx, stop);
           if (_mdArgs) return { bind: chainBinding([makeSynthStr('true')]), next: _mdArgs.next };
+        }
+        // Map / Set iteration (ABSTRACT-DOMAIN.md §4.8 / G3
+        // closure): `.entries()` / `.values()` / `.keys()`
+        // materialize the _mapLike object's stored props into a
+        // concrete array so `for (var [k,v] of m.entries())`
+        // iterates per-entry. For a Map, entries yield
+        // `[keyStr, value]` pairs; values yield value bindings;
+        // keys yield key-string literals. For a Set (which
+        // stores `key → synthStr('true')`), values / keys yield
+        // the keys and entries yields `[key, key]` pairs.
+        // Internal keys (__mapStar, __setter_*, __getter_*) are
+        // skipped.
+        if (method === 'entries' || method === 'values' || method === 'keys') {
+          var _miArgs = await readCallArgBindings(parenIdx, stop);
+          if (_miArgs) {
+            var _miElems = [];
+            var _miIsSet = (bind._mapLike === 'Set' || bind._mapLike === 'WeakSet');
+            // Known-key entries from bind.props.
+            for (var _mik in bind.props) {
+              if (_mik.indexOf('__') === 0) continue;
+              var _miKeyChain = chainBinding([makeSynthStr(_mik)]);
+              var _miValBind = bind.props[_mik];
+              if (method === 'entries') {
+                if (_miIsSet) {
+                  _miElems.push(arrayBinding([_miKeyChain, _miKeyChain]));
+                } else {
+                  _miElems.push(arrayBinding([_miKeyChain, _miValBind]));
+                }
+              } else if (method === 'values') {
+                _miElems.push(_miIsSet ? _miKeyChain : _miValBind);
+              } else { // keys
+                _miElems.push(_miKeyChain);
+              }
+            }
+            // Opaque-key entries from bind._opaqueEntries preserve
+            // the original tainted bindings verbatim so iteration
+            // still sees their labels.
+            if (bind._opaqueEntries) {
+              for (var _moi = 0; _moi < bind._opaqueEntries.length; _moi++) {
+                var _moe = bind._opaqueEntries[_moi];
+                if (method === 'entries') {
+                  _miElems.push(arrayBinding([_moe.key || chainBinding([exprRef('opaque')]), _moe.value || chainBinding([exprRef('opaque')])]));
+                } else if (method === 'values') {
+                  _miElems.push(_moe.value || chainBinding([exprRef('opaque')]));
+                } else {
+                  _miElems.push(_moe.key || chainBinding([exprRef('opaque')]));
+                }
+              }
+            }
+            return { bind: arrayBinding(_miElems), next: _miArgs.next };
+          }
+        }
+        // Map / Set forEach: iterate (value, key) pairs and
+        // walk the callback once per entry so sinks inside the
+        // body fire with the bound key/value.
+        if (method === 'forEach') {
+          const _mflp = tks[parenIdx];
+          if (_mflp && _mflp.type === 'open' && _mflp.char === '(') {
+            var _mfFn = null, _mfFnEnd = 0;
+            var _mfArrow = peekArrow(parenIdx + 1, stop);
+            if (_mfArrow) {
+              var _mfBody = readArrowBody(_mfArrow.arrowNext, stop);
+              if (_mfBody) {
+                _mfFn = functionBinding(_mfArrow.params, _mfBody.bodyStart, _mfBody.bodyEnd, _mfBody.isBlock, _mfArrow.isAsync);
+                _mfFn.capturedScope = _snapshotClosureForCapture();
+                _mfFnEnd = _mfBody.next;
+              }
+            }
+            if (!_mfFn) {
+              var _mfFexpr = await readFunctionExpr(parenIdx + 1, stop);
+              if (_mfFexpr) { _mfFn = _mfFexpr.binding; _mfFnEnd = _mfFexpr.next; }
+            }
+            if (_mfFn) {
+              var _mfRp = tks[_mfFnEnd];
+              if (_mfRp && _mfRp.type === 'close' && _mfRp.char === ')') {
+                var _mfIsSet = (bind._mapLike === 'Set' || bind._mapLike === 'WeakSet');
+                for (var _mfk in bind.props) {
+                  if (_mfk.indexOf('__') === 0) continue;
+                  var _mfKeyChain = chainBinding([makeSynthStr(_mfk)]);
+                  var _mfValBind = _mfIsSet ? _mfKeyChain : bind.props[_mfk];
+                  // Map.forEach(fn) / Set.forEach(fn) call fn with
+                  // (value, key, collection). Arrow / function cb
+                  // with fewer params just drops the trailing ones.
+                  await instantiateFunction(_mfFn, [_mfValBind, _mfKeyChain, bind]);
+                }
+                // Also walk opaque-key entries (preserves tainted
+                // keys / values that chainAsKnownString couldn't
+                // resolve at insertion time).
+                if (bind._opaqueEntries) {
+                  for (var _mfoi = 0; _mfoi < bind._opaqueEntries.length; _mfoi++) {
+                    var _mfoe = bind._opaqueEntries[_mfoi];
+                    var _mfoKey = _mfoe.key || chainBinding([exprRef('opaque')]);
+                    var _mfoVal = _mfoe.value || chainBinding([exprRef('opaque')]);
+                    await instantiateFunction(_mfFn, [_mfoVal, _mfoKey, bind]);
+                  }
+                }
+                if (_pendingCallbacks && taintEnabled) {
+                  _pendingCallbacks.push({ fn: _mfFn, params: [], isEventHandler: false });
+                }
+                return { bind: chainBinding([makeSynthStr('undefined')]), next: _mfFnEnd + 1 };
+              }
+            }
+          }
         }
       }
       if (method === 'concat') {
@@ -10283,9 +10402,33 @@
                     if (_fiIterBind && _fiIterBind.kind === 'array') {
                       for (var _fie = 0; _fie < _fiIterBind.elems.length; _fie++) {
                         var _fiElem = _fiIterBind.elems[_fie];
-                        if (_fiElem && _fiElem.kind === 'chain') {
+                        if (!_fiElem) continue;
+                        if (_fiElem.kind === 'chain') {
                           _fiTaintSources.push(_fiElem.toks);
                           _fiKnownVals.push(_fiElem);
+                        } else if (_fiElem.kind === 'array' || _fiElem.kind === 'object' || _fiElem.kind === 'element') {
+                          // Iterable-of-iterables / iterable-of-
+                          // objects: bind the loop variable to
+                          // the structured element directly so
+                          // `for (var pair of m.entries()) pair[0]`
+                          // and similar index/prop reads work.
+                          _fiKnownVals.push(_fiElem);
+                          // Collect labels from any chain values
+                          // inside so _forInOfTaint still fires
+                          // for the loop's taint seed.
+                          if (_fiElem.kind === 'array') {
+                            for (var _fiae = 0; _fiae < _fiElem.elems.length; _fiae++) {
+                              if (_fiElem.elems[_fiae] && _fiElem.elems[_fiae].kind === 'chain') {
+                                _fiTaintSources.push(_fiElem.elems[_fiae].toks);
+                              }
+                            }
+                          } else if (_fiElem.kind === 'object') {
+                            for (var _fiop in _fiElem.props) {
+                              if (_fiElem.props[_fiop] && _fiElem.props[_fiop].kind === 'chain') {
+                                _fiTaintSources.push(_fiElem.props[_fiop].toks);
+                              }
+                            }
+                          }
                         }
                       }
                     } else if (_fiIterBind && _fiIterBind.kind === 'object' && _forInOf === 'in') {
@@ -11879,11 +12022,16 @@
             }
             // Map / Set / WeakMap / WeakSet statements: `.set(k, v)`,
             // `.add(v)`, `.delete(k)`, `.clear()` mutate the receiver
-            // in place. Route through applyMethod which handles the
-            // mapLike dispatch (see the Map/Set block at the top of
+            // in place; `.forEach(cb)` walks its callback per entry;
+            // `.entries/.values/.keys` materialise an iterable.
+            // Route through applyMethod which handles the mapLike
+            // dispatch (see the Map/Set block at the top of
             // applyMethod for semantics).
             if (baseBind && baseBind.kind === 'object' && baseBind._mapLike &&
-                (method === 'set' || method === 'add' || method === 'delete' || method === 'clear' || method === 'has' || method === 'get')) {
+                (method === 'set' || method === 'add' || method === 'delete' ||
+                 method === 'clear' || method === 'has' || method === 'get' ||
+                 method === 'forEach' || method === 'entries' ||
+                 method === 'values' || method === 'keys')) {
               var _mapStmtResult = await applyMethod(baseBind, method, i + 1, stop);
               if (_mapStmtResult) {
                 i = _mapStmtResult.next - 1;

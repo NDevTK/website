@@ -4018,6 +4018,20 @@ await (async function () {
   // .catch on its result should not fire.
   await checkTaint('non-async .catch is no-op', { 'a.js': 'function f(){ return "safe"; } var p = f(); if (p && p.catch) p.catch(e => document.getElementById("o").innerHTML = e);' }, 0);
 
+  // Map / Set iteration (ABSTRACT-DOMAIN.md §4.4 / G3 closure):
+  // entries(), values(), keys(), and forEach() materialise the
+  // stored entries so downstream iteration (for-of, destructuring
+  // by index, direct forEach callbacks) picks up per-entry taint.
+  // Opaque-keyed entries (tainted key OR value) are preserved on
+  // bind._opaqueEntries so iteration still sees them.
+  await checkTaint('map.values for-of', { 'a.js': 'var m = new Map(); m.set("k", location.hash); for (var v of m.values()) { document.getElementById("o").innerHTML = v; }' }, 1, { sources: ['url'] });
+  await checkTaint('map.keys for-of (tainted key)', { 'a.js': 'var m = new Map(); m.set(location.hash, "v"); for (var k of m.keys()) { document.getElementById("o").innerHTML = k; }' }, 1, { sources: ['url'] });
+  await checkTaint('map.entries index access', { 'a.js': 'var m = new Map(); m.set("k", location.hash); for (var e of m.entries()) { document.getElementById("o").innerHTML = e[1]; }' }, 1, { sources: ['url'] });
+  await checkTaint('map.forEach arrow', { 'a.js': 'var m = new Map(); m.set("k", location.hash); m.forEach((v, k) => { document.getElementById("o").innerHTML = v; });' }, 1, { sources: ['url'] });
+  await checkTaint('map.forEach function', { 'a.js': 'var m = new Map(); m.set("k", location.hash); m.forEach(function(v, k) { document.getElementById("o").innerHTML = v; });' }, 1, { sources: ['url'] });
+  await checkTaint('set.values for-of', { 'a.js': 'var s = new Set(); s.add(location.hash); for (var v of s.values()) { document.getElementById("o").innerHTML = v; }' }, 1, { sources: ['url'] });
+  await checkTaint('set.forEach', { 'a.js': 'var s = new Set(); s.add(location.hash); s.forEach(v => { document.getElementById("o").innerHTML = v; });' }, 1, { sources: ['url'] });
+
   // --- filter(...).map(...).join: chain on opaque filter result ---
   await checkTaint('filter map join chain', { 'a.js': 'document.getElementById("o").innerHTML = ["a", location.hash].filter(x => x).map(x => x).join("");' }, 1, { sources: ['url'] });
 

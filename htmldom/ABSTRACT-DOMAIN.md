@@ -1176,16 +1176,30 @@ The current `for-of` handler does not understand `await`. A
 and treat the iterable as `AsyncIterable<T>` with `T` extracted from
 the iterable's `innerType`.
 
-### G3. `Map.entries()` / `Map.values()` / `Set.values()` iteration
+### G3. `Map.entries()` / `Map.values()` / `Set.values()` iteration ✓ implemented
 
-The `_mapLike` Object binding tracks key-indexed reads/writes via
-`.set/.get/.has` (§4.8 indirectly through `applyMethod`), but the
-iteration protocol is unmodeled. `for (var [k, v] of m.entries())`
-gives `v` no taint.
+`applyMethod` now materialises the `_mapLike` Object's stored
+entries into a concrete Array binding when the method is
+`.entries()`, `.values()`, or `.keys()`, and walks the callback
+per entry for `.forEach()`. Known-string-keyed entries come from
+`bind.props`; tainted / opaque keys and values are preserved on
+`bind._opaqueEntries` (a list pushed at `.set` / `.add` time when
+`chainAsKnownString` couldn't resolve the key) and included in
+both iteration and forEach walks.
 
-**Sketch of fix.** When `applyMethod` sees `.entries()`/`.values()`
-/`.keys()` on a `_mapLike` Object, return an Array binding whose
-elements are constructed from the Object's known props.
+The statement-level walker also routes `m.forEach(cb)`,
+`m.entries()`, `m.values()`, `m.keys()` through `applyMethod` so
+bare-statement calls fire the same iteration handlers as
+expression-position ones.
+
+The for-of loop handler was extended to bind loop variables to
+structured elements (array / object / element) when iterating an
+array of such elements — so `for (var pair of m.entries()) pair[1]`
+resolves `pair[1]` correctly. Sub-gap: **destructure-in-for-of**
+(`for (var [k, v] of m.entries())`) is not yet implemented —
+the for-of loop variable parser only extracts single identifiers
+and doesn't apply `applyPatternBindings` per iteration. Tracked
+as a separate gap.
 
 ### G4. `Symbol.iterator` protocol on plain objects
 
