@@ -4170,6 +4170,15 @@ await (async function () {
   await checkTaint('F.prototype.greet returns tainted', { 'a.js': 'function F() {} F.prototype.greet = function() { return location.hash; }; var f = new F(); document.getElementById("o").innerHTML = f.greet();' }, 1, { sources: ['url'] });
   await checkTaint('F.prototype method reads this.x', { 'a.js': 'function F(x) { this.x = x; } F.prototype.getX = function() { return this.x; }; var f = new F(location.hash); document.getElementById("o").innerHTML = f.getX();' }, 1, { sources: ['url'] });
 
+  // Aliased-container mutation: writing `.prop = value` on a
+  // binding retrieved via bracket-subscript or method-call result
+  // should mutate the underlying object through the alias, so
+  // reads through other references see the change.
+  await checkTaint('bracket-subscript alias write', { 'a.js': 'var o = {}; var a = [o]; a[0].x = location.hash; document.getElementById("o").innerHTML = o.x;' }, 1, { sources: ['url'] });
+  await checkTaint('shared obj via two arrays', { 'a.js': 'var o = {}; var a = [o]; var b = [o]; a[0].x = location.hash; document.getElementById("o").innerHTML = b[0].x;' }, 1, { sources: ['url'] });
+  await checkTaint('nested container push', { 'a.js': 'var store = {items: []}; store.items.push(location.hash); document.getElementById("o").innerHTML = store.items[0];' }, 1, { sources: ['url'] });
+  await checkTaint('Map get().prop = write', { 'a.js': 'var m = new Map(); var o = {}; m.set("a", o); m.get("a").x = location.hash; document.getElementById("o").innerHTML = o.x;' }, 1, { sources: ['url'] });
+
   // --- filter(...).map(...).join: chain on opaque filter result ---
   await checkTaint('filter map join chain', { 'a.js': 'document.getElementById("o").innerHTML = ["a", location.hash].filter(x => x).map(x => x).join("");' }, 1, { sources: ['url'] });
 

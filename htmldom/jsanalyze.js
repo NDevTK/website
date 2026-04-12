@@ -12429,6 +12429,32 @@
                   if (_chEq && _chEq.type === 'sep' && (_chEq.char === '=' || _chEq.char === '+=')) {
                     var _chExprResult = await readValue(i, _prevChainEnd, TERMS_TOP);
                     var _chRecvBind = _chExprResult && _chExprResult.binding;
+                    // Object-receiver: the method call returned a
+                    // concrete object (e.g. `m.get("a")` returns
+                    // the stored object). Write `.prop = rhs`
+                    // directly on the object binding so subsequent
+                    // reads through other aliases see the mutation.
+                    // This is what makes `m.get("a").x = tainted;
+                    // sink(o.x)` work when o is the same ref.
+                    if (_chRecvBind && _chRecvBind.kind === 'object') {
+                      var _chObjProp = _chTok.text.slice(1);
+                      var _chObjRhs = await readValue(_chJ + 2, stop, TERMS_TOP);
+                      if (_chObjRhs && _chObjRhs.binding) {
+                        _chRecvBind.props[_chObjProp] = _chObjRhs.binding;
+                        if (taintEnabled) {
+                          var _chObjSinkInfo = _classifyBindingSink(_chRecvBind, _chObjProp);
+                          if (_chObjSinkInfo && _chObjSinkInfo.severity !== 'safe') {
+                            var _chObjLabels = getBindingLabels(_chObjRhs.binding);
+                            if (_chObjLabels && _chObjLabels.size) {
+                              recordTaintFinding(_chObjSinkInfo.type, _chObjSinkInfo.severity, _chObjProp, null, _chObjLabels, taintCondStack,
+                                { expr: t.text + '(...)' + _chTok.text, line: countLines(t._src, t.start) });
+                            }
+                          }
+                        }
+                      }
+                      i = skipExpr(_chJ + 2, stop) - 1;
+                      break;
+                    }
                     if (_chRecvBind && _chRecvBind.kind === 'chain' && _chRecvBind.typeName) {
                       var _chProp = _chTok.text.slice(1);
                       var _chSinkInfo = _classifyBindingSink(_chRecvBind, _chProp);
@@ -12593,6 +12619,71 @@
                 }
                 i = skipExpr(i + 2, stop) - 1;
                 continue;
+              }
+            }
+          }
+        }
+      }
+
+      // Bracket-subscript-path assignment: `a[expr].prop = value`
+      // / `a[expr].prop.sub = value`. The statement starts with
+      // an ident, then `[`, balanced `]`, then `.prop…`, then
+      // `=`. Walk `ident[expr]` via readValue to get the receiver
+      // binding (e.g. the element of a materialised array), then
+      // apply the trailing `.prop = rhs` path write against it.
+      // This is the aliasing path: `var o = {}; var a = [o];
+      // a[0].x = tainted; sink(o.x)` works because `a[0]`
+      // returns the same object reference as `o`.
+      if (t.type === 'other' && IDENT_RE.test(t.text)) {
+        var _bkNext = tokens[i + 1];
+        if (_bkNext && _bkNext.type === 'open' && _bkNext.char === '[') {
+          // Find matching `]`.
+          var _bkDepth = 1, _bkK = i + 2;
+          while (_bkK < stop && _bkDepth > 0) {
+            if (tokens[_bkK].type === 'open' && tokens[_bkK].char === '[') _bkDepth++;
+            else if (tokens[_bkK].type === 'close' && tokens[_bkK].char === ']') _bkDepth--;
+            if (_bkDepth === 0) break;
+            _bkK++;
+          }
+          if (_bkDepth === 0) {
+            var _bkAfter = tokens[_bkK + 1];
+            if (_bkAfter && _bkAfter.type === 'other' && /^(?:\.[A-Za-z_$][A-Za-z0-9_$]*)+$/.test(_bkAfter.text)) {
+              var _bkEq = tokens[_bkK + 2];
+              if (_bkEq && _bkEq.type === 'sep' && (_bkEq.char === '=' || _bkEq.char === '+=')) {
+                // Read `ident[expr]` only up to the close-bracket
+                // so the receiver binding is the ELEMENT, not the
+                // deeper prop read.
+                var _bkReceiver = await readValue(i, _bkK + 1, TERMS_TOP);
+                if (_bkReceiver && _bkReceiver.binding && _bkReceiver.binding.kind === 'object') {
+                  var _bkPropParts = _bkAfter.text.slice(1).split('.');
+                  var _bkContainer = _bkReceiver.binding;
+                  var _bkOk = true;
+                  for (var _bkpi = 0; _bkpi < _bkPropParts.length - 1; _bkpi++) {
+                    var _bknext = _bkContainer.props[_bkPropParts[_bkpi]];
+                    if (_bknext && _bknext.kind === 'object') { _bkContainer = _bknext; continue; }
+                    _bkOk = false; break;
+                  }
+                  if (_bkOk) {
+                    var _bkRhs = await readValue(_bkK + 3, stop, TERMS_TOP);
+                    if (_bkRhs && _bkRhs.binding) {
+                      var _bkLeaf = _bkPropParts[_bkPropParts.length - 1];
+                      _bkContainer.props[_bkLeaf] = _bkRhs.binding;
+                      // Also check for sink classification.
+                      if (taintEnabled) {
+                        var _bkSinkInfo = _classifyBindingSink(_bkReceiver.binding, _bkLeaf);
+                        if (_bkSinkInfo && _bkSinkInfo.severity !== 'safe') {
+                          var _bkLabels = getBindingLabels(_bkRhs.binding);
+                          if (_bkLabels && _bkLabels.size) {
+                            recordTaintFinding(_bkSinkInfo.type, _bkSinkInfo.severity, _bkLeaf, null, _bkLabels, taintCondStack,
+                              { expr: t.text + '[…]' + _bkAfter.text, line: countLines(t._src, t.start) });
+                          }
+                        }
+                      }
+                    }
+                    i = skipExpr(_bkK + 3, stop) - 1;
+                    continue;
+                  }
+                }
               }
             }
           }
