@@ -4097,6 +4097,19 @@ await (async function () {
   await checkTaint('for await array of promises', { 'a.js': 'async function f(){ for await (var r of [fetch("/a"), fetch("/b")]) { document.getElementById("o").innerHTML = r; } } f();' }, 1, { sources: ['network'] });
   await checkTaint('for await Response.url', { 'a.js': 'async function f(){ for await (var r of fetch("/api")) { document.getElementById("o").innerHTML = r.url; } } f();' }, 1);
 
+  // Symbol.iterator protocol on user-defined iterables
+  // (ABSTRACT-DOMAIN.md §4.4 / G4 closure). Object literals
+  // with a `[Symbol.iterator]` key are recognised by the
+  // object-literal parser (stored under the `__symbolIterator`
+  // sentinel). The for-of handler invokes the iterator method,
+  // and when the method is a generator, the G1 machinery
+  // materialises the yields into an Array which drives the
+  // loop variable bindings. Same for Symbol.asyncIterator with
+  // for-await.
+  await checkTaint('Symbol.iterator generator', { 'a.js': 'var it = { [Symbol.iterator]: function*() { yield location.hash; } }; for (var v of it) { document.getElementById("o").innerHTML = v; }' }, 1, { sources: ['url'] });
+  await checkTaint('Symbol.iterator multiple yields', { 'a.js': 'var it = { [Symbol.iterator]: function*() { yield "safe"; yield location.hash; } }; for (var v of it) { document.getElementById("o").innerHTML = v; }' }, 1, { sources: ['url'] });
+  await checkTaint('Symbol.asyncIterator for await', { 'a.js': 'async function f() { var it = { [Symbol.asyncIterator]: function*() { yield location.hash; } }; for await (var v of it) { document.getElementById("o").innerHTML = v; } } f();' }, 1, { sources: ['url'] });
+
   // --- filter(...).map(...).join: chain on opaque filter result ---
   await checkTaint('filter map join chain', { 'a.js': 'document.getElementById("o").innerHTML = ["a", location.hash].filter(x => x).map(x => x).join("");' }, 1, { sources: ['url'] });
 

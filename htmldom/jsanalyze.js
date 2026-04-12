@@ -4931,10 +4931,31 @@
           frame._rp = null;
         } else if (frame._rp === 'computed') {
           const inner = _consumeResult();
-          if (!inner || !inner.toks || inner.toks.length !== 1 || inner.toks[0].type !== 'str') { _completeFrame(null); return; }
-          frame._pendingKey = inner.toks[0].text;
-          frame.i = frame._computedEnd + 1;
-          frame._rp = null;
+          if (!inner || !inner.toks) { _completeFrame(null); return; }
+          // Known well-known symbol keys: store under a sentinel
+          // string so the walker's for-of Symbol.iterator handler
+          // can find the method via `props['__symbolIterator']` /
+          // `props['__symbolAsyncIterator']`. (§4.4 / G4 closure.)
+          if (inner.toks.length === 1 && inner.toks[0].type === 'other') {
+            var _ckText = inner.toks[0].text;
+            if (_ckText === 'Symbol.iterator') {
+              frame._pendingKey = '__symbolIterator';
+              frame.i = frame._computedEnd + 1;
+              frame._rp = null;
+            } else if (_ckText === 'Symbol.asyncIterator') {
+              frame._pendingKey = '__symbolAsyncIterator';
+              frame.i = frame._computedEnd + 1;
+              frame._rp = null;
+            } else if (inner.toks.length === 1 && inner.toks[0].type === 'str') {
+              frame._pendingKey = inner.toks[0].text;
+              frame.i = frame._computedEnd + 1;
+              frame._rp = null;
+            } else { _completeFrame(null); return; }
+          } else if (inner.toks.length === 1 && inner.toks[0].type === 'str') {
+            frame._pendingKey = inner.toks[0].text;
+            frame.i = frame._computedEnd + 1;
+            frame._rp = null;
+          } else { _completeFrame(null); return; }
         }
       }
       const props = frame.props, stop = frame.stop;
@@ -10670,10 +10691,45 @@
                         _fiKnownVals.push(chainBinding([makeSynthStr(_fip)]));
                       }
                     } else if (_fiIterBind && _fiIterBind.kind === 'object' && _forInOf === 'of') {
-                      for (var _fipv in _fiIterBind.props) {
-                        if (_fiIterBind.props[_fipv] && _fiIterBind.props[_fipv].kind === 'chain') {
-                          _fiTaintSources.push(_fiIterBind.props[_fipv].toks);
-                          _fiKnownVals.push(_fiIterBind.props[_fipv]);
+                      // Symbol.iterator protocol (§4.4 / G4
+                      // closure): when an object carries
+                      // `[Symbol.iterator]` (stored under the
+                      // `__symbolIterator` sentinel by the
+                      // object-literal parser's computed-key
+                      // path), invoke it to get the iterable.
+                      // If the iterator function is a generator,
+                      // instantiateFunction returns a
+                      // materialised Array of yielded values —
+                      // exactly what we need for for-of.
+                      // `Symbol.asyncIterator` does the same for
+                      // `for await (…)`.
+                      var _siFn = null;
+                      if (_forAwait && _fiIterBind.props['__symbolAsyncIterator']) {
+                        _siFn = _fiIterBind.props['__symbolAsyncIterator'];
+                      } else if (_fiIterBind.props['__symbolIterator']) {
+                        _siFn = _fiIterBind.props['__symbolIterator'];
+                      }
+                      if (_siFn && _siFn.kind === 'function') {
+                        var _siRes = await instantiateFunction(_siFn, [], _fiIterBind);
+                        if (_siRes && _siRes.kind === 'array') {
+                          for (var _siei = 0; _siei < _siRes.elems.length; _siei++) {
+                            var _siEl = _siRes.elems[_siei];
+                            if (!_siEl) continue;
+                            if (_siEl.kind === 'chain') {
+                              _fiTaintSources.push(_siEl.toks);
+                              _fiKnownVals.push(_siEl);
+                            } else {
+                              _fiKnownVals.push(_siEl);
+                            }
+                          }
+                        }
+                      } else {
+                        for (var _fipv in _fiIterBind.props) {
+                          if (_fipv.indexOf('__') === 0) continue;
+                          if (_fiIterBind.props[_fipv] && _fiIterBind.props[_fipv].kind === 'chain') {
+                            _fiTaintSources.push(_fiIterBind.props[_fipv].toks);
+                            _fiKnownVals.push(_fiIterBind.props[_fipv]);
+                          }
                         }
                       }
                     } else if (_fiIterBind && _fiIterBind.kind === 'chain') {

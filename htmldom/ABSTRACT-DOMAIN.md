@@ -1284,11 +1284,32 @@ The for-of loop handler was extended along two axes:
      `for (var [k, v] of [[tainted, "v"]])` flags reads of `k`
      but not `v`.
 
-### G4. `Symbol.iterator` protocol on plain objects
+### G4. `Symbol.iterator` protocol on plain objects ✓ implemented
 
-A user-defined iterator (`{ [Symbol.iterator]: function*() { … } }`)
-is not recognised. `for (var v of customIter)` walks an opaque
-chain.
+The object-literal parser's computed-key branch (`[expr]:`) now
+recognises two well-known symbol keys and stores them under
+sentinel string keys:
+
+  `[Symbol.iterator]`       → `props['__symbolIterator']`
+  `[Symbol.asyncIterator]`  → `props['__symbolAsyncIterator']`
+
+When the for-of (or for-await-of) handler encounters an object
+iterable with one of these sentinel keys, it invokes the stored
+function via `instantiateFunction(fn, [], iter)`. If the
+function is a generator — which it typically is in real-world
+patterns — the G1 yield-capture machinery returns a materialised
+Array of yielded values which then drives the loop variable
+bindings via the existing array-iteration path (including the
+structured-element and destructure-in-for-of handling from G3).
+
+The sentinel-string approach means Symbol.iterator is a pure
+syntactic marker; we don't model `Symbol` as a runtime value or
+track symbol identity. This is sound for the common user-defined
+iterable pattern where the symbol key is the textual expression
+`Symbol.iterator`. Aliased forms like `var sym = Symbol.iterator;
+var o = { [sym]: … }` aren't recognised (the computed-key path
+bails out unless the inner expression is exactly the sentinel
+text).
 
 ### G5. Parametric `Array<T>` for opaque arrays
 
