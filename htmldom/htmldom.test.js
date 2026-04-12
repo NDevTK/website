@@ -4062,6 +4062,20 @@ await (async function () {
   // Generator with no taint stays clean.
   await checkTaint('generator all-safe', { 'a.js': 'function* gen() { yield "a"; yield "b"; } for (var v of gen()) { document.getElementById("o").innerHTML = v; }' }, 0);
 
+  // Function.prototype.bind partial application (ABSTRACT-DOMAIN.md
+  // §4.8 / A12 closure). `f.bind(thisArg, ...preBound)` clones f
+  // with `_boundArgs` and `_boundThis` fields that instantiateFunction
+  // prepends to the caller's arg list at invocation time. Pre-bound
+  // positional args are taint-transparent; a second .bind cannot
+  // rebind `this`.
+  await checkTaint('bind one preBound arg', { 'a.js': 'function f(x) { document.getElementById("o").innerHTML = x; } var g = f.bind(null, location.hash); g();' }, 1, { sources: ['url'] });
+  await checkTaint('bind preBound + call arg', { 'a.js': 'function f(x, y) { document.getElementById("o").innerHTML = x + y; } var g = f.bind(null, location.hash); g("suffix");' }, 1, { sources: ['url'] });
+  await checkTaint('bind two preBound args', { 'a.js': 'function f(x, y) { document.getElementById("o").innerHTML = y; } var g = f.bind(null, "a", location.hash); g();' }, 1, { sources: ['url'] });
+  await checkTaint('rebind preserves original preBound', { 'a.js': 'function f(x) { document.getElementById("o").innerHTML = x; } var g = f.bind(null, location.hash); var h = g.bind(null); h();' }, 1, { sources: ['url'] });
+  await checkTaint('bind this reference', { 'a.js': 'function f() { document.getElementById("o").innerHTML = this.data; } var g = f.bind({data: location.hash}); g();' }, 1, { sources: ['url'] });
+  // Safe: pre-bound constant at the slot read by the sink.
+  await checkTaint('bind preserves arg positions', { 'a.js': 'function f(x, y) { document.getElementById("o").innerHTML = x; } var g = f.bind(null, "safe"); g(location.hash);' }, 0);
+
   // --- filter(...).map(...).join: chain on opaque filter result ---
   await checkTaint('filter map join chain', { 'a.js': 'document.getElementById("o").innerHTML = ["a", location.hash].filter(x => x).map(x => x).join("");' }, 1, { sources: ['url'] });
 

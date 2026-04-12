@@ -1103,18 +1103,28 @@ report `eval(tainted)` itself as a critical sink (`code` finding) so
 the dangerous case is not missed even though the body of the eval'd
 string is not analysed.
 
-### A12. `Function.prototype.bind` does not preserve partial application
+### A12. `Function.prototype.bind` partial application ✓ implemented
 
-**Lines:** 5682–5687.
-**Class:** UNSAFE.
-**Statement.** `f.bind(thisArg, ...preBound)` returns the original
-function `f` unchanged. The pre-bound arguments are forgotten;
-subsequent invocations `g(restArgs)` walk `f`'s body with `restArgs`
-as the parameters, not `[...preBound, ...restArgs]`.
-**Condition.** Sound iff partial application is not used to thread
-taint through the bound arguments. Any code that relies on
-`f.bind(null, taintedConst)` to preserve `taintedConst` across
-invocations is unsupported.
+**Lines:** 5739–5768 (applyMethod `.bind` handler),
+7918–7930 (instantiateFunction entry-point prepend).
+**Class:** SAFE.
+**Statement.** `f.bind(thisArg, ...preBound)` now clones the
+function binding and stores `_boundArgs := preBound` and
+`_boundThis := thisArg` on the clone (the original is untouched
+so other references to `f` aren't disturbed). When the clone is
+later called, `instantiateFunction` prepends `_boundArgs` to
+the caller's argument list and uses `_boundThis` in place of
+the caller's `thisBinding` if none was supplied. Rebinding via
+a second `.bind(…)` concatenates the new pre-bound args onto
+the existing `_boundArgs` but does NOT rebind `this` — matching
+the ECMAScript spec where a bound function's `this` is fixed at
+the outermost `.bind`.
+**Condition.** Sound iff every `.bind` result flows through
+`instantiateFunction` at its call site (which includes direct
+calls, `.call`/`.apply` reflective dispatch, `.then`/`.catch`
+callbacks, forEach callbacks, and factoryRef aliases). Chain
+tokens that contain bound functions without ever hitting a call
+site can't be refined further, but no taint flow is lost.
 
 ### A13. Parser failures silently fall back to opaque
 

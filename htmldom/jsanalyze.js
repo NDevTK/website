@@ -5739,10 +5739,27 @@
       if (bind && bind.kind === 'function' && method === 'bind') {
         var _bindArgs = await readCallArgBindings(parenIdx, stop);
         if (!_bindArgs) return null;
-        // Return the function itself so subsequent calls still
-        // dispatch via instantiateFunction. Arg taint bleeds
-        // into findings when the body is walked.
-        return { bind: bind, next: _bindArgs.next };
+        // Function.prototype.bind partial-application (A12
+        // closure). Clone the function binding so the original is
+        // untouched, carry the explicit `this` and any pre-bound
+        // positional args on the clone's `_boundThis` /
+        // `_boundArgs` fields, and preserve any existing
+        // bind-chain state when rebinding. instantiateFunction
+        // prepends _boundArgs to the caller's arg list and uses
+        // _boundThis in place of the caller's thisBinding so the
+        // body walks with the fully-applied parameter vector.
+        var _bindThisArg = _bindArgs.bindings[0] || null;
+        var _bindPreArgs = _bindArgs.bindings.slice(1);
+        var _boundFn = Object.assign({}, bind);
+        if (bind._boundArgs && bind._boundArgs.length) {
+          _boundFn._boundArgs = bind._boundArgs.concat(_bindPreArgs);
+        } else {
+          _boundFn._boundArgs = _bindPreArgs;
+        }
+        // The outermost `bind`'s `this` wins — a second `bind`
+        // cannot rebind `this` per ECMAScript spec.
+        _boundFn._boundThis = bind._boundThis || _bindThisArg;
+        return { bind: _boundFn, next: _bindArgs.next };
       }
       if (bind && bind.kind === 'function' && (method === 'call' || method === 'apply')) {
         var _caArgs = await readCallArgBindings(parenIdx, stop);
@@ -7899,6 +7916,17 @@
       return parts.join('/');
     };
     const instantiateFunction = async (fn, argBindings, thisBinding) => {
+      // Function.prototype.bind partial-application: when the
+      // function binding carries pre-bound args or `this` from a
+      // prior `.bind(…)` (see applyMethod), prepend them to the
+      // caller's arg list and use the bound `this` if the caller
+      // didn't supply one. (ABSTRACT-DOMAIN.md §4.8 / A12 closure.)
+      if (fn && fn._boundArgs && fn._boundArgs.length) {
+        argBindings = fn._boundArgs.concat(argBindings || []);
+      }
+      if (fn && fn._boundThis && !thisBinding) {
+        thisBinding = fn._boundThis;
+      }
       var _fnKey = (fn && fn.bodyStart != null) ? (fn.bodyStart + ':' + fn.bodyEnd) : null;
       // Detect recursion: the same function body is already being
       // walked. Return null so the caller falls back to its own
