@@ -1,0 +1,11 @@
+{
+  "name": "jsanalyze",
+  "version": "0.1.0",
+  "description": "Whole-program static analysis library for JavaScript, designed for precision, explicit assumption tracking, and iterative analysis.",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "node test/run.js"
+  },
+  "author": "",
+  "license": "MIT"
+}
