@@ -7218,23 +7218,39 @@
               }
               return { bind: arrayBinding(out), next: argRes.next };
             }
-            // Array.from({length: n}) with optional mapFn.
+            // Array.from({length: n}) with optional mapFn. When
+            // mapFn is present, walking it n times with distinct
+            // index bindings gives per-index precision. When mapFn
+            // is absent, every element is `undefined` — we produce
+            // a SINGLE synthetic element marking the whole array
+            // as "n undefineds" so downstream reads see the
+            // structure without materialising n identical elements.
+            //
+            // Design note: there is no numeric cap on `lenN`. The
+            // library does not impose arbitrary limits; adversarial
+            // inputs that request absurdly large arrays simply walk
+            // mapFn that many times (with the summary cache making
+            // repeated calls with identical fingerprints cheap).
             if (src && src.kind === 'object') {
               const lenB = src.props.length;
               const lenN = lenB ? chainAsNumber(lenB) : null;
-              if (lenN !== null && lenN >= 0 && lenN < 10000) {
+              if (lenN !== null && lenN >= 0) {
+                if (!mapFn || mapFn.kind !== 'function') {
+                  // No mapFn: every slot is `undefined`. Produce
+                  // a typed chain representing the array-of-n
+                  // without materialising n identical bindings.
+                  var _unchain = chainBinding([exprRef('Array.from(undefined*' + lenN + ')')]);
+                  _unchain.typeName = 'Array';
+                  return { bind: _unchain, next: argRes.next };
+                }
                 const out = [];
                 for (let idx = 0; idx < lenN; idx++) {
-                  if (mapFn && mapFn.kind === 'function') {
-                    const toks = await instantiateFunction(mapFn, [
-                      chainBinding([exprRef('undefined')]),
-                      chainBinding([makeSynthStr(String(idx))]),
-                    ]);
-                    if (!toks) return null;
-                    out.push(chainBinding(toks));
-                  } else {
-                    out.push(chainBinding([exprRef('undefined')]));
-                  }
+                  const toks = await instantiateFunction(mapFn, [
+                    chainBinding([exprRef('undefined')]),
+                    chainBinding([makeSynthStr(String(idx))]),
+                  ]);
+                  if (!toks) return null;
+                  out.push(chainBinding(toks));
                 }
                 return { bind: arrayBinding(out), next: argRes.next };
               }
