@@ -13,12 +13,23 @@
 
 let _acorn = null;
 
+// Resolve acorn: prefer the vendored copy shipped under
+// jsanalyze/vendor/, fall back to a node_modules install. We
+// check for the file's existence explicitly rather than catching
+// a require error — the boundary between "vendored" and
+// "installed" is an environment property, not data-dependent
+// recovery.
 function getAcorn() {
   if (_acorn) return _acorn;
-  try { _acorn = require('../vendor/acorn.js'); return _acorn; } catch (_) {}
-  try { _acorn = require('acorn'); return _acorn; } catch (e) {
-    throw new Error('jsanalyze/parse: acorn not available. ' + e.message);
+  const path = require('path');
+  const fs = require('fs');
+  const vendoredPath = path.join(__dirname, '..', 'vendor', 'acorn.js');
+  if (fs.existsSync(vendoredPath)) {
+    _acorn = require(vendoredPath);
+    return _acorn;
   }
+  _acorn = require('acorn');
+  return _acorn;
 }
 
 // --- Lexer adapter -----------------------------------------------------
@@ -39,16 +50,15 @@ function createLexer(source, filename) {
     filename,
     current: null,    // peeked token
     prev: null,       // most recently consumed token
-    error: null,
   };
   function advance() {
     state.prev = state.current;
-    try {
-      state.current = iter.getToken();
-    } catch (e) {
-      state.error = e;
-      state.current = { type: { label: 'eof' }, value: null, start: source.length, end: source.length, loc: null };
-    }
+    // Tokenizer exceptions propagate. A tokenizer failure means
+    // the source contains invalid lexical structure (unterminated
+    // string, bad escape, etc.); parse.js converts this into a
+    // visible error at the parseModule boundary where the caller
+    // sees it in `trace.warnings`. No silent recovery.
+    state.current = iter.getToken();
     return state.prev;
   }
   // Prime with the first token.
@@ -517,7 +527,27 @@ function parsePrimary(lexer) {
     expect(lexer, ')');
     return expr;
   }
-  throw parseError(lexer, 'unexpected token: ' + label);
+  // Unknown primary. Emit an UnimplementedExpression marker so
+  // the IR builder can raise an explicit `unimplemented`
+  // assumption at this location. Consume the token so the
+  // surrounding parser doesn't loop forever on the same
+  // unrecognised input; if it's a balanced delimiter, skip the
+  // matched region.
+  const startTok = lexer.advance();
+  let endTok = startTok;
+  if (startTok.type.label === '[' || startTok.type.label === '{') {
+    // Skip to matching close.
+    const opener = startTok.type.label;
+    const closer = opener === '[' ? ']' : '}';
+    let depth = 1;
+    while (!lexer.eof() && depth > 0) {
+      const t2 = lexer.advance();
+      endTok = t2;
+      if (t2.type.label === opener) depth++;
+      else if (t2.type.label === closer) depth--;
+    }
+  }
+  return mkUnimplementedExpression(label, startTok, endTok);
 }
 
 function expect(lexer, label) {
@@ -547,15 +577,15 @@ function parseError(lexer, msg) {
 
 function parseModule(source, filename, options) {
   const opts = options || {};
+  // createLexer() advances once to prime the token stream, so
+  // a tokenizer error on the first character surfaces here. Both
+  // createLexer and parseTopLevel propagate exceptions upward;
+  // the boundary handler in index.js wraps them into a partial
+  // trace warning so the consumer always sees what went wrong.
   const lexer = createLexer(source, filename);
   const body = parseTopLevel(lexer);
   const program = mkProgram(body, opts.sourceType || 'script');
   program._jsanalyzeFilename = filename;
-  if (lexer.state.error) {
-    const e = new Error((filename ? filename + ': ' : '') + lexer.state.error.message);
-    e.original = lexer.state.error;
-    throw e;
-  }
   return program;
 }
 
@@ -939,19 +969,13 @@ function beginStatement(lexer, tasks, outputs) {
     return;
   }
 
-  // Expression statement — fall-through. If the expression parser
-  // itself rejects, we catch and emit an UnimplementedStatement
-  // instead of propagating the error.
-  try {
-    const expr = parseExpression(lexer);
-    if (lexer.peek() && lexer.peek().type.label === ';') lexer.advance();
-    outputs.push(mkExpressionStatement(expr));
-  } catch (e) {
-    // Skip to the next boundary and emit a marker rather than
-    // aborting the whole parse.
-    const endTok = skipToNextStatementBoundary(lexer);
-    outputs.push(mkUnimplementedStatement('expression', t, endTok));
-  }
+  // Expression statement — fall-through. The expression parser
+  // propagates errors; unknown primaries become
+  // UnimplementedExpression markers inside parsePrimary rather
+  // than via exception-and-recover here.
+  const expr = parseExpression(lexer);
+  if (lexer.peek() && lexer.peek().type.label === ';') lexer.advance();
+  outputs.push(mkExpressionStatement(expr));
 }
 
 // Keywords that introduce statement constructs we haven't

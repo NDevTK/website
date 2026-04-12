@@ -5,6 +5,34 @@ the lattice of abstract values, the abstract state at each program
 point, the transfer functions per IR instruction, and the worklist
 fixpoint algorithm.
 
+## No hidden caps
+
+The engine contains **zero arbitrary numeric thresholds**. Things
+that a typical static analyzer hides behind a tunable constant —
+widening after `k` lattice joins, flattening after `d` overlay
+layers, capping OneOf cardinality at `n` elements, limiting the
+fixpoint to `m` iterations — are **not present here**. Every
+approximation is either:
+
+1. a principled lattice operation (Concrete → OneOf → Top, with
+   joins always computing the exact least upper bound), or
+2. a visible `Assumption` record with a reason code, consumable
+   via `query.assumptions(trace)`.
+
+If the engine takes exponential time on an adversarial input,
+that is a documented complexity characteristic of the algorithm,
+not a cap to be tuned. If the fixpoint fails to converge, the
+analysis hangs — it does not silently return a truncated result
+and pretend success. If an operand set blows up to a million
+entries, it is tracked as a million-entry OneOf; downstream
+analyses decide how to handle it.
+
+The only exceptions the engine catches are the two
+analysis-boundary catches in `src/index.js`, and each of those
+raises an explicit `unimplemented` soundness assumption so the
+caught error is visible both in `trace.warnings` and in
+`trace.assumptions`.
+
 ## Abstract values
 
 ```

@@ -8,7 +8,7 @@
 
 const { buildModule } = require('./ir.js');
 const { analyseFunction } = require('./worklist.js');
-const { AssumptionTracker } = require('./assumptions.js');
+const { AssumptionTracker, REASONS, SEVERITIES } = require('./assumptions.js');
 const D = require('./domain.js');
 const { overlayEntries } = require('./domain.js');
 const query = require('./query.js');
@@ -43,6 +43,13 @@ async function analyze(input, options) {
 
   for (const filename of Object.keys(files)) {
     let module;
+    // Boundary: parse/IR errors. We catch here — and ONLY here —
+    // so one bad file doesn't tank the whole multi-file analysis.
+    // Every caught error raises an explicit `unimplemented`
+    // soundness assumption so consumers that only inspect
+    // `trace.assumptions` still see the floor, AND a
+    // human-readable entry in `trace.warnings`. The underlying
+    // exception's message is recorded on both.
     try {
       module = buildModule(files[filename], filename);
     } catch (e) {
@@ -51,7 +58,14 @@ async function analyze(input, options) {
         severity: 'error',
         message: 'parse/IR error: ' + e.message,
         file: filename,
+        stack: e.stack,
       });
+      assumptions.raise(
+        REASONS.UNIMPLEMENTED,
+        'parse/IR error: ' + e.message,
+        { file: filename, line: 0, col: 0, pos: 0 },
+        { severity: SEVERITIES.SOUNDNESS }
+      );
       continue;
     }
 
@@ -60,11 +74,14 @@ async function analyze(input, options) {
       assumptions,
       typeDB: options.typeDB || null,
       nextObjId: 0,
-      onCall: null, // TODO: interprocedural dispatch
+      onCall: null,
     };
 
     const initialState = D.createState();
     let result;
+    // Boundary: worklist / transfer function errors. Same
+    // dual-visibility rule as above — warning + soundness
+    // assumption.
     try {
       result = analyseFunction(module, module.top, initialState, ctx);
     } catch (e) {
@@ -73,7 +90,14 @@ async function analyze(input, options) {
         severity: 'error',
         message: 'worklist error: ' + e.message,
         file: filename,
+        stack: e.stack,
       });
+      assumptions.raise(
+        REASONS.UNIMPLEMENTED,
+        'worklist error: ' + e.message,
+        { file: filename, line: 0, col: 0, pos: 0 },
+        { severity: SEVERITIES.SOUNDNESS }
+      );
       continue;
     }
 

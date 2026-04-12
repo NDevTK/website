@@ -454,32 +454,19 @@ function unfreezeState(state) {
   };
 }
 
-// Max overlay chain depth before we flatten on freeze. Keeping
-// this bounded keeps `overlayGet` O(1) amortized and
-// `overlaysDelta` bounded in the common case. Flattening is O(k)
-// where k is the number of unique keys in the chain.
-const MAX_OVERLAY_DEPTH = 16;
-
-function overlayDepth(overlay) {
-  let n = 0;
-  let o = overlay;
-  while (o) { n++; o = o.parent; }
-  return n;
-}
-
 function freezeState(state) {
   if (state._frozen) return state;
-  let regs = state.regs;
-  let heap = state.heap;
-  if (overlayDepth(regs) > MAX_OVERLAY_DEPTH) {
-    regs = { own: overlayFlatten(regs), parent: null };
-  }
-  if (overlayDepth(heap) > MAX_OVERLAY_DEPTH) {
-    heap = { own: overlayFlatten(heap), parent: null };
-  }
+  // NB: no overlay-depth flattening. A previous version capped the
+  // chain at a constant depth "for performance", but the cap was
+  // an arbitrary assumption. Chains grow as the worklist adds
+  // layers; lookups and joins are O(depth) in the worst case. The
+  // cost is documented as a complexity characteristic rather than
+  // hidden behind a magic number. Callers that need tighter
+  // performance should restructure the analysis, not tune a
+  // constant.
   return Object.freeze({
-    regs,
-    heap,
+    regs: state.regs,
+    heap: state.heap,
     pathConds: state.pathConds,
     assumptionIds: state.assumptionIds,
     callStack: state.callStack,

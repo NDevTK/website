@@ -11,10 +11,9 @@
 
 'use strict';
 
-const { OP, TERMINATOR_KINDS } = require('./ir.js');
+const { OP } = require('./ir.js');
 const D = require('./domain.js');
 const { applyInstruction } = require('./transfer.js');
-const { REASONS } = require('./assumptions.js');
 
 // Analyse one function to a fixpoint. Returns:
 //   { blockStates: Map<BlockId, State>, exitState: State }
@@ -71,21 +70,15 @@ function analyseFunction(module, fn, initialState, ctx) {
 
   enqueue(cfg.entry, initialState);
 
-  // Hard iteration cap as a safety net. Monotone lattices with
-  // finite ascending chains terminate without the cap, but the
-  // cap protects against bugs in the lattice ops.
-  const maxIterations = 100000;
-  let iterations = 0;
-
+  // No iteration cap. The lattice is monotone with finite height
+  // — each register draws from a Value lattice whose height is
+  // bounded by the number of distinct concrete values observed
+  // in the program — so ascending chains terminate. An iteration
+  // cap would mask a bug in the lattice ops by cutting off the
+  // fixpoint early, producing silently unsound results. If the
+  // fixpoint doesn't terminate, that is a bug the user must see
+  // by having the analysis hang rather than silently give up.
   while (pending.length > 0) {
-    if (++iterations > maxIterations) {
-      ctx.assumptions.raise(
-        REASONS.UNSOLVABLE_MATH,
-        'worklist exceeded iteration cap of ' + maxIterations + ' — lattice may not be converging',
-        { file: module.name, line: 0, col: 0, pos: 0 }
-      );
-      break;
-    }
     const blockId = dequeue();
     const block = cfg.blocks.get(blockId);
     if (!block) continue;

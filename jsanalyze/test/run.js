@@ -19,6 +19,7 @@ const testFiles = [
   'transfer.test.js',
   'worklist.test.js',
   'analyze.test.js',
+  'no-caps.test.js',
 ];
 
 async function main() {

@@ -78,25 +78,21 @@ function applyBinOp(ctx, state, instr) {
 function computeBinOp(op, a, b, loc) {
   // Both concrete → fold directly.
   if (a && a.kind === D.V.CONCRETE && b && b.kind === D.V.CONCRETE) {
-    try {
-      const folded = evalJsBinOp(op, a.value, b.value);
-      if (folded !== undefined) {
-        return D.concrete(folded, undefined, loc);
-      }
-    } catch (_) {
-      // Fall through to type-level join.
+    const folded = evalJsBinOp(op, a.value, b.value);
+    if (folded !== undefined) {
+      return D.concrete(folded, undefined, loc);
     }
   }
-  // Both OneOf → compute pairwise Cartesian product (bounded by small sizes).
-  if (a && a.kind === D.V.ONE_OF && b && b.kind === D.V.ONE_OF
-      && a.values.length * b.values.length <= 64) {
+  // Both OneOf → compute the full pairwise cartesian product.
+  // No size cap. For large OneOfs this produces a large result,
+  // which is the precise answer. If the result is too large to
+  // reason about downstream, subsequent joins will handle it.
+  if (a && a.kind === D.V.ONE_OF && b && b.kind === D.V.ONE_OF) {
     const results = [];
     for (const va of a.values) {
       for (const vb of b.values) {
-        try {
-          const r = evalJsBinOp(op, va, vb);
-          if (r !== undefined) results.push(r);
-        } catch (_) {}
+        const r = evalJsBinOp(op, va, vb);
+        if (r !== undefined) results.push(r);
       }
     }
     if (results.length > 0) {
@@ -104,27 +100,23 @@ function computeBinOp(op, a, b, loc) {
       return D.oneOf(results, undefined, loc);
     }
   }
-  // Concrete × OneOf → broadcast.
-  if (a && a.kind === D.V.CONCRETE && b && b.kind === D.V.ONE_OF && b.values.length <= 16) {
+  // Concrete × OneOf → broadcast across every element.
+  if (a && a.kind === D.V.CONCRETE && b && b.kind === D.V.ONE_OF) {
     const results = [];
     for (const vb of b.values) {
-      try {
-        const r = evalJsBinOp(op, a.value, vb);
-        if (r !== undefined) results.push(r);
-      } catch (_) {}
+      const r = evalJsBinOp(op, a.value, vb);
+      if (r !== undefined) results.push(r);
     }
     if (results.length > 0) {
       if (results.length === 1) return D.concrete(results[0], undefined, loc);
       return D.oneOf(results, undefined, loc);
     }
   }
-  if (b && b.kind === D.V.CONCRETE && a && a.kind === D.V.ONE_OF && a.values.length <= 16) {
+  if (b && b.kind === D.V.CONCRETE && a && a.kind === D.V.ONE_OF) {
     const results = [];
     for (const va of a.values) {
-      try {
-        const r = evalJsBinOp(op, va, b.value);
-        if (r !== undefined) results.push(r);
-      } catch (_) {}
+      const r = evalJsBinOp(op, va, b.value);
+      if (r !== undefined) results.push(r);
     }
     if (results.length > 0) {
       if (results.length === 1) return D.concrete(results[0], undefined, loc);
@@ -134,22 +126,55 @@ function computeBinOp(op, a, b, loc) {
   // Opaque propagates.
   if (a && a.kind === D.V.OPAQUE) return D.opaque(a.assumptionIds, null, loc);
   if (b && b.kind === D.V.OPAQUE) return D.opaque(b.assumptionIds, null, loc);
-  // Give up → top. We don't raise an assumption here because the
-  // result is a join of the known domains, not a loss of information.
+  // Operands are of kinds we don't know how to combine for this
+  // operator (e.g. Interval + StrPattern). Result is Top. No
+  // assumption raised because this is a valid lattice join, not
+  // an information loss.
   return D.top(loc);
 }
 
-// Evaluate a JavaScript binary op on two concrete primitive values.
-// Returns undefined if the op isn't handled or the evaluation would
-// throw. Never raises — the caller falls back to top.
+// Evaluate a JavaScript binary op on two concrete primitive
+// values. Returns the exact JS result as a primitive, or
+// `undefined` if the operation is either not handled or would
+// throw a runtime TypeError (e.g. arithmetic across BigInt and
+// Number). Never throws itself — all guards are explicit checks.
+//
+// When this function returns `undefined`, the caller's lattice
+// transfer falls through to a more conservative answer. The
+// underlying JS exception semantics (TypeError on BigInt mix)
+// would be modelled separately when exception flow is
+// implemented.
 function evalJsBinOp(op, a, b) {
+  // Arithmetic and bitwise ops throw if exactly one operand is
+  // a BigInt and the other is not.
+  const aIsBig = typeof a === 'bigint';
+  const bIsBig = typeof b === 'bigint';
+  const mixedBigint = aIsBig !== bIsBig;
+  const arithLike = op === '+' || op === '-' || op === '*' || op === '/'
+    || op === '%' || op === '**' || op === '&' || op === '|' || op === '^'
+    || op === '<<' || op === '>>' || op === '>>>';
+  if (arithLike && mixedBigint) return undefined;
+  // `+` on BigInt + string also throws; `+` on number + string is
+  // concatenation which is fine. Only the BigInt-string case is
+  // dangerous.
+  if (op === '+' && ((aIsBig && typeof b === 'string') || (bIsBig && typeof a === 'string'))) {
+    return undefined;
+  }
   switch (op) {
     case '+': return a + b;
     case '-': return a - b;
     case '*': return a * b;
-    case '/': return a / b;
-    case '%': return a % b;
-    case '**': return a ** b;
+    case '/':
+      // Integer division by zero on BigInt throws RangeError.
+      if (aIsBig && b === 0n) return undefined;
+      return a / b;
+    case '%':
+      if (aIsBig && b === 0n) return undefined;
+      return a % b;
+    case '**':
+      // Negative BigInt exponents throw.
+      if (bIsBig && b < 0n) return undefined;
+      return a ** b;
     case '==': return a == b;   // eslint-disable-line eqeqeq
     case '!=': return a != b;   // eslint-disable-line eqeqeq
     case '===': return a === b;
@@ -158,12 +183,20 @@ function evalJsBinOp(op, a, b) {
     case '<=': return a <= b;
     case '>': return a > b;
     case '>=': return a >= b;
-    case '&': return (a & b) | 0;
-    case '|': return (a | b) | 0;
-    case '^': return (a ^ b) | 0;
-    case '<<': return a << b;
-    case '>>': return a >> b;
-    case '>>>': return a >>> b;
+    case '&': return aIsBig ? (a & b) : ((a & b) | 0);
+    case '|': return aIsBig ? (a | b) : ((a | b) | 0);
+    case '^': return aIsBig ? (a ^ b) : ((a ^ b) | 0);
+    case '<<':
+      // BigInt shifts can throw on negative shifts too.
+      if (aIsBig && b < 0n) return undefined;
+      return a << b;
+    case '>>':
+      if (aIsBig && b < 0n) return undefined;
+      return a >> b;
+    case '>>>':
+      // BigInt doesn't support unsigned right shift — throws.
+      if (aIsBig) return undefined;
+      return a >>> b;
     case '&&': return a && b;
     case '||': return a || b;
     case '??': return a != null ? a : b;  // eslint-disable-line eqeqeq
@@ -430,12 +463,17 @@ function applyCall(ctx, state, instr) {
   // wired up in worklist.js when `onCall` is set; if not set, we
   // return opaque.
   if (ctx.onCall) {
-    try {
-      const result = ctx.onCall(callee, instr.args.map(r => D.getReg(state, r)),
-        instr.thisArg ? D.getReg(state, instr.thisArg) : null,
-        state, loc, instr);
-      if (result) return D.setReg(result.state || state, instr.dest, result.value);
-    } catch (_) {}
+    // If the consumer's onCall hook throws, the exception
+    // propagates — it is a visible consumer bug, not a silent
+    // precision issue. Analyses that want fault tolerance
+    // should handle errors inside their own hook.
+    const result = ctx.onCall(
+      callee,
+      instr.args.map(r => D.getReg(state, r)),
+      instr.thisArg ? D.getReg(state, instr.thisArg) : null,
+      state, loc, instr
+    );
+    if (result) return D.setReg(result.state || state, instr.dest, result.value);
   }
   const a = ctx.assumptions.raise(
     REASONS.OPAQUE_CALL,
