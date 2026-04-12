@@ -4087,6 +4087,16 @@ await (async function () {
   await checkTaint('ES5 ctor with method', { 'a.js': 'function Foo(x) { this.url = x; this.render = function() { return this.url; }; } var f = new Foo(location.hash); document.getElementById("o").innerHTML = f.render();' }, 1, { sources: ['url'] });
   await checkTaint('ES5 factory returning object', { 'a.js': 'function Factory(x) { return { prop: x }; } var f = new Factory(location.hash); document.getElementById("o").innerHTML = f.prop;' }, 1, { sources: ['url'] });
 
+  // for await (…) — async iterator loops (ABSTRACT-DOMAIN.md
+  // §4.4 / G2 closure). When the iterable yields Promise<T>
+  // elements, the walker unwraps each to T and binds the loop
+  // variable to an opaque chain typed as T with the receiver's
+  // labels. Body reads on T's properties resolve through the
+  // TypeDB's per-prop source descriptors.
+  await checkTaint('for await fetch receiver', { 'a.js': 'async function f(){ for await (var chunk of fetch("/api")) { document.getElementById("o").innerHTML = chunk; } } f();' }, 1, { sources: ['network'] });
+  await checkTaint('for await array of promises', { 'a.js': 'async function f(){ for await (var r of [fetch("/a"), fetch("/b")]) { document.getElementById("o").innerHTML = r; } } f();' }, 1, { sources: ['network'] });
+  await checkTaint('for await Response.url', { 'a.js': 'async function f(){ for await (var r of fetch("/api")) { document.getElementById("o").innerHTML = r.url; } } f();' }, 1);
+
   // --- filter(...).map(...).join: chain on opaque filter result ---
   await checkTaint('filter map join chain', { 'a.js': 'document.getElementById("o").innerHTML = ["a", location.hash].filter(x => x).map(x => x).join("");' }, 1, { sources: ['url'] });
 

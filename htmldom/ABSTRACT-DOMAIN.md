@@ -1216,15 +1216,41 @@ generator `.next()` / `.throw()` / `.return()` method calls —
 direct iteration via `for-of` and `spread` cover the common
 cases.
 
-### G2. Async iterators (`for await (… of stream)`)
+### G2. Async iterators (`for await (… of stream)`) ✓ implemented
 
-The current `for-of` handler does not understand `await`. A
-`for await (var chunk of fetch('/api'))` therefore drops the
-`network` label.
+The for-loop header parser now recognises `for await (…)` by
+peeking for the `await` keyword between `for` and `(`. The
+`_forOpenParenIdx` cursor is advanced past the `await` so all
+downstream header-reading code (variable declaration parsing,
+destructure pattern detection, iterable readValue, mutated-in-
+body scan, loop condition formula, etc.) sees the same token
+range as a regular for-of.
 
-**Sketch of fix.** Lift the for-of handler to recognise `for await`
-and treat the iterable as `AsyncIterable<T>` with `T` extracted from
-the iterable's `innerType`.
+When the iterable yields `Promise<T>` elements, the walker
+unwraps each to T and binds the loop variable accordingly:
+
+  1. When the iterable itself is a typed chain with `innerType`
+     set (e.g. `fetch('/api')` → `Promise<Response>`), the loop
+     variable is bound to an opaque chain typed as `innerType`
+     with the receiver's labels. Body reads on that variable's
+     properties resolve against the inner type's TypeDB
+     descriptors — so `for await (var r of fetch('/api')) sink(r.url)`
+     correctly picks up both the upstream `network` label and
+     the `Response.url` `url` source label.
+  2. When the iterable is an Array of typed chains (e.g.
+     `[fetch('/a'), fetch('/b')]`), the walker collects each
+     element's `innerType` + label set and joins them into the
+     loop variable's type / label union.
+
+Remaining gap: user-defined async generators
+(`async function* stream() { yield await fetch(...); }`)
+work through the G1 yield-capture machinery because async +
+generator flags can co-exist, but their for-await consumers
+need to peek through the async-generator-as-array synthetic
+return to pick up each element's promise unwrapping. The
+common case (Array of promises, Promise<Iterable>) is covered;
+the composed case (async generator + for-await) is a narrower
+follow-up.
 
 ### G3. `Map.entries()` / `Map.values()` / `Set.values()` iteration ✓ implemented
 

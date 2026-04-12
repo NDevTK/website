@@ -10514,11 +10514,23 @@
       }
 
       if (t.text === 'for' || t.text === 'while') {
+        // Detect `for await (…)` — an async iterator loop from
+        // async functions. The walker treats it as a regular
+        // for-of but unwraps each element's `innerType` (when
+        // the iterable yields Promise<T>) so the loop variable
+        // sees T and the T's labels. (ABSTRACT-DOMAIN.md §4.4 /
+        // G2 closure.)
+        var _forAwait = false;
+        var _forOpenParenIdx = i + 1;
+        if (t.text === 'for' && tokens[i + 1] && tokens[i + 1].type === 'other' && tokens[i + 1].text === 'await') {
+          _forAwait = true;
+          _forOpenParenIdx = i + 2;
+        }
         // Detect loop header and body range. The body is either a `{ ... }`
         // block or a single statement terminated by `;`.
-        const openParen = tokens[i + 1];
+        const openParen = tokens[_forOpenParenIdx];
         if (openParen && openParen.type === 'open' && openParen.char === '(') {
-          let depth = 1, j = i + 2;
+          let depth = 1, j = _forOpenParenIdx + 1;
           while (j < stop && depth > 0) {
             const tk = tokens[j];
             if (tk.type === 'open' && tk.char === '(') depth++;
@@ -10526,8 +10538,8 @@
             if (depth === 0) break;
             j++;
           }
-          if (j < stop && tokens[j].type === 'close' && tokens[j].char === ')' && j > i + 2) {
-            const headerFirst = tokens[i + 2];
+          if (j < stop && tokens[j].type === 'close' && tokens[j].char === ')' && j > _forOpenParenIdx + 1) {
+            const headerFirst = tokens[_forOpenParenIdx + 1];
             const headerLast = tokens[j - 1];
             // Detect body range first so we can find mutated variables.
             const bodyTok = tokens[j + 1];
@@ -10562,11 +10574,16 @@
             var _forInOfKnownValues = null;
             var _forInOfLoopVarName = null;
             var _forInOfDestructure = null;
+            // For-await-of metadata (G2): when the iterable
+            // yields Promise<T> elements, the innerType T and
+            // the upstream labels propagate to the loop var.
+            var _forInOfAwaitInnerType = null;
+            var _forInOfAwaitLabels = null;
             if (taintEnabled) {
-              for (var _fi = i + 2; _fi < j; _fi++) {
+              for (var _fi = _forOpenParenIdx + 1; _fi < j; _fi++) {
                 if (tokens[_fi].type === 'other' && (tokens[_fi].text === 'in' || tokens[_fi].text === 'of')) {
                   var _forInOf = tokens[_fi].text;
-                  var _fiVarStart = i + 2;
+                  var _fiVarStart = _forOpenParenIdx + 1;
                   if (tokens[_fiVarStart].type === 'other' && (tokens[_fiVarStart].text === 'var' || tokens[_fiVarStart].text === 'let' || tokens[_fiVarStart].text === 'const')) _fiVarStart++;
                   // Detect destructure pattern: `for (var [k, v] of m.entries())`
                   // or `for (var {prop} of arr)`. Parse the pattern
@@ -10662,6 +10679,37 @@
                     } else if (_fiIterBind && _fiIterBind.kind === 'chain') {
                       _fiTaintSources.push(_fiIterBind.toks);
                     }
+                    // `for await (var x of promiseIter)`: the
+                    // iterable yields Promise<T> elements which
+                    // `await` unwraps before binding to the loop
+                    // variable. When the iterable is a typed
+                    // chain with `innerType` set (e.g. the result
+                    // of fetch() as Promise<Response>), bind x as
+                    // the inner type with the chain's labels so
+                    // body reads resolve against T's descriptors.
+                    // (ABSTRACT-DOMAIN.md §4.4 / G2 closure.)
+                    if (_forAwait && _fiIterBind && _fiIterBind.kind === 'chain' && _fiIterBind.innerType) {
+                      _forInOfAwaitInnerType = _fiIterBind.innerType;
+                      var _faLabels = collectChainTaint(_fiIterBind.toks);
+                      if (_faLabels) _forInOfAwaitLabels = _faLabels;
+                    }
+                    // For an iterable that's itself an array of
+                    // promise-typed chains (e.g. `[fetch('/a'),
+                    // fetch('/b')]`), unwrap each element to its
+                    // innerType and seed the may-be lattice.
+                    if (_forAwait && _fiIterBind && _fiIterBind.kind === 'array') {
+                      for (var _faei = 0; _faei < _fiIterBind.elems.length; _faei++) {
+                        var _faEl = _fiIterBind.elems[_faei];
+                        if (_faEl && _faEl.kind === 'chain' && _faEl.innerType) {
+                          if (!_forInOfAwaitInnerType) _forInOfAwaitInnerType = _faEl.innerType;
+                          var _faElLabels = collectChainTaint(_faEl.toks);
+                          if (_faElLabels) {
+                            if (!_forInOfAwaitLabels) _forInOfAwaitLabels = new Set();
+                            for (var _fal of _faElLabels) _forInOfAwaitLabels.add(_fal);
+                          }
+                        }
+                      }
+                    }
                     if (_fiTaintSources.length) _forInOfTaint = { varName: _fiVarName, sources: _fiTaintSources };
                     if (_fiKnownVals.length) _forInOfKnownValues = _fiKnownVals;
                     // Remember the destructure pattern (if any)
@@ -10700,7 +10748,7 @@
             // Also check the for-loop update clause (third part after second ;)
             if (t.text === 'for') {
               var semiCount = 0;
-              for (var fi = i + 2; fi < j; fi++) {
+              for (var fi = _forOpenParenIdx + 1; fi < j; fi++) {
                 if (tokens[fi].type === 'sep' && tokens[fi].char === ';') semiCount++;
                 if (semiCount >= 2 && tokens[fi].type === 'other' && IDENT_RE.test(tokens[fi].text)) {
                   mutatedInBody.add(tokens[fi].text);
@@ -10711,13 +10759,13 @@
             // (important for loops inside inlined functions where
             // parameter names need to be replaced with argument values).
             var headerParts = [];
-            for (var hi = i + 2; hi <= j - 1; hi++) {
+            for (var hi = _forOpenParenIdx + 1; hi <= j - 1; hi++) {
               var ht = tokens[hi];
               if (ht.type === 'other' && (IDENT_RE.test(ht.text) || IDENT_OR_PATH_RE.test(ht.text))) {
                 // Don't resolve variables mutated in the loop body/header.
                 var htRoot = ht.text.split('.')[0];
                 if (mutatedInBody.has(htRoot)) {
-                  var prevEnd2 = hi > i + 2 ? tokens[hi - 1].end : headerFirst.start;
+                  var prevEnd2 = hi > _forOpenParenIdx + 1 ? tokens[hi - 1].end : headerFirst.start;
                   var gap2 = ht._src.slice(prevEnd2, ht.start);
                   headerParts.push(gap2 + ht._src.slice(ht.start, ht.end));
                   continue;
@@ -10732,7 +10780,7 @@
                 }
               }
               // Preserve original source text with surrounding whitespace.
-              var prevEnd = hi > i + 2 ? tokens[hi - 1].end : headerFirst.start;
+              var prevEnd = hi > _forOpenParenIdx + 1 ? tokens[hi - 1].end : headerFirst.start;
               var gap = ht._src.slice(prevEnd, ht.start);
               headerParts.push(gap + ht._src.slice(ht.start, ht.end));
             }
@@ -10749,7 +10797,7 @@
             // single-statement (`for (...) stmt;`) loops.
             const loopFrame = { bindings: Object.create(null), isFunction: false };
             // Scan the header for var/let/const declarations.
-            for (let h = i + 2; h < j; h++) {
+            for (let h = _forOpenParenIdx + 1; h < j; h++) {
               const hk = tokens[h];
               if (hk.type === 'other' && (hk.text === 'var' || hk.text === 'let' || hk.text === 'const')) {
                 const nm = tokens[h + 1];
@@ -10793,10 +10841,10 @@
             {
               var _loopCondStart = -1, _loopCondEnd = -1;
               if (t.text === 'while') {
-                _loopCondStart = i + 2; _loopCondEnd = j;
+                _loopCondStart = _forOpenParenIdx + 1; _loopCondEnd = j;
               } else {
                 // for: condition is between 1st and 2nd semicolons.
-                for (var _lsi = i + 2; _lsi < j; _lsi++) {
+                for (var _lsi = _forOpenParenIdx + 1; _lsi < j; _lsi++) {
                   if (tokens[_lsi].type === 'sep' && tokens[_lsi].char === ';') {
                     if (_loopCondStart < 0) _loopCondStart = _lsi + 1;
                     else { _loopCondEnd = _lsi; break; }
@@ -10824,6 +10872,24 @@
             // Apply for-in/for-of taint to the loop frame binding.
             if (_forInOfTaint && loopFrame.bindings[_forInOfTaint.varName]) {
               loopFrame.bindings[_forInOfTaint.varName] = chainBinding([deriveExprRef.apply(null, [_forInOfTaint.varName].concat(_forInOfTaint.sources))]);
+            }
+            // `for await`: when the iterable yielded Promise<T>
+            // elements, replace (or create) the loop-var binding
+            // with an opaque chain typed as T and tagged with
+            // the upstream labels. Body reads on the loop var
+            // then walk through T's TypeDB descriptors for
+            // precise per-prop sink classification.
+            if (_forAwait && _forInOfLoopVarName && _forInOfAwaitInnerType) {
+              var _faRef = exprRef(_forInOfLoopVarName);
+              if (_forInOfAwaitLabels && _forInOfAwaitLabels.size) {
+                _faRef.taint = new Set(_forInOfAwaitLabels);
+              }
+              var _faBind = chainBinding([_faRef]);
+              _faBind.typeName = _forInOfAwaitInnerType;
+              if (_forInOfAwaitLabels && _forInOfAwaitLabels.size) {
+                _faBind.labels = new Set(_forInOfAwaitLabels);
+              }
+              loopFrame.bindings[_forInOfLoopVarName] = _faBind;
             }
             // Destructure-in-for-of: when the loop variable is a
             // destructure pattern like `var [k, v]` or `var {x}`,
