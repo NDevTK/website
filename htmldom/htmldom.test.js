@@ -4148,6 +4148,28 @@ await (async function () {
   // `this._v` reads the instance slot the setter populated.
   await checkTaint('class getter/setter with this._v', { 'a.js': 'class C { get v() { return this._v; } set v(x) { this._v = x; } } var c = new C(); c.v = location.hash; document.getElementById("o").innerHTML = c.v;' }, 1, { sources: ['url'] });
 
+  // Nested container method call: `store.items.push(x)` needs
+  // to walk through the dotted path (store → items is an
+  // array binding nested on store.props). Previously `resolve()`
+  // only handled single identifiers; now `resolvePath` walks
+  // through object-prop chains.
+  await checkTaint('nested container push', { 'a.js': 'var store = {items: []}; store.items.push(location.hash); document.getElementById("o").innerHTML = store.items[0];' }, 1, { sources: ['url'] });
+
+  // Proxy apply trap (A6 completion): a function wrapped via
+  // `new Proxy(fn, {apply: trap})` is callable; invocations
+  // route through the trap with (target, thisArg, argArray).
+  await checkTaint('proxy apply trap', { 'a.js': 'var p = new Proxy(function() {}, { apply: function(target, thisArg, args) { return location.hash; } }); document.getElementById("o").innerHTML = p();' }, 1, { sources: ['url'] });
+  // Proxy construct trap: `new p(...)` on a proxied function
+  // routes through handler.construct(target, args, newTarget).
+  await checkTaint('proxy construct trap', { 'a.js': 'var P = new Proxy(function() {}, { construct: function(target, args) { return { u: location.hash }; } }); var p = new P(); document.getElementById("o").innerHTML = p.u;' }, 1, { sources: ['url'] });
+
+  // ES5 prototype-assignment pattern (A7-related): `F.prototype.m
+  // = function() {...}` lazily creates `F._prototype` with the
+  // method, and `new F()` copies prototype methods into the
+  // instance.
+  await checkTaint('F.prototype.greet returns tainted', { 'a.js': 'function F() {} F.prototype.greet = function() { return location.hash; }; var f = new F(); document.getElementById("o").innerHTML = f.greet();' }, 1, { sources: ['url'] });
+  await checkTaint('F.prototype method reads this.x', { 'a.js': 'function F(x) { this.x = x; } F.prototype.getX = function() { return this.x; }; var f = new F(location.hash); document.getElementById("o").innerHTML = f.getX();' }, 1, { sources: ['url'] });
+
   // --- filter(...).map(...).join: chain on opaque filter result ---
   await checkTaint('filter map join chain', { 'a.js': 'document.getElementById("o").innerHTML = ["a", location.hash].filter(x => x).map(x => x).join("");' }, 1, { sources: ['url'] });
 

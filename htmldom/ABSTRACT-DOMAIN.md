@@ -1027,15 +1027,17 @@ processed once per phase, phase 2 converges on a fixpoint of
 callback re-walks, and the may-be lattice itself never drives
 extra iterations.
 
-### A6. `new Proxy(target, handler)` traps ✓ implemented (get + set)
+### A6. `new Proxy(target, handler)` traps ✓ implemented (get + set + apply + construct)
 
-**Lines:** 6764–6811 (handler detection & stamping),
+**Lines:** 6967–7022 (handler detection & stamping),
 5657–5679 (applySuffixes dotted-path get dispatch),
 4271–4285 (resolvePath get dispatch), 12395–12410
-(statement-level path-assignment set dispatch).
-**Class:** SAFE for modelled traps (`get`, `set`); unchanged
-behaviour for unmodelled traps (`has`, `deleteProperty`,
-`apply`, `construct`).
+(statement-level path-assignment set dispatch),
+7918–7933 (instantiateFunction apply-trap dispatch),
+7071–7091 (new-expression construct-trap dispatch).
+**Class:** SAFE for modelled traps (`get`, `set`, `apply`,
+`construct`); unchanged behaviour for unmodelled traps (`has`,
+`deleteProperty`).
 **Statement.** `new Proxy(target, handler)` now inspects
 `handler` for a `get` function. When present, the target is
 cloned and a `_proxyHandler` record `{target, get, set, has}`
@@ -1066,22 +1068,65 @@ Sanitising traps (`target[k] = "safe"`) correctly neutralise
 taint because the walker sees the actual target mutation inside
 the trap body, not the caller's RHS.
 
-**Partial**: `has`, `deleteProperty`, `apply`, and `construct`
-traps are stamped on `_proxyHandler` but not yet dispatched.
-Each is a small self-contained addition following the same
-`instantiateFunction(trap, [target, ..., receiver])` pattern.
+**Apply trap**: when the target is a function and the handler
+has an `apply` trap, `Proxy` clones the function binding (kind
+stays `function` so callers still dispatch it) and stamps
+`_proxyHandler` on it. `instantiateFunction` checks for
+`fn._proxyHandler.apply` at entry and routes the call through
+the trap with `(target, thisArg, arrayBinding(args))` instead
+of walking the original body.
 
-### A7. Class `extends` is copy-at-definition
+**Construct trap**: the `new` handler checks for
+`_newBind._proxyHandler.construct` on a proxied function
+constructor and routes through the trap with `(target,
+arrayBinding(args), newTarget)` before creating any instance.
+The trap's return is used as the `new` expression's result.
 
-**Lines:** 10125–10128.
-**Class:** SAFE for static method tables; UNSAFE for late-binding.
-**Statement.** Parent methods are copied into the child class's prop
-map at the moment of class definition. Subsequent assignments to a
-parent class's prototype after the child is defined do not propagate
-to instances of the child.
-**Condition.** Sound iff no code mutates a parent class's prototype
-after a subclass has been defined. Standard ES6 class hierarchies
-satisfy this; legacy prototype-extension patterns may not.
+**Partial**: `has` and `deleteProperty` traps are stamped on
+`_proxyHandler` but not yet dispatched (the `in` operator and
+`delete` statement handlers don't currently route through
+proxies). Each is a small self-contained addition following
+the same `instantiateFunction(trap, [target, ..., receiver])`
+pattern.
+
+### A7. ES5 function prototype + class extends ✓ implemented (partial)
+
+**Lines:** 10125–10128 (class extends copy at definition),
+12628–12658 (statement-level `F.prototype.X = …`
+handling), 7062–7073 (constructor-function instance
+prototype-method copying).
+**Class:** SAFE.
+**Statement.** Two related late-binding patterns are now
+supported:
+
+  1. **ES5 function prototype assignment**: `function F() {}`
+     followed by `F.prototype.method = function() { … }`
+     lazily creates `F._prototype` (an objectBinding) at the
+     statement-level path-assignment handler. Subsequent
+     writes land on the shared prototype object. When
+     `new F(...)` is later evaluated, the constructor-function
+     handler copies every prop from `F._prototype.props` into
+     the fresh instance before running the constructor body.
+     Instance-body writes (`this.x = …`) override the
+     prototype-copied defaults, which is the correct ES5
+     semantics for the common case.
+
+  2. **ES6 class `extends`**: parent methods are still copied
+     into the child class's prop map at class-definition time.
+     Post-definition mutations to the parent class's
+     prototype do NOT propagate to existing child instances
+     (no dynamic prototype-chain walking). This is a narrower
+     sub-gap: monkey-patching a parent class after a child is
+     defined is rare in modern code, and adding a runtime
+     prototype chain walker has a significant architectural
+     cost.
+
+**Condition.** Sound for the ES5 pattern whenever prototype
+assignments are reachable to the `new F()` call site in the
+walker's execution order (they are, because Phase 1 processes
+all statements sequentially). For the ES6 sub-gap: sound iff
+no code mutates a parent class's prototype after a subclass
+has been defined.
 
 ### A8. Optional chaining drops the null-check
 

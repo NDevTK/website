@@ -6976,27 +6976,46 @@
                     var _pxGet = _pxHandler.props && _pxHandler.props.get;
                     var _pxSet = _pxHandler.props && _pxHandler.props.set;
                     var _pxHas = _pxHandler.props && _pxHandler.props.has;
-                    if ((_pxGet && _pxGet.kind === 'function') ||
-                        (_pxSet && _pxSet.kind === 'function') ||
-                        (_pxHas && _pxHas.kind === 'function')) {
-                      // Clone the target so we can stamp the
-                      // handler without disturbing the original.
-                      var _pxProxied;
-                      if (_pxTarget.kind === 'object') {
-                        _pxProxied = objectBinding(Object.assign(Object.create(null), _pxTarget.props));
-                      } else {
-                        // Non-object target: wrap in a bare object
-                        // binding so we have somewhere to stamp
-                        // the handler.
-                        _pxProxied = objectBinding(Object.create(null));
-                        _pxProxied.props['__proxyTarget'] = _pxTarget;
-                      }
-                      _pxProxied._proxyHandler = {
+                    var _pxApply = _pxHandler.props && _pxHandler.props.apply;
+                    var _pxConstruct = _pxHandler.props && _pxHandler.props.construct;
+                    var _pxHasTraps =
+                      (_pxGet && _pxGet.kind === 'function') ||
+                      (_pxSet && _pxSet.kind === 'function') ||
+                      (_pxHas && _pxHas.kind === 'function') ||
+                      (_pxApply && _pxApply.kind === 'function') ||
+                      (_pxConstruct && _pxConstruct.kind === 'function');
+                    if (_pxHasTraps) {
+                      var _pxHandlerRec = {
                         target: _pxTarget,
                         get: (_pxGet && _pxGet.kind === 'function') ? _pxGet : null,
                         set: (_pxSet && _pxSet.kind === 'function') ? _pxSet : null,
                         has: (_pxHas && _pxHas.kind === 'function') ? _pxHas : null,
+                        apply: (_pxApply && _pxApply.kind === 'function') ? _pxApply : null,
+                        construct: (_pxConstruct && _pxConstruct.kind === 'function') ? _pxConstruct : null,
                       };
+                      // When target is a function AND handler
+                      // has apply/construct traps, clone the
+                      // function binding (preserving kind:
+                      // 'function' so callers dispatch it) and
+                      // stamp the handler. The call dispatch
+                      // sites check _proxyHandler.apply /
+                      // .construct before walking the body.
+                      if (_pxTarget.kind === 'function') {
+                        var _pxFnProxied = Object.assign({}, _pxTarget);
+                        _pxFnProxied._proxyHandler = _pxHandlerRec;
+                        return { bind: _pxFnProxied, next: _pxArgs.next };
+                      }
+                      // Object target: clone and stamp. The
+                      // get/set/has dispatch sites check
+                      // _proxyHandler.
+                      var _pxProxied;
+                      if (_pxTarget.kind === 'object') {
+                        _pxProxied = objectBinding(Object.assign(Object.create(null), _pxTarget.props));
+                      } else {
+                        _pxProxied = objectBinding(Object.create(null));
+                        _pxProxied.props['__proxyTarget'] = _pxTarget;
+                      }
+                      _pxProxied._proxyHandler = _pxHandlerRec;
                       return { bind: _pxProxied, next: _pxArgs.next };
                     }
                   }
@@ -7041,6 +7060,18 @@
           var _ctorFnBind = _newBind;
           if (_ctorFnBind && _ctorFnBind.kind === 'function') {
             var _cfInst = objectBinding(Object.create(null));
+            // Copy prototype methods (ES5 `F.prototype.m = ...`
+            // assignments) into the new instance. The
+            // _prototype object is populated lazily at the
+            // statement-level path-assignment handler. Instance
+            // writes in the constructor body override these
+            // prototype-copied defaults, which is semantically
+            // what ES5 prototype chains do for the common case.
+            if (_ctorFnBind._prototype && _ctorFnBind._prototype.props) {
+              for (var _cpKey in _ctorFnBind._prototype.props) {
+                _cfInst.props[_cpKey] = _ctorFnBind._prototype.props[_cpKey];
+              }
+            }
             var _cfJ = k + 2;
             var _cfArgs = null;
             if (tks[_cfJ] && tks[_cfJ].type === 'open' && tks[_cfJ].char === '(') {
@@ -7048,6 +7079,27 @@
               if (_cfArgs) _cfJ = _cfArgs.next;
             }
             var _cfArgBinds = _cfArgs ? _cfArgs.bindings : [];
+            // Proxy construct-trap dispatch (A6 closure). When
+            // the constructor is a function wrapped via
+            // `new Proxy(ctor, {construct: trap})`, invoke the
+            // trap with `(target, args-as-array, newTarget)`
+            // instead of walking the original constructor body.
+            // The trap's return (an object) becomes the new
+            // expression's result.
+            if (_ctorFnBind._proxyHandler && _ctorFnBind._proxyHandler.construct) {
+              var _cfProxiedRes = await instantiateFunction(_ctorFnBind._proxyHandler.construct, [
+                _ctorFnBind._proxyHandler.target,
+                arrayBinding(_cfArgBinds.slice()),
+                _ctorFnBind,
+              ]);
+              if (_cfProxiedRes && _cfProxiedRes.kind && _cfProxiedRes.kind !== 'chain') {
+                return { bind: _cfProxiedRes, next: _cfJ };
+              }
+              if (_cfProxiedRes && Array.isArray(_cfProxiedRes)) {
+                return { bind: chainBinding(_cfProxiedRes), next: _cfJ };
+              }
+              return { bind: objectBinding(Object.create(null)), next: _cfJ };
+            }
             var _cfRes = await instantiateFunction(_ctorFnBind, _cfArgBinds, _cfInst);
             // If the constructor returns a non-chain binding
             // (object / array), ECMAScript semantics say `new`
@@ -8246,6 +8298,20 @@
       return parts.join('/');
     };
     const instantiateFunction = async (fn, argBindings, thisBinding) => {
+      // Proxy apply-trap dispatch (A6 closure). When the
+      // function was wrapped via `new Proxy(fn, {apply: trap})`,
+      // calling the proxy invokes the trap with
+      // `(target, thisArg, args-as-array)` instead of walking
+      // the original function body. The trap's return value
+      // replaces the call result.
+      if (fn && fn._proxyHandler && fn._proxyHandler.apply) {
+        var _pxaArgsArr = arrayBinding((argBindings || []).slice());
+        return await instantiateFunction(fn._proxyHandler.apply, [
+          fn._proxyHandler.target,
+          thisBinding || chainBinding([makeSynthStr('undefined')]),
+          _pxaArgsArr,
+        ]);
+      }
       // Function.prototype.bind partial-application: when the
       // function binding carries pre-bound args or `this` from a
       // prior `.bind(…)` (see applyMethod), prepend them to the
@@ -12565,7 +12631,33 @@
         // Path compound assignment: obj.prop += value
         if (eqTok && eqTok.type === 'sep' && (eqTok.char === '=' || eqTok.char === '+=')) {
           const parts = t.text.split('.');
-          const baseBind = resolve(parts[0]);
+          var baseBind = resolve(parts[0]);
+          // ES5 prototype assignment: `F.prototype.X = value`
+          // when F is a constructor function. Lazily create
+          // F._prototype as an object binding so subsequent
+          // writes land on the shared prototype, and `new F()`
+          // copies the prototype methods into the instance.
+          if (baseBind && baseBind.kind === 'function' && parts.length >= 3 && parts[1] === 'prototype') {
+            if (!baseBind._prototype) baseBind._prototype = objectBinding(Object.create(null));
+            var _protoBase = baseBind._prototype;
+            // Walk through any intermediate segments
+            // (F.prototype.a.b = v) using the proto obj as root.
+            var _ptContainer = _protoBase;
+            var _ptOk = true;
+            for (var _pti = 2; _pti < parts.length - 1; _pti++) {
+              var _ptNext = _ptContainer.props[parts[_pti]];
+              if (!_ptNext || _ptNext.kind !== 'object') { _ptOk = false; break; }
+              _ptContainer = _ptNext;
+            }
+            if (_ptOk) {
+              const _ptR = await readValue(i + 2, stop, TERMS_TOP);
+              if (_ptR && _ptR.binding) {
+                _ptContainer.props[parts[parts.length - 1]] = _ptR.binding;
+              }
+              i = skipExpr(i + 2, stop) - 1;
+              continue;
+            }
+          }
           // Object property assignment: obj.prop = value, or
           // multi-segment obj.a.b.c = value. Walk through the
           // intermediate segments to find the deepest object,
@@ -12744,7 +12836,13 @@
           if (dot > 0) {
             const base = t.text.slice(0, dot);
             const method = t.text.slice(dot + 1);
-            const baseBind = resolve(base);
+            // Use resolvePath so nested paths like
+            // `store.items.push(…)` find the intermediate
+            // container's array / object binding, not just the
+            // root `store`. resolve() only walks the scope
+            // stack for single identifiers; resolvePath
+            // additionally walks through object prop chains.
+            const baseBind = await resolvePath(base);
             if (baseBind && baseBind.kind === 'element' && DOM_METHODS.has(method)) {
               const argResult = await readCallArgBindings(i + 1, stop);
               if (argResult) {
