@@ -4076,6 +4076,17 @@ await (async function () {
   // Safe: pre-bound constant at the slot read by the sink.
   await checkTaint('bind preserves arg positions', { 'a.js': 'function f(x, y) { document.getElementById("o").innerHTML = x; } var g = f.bind(null, "safe"); g(location.hash);' }, 0);
 
+  // ES5 constructor-function pattern (ABSTRACT-DOMAIN.md §4.9 /
+  // A10 closure). `new Foo(arg)` where Foo is a plain function
+  // now walks Foo's body with a fresh empty object bound as
+  // `this`, so `this.x = arg` writes populate the instance.
+  // The constructor can also return an object to override the
+  // default `this`-return, matching ECMAScript semantics.
+  await checkTaint('ES5 ctor this.x = arg', { 'a.js': 'function Foo(x) { this.x = x; } var f = new Foo(location.hash); document.getElementById("o").innerHTML = f.x;' }, 1, { sources: ['url'] });
+  await checkTaint('ES5 ctor this.safe constant', { 'a.js': 'function Foo(x) { this.x = "safe"; } var f = new Foo(location.hash); document.getElementById("o").innerHTML = f.x;' }, 0);
+  await checkTaint('ES5 ctor with method', { 'a.js': 'function Foo(x) { this.url = x; this.render = function() { return this.url; }; } var f = new Foo(location.hash); document.getElementById("o").innerHTML = f.render();' }, 1, { sources: ['url'] });
+  await checkTaint('ES5 factory returning object', { 'a.js': 'function Factory(x) { return { prop: x }; } var f = new Factory(location.hash); document.getElementById("o").innerHTML = f.prop;' }, 1, { sources: ['url'] });
+
   // --- filter(...).map(...).join: chain on opaque filter result ---
   await checkTaint('filter map join chain', { 'a.js': 'document.getElementById("o").innerHTML = ["a", location.hash].filter(x => x).map(x => x).join("");' }, 1, { sources: ['url'] });
 

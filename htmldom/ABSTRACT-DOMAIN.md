@@ -1077,18 +1077,40 @@ properties don't depend on the order microtasks resolve —
 anything stateful (e.g. "this initialiser must run before that
 sink") is still too coarse.
 
-### A10. Unknown constructors are opaque
+### A10. Constructor-function `new` ✓ implemented
 
-**Lines:** 6579–6640.
+**Lines:** 6783–6817 (constructor-function walking),
+6579–6770 (existing class / Proxy / Map-Set paths).
 **Class:** SAFE.
-**Statement.** `new C(args)` where `C` is not a class binding, not a
-TypeDB-known constructor, and not a `_mapLike` builtin produces an
-opaque chain whose labels are the union of all argument labels. The
-constructor body — and any side effects it would have on outer
-state — are not walked.
-**Condition.** Sound iff the unknown constructor has no side effects
-the analysis cares about. Constructors that mutate global state or
-register event handlers via the constructed instance are missed.
+**Statement.** When `new C(args)` is evaluated and `C` resolves
+to a plain function binding (not a class, not Proxy, not a
+built-in `_mapLike`), the walker now:
+
+  1. Creates a fresh empty Object binding as the instance.
+  2. Reads the constructor arguments via `readCallArgBindings`.
+  3. Calls `instantiateFunction(C, args, instance)` — the
+     constructor body walks with `this` bound to the fresh
+     instance, so `this.prop = arg` writes populate the
+     instance object (and feed `_varMayBe` for subsequent
+     indirect-dispatch lookups).
+  4. If the constructor returns a non-chain binding (object /
+     array / function), ECMAScript semantics say `new` yields
+     that return value rather than the freshly constructed
+     `this`. Otherwise yield the instance.
+
+Closes the pre-class constructor-function pattern
+`function Foo(x) { this.x = x; }` and the factory pattern
+`function Factory(x) { return { prop: x }; }`. Taint flows
+through argument-to-instance writes and through method calls
+on the resulting instance.
+
+**Condition.** Sound for any constructor whose body is a plain
+JavaScript function (the walker supports all the same constructs
+as ordinary function bodies). Unknown `new C(args)` where `C`
+does not resolve to a function binding still falls through to
+the opaque-expression handler further down, which propagates
+arg-taint but loses side effects — tracked as a narrower
+sub-gap (genuinely unknown / dynamically-imported constructors).
 
 ### A11. `eval` and `with` are unmodelled
 

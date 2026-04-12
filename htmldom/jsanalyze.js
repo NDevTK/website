@@ -6780,6 +6780,36 @@
             }
             return { bind: _mObj, next: _mJ };
           }
+          // Constructor-function pattern (pre-class ES5):
+          //   function Foo(x) { this.x = x; }
+          //   var f = new Foo(tainted);
+          //   sink(f.x);
+          // When the constructor name resolves to a plain
+          // function binding, walk its body with a fresh empty
+          // object as `this`. Any `this.prop = arg` writes
+          // populate the instance, which is returned from the
+          // `new` expression. (ABSTRACT-DOMAIN.md §4.9 / A10
+          // closure.)
+          var _ctorFnBind = _newBind;
+          if (_ctorFnBind && _ctorFnBind.kind === 'function') {
+            var _cfInst = objectBinding(Object.create(null));
+            var _cfJ = k + 2;
+            var _cfArgs = null;
+            if (tks[_cfJ] && tks[_cfJ].type === 'open' && tks[_cfJ].char === '(') {
+              _cfArgs = await readCallArgBindings(_cfJ, stop);
+              if (_cfArgs) _cfJ = _cfArgs.next;
+            }
+            var _cfArgBinds = _cfArgs ? _cfArgs.bindings : [];
+            var _cfRes = await instantiateFunction(_ctorFnBind, _cfArgBinds, _cfInst);
+            // If the constructor returns a non-chain binding
+            // (object / array), ECMAScript semantics say `new`
+            // yields that return value instead of the freshly
+            // constructed `this`. Otherwise yield `this`.
+            if (_cfRes && _cfRes.kind && _cfRes.kind !== 'chain') {
+              return { bind: _cfRes, next: _cfJ };
+            }
+            return { bind: _cfInst, next: _cfJ };
+          }
         }
         let j = k + 1;
         var _newCtorTok = null;
