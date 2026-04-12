@@ -326,9 +326,14 @@ function applyGetIndex(ctx, state, instr) {
   if (obj && obj.kind === D.V.OPAQUE) {
     return D.setReg(state, instr.dest, D.opaque(obj.assumptionIds, null, loc));
   }
+  // Computed index whose target object or key couldn't be
+  // narrowed to a concrete value. This is an engineering gap
+  // (it would resolve if the may-be lattice narrowed the key
+  // to a finite set, or if a points-to analysis pinned the
+  // target object) rather than a distinct assumption class.
   const a = ctx.assumptions.raise(
-    REASONS.RUNTIME_TYPE,
-    'computed index access with unresolved target or key',
+    REASONS.UNIMPLEMENTED,
+    'computed index access with unresolved target or key — may-be lattice did not narrow the dispatch',
     loc
   );
   return D.setReg(state, instr.dest, D.opaque([a.id], null, loc));
@@ -366,8 +371,8 @@ function applySetIndex(ctx, state, instr) {
     return writeHeapField(state, obj.objId, String(key.value), val);
   }
   ctx.assumptions.raise(
-    REASONS.RUNTIME_TYPE,
-    'computed index write with unresolved target or key',
+    REASONS.UNIMPLEMENTED,
+    'computed index write with unresolved target or key — may-be lattice did not narrow the dispatch',
     loc
   );
   return state;

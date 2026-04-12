@@ -165,16 +165,23 @@ type Assumption = {
 };
 
 type AssumptionReason =
+  // Theoretical floor: unknowable at analysis time
   | 'network'
-  | 'user-input'
-  | 'randomness'
-  | 'timing'
+  | 'attacker-input'
+  | 'persistent-state'
+  | 'dom-state'
+  | 'ui-interaction'
+  | 'environmental'
+  | 'runtime-time'
+  | 'pseudorandom'
+  | 'cryptographic-random'
   | 'unsolvable-math'
-  | 'unimplemented'
-  | 'dynamic-code'
+  // Environmental: can be narrowed with more input
   | 'opaque-call'
   | 'external-module'
-  | 'runtime-type'
+  | 'code-from-data'
+  // Engineering gaps: can be eliminated by more code
+  | 'unimplemented'
   | 'heap-escape';
 
 type Location = {

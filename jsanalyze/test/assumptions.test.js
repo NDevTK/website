@@ -85,11 +85,57 @@ const tests = [
     name: 'REASONS frozen and covers all spec reasons',
     fn: () => {
       assert(Object.isFrozen(REASONS));
-      const required = ['network', 'user-input', 'randomness', 'timing',
-        'unsolvable-math', 'unimplemented', 'dynamic-code', 'opaque-call',
-        'external-module', 'runtime-type', 'heap-escape'];
+      const required = [
+        // Theoretical floor
+        'network',
+        'attacker-input',
+        'persistent-state',
+        'dom-state',
+        'ui-interaction',
+        'environmental',
+        'runtime-time',
+        'pseudorandom',
+        'cryptographic-random',
+        'unsolvable-math',
+        // Environmental
+        'opaque-call',
+        'external-module',
+        'code-from-data',
+        // Engineering gaps
+        'unimplemented',
+        'heap-escape',
+      ];
       const have = new Set(Object.values(REASONS));
       for (const r of required) assert(have.has(r), 'missing reason: ' + r);
+    },
+  },
+  {
+    name: 'removed reason codes are not present',
+    fn: () => {
+      const removed = ['user-input', 'randomness', 'timing', 'dynamic-code', 'runtime-type'];
+      const have = new Set(Object.values(REASONS));
+      for (const r of removed) {
+        assert(!have.has(r), 'removed reason still present: ' + r);
+      }
+    },
+  },
+  {
+    name: 'default severities are correctly categorized',
+    fn: () => {
+      const { DEFAULT_SEVERITY } = require('../src/assumptions.js');
+      // Theoretical-floor reasons are precision.
+      assertEqual(DEFAULT_SEVERITY['network'], 'precision');
+      assertEqual(DEFAULT_SEVERITY['attacker-input'], 'precision');
+      assertEqual(DEFAULT_SEVERITY['runtime-time'], 'precision');
+      assertEqual(DEFAULT_SEVERITY['pseudorandom'], 'precision');
+      assertEqual(DEFAULT_SEVERITY['cryptographic-random'], 'precision');
+      assertEqual(DEFAULT_SEVERITY['unsolvable-math'], 'precision');
+      // Environmental and engineering-gap reasons are soundness.
+      assertEqual(DEFAULT_SEVERITY['opaque-call'], 'soundness');
+      assertEqual(DEFAULT_SEVERITY['external-module'], 'soundness');
+      assertEqual(DEFAULT_SEVERITY['code-from-data'], 'soundness');
+      assertEqual(DEFAULT_SEVERITY['unimplemented'], 'soundness');
+      assertEqual(DEFAULT_SEVERITY['heap-escape'], 'soundness');
     },
   },
 ];
