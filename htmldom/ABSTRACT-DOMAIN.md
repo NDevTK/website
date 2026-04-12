@@ -1221,18 +1221,60 @@ the opaque-expression handler further down, which propagates
 arg-taint but loses side effects — tracked as a narrower
 sub-gap (genuinely unknown / dynamically-imported constructors).
 
-### A11. `eval` and `with` are unmodelled
+### A11. Constant-string `eval` ✓ implemented; `with` unmodelled
 
-**Lines:** no dedicated handler.
-**Class:** UNSAFE in the strict sense.
-**Statement.** The walker does not interpret `eval(s)` even when `s`
-is a known constant string, and `with (obj) { … }` is treated as a
-plain block scope.
-**Condition.** Sound iff the program does not use `eval` for control
-flow or `with` for scope manipulation. In the security setting we
-report `eval(tainted)` itself as a critical sink (`code` finding) so
-the dangerous case is not missed even though the body of the eval'd
-string is not analysed.
+**Lines:** 12266–12326 (statement-level eval interpreter in
+`walkRange`'s bare-call handler).
+**Class:** SAFE for constant-string `eval`; UNSAFE remains for
+`with` (no dedicated handler).
+
+**Statement.** When the walker encounters `eval(s)` in statement
+position, it uses `_classifyCallSinkViaDB` to verify the callee
+resolves to the global `GlobalEval` type (respecting lexical
+shadowing — `var eval = ...` disables the intercept). When the
+first argument is a chain whose value folds to a known constant
+string via `chainAsKnownString` (literals, concat chains of
+literals, static template literals), the walker:
+
+1. Tokenizes the string via the top-level `tokenize` function.
+2. Appends the resulting tokens to the shared `tokens` array.
+3. Calls `walkRange(start, end)` on the appended range, walking
+   the eval'd code in the **current** lexical scope — matching
+   ECMAScript's direct-eval semantics where the eval'd code
+   shares the caller's environment.
+4. Side effects of the eval'd code (variable declarations, path
+   assignments, sink findings, DOM operations) propagate through
+   the outer walker's state as if the code were inlined at the
+   `eval(...)` call site.
+5. The call watchers fire for the eval call site so external
+   consumers (e.g. `csp-derive`'s unsafe-eval detector) still
+   observe the eval call in the trace.
+
+Non-constant arguments (tainted input, runtime-computed strings)
+fall through to the existing `code`-sink check at
+`checkSinkCall`, so dangerous `eval(location.hash)` is still
+reported as a finding.
+
+Nested `eval("eval('…')")` calls work transparently: the
+recursive `walkRange` fires the same handler on the inner eval
+call, repeating the tokenize-and-walk step for each nesting
+level. Termination is guaranteed because each intercept
+consumes one concrete-string argument, and the nesting depth is
+bounded by the syntactic depth of nested eval in the source.
+
+**Condition.** Sound when the eval'd string parses as valid JS
+(invalid syntax → `tokenize` returns null and the walker falls
+through to the opaque-call path). Sound for any eval whose
+argument concretely folds to a known string. Unsound only when
+the argument is tainted or runtime-computed — in which case the
+code sink finding still fires, so the dangerous case is
+reported.
+
+`with (obj) { ... }` is still treated as a plain block scope.
+This is a precision loss (property reads inside the block
+resolve against the outer scope instead of `obj`) but does not
+cause taint to be missed — any tainted flow through the block
+still follows the standard transfer functions.
 
 ### A12. `Function.prototype.bind` partial application ✓ implemented
 

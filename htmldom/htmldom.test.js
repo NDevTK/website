@@ -3994,6 +3994,27 @@ await (async function () {
   // Opaque arg blocks substitution → both branches retained → finding fires.
   await checkTaint('opaque arg leaves both branches reachable', { 'a.js': 'function f(a) { if (a > 5) return "safe"; return location.hash; } document.getElementById("o").innerHTML = f(unknown);' }, 1, { sources: ['url'] });
 
+  // Constant-string eval (ABSTRACT-DOMAIN.md A11 closure). When the
+  // argument to eval is a known constant string, the walker tokenizes
+  // the string and walks it inline in the current lexical scope —
+  // correct direct-eval semantics. Sinks inside the eval'd code
+  // fire with the labels of any taint sources inside it.
+  await checkTaint('eval const: sink inside eval fires',
+    { 'a.js': 'eval("document.getElementById(\\\"o\\\").innerHTML = location.hash;");' }, 1, { sources: ['url'] });
+  await checkTaint('eval const: safe content no findings',
+    { 'a.js': 'eval("var y = 1; y + 2;");' }, 0);
+  await checkTaint('eval const: defines variable used outside',
+    { 'a.js': 'eval("var z = location.hash;"); document.getElementById("o").innerHTML = z;' }, 1, { sources: ['url'] });
+  await checkTaint('eval const: mutates outer binding',
+    { 'a.js': 'var el = document.getElementById("o"); eval("el.innerHTML = location.hash;");' }, 1, { sources: ['url'] });
+  await checkTaint('shadowed eval is not intercepted',
+    { 'a.js': 'var eval = function(x) { return x; }; eval("location.hash");' }, 0);
+  await checkTaint('nested eval const',
+    { 'a.js': "eval(\"eval('document.getElementById(\\\"o\\\").innerHTML = location.hash;')\");" }, 1, { sources: ['url'] });
+  // Concat chain that folds to a constant string.
+  await checkTaint('eval concat const',
+    { 'a.js': 'eval("document.getElementById(\\\"o\\\").innerHTML" + " = location.hash;");' }, 1, { sources: ['url'] });
+
   // Walker-driven throw accumulator (ABSTRACT-DOMAIN.md §4.5, G6 closure):
   // throws inside method calls, deep call chains, and `new Error(tainted)`
   // all flow through the per-try accumulator. Nested try-catch boundaries

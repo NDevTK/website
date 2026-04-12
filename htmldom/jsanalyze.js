@@ -12264,6 +12264,86 @@
             }
           }
           var calleeBind = await resolvePath(t.text);
+          // Constant-string eval interpretation (A11 closure).
+          // When `eval("code")` is called with a known constant
+          // string AND `eval` resolves to the global eval (not a
+          // shadowed local binding), tokenize the argument and
+          // walk it inline in the current lexical scope. This is
+          // the correct direct-eval semantics — the eval'd code
+          // sees and mutates the caller's bindings.
+          //
+          // Shadowing: if the user wrote `var eval = ...`,
+          // resolvePath('eval') returns a non-null binding and
+          // we skip the intercept (falls through to the normal
+          // call handler).
+          //
+          // Sink check: if the argument is NOT a known constant
+          // string (tainted input or computed at runtime), the
+          // existing call-sink handler further down fires the
+          // `code` sink finding so dangerous eval is still
+          // reported.
+          //
+          // TypeDB integration: we detect eval via the same
+          // `_classifyCallSinkViaDB` check the sink detector
+          // uses, so consumers who add their own eval-like
+          // sinks to the TypeDB (`new Function`, `setTimeout`
+          // with string arg) are handled uniformly.
+          if (taintEnabled && !calleeBind) {
+            var _evSinkInfo = _classifyCallSinkViaDB(_activeDB, t.text, typedScope);
+            if (_evSinkInfo && _evSinkInfo.type === 'code') {
+              // Use _rangeEnd rather than the outer `stop` so calls
+              // inside recursively-walked eval'd code can read
+              // their arg lists — `stop` was frozen at the outer
+              // buildScopeState range length and doesn't grow when
+              // eval appends new tokens.
+              var _evArgs = await readCallArgBindings(i + 1, _rangeEnd);
+              if (_evArgs && _evArgs.bindings.length >= 1) {
+                // Fire call watchers for the eval call site. This
+                // ensures external consumers (csp-derive's
+                // unsafe-eval detector, fetch-trace, etc.) still
+                // observe the call even though we intercept its
+                // body handling below.
+                if (_callWatchers && _callWatchers.length > 0) {
+                  var _evCwInfo = {
+                    stage: 'statement',
+                    reached: true,
+                    pathConditions: taintCondStack ? taintCondStack.slice() : [],
+                    pathFormulas: pathConstraints ? pathConstraints.slice() : [],
+                    mayBe: _varMayBe,
+                    resolve: resolve,
+                    resolvePath: resolvePath,
+                  };
+                  for (var _evCwi = 0; _evCwi < _callWatchers.length; _evCwi++) {
+                    try { _callWatchers[_evCwi](t.text, _evArgs.bindings, t, _evCwInfo); } catch (_) {}
+                  }
+                }
+                var _evArg0 = _evArgs.bindings[0];
+                var _evStr = (_evArg0 && _evArg0.kind === 'chain')
+                  ? chainAsKnownString(_evArg0) : null;
+                // Concrete string → walk inline (A11 closure); the
+                // eval'd code has no attacker input at this call
+                // site, so the code sink itself is suppressed.
+                // Non-constant / tainted arg → keep the existing
+                // code-sink finding.
+                if (_evStr !== null && _evStr.length > 0) {
+                  var _evNewToks = null;
+                  try { _evNewToks = tokenize(_evStr); } catch (_) { _evNewToks = null; }
+                  if (_evNewToks && _evNewToks.length > 0) {
+                    var _evStart = tokens.length;
+                    for (var _eti = 0; _eti < _evNewToks.length; _eti++) {
+                      tokens.push(_evNewToks[_eti]);
+                    }
+                    var _evEnd = tokens.length;
+                    await walkRange(_evStart, _evEnd);
+                  }
+                } else {
+                  checkSinkCall(t.text, _evArgs.bindings, t);
+                }
+                i = _evArgs.next - 1;
+                continue;
+              }
+            }
+          }
           // Universal call watcher: when a recorder is registered,
           // fire it for every bare-statement call regardless of whether
           // the callee is resolvable. This is how external analyses
