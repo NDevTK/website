@@ -12919,6 +12919,42 @@
               continue;
             }
           }
+          // `obj.onXXX = functionExpr` — property-assignment form
+          // of event-handler binding (e.g. `xhr.onload = fn`,
+          // `el.onclick = fn`). The function is a callback that
+          // should be walked with the event's type bindings (if
+          // known) and registered for the phase-2 fixpoint so
+          // mutations from sibling callbacks are visible.
+          if (taintEnabled && parts.length === 2 && /^on[a-z]+$/.test(parts[1]) && eqTok && eqTok.char === '=') {
+            var _onRhs = await readValue(i + 2, stop, TERMS_TOP);
+            if (_onRhs && _onRhs.binding && _onRhs.binding.kind === 'function') {
+              var _onFn = _onRhs.binding;
+              // Build an event-param binding with the event type
+              // from the TypeDB eventMap if available.
+              var _onEvtName = parts[1].slice(2); // strip "on"
+              var _onEvtType = _activeDB.eventMap && _activeDB.eventMap[_onEvtName];
+              var _onParamBinds = [];
+              if (_onFn.params && _onFn.params.length > 0) {
+                var _onPn = _onFn.params[0].name;
+                var _onRef = exprRef(_onPn);
+                var _onBind = chainBinding([_onRef]);
+                if (_onEvtType) _onBind.typeName = _onEvtType;
+                _onParamBinds.push(_onBind);
+              }
+              await instantiateFunction(_onFn, _onParamBinds);
+              if (_pendingCallbacks) {
+                _pendingCallbacks.push({ fn: _onFn, params: _onParamBinds, isEventHandler: true });
+              }
+              // Also store the function on the base object for
+              // any downstream reads (e.g. `x.onload()` explicit
+              // invocation).
+              if (baseBind && baseBind.kind === 'object') {
+                baseBind.props[parts[1]] = _onFn;
+              }
+              i = _onRhs.next - 1;
+              continue;
+            }
+          }
         }
         // Path method call: `el.appendChild(child)`, `el.setAttribute(...)`.
         const parenTok = tokens[i + 1];
