@@ -3206,8 +3206,8 @@
   var _nextObjId = 0;
   const objectBinding = (props) => ({ kind: 'object', props, __objId: ++_nextObjId });
   const arrayBinding = (elems) => ({ kind: 'array', elems, __objId: ++_nextObjId });
-  const functionBinding = (params, bodyStart, bodyEnd, isBlock) => ({
-    kind: 'function', params, bodyStart, bodyEnd, isBlock,
+  const functionBinding = (params, bodyStart, bodyEnd, isBlock, isAsync) => ({
+    kind: 'function', params, bodyStart, bodyEnd, isBlock, isAsync: !!isAsync,
   });
   // Virtual DOM element binding factories. Each `buildScopeState` invocation
   // maintains its own element-id counter via a closure (see below). The
@@ -3462,6 +3462,12 @@
     }
     let pendingFunctionBrace = false;
     let pendingFunctionParams = null;
+    // One-statement lookahead: set when the walker sees the
+    // `async` keyword immediately before `function NAME()`, so
+    // the `function` declaration handler can stamp the binding
+    // with isAsync. Consumed by the immediately-following
+    // `function` branch; cleared on any other statement.
+    let _pendingAsyncFunctionDecl = false;
     // Taint tracking state (active when taintConfig is provided).
     const taintEnabled = !!taintConfig;
     const taintFindings = taintEnabled ? [] : null;
@@ -5114,19 +5120,23 @@
       let t = tks[k];
       if (!t) return null;
       // `async` prefix: `async ident => ...` / `async (params) => ...`.
-      // The walker doesn't distinguish async from sync arrows — await
-      // propagates through its argument as a transparent operator —
-      // so we simply skip the keyword and parse the rest normally.
+      // `await` propagates through its argument as a transparent
+      // operator but the async-ness is still recorded so
+      // instantiateFunction can route unhandled throws into the
+      // return Promise's rejection labels (A9 promise-rejection
+      // sub-gap closure).
+      var _peekIsAsync = false;
       if (t.type === 'other' && t.text === 'async') {
         k = k + 1;
         t = tks[k];
         if (!t) return null;
+        _peekIsAsync = true;
       }
       // Single-param form: `ident => body`.
       if (t.type === 'other' && IDENT_RE.test(t.text)) {
         const arrow = tks[k + 1];
         if (arrow && arrow.type === 'other' && arrow.text === '=>') {
-          return { params: [{ name: t.text }], arrowNext: k + 2 };
+          return { params: [{ name: t.text }], arrowNext: k + 2, isAsync: _peekIsAsync };
         }
         return null;
       }
@@ -5138,7 +5148,7 @@
       if (first && first.type === 'close' && first.char === ')') {
         const arrow = tks[i + 1];
         if (arrow && arrow.type === 'other' && arrow.text === '=>') {
-          return { params, arrowNext: i + 2 };
+          return { params, arrowNext: i + 2, isAsync: _peekIsAsync };
         }
         return null;
       }
@@ -5189,7 +5199,7 @@
       }
       const arrow = tks[i];
       if (!arrow || arrow.type !== 'other' || arrow.text !== '=>') return null;
-      return { params, arrowNext: i + 1 };
+      return { params, arrowNext: i + 1, isAsync: _peekIsAsync };
     };
 
     // Given the token index just after `=>`, determine the body range.
@@ -5225,12 +5235,17 @@
       if (!ft || ft.type !== 'other') return null;
       // Optional `async` prefix: `async function (...) {...}`. Skip
       // it so the IIFE handler can detect `(async function(){})()`
-      // patterns the same way it detects `(function(){})()`.
+      // patterns the same way it detects `(function(){})()`. Record
+      // the async-ness so instantiateFunction can route unhandled
+      // throws into the return Promise's rejection labels
+      // (ABSTRACT-DOMAIN.md §4.8 / A9 promise-rejection sub-gap).
+      var _readFnIsAsync = false;
       if (ft.text === 'async') {
         var _afterAsync = tks[k + 1];
         if (_afterAsync && _afterAsync.type === 'other' && _afterAsync.text === 'function') {
           ft = _afterAsync;
           k = k + 1;
+          _readFnIsAsync = true;
         }
       }
       if (ft.text !== 'function') return null;
@@ -5315,7 +5330,7 @@
         else if (tks[bodyEnd].type === 'close' && tks[bodyEnd].char === '}') depth--;
         bodyEnd++;
       }
-      var _fnBind = functionBinding(params, fj, bodyEnd, true);
+      var _fnBind = functionBinding(params, fj, bodyEnd, true, _readFnIsAsync);
       // Closure capture: snapshot every binding visible at function-
       // expression creation time. When the function is later called
       // (potentially after the creating scope has returned), the
@@ -5337,7 +5352,7 @@
       if (arrow) {
         const body = readArrowBody(arrow.arrowNext, stop);
         if (!body) return null;
-        var _aBind = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock);
+        var _aBind = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock, arrow.isAsync);
         _aBind.capturedScope = _snapshotClosureForCapture();
         return {
           binding: _aBind,
@@ -5903,7 +5918,7 @@
           const arrow = peekArrow(parenIdx + 1, stop);
           if (arrow) {
             const body = readArrowBody(arrow.arrowNext, stop);
-            if (body) { fn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock); fn.capturedScope = _snapshotClosureForCapture(); fnNext = body.next; }
+            if (body) { fn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock, arrow.isAsync); fn.capturedScope = _snapshotClosureForCapture(); fnNext = body.next; }
           }
           if (!fn) {
             var fexpr = await readFunctionExpr(parenIdx + 1, stop);
@@ -5970,7 +5985,7 @@
           const arrow = peekArrow(parenIdx + 1, stop);
           if (arrow && arrow.params.length === 2) {
             const body = readArrowBody(arrow.arrowNext, stop);
-            if (body) { reduceFn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock); reduceFn.capturedScope = _snapshotClosureForCapture(); reduceFnNext = body.next; }
+            if (body) { reduceFn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock, arrow.isAsync); reduceFn.capturedScope = _snapshotClosureForCapture(); reduceFnNext = body.next; }
           }
           if (!reduceFn) {
             var rfexpr = await readFunctionExpr(parenIdx + 1, stop);
@@ -6065,7 +6080,7 @@
           if (_iterArrow) {
             const _iterBody = readArrowBody(_iterArrow.arrowNext, stop);
             if (_iterBody) {
-              _iterFn = functionBinding(_iterArrow.params, _iterBody.bodyStart, _iterBody.bodyEnd, _iterBody.isBlock);
+              _iterFn = functionBinding(_iterArrow.params, _iterBody.bodyStart, _iterBody.bodyEnd, _iterBody.isBlock, _iterArrow.isAsync);
               _iterFn.capturedScope = _snapshotClosureForCapture();
               _iterFnNext = _iterBody.next;
             }
@@ -6129,7 +6144,7 @@
             if (_chArrow) {
               var _chBody = readArrowBody(_chArrow.arrowNext, stop);
               if (_chBody) {
-                _chFn = functionBinding(_chArrow.params, _chBody.bodyStart, _chBody.bodyEnd, _chBody.isBlock);
+                _chFn = functionBinding(_chArrow.params, _chBody.bodyStart, _chBody.bodyEnd, _chBody.isBlock, _chArrow.isAsync);
                 _chFn.capturedScope = _snapshotClosureForCapture();
                 _chFnNext = _chBody.next;
               }
@@ -6186,7 +6201,7 @@
         if (arrow) {
           const body = readArrowBody(arrow.arrowNext, stop);
           if (body) {
-            fn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock);
+            fn = functionBinding(arrow.params, body.bodyStart, body.bodyEnd, body.isBlock, arrow.isAsync);
             fn.capturedScope = _snapshotClosureForCapture();
             fnEnd = body.next;
           }
@@ -6226,7 +6241,7 @@
         const parrow = peekArrow(parenIdx + 1, stop);
         if (parrow) {
           const pbody = readArrowBody(parrow.arrowNext, stop);
-          if (pbody) { pfn = functionBinding(parrow.params, pbody.bodyStart, pbody.bodyEnd, pbody.isBlock); pfnEnd = pbody.next; }
+          if (pbody) { pfn = functionBinding(parrow.params, pbody.bodyStart, pbody.bodyEnd, pbody.isBlock, parrow.isAsync); pfnEnd = pbody.next; }
         }
         if (!pfn) {
           var pfexpr = await readFunctionExpr(parenIdx + 1, stop);
@@ -6243,14 +6258,22 @@
         const prp = tks[pfnEnd];
         if (!prp || prp.type !== 'close' || prp.char !== ')') return null;
         // The first arg of the callback receives the Promise's
-        // resolved value. If the receiver chain carries an
-        // `innerType` (set when `fetch()` / `Response.json()` /
-        // etc. wrapped the value as Promise<T>), type the
-        // callback's first param as T. Otherwise fall back to
-        // the receiver-chain passthrough so taint still flows.
+        // resolved value (for .then / .finally) or the rejection
+        // value (for .catch). For .catch, if the receiver chain
+        // carries `rejectionLabels` (set by instantiateFunction
+        // when the async function body had unhandled throws),
+        // bind the callback's first param to an opaque chain
+        // tagged with those labels — this is the academic
+        // promise-rejection effect flow, closing the A9 sub-gap.
         var receiverTaint = collectChainTaint(bind.toks);
         var firstArgChain;
-        if (method === 'then' && bind.innerType) {
+        if (method === 'catch' && bind.rejectionLabels && bind.rejectionLabels.size) {
+          var _catchPName = (pfn.params[0] && pfn.params[0].name) || '__rejectionValue__';
+          var _catchRef = exprRef(_catchPName);
+          _catchRef.taint = new Set(bind.rejectionLabels);
+          firstArgChain = chainBinding([_catchRef]);
+          firstArgChain.labels = new Set(bind.rejectionLabels);
+        } else if (method === 'then' && bind.innerType) {
           // Typed Promise unwrap: callback arg is an opaque
           // chain with the inner typeName. Carries the
           // receiver's taint so upstream labels flow forward.
@@ -6299,7 +6322,16 @@
           for (var prtl of receiverTaint) pRTok0.taint.add(prtl);
           pResultToks = [pRTok0].concat(pResultToks.slice(1));
         }
-        return { bind: chainBinding(pResultToks), next: pfnEnd + 1 };
+        var _chainedResult = chainBinding(pResultToks);
+        // Propagate rejection labels through a .then chain so
+        // `.then(x => …).catch(e => sink(e))` still consumes the
+        // upstream async function's unhandled throws. .catch on
+        // its own terminates the rejection chain (the caller
+        // "handled" it) so we do not forward those labels.
+        if (method === 'then' && bind.rejectionLabels && bind.rejectionLabels.size) {
+          _chainedResult.rejectionLabels = new Set(bind.rejectionLabels);
+        }
+        return { bind: _chainedResult, next: pfnEnd + 1 };
       }
       // Generic typed-method dispatch: when the receiver is a
       // chain OR element binding with a typeName and the
@@ -6693,7 +6725,7 @@
           if (_parr) {
             var _parrBody = readArrowBody(_parr.arrowNext, stop);
             if (_parrBody) {
-              _innerFn = functionBinding(_parr.params, _parrBody.bodyStart, _parrBody.bodyEnd, _parrBody.isBlock);
+              _innerFn = functionBinding(_parr.params, _parrBody.bodyStart, _parrBody.bodyEnd, _parrBody.isBlock, _parr.isAsync);
               _innerFn.capturedScope = _snapshotClosureForCapture();
               _innerFnEnd = _parrBody.next;
             }
@@ -7286,12 +7318,16 @@
             }
             // Preserve parametric metadata annotated on the
             // return tokens (see instantiateFunction's return
-            // handler): `_typeName` / `_innerType` carry
-            // through so Promise<T> returned from an async
-            // function still unwraps to T at the call site.
+            // handler): `_typeName` / `_innerType` / `_rejectionLabels`
+            // carry through so Promise<T> returned from an async
+            // function still unwraps to T at the call site, and
+            // `.catch` handlers downstream can consume the
+            // unhandled-throw labels accumulated during the body
+            // walk.
             var _retBind = chainBinding(toks);
             if (toks && toks._typeName) _retBind.typeName = toks._typeName;
             if (toks && toks._innerType) _retBind.innerType = toks._innerType;
+            if (toks && toks._rejectionLabels) _retBind.rejectionLabels = toks._rejectionLabels;
             return { bind: _retBind, next: args.next };
           }
           return { bind: b, next: k + 1 };
@@ -7893,7 +7929,29 @@
           entryPCSize: pathConstraints ? pathConstraints.length : 0,
           entryTCSize: taintCondStack ? taintCondStack.length : 0,
         };
+        // For async function bodies, push a fresh rejection-label
+        // accumulator onto _tryThrowAccStack so every unhandled
+        // `throw e` reached during the body walk unions its labels
+        // into the accumulator. Nested try-catches inside the
+        // async body push their own deeper entries, so only
+        // throws that escape become promise rejections.
+        // (ABSTRACT-DOMAIN.md §4.8 + A9 promise-rejection sub-gap.)
+        var _asyncRejectAcc = null;
+        if (taintEnabled && fn.isAsync) {
+          _asyncRejectAcc = new Set();
+          _tryThrowAccStack.push(_asyncRejectAcc);
+        }
         await walkRange(bodyStart, bodyEnd);
+        // Pop the async rejection accumulator now the body walk
+        // is complete. Its contents are the union of every
+        // unhandled throw's labels — these become rejectionLabels
+        // on the returned Promise chain.
+        if (_asyncRejectAcc != null) {
+          if (_tryThrowAccStack.length > 0
+              && _tryThrowAccStack[_tryThrowAccStack.length - 1] === _asyncRejectAcc) {
+            _tryThrowAccStack.pop();
+          }
+        }
         var _walkerReturns = _returnCapture.entries;
         _returnCapture = _savedReturnCapture;
         fnLoopVars = loopVars.splice(lvBefore);
@@ -8144,6 +8202,29 @@
       // Return non-chain binding directly (object/array from return statement).
       var _finalResult = result;
       if (!result && fnReturnBinding) _finalResult = fnReturnBinding;
+      // Async-function rejection labels: attach the accumulated
+      // set to the token-array result so the caller's chain
+      // wrapper propagates it as `chain.rejectionLabels`. The
+      // `.catch(cb)` handler reads this to bind cb's first
+      // param to the unhandled throw labels (A9 sub-gap).
+      if (_asyncRejectAcc && _asyncRejectAcc.size) {
+        if (!_finalResult) {
+          // Void async function: synthesise a chain so the
+          // caller has something to carry the rejection labels.
+          _finalResult = [exprRef('Promise')];
+          _finalResult._typeName = 'Promise';
+        }
+        if (Array.isArray(_finalResult)) {
+          _finalResult._rejectionLabels = new Set(_asyncRejectAcc);
+          // Ensure the async function's return is typed as a
+          // Promise so `.then` / `.catch` dispatch through the
+          // existing typed-method handler.
+          if (!_finalResult._typeName) _finalResult._typeName = 'Promise';
+        } else if (_finalResult.kind === 'chain') {
+          _finalResult.rejectionLabels = new Set(_asyncRejectAcc);
+          if (!_finalResult.typeName) _finalResult.typeName = 'Promise';
+        }
+      }
       // Summary cache store: the walk is "pure for this input"
       // iff it didn't add findings, push domOps, or mutate
       // any outer-scope binding. Cache only such invocations
@@ -9450,7 +9531,7 @@
           var _iifeFn = _iifeFnE ? _iifeFnE.binding : null;
           if (!_iifeFn) {
             var _iifeArr = peekArrow(_iifeOpenIdx + 1, i);
-            if (_iifeArr) { var _iifeB = readArrowBody(_iifeArr.arrowNext, i); if (_iifeB) _iifeFn = functionBinding(_iifeArr.params, _iifeB.bodyStart, _iifeB.bodyEnd, _iifeB.isBlock); }
+            if (_iifeArr) { var _iifeB = readArrowBody(_iifeArr.arrowNext, i); if (_iifeB) _iifeFn = functionBinding(_iifeArr.params, _iifeB.bodyStart, _iifeB.bodyEnd, _iifeB.isBlock, _iifeArr.isAsync); }
           }
           if (_iifeFn) {
             // Phase 1's statement walker skips IIFE-wrapper bodies
@@ -10628,7 +10709,19 @@
         }
         continue;
       }
+      // `async function f() {...}` declaration: skip the `async`
+      // keyword but record that the next function is async so
+      // the declaration handler below stamps the binding with
+      // isAsync. Matches the A9 promise-rejection flow: throws
+      // inside the async body become the return Promise's
+      // rejection labels.
+      if (t.text === 'async' && tokens[i + 1] && tokens[i + 1].type === 'other' && tokens[i + 1].text === 'function') {
+        _pendingAsyncFunctionDecl = true;
+        continue;
+      }
       if (t.text === 'function') {
+        var _fnDeclIsAsync = _pendingAsyncFunctionDecl;
+        _pendingAsyncFunctionDecl = false;
         // Try to capture a function declaration: `function NAME(params) { body }`.
         const nameTok = tokens[i + 1];
         const openParen = tokens[i + 2];
@@ -10663,7 +10756,7 @@
               k++;
             }
             if (depth === 0) {
-              declFunction(nameTok.text, functionBinding(params, j + 1, k - 1, true));
+              declFunction(nameTok.text, functionBinding(params, j + 1, k - 1, true, _fnDeclIsAsync));
               // Fall through to let the walker traverse the body in a new
               // function scope, so inner `var`/`let`/`const` and assignments
               // (including `this.innerHTML = ...` sites) remain visible to

@@ -791,13 +791,21 @@ the `constructor` method with the new instance bound as `this`.
 
 ```
 ⟦throw e⟧ α =
-  push ⟦e⟧_expr α onto the surrounding try's thrown-set Θ
-  mark the rest of the current range dead within this scope
+  if _tryThrowAccStack non-empty:
+    read ⟦e⟧_expr α via readValue
+    union getBindingLabels(result) into top-of-stack accumulator
+  advance past the throw expression
+  (implicit: the rest of the enclosing scope is dead)
 ```
 
-The walker does not statically distinguish reachable throws from
-unreachable ones; the thrown set is unioned over every `throw` site
-syntactically inside the try body.
+The walker-driven accumulator is path-sensitive: only throws
+actually reached during the walk are unioned into the top
+accumulator. The enclosing try (§4.5) or async function body
+(§4.8) supplies that top accumulator. Function calls inside
+either context share the same accumulator because
+`instantiateFunction` walks through the same handler — so
+unhandled throws across arbitrary call depth surface to the
+outer frame.
 
 ---
 
@@ -1023,18 +1031,51 @@ reports it whether or not `a` was actually non-null at runtime. Any
 analysis that depends on knowing `a !== null` (e.g. dead-code
 elimination after `if (a == null) return`) is lossy.
 
-### A9. Async / await are treated as synchronous
+### A9. Async / await are treated as synchronous (with promise rejection flow)
 
-**Lines:** 5120 (`async` skip), 6472 (`await` unwrap).
-**Class:** SAFE.
-**Statement.** `async function` is parsed identically to a
-synchronous function. `await e` resolves to `e`'s `innerType` if `e`
-is a `Promise<T>`, else to `e` directly. No suspension / resumption
-is modelled; the event loop is invisible.
-**Condition.** Sound iff the order in which awaited promises resolve
-does not affect which sink fires. For purely data-flow taint
-tracking this holds. For temporal properties (e.g. "this sink only
-fires after that initialiser ran") the abstraction is too coarse.
+**Lines:** 5120 (`async` skip), 6472 (`await` unwrap), 7905–7935
+(instantiateFunction rejection-label accumulator), 6262–6272
+(`.catch` handler reading `rejectionLabels`), 10706–10720 (async
+function declaration stamping).
+**Class:** SAFE for data-flow, PARTIAL for temporal.
+**Statement.** Async functions are parsed with an `isAsync` flag.
+`async function f() {…}`, `async function(…)` expressions, and
+`async (…) => …` arrows all set the flag on the resulting
+`functionBinding`. `await e` still resolves synchronously to `e`'s
+`innerType` if `e` is a `Promise<T>`, else to `e` directly. The
+event loop, microtask ordering, and suspension semantics are
+invisible — the walker executes async bodies straight-line.
+
+**Promise rejection flow (A9 sub-gap closure).** Unhandled throws
+inside an async function body become the rejection labels of its
+returned Promise:
+
+1. `instantiateFunction` pushes a fresh `Set<label>` onto
+   `_tryThrowAccStack` before walking the body iff `fn.isAsync`
+   is true.
+2. The walker's `throw` handler (shared with G6 exception flow)
+   unions throw-expression labels into the top accumulator; an
+   inner try-catch pushes its own deeper entry so handled
+   throws don't escape.
+3. After the body walk, the accumulator is popped. If non-empty,
+   the labels are attached to the return token array as
+   `_rejectionLabels` (and the result is typed as `Promise` if
+   not already).
+4. The caller's `chainBinding` wrapper copies `_rejectionLabels`
+   onto the chain as `chain.rejectionLabels`.
+5. The `.catch(cb)` handler in `applyMethod` reads
+   `bind.rejectionLabels` and binds `cb`'s first parameter to
+   an opaque chain tagged with those labels.
+6. The `.then(cb)` handler propagates `rejectionLabels` through
+   the returned chain so `.then(x => …).catch(e => …)` still
+   consumes the upstream rejection.
+
+**Condition.** Sound for data-flow through async functions: every
+unhandled throw inside an async body reaches a `.catch` downstream
+with its labels. Sound for temporal properties ONLY when those
+properties don't depend on the order microtasks resolve —
+anything stateful (e.g. "this initialiser must run before that
+sink") is still too coarse.
 
 ### A10. Unknown constructors are opaque
 
@@ -1177,16 +1218,13 @@ academic effect-system semantics; each function's effective
 `thrown : Λ` set is the labels of throws it does not catch
 internally.
 
-Remaining gap in this area: **promise rejection**. An async
-function `async function f(){ throw x; }` should produce a
-rejected promise whose `.catch(e => …)` callback receives the
-throw's labels. The current implementation doesn't model this —
-async / await are still treated as synchronous (assumption A9),
-so a top-level `throw` inside an async function doesn't translate
-to a `.catch` arrival. Closing this would require either lifting
-async functions to wrap their throws in synthetic Promise.reject
-chains, or adding a separate `promiseReject : Λ` field to async
-function summaries. Tracked as a sub-gap of A9.
+Promise rejection flow (previously a sub-gap of A9) is now
+**implemented** as an extension of this same walker-driven
+accumulator: `instantiateFunction` pushes a fresh entry onto
+`_tryThrowAccStack` when entering an `async` function body, so
+unhandled throws surface as `chain.rejectionLabels` on the
+returned Promise. The `.catch(cb)` handler reads these labels
+and binds them to the callback's first parameter. See A9 in §6.
 
 ### G7. Path-sensitive function summaries
 

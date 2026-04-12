@@ -4004,6 +4004,20 @@ await (async function () {
   await checkTaint('nested try-catch swallows inner throw', { 'a.js': 'function f(){ try { throw location.hash; } catch(e) { } } try { f(); } catch(e) { document.getElementById("o").innerHTML = e; }' }, 0);
   await checkTaint('nested try re-throws tainted', { 'a.js': 'function f(){ try { return safe; } catch(e) { throw location.hash; } } try { f(); } catch(e) { document.getElementById("o").innerHTML = e; }' }, 1, { sources: ['url'] });
 
+  // Async function rejection flow (ABSTRACT-DOMAIN.md §4.8 / A9
+  // sub-gap closure): unhandled throws inside async function
+  // bodies become rejection labels on the returned Promise, and
+  // `.catch(e => …)` binds e to those labels.
+  await checkTaint('async reject → .catch', { 'a.js': 'async function f(){ throw location.hash; } f().catch(e => document.getElementById("o").innerHTML = e);' }, 1, { sources: ['url'] });
+  await checkTaint('async reject via .then.catch', { 'a.js': 'async function f(){ throw location.hash; } f().then(r => r).catch(e => document.getElementById("o").innerHTML = e);' }, 1, { sources: ['url'] });
+  await checkTaint('async inner try-catch swallows', { 'a.js': 'async function f(){ try { throw location.hash; } catch (e) { } } f().catch(e => document.getElementById("o").innerHTML = e);' }, 0);
+  await checkTaint('async throw new Error propagates arg', { 'a.js': 'async function f(){ throw new Error(location.hash); } f().catch(e => document.getElementById("o").innerHTML = e.message);' }, 1, { sources: ['url'] });
+  await checkTaint('async arrow rejection', { 'a.js': 'var f = async () => { throw location.hash; }; f().catch(e => document.getElementById("o").innerHTML = e);' }, 1, { sources: ['url'] });
+  await checkTaint('async rethrow from internal catch', { 'a.js': 'async function f(){ try { return safe; } catch(e) { throw location.hash; } } f().catch(e => document.getElementById("o").innerHTML = e);' }, 1, { sources: ['url'] });
+  // Non-async function returning a string doesn't have rejection labels;
+  // .catch on its result should not fire.
+  await checkTaint('non-async .catch is no-op', { 'a.js': 'function f(){ return "safe"; } var p = f(); if (p && p.catch) p.catch(e => document.getElementById("o").innerHTML = e);' }, 0);
+
   // --- filter(...).map(...).join: chain on opaque filter result ---
   await checkTaint('filter map join chain', { 'a.js': 'document.getElementById("o").innerHTML = ["a", location.hash].filter(x => x).map(x => x).join("");' }, 1, { sources: ['url'] });
 
