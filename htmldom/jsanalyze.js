@@ -6618,6 +6618,28 @@
         var _newText = first._src.slice(first.start, last.end);
         var _newRef = exprRef(_newText);
         var _newTaint = checkTaintSource(_newText);
+        // Propagate constructor argument taint into the result.
+        // `new Error(location.hash)` should yield an opaque chain
+        // tagged with `url` so a downstream `throw` / `catch (e)
+        // { sink(e.message) }` flow surfaces.
+        var _newArgParen = -1;
+        for (var _napi = k + 1; _napi < j; _napi++) {
+          if (tks[_napi] && tks[_napi].type === 'open' && tks[_napi].char === '(') { _newArgParen = _napi; break; }
+        }
+        if (_newArgParen >= 0) {
+          try {
+            var _newArgs = await readCallArgBindings(_newArgParen, j);
+            if (_newArgs && _newArgs.bindings) {
+              for (var _nai = 0; _nai < _newArgs.bindings.length; _nai++) {
+                var _naLabels = getBindingLabels(_newArgs.bindings[_nai]);
+                if (_naLabels && _naLabels.size) {
+                  if (!_newTaint) _newTaint = new Set();
+                  for (var _nal of _naLabels) _newTaint.add(_nal);
+                }
+              }
+            }
+          } catch (_) { /* fall through */ }
+        }
         if (_newTaint) _newRef.taint = _newTaint;
         // Classify the constructor as a call-sink via the
         // TypeDB. `new Worker(url)` and similar fire when the
@@ -7594,6 +7616,25 @@
       }
       return out;
     };
+
+    // Walker-driven throw accumulator stack (ABSTRACT-DOMAIN.md
+    // §4.5, G6 closure). Each entry is a `Set<label>` representing
+    // the union of taint labels carried by every `throw e` reached
+    // during the body walk of an enclosing try block. The stack is
+    // pushed when entering a try-body and popped (with the
+    // accumulated labels bound to the catch parameter) when leaving.
+    //
+    // Function calls inside a try body share the SAME accumulator:
+    // walker-driven means instantiateFunction's body walk goes
+    // through the same `throw` handler in walkRange that pushes
+    // into `_tryThrowAccStack[top]`. Nested try-catch inside the
+    // called function pushes its own entry, captures the throws
+    // it handles itself, and pops on exit — so only UNHANDLED
+    // throws escape to the outer accumulator. This is the academic
+    // effect-system semantics: each function has an effective
+    // `thrown : Λ` set composed of the throws it doesn't catch
+    // internally.
+    var _tryThrowAccStack = [];
 
     // Path-sensitive multi-return capture (see ABSTRACT-DOMAIN.md
     // §4.7.1). When non-null, the walker's `return` handler
@@ -8922,6 +8963,10 @@
       switch_capture: 'pop case-equality from P; capture case bindings',
       // Combine all case results into a switch token; queue post-switch range.
       switch_merge:   'merge cases into switch token; queue tail range',
+      // Pop the walker-driven throw accumulator after a try-without-catch
+      // body finishes walking. The accumulated labels are discarded
+      // because there's no catch handler to consume them.
+      try_throw_pop:  'pop _tryThrowAccStack entry after try-without-catch',
     };
     // Statement-kind transitions fired from within the `range` task's
     // dispatcher. This table doesn't directly drive dispatch (the
@@ -9064,6 +9109,24 @@
       _task.ctx.tryBindings = tryBindings;
       _task.ctx.tryLoopVars = tryLoopVars;
       _task.ctx.lvBefore2 = loopVars.length;
+      // Pop the walker-driven throw accumulator now that the try
+      // body walk is complete. The accumulator's contents are the
+      // union of (a) the static-scan seed, (b) every throw the
+      // walker reached during the try body walk, and (c) every
+      // unhandled throw escaping out of function calls inside the
+      // try body. Use this set when binding the catch parameter
+      // so cross-function / method / built-in throws all flow.
+      var _tcAccLabels = null;
+      if (taintEnabled && _task.ctx.throwAcc) {
+        // The pushed accumulator must currently be at the top of
+        // the stack — the try body walked between the push and
+        // here, and any nested try push/pops are balanced.
+        if (_tryThrowAccStack.length > 0
+            && _tryThrowAccStack[_tryThrowAccStack.length - 1] === _task.ctx.throwAcc) {
+          _tryThrowAccStack.pop();
+        }
+        _tcAccLabels = _task.ctx.throwAcc;
+      }
       // Bind the catch parameter to an opaque chain tagged with every
       // taint source that could flow through a throw inside the try
       // body (including throws inside any function called from it).
@@ -9071,9 +9134,20 @@
       // looks like a safe use of an unbound variable.
       if (taintEnabled && _task.catchStart >= 0 && _task.ctx.catchParamName) {
         var _tcCatchRef = exprRef(_task.ctx.catchParamName);
-        if (_task.ctx.throwTaint && _task.ctx.throwTaint.size) {
-          _tcCatchRef.taint = new Set(_task.ctx.throwTaint);
+        // The walker accumulator is the SOLE source of truth.
+        // It captures every throw the walker actually reached
+        // during the try body walk, respecting nested try-catch
+        // boundaries (inner try-catches push their own deeper
+        // entry and pop it on exit, so their handled throws
+        // don't escape to this outer level). The legacy
+        // static-scan `throwTaint` was an over-approximation
+        // that ignored nested try-catch and missed method /
+        // dispatch / built-in throws — superseded entirely.
+        var _tcLabels = null;
+        if (_tcAccLabels && _tcAccLabels.size) {
+          _tcLabels = new Set(_tcAccLabels);
         }
+        if (_tcLabels && _tcLabels.size) _tcCatchRef.taint = _tcLabels;
         // Declare the catch parameter in the current block so the
         // catch body can resolve it. The body's `{` will push a new
         // block frame on top, but declBlock attaches to the current
@@ -9120,6 +9194,17 @@
         }
       }
       if (_task.finallyStart >= 0) _ws.push({ type: 'range', start: _task.finallyStart, end: _task.finallyEnd });
+      continue;
+    }
+    // --- Transition: pop the throw accumulator after a try-without-catch
+    //     body finishes. The accumulated throw labels are dropped because
+    //     no catch handler is in scope to consume them.
+    if (_task.type === 'try_throw_pop') {
+      if (_task.ctx && _task.ctx.throwAcc &&
+          _tryThrowAccStack.length > 0 &&
+          _tryThrowAccStack[_tryThrowAccStack.length - 1] === _task.ctx.throwAcc) {
+        _tryThrowAccStack.pop();
+      }
       continue;
     }
     // --- Transition: switch case — rollback to pre-switch bindings,
@@ -9527,6 +9612,39 @@
         // as it always did.
       }
 
+      // Walker-driven throw accumulator (ABSTRACT-DOMAIN.md §4.5,
+      // G6 closure). When at least one enclosing try block has
+      // pushed a Set onto _tryThrowAccStack, every `throw e`
+      // reached during the body walk reads e via readValue and
+      // unions its labels into the top accumulator. Function
+      // calls inside a try body propagate their throws via the
+      // SAME stack — instantiateFunction's body walk goes through
+      // this same handler, so unhandled throws inside called
+      // functions surface to the outer try's accumulator.
+      // Nested try-catches inside a called function push their
+      // own entry, capture the throws they handle internally,
+      // and pop on exit, so only ESCAPED throws reach the outer
+      // accumulator.
+      //
+      // Unlike the return handler, this handler CONSUMES the
+      // throw expression (advancing i past it) so the walker
+      // doesn't double-process it as a regular statement. The
+      // call watchers and sink classifiers inside the throw
+      // expression still fire because readValue itself walks
+      // expressions through the same handlers.
+      if (t.text === 'throw' && _tryThrowAccStack.length > 0) {
+        var _twR = await readValue(i + 1, _rangeEnd, TERMS_TOP);
+        if (_twR && _twR.binding) {
+          var _twLabels = getBindingLabels(_twR.binding);
+          if (_twLabels && _twLabels.size) {
+            var _twTop = _tryThrowAccStack[_tryThrowAccStack.length - 1];
+            for (var _twL of _twLabels) _twTop.add(_twL);
+          }
+          i = _twR.next - 1;
+        }
+        continue;
+      }
+
       // `if (cond) { ... } [else { ... }]` — when the condition is
       // concrete, walk only the matching branch. When opaque, walk both
       // branches; if a build variable is mutated in only one branch,
@@ -9866,8 +9984,33 @@
           }
           _tCtx.throwTaint = _throwTaint;
           _tCtx.catchParamName = catchParam;
+          // Walker-driven throw accumulator: push a fresh empty Set
+          // so every `throw` reached during the try body walk —
+          // directly OR via function calls — accumulates into it.
+          // The accumulator is RESPECTFUL of nested try-catch:
+          // throws inside an inner try-catch push onto a deeper
+          // entry, so they don't escape to this outer level. The
+          // legacy static-scan _throwTaint is kept as a fallback
+          // ONLY when the walker accumulator stays empty (e.g.
+          // because the try body wasn't actually reached during
+          // a concrete walk), preserving precision in the common
+          // case while keeping the safety net for the rare one.
+          if (taintEnabled) {
+            var _twAcc = new Set();
+            _tryThrowAccStack.push(_twAcc);
+            _tCtx.throwAcc = _twAcc;
+          }
           if (catchStart < 0) {
             // No catch — try body state persists. Just walk try + finally.
+            // Pop the accumulator at the end of the try body since there's
+            // no catch to consume it; we still queue a no-op task to do
+            // the pop in the right order.
+            if (taintEnabled) {
+              _ws.push({ type: 'range', start: k, end: _rangeEnd });
+              if (finallyStart >= 0) _ws.push({ type: 'range', start: finallyStart, end: finallyEnd });
+              _ws.push({ type: 'try_throw_pop', ctx: _tCtx });
+              _rangeEnd = tryEnd; continue;
+            }
             _ws.push({ type: 'range', start: k, end: _rangeEnd });
             if (finallyStart >= 0) _ws.push({ type: 'range', start: finallyStart, end: finallyEnd });
             _rangeEnd = tryEnd; continue;

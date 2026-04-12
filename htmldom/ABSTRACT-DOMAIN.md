@@ -587,17 +587,42 @@ recursive calls via `_callStack`.
 
 ```
 ⟦try B catch (e) C finally F⟧ α =
-  let α_B = walk B with throws collected into a thrown-set Θ
-      α_C = walk C in α with e ↦ join(Θ)
+  push fresh Θ onto _tryThrowAccStack
+  let α_B = walk B (every `throw e` reached during the walk
+            unions getBindingLabels(e) into Θ; nested try-catches
+            push their own deeper Θ' so handled throws don't
+            escape; function calls inside B also push to Θ via
+            instantiateFunction's body walk going through the
+            same throw handler)
+  pop Θ from _tryThrowAccStack
+  bind catch parameter e to chainBinding([exprRef(e) with taint=Θ])
+  let α_C = walk C in α[Γ[e ↦ Θ-tagged]]
       Γ'  = join_try(Γ_B, Γ_C, e)
       α_F = walk F in α[Γ ↦ Γ']
   in α_F
 ```
 
-Implemented as `try_restore` (line 8421) and `try_merge` (line 8429).
-The thrown-set `Θ` is currently approximated as the union of all
-chain labels appearing inside `B`'s walk; per-throw-site precision is
-not modelled. See §6.6.
+Implemented across the try handler (line 9810+), `try_restore`
+(line 9078+), `try_merge` (line 9141+), and the walker `throw`
+handler (line 9143+).
+
+The thrown-set `Θ` is computed by the **walker-driven throw
+accumulator** `_tryThrowAccStack`: every reachable `throw e`
+unions `getBindingLabels(e)` into the top-of-stack accumulator.
+Critically, function calls inside B share the same accumulator
+because instantiateFunction's body walk dispatches through the
+same `throw` handler in `walkRange`. Nested try-catch inside a
+called function pushes its own Θ' onto the stack, captures its
+own handled throws, and pops on exit — so only **escaping**
+throws reach the outer accumulator. This is the academic
+**effect-system** semantics: each function's effective `thrown :
+Λ` set is the labels of throws it does not catch internally.
+
+The legacy syntactic `_scanThrowsIn` static scan is still
+present but no longer feeds the catch parameter; the walker
+accumulator is now the sole source of truth (the static scan
+ignored nested try-catch and missed method/dispatch/built-in
+throws).
 
 ### §4.6 Switch
 
@@ -1139,17 +1164,29 @@ typed `Array` and propagate it through `.forEach(e => …)`,
 `.map(e => …)`, etc. so the callback's first param is bound to a
 chain typed by `elementType`.
 
-### G6. Real interprocedural exception flow
+### G6. Real interprocedural exception flow ✓ implemented
 
-`try { f(); } catch (e) { sink(e.message); }` does not propagate
-labels from inside `f`'s body to the caller's catch parameter.
-Currently the catch parameter is bound to a single union over all
-syntactic throws inside the lexical try body, ignoring throws inside
-called functions.
+The walker-driven throw accumulator `_tryThrowAccStack` (§4.5)
+captures every `throw e` reached during a try body walk —
+directly OR through arbitrarily-deep function calls — and
+respects nested try-catch boundaries so handled throws don't
+escape. `try { f(); } catch (e) { sink(e.message); }` now flows
+labels from inside `f`'s body (and any function `f` calls
+transitively) to the caller's catch parameter. This is the
+academic effect-system semantics; each function's effective
+`thrown : Λ` set is the labels of throws it does not catch
+internally.
 
-**Sketch of fix.** Augment function summaries with a `thrown : Λ`
-field. On instantiation, the caller's enclosing try (if any) joins
-the callee's `thrown` into its catch parameter's labels.
+Remaining gap in this area: **promise rejection**. An async
+function `async function f(){ throw x; }` should produce a
+rejected promise whose `.catch(e => …)` callback receives the
+throw's labels. The current implementation doesn't model this —
+async / await are still treated as synchronous (assumption A9),
+so a top-level `throw` inside an async function doesn't translate
+to a `.catch` arrival. Closing this would require either lifting
+async functions to wrap their throws in synthetic Promise.reject
+chains, or adding a separate `promiseReject : Λ` field to async
+function summaries. Tracked as a sub-gap of A9.
 
 ### G7. Path-sensitive function summaries
 

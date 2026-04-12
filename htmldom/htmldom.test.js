@@ -3994,6 +3994,16 @@ await (async function () {
   // Opaque arg blocks substitution → both branches retained → finding fires.
   await checkTaint('opaque arg leaves both branches reachable', { 'a.js': 'function f(a) { if (a > 5) return "safe"; return location.hash; } document.getElementById("o").innerHTML = f(unknown);' }, 1, { sources: ['url'] });
 
+  // Walker-driven throw accumulator (ABSTRACT-DOMAIN.md §4.5, G6 closure):
+  // throws inside method calls, deep call chains, and `new Error(tainted)`
+  // all flow through the per-try accumulator. Nested try-catch boundaries
+  // are respected — handled throws don't escape to outer catches.
+  await checkTaint('throw via method call', { 'a.js': 'var o = { m: function(){ throw location.hash; } }; try { o.m(); } catch(e) { document.getElementById("o").innerHTML = e; }' }, 1, { sources: ['url'] });
+  await checkTaint('throw via deep call chain', { 'a.js': 'function a(){ b(); } function b(){ c(); } function c(){ throw location.hash; } try { a(); } catch(e) { document.getElementById("o").innerHTML = e; }' }, 1, { sources: ['url'] });
+  await checkTaint('throw new Error(tainted) propagates arg taint', { 'a.js': 'try { throw new Error(location.hash); } catch(e) { document.getElementById("o").innerHTML = e.message; }' }, 1, { sources: ['url'] });
+  await checkTaint('nested try-catch swallows inner throw', { 'a.js': 'function f(){ try { throw location.hash; } catch(e) { } } try { f(); } catch(e) { document.getElementById("o").innerHTML = e; }' }, 0);
+  await checkTaint('nested try re-throws tainted', { 'a.js': 'function f(){ try { return safe; } catch(e) { throw location.hash; } } try { f(); } catch(e) { document.getElementById("o").innerHTML = e; }' }, 1, { sources: ['url'] });
+
   // --- filter(...).map(...).join: chain on opaque filter result ---
   await checkTaint('filter map join chain', { 'a.js': 'document.getElementById("o").innerHTML = ["a", location.hash].filter(x => x).map(x => x).join("");' }, 1, { sources: ['url'] });
 
