@@ -10386,13 +10386,53 @@
             var _forInOfTaint = null;
             var _forInOfKnownValues = null;
             var _forInOfLoopVarName = null;
+            var _forInOfDestructure = null;
             if (taintEnabled) {
               for (var _fi = i + 2; _fi < j; _fi++) {
                 if (tokens[_fi].type === 'other' && (tokens[_fi].text === 'in' || tokens[_fi].text === 'of')) {
                   var _forInOf = tokens[_fi].text;
                   var _fiVarStart = i + 2;
                   if (tokens[_fiVarStart].type === 'other' && (tokens[_fiVarStart].text === 'var' || tokens[_fiVarStart].text === 'let' || tokens[_fiVarStart].text === 'const')) _fiVarStart++;
-                  var _fiVarName = tokens[_fiVarStart] && IDENT_RE.test(tokens[_fiVarStart].text) ? tokens[_fiVarStart].text : null;
+                  // Detect destructure pattern: `for (var [k, v] of m.entries())`
+                  // or `for (var {prop} of arr)`. Parse the pattern
+                  // via readDestructurePattern so we can apply it
+                  // per-iteration to extract per-name bindings.
+                  // (ABSTRACT-DOMAIN.md §4.4 / destructure-in-for-of
+                  // sub-gap closure.)
+                  var _fiDestructPattern = null;
+                  var _fiDestructNames = [];
+                  if (tokens[_fiVarStart] && tokens[_fiVarStart].type === 'open' &&
+                      (tokens[_fiVarStart].char === '[' || tokens[_fiVarStart].char === '{')) {
+                    var _fiPatRes = readDestructurePattern(_fiVarStart, j);
+                    if (_fiPatRes) {
+                      _fiDestructPattern = _fiPatRes.pattern;
+                      // Collect all leaf names so each gets a loop
+                      // frame slot. readDestructurePattern returns
+                      // `{ kind: 'arr-pattern', entries }` or
+                      // `{ kind: 'obj-pattern', entries, rest }`
+                      // where each entry is either null (array
+                      // hole) or `{ key?, name, dflt, nested }`.
+                      var _collectNames = function (pat) {
+                        if (!pat) return;
+                        if (pat.kind === 'arr-pattern' || pat.kind === 'obj-pattern') {
+                          if (pat.entries) {
+                            for (var _cn = 0; _cn < pat.entries.length; _cn++) {
+                              var _cne = pat.entries[_cn];
+                              if (!_cne) continue;
+                              if (_cne.nested) { _collectNames(_cne.nested); continue; }
+                              if (_cne.name) _fiDestructNames.push(_cne.name);
+                            }
+                          }
+                          if (pat.rest) _fiDestructNames.push(pat.rest);
+                          return;
+                        }
+                      };
+                      _collectNames(_fiDestructPattern);
+                    }
+                  }
+                  var _fiVarName = tokens[_fiVarStart] && tokens[_fiVarStart].type === 'other' && IDENT_RE.test(tokens[_fiVarStart].text)
+                    ? tokens[_fiVarStart].text
+                    : (_fiDestructNames.length > 0 ? _fiDestructNames[0] : null);
                   if (_fiVarName) {
                     _forInOfLoopVarName = _fiVarName;
                     var _fiExprVal = await readValue(_fi + 1, j, null);
@@ -10449,6 +10489,17 @@
                     }
                     if (_fiTaintSources.length) _forInOfTaint = { varName: _fiVarName, sources: _fiTaintSources };
                     if (_fiKnownVals.length) _forInOfKnownValues = _fiKnownVals;
+                    // Remember the destructure pattern (if any)
+                    // so the loop-frame binding below can apply
+                    // it per known element and bind each leaf
+                    // name to the union of its per-iteration
+                    // values.
+                    if (_fiDestructPattern) {
+                      _forInOfDestructure = {
+                        pattern: _fiDestructPattern,
+                        names: _fiDestructNames,
+                      };
+                    }
                   }
                   break;
                 }
@@ -10598,6 +10649,75 @@
             // Apply for-in/for-of taint to the loop frame binding.
             if (_forInOfTaint && loopFrame.bindings[_forInOfTaint.varName]) {
               loopFrame.bindings[_forInOfTaint.varName] = chainBinding([deriveExprRef.apply(null, [_forInOfTaint.varName].concat(_forInOfTaint.sources))]);
+            }
+            // Destructure-in-for-of: when the loop variable is a
+            // destructure pattern like `var [k, v]` or `var {x}`,
+            // apply the pattern to every known iterable element
+            // and collect per-leaf-name bindings into the loop
+            // frame. Each leaf name gets an opaque chain carrying
+            // the union of labels from its slot across all known
+            // elements. The body's reads on that name see the
+            // aggregate taint so sinks downstream fire correctly.
+            if (_forInOfDestructure && _forInOfKnownValues && _forInOfKnownValues.length > 0) {
+              // Aggregator: name → Set<tok-array> of label sources
+              // from every matching slot in every known element.
+              var _fiLeafTaint = Object.create(null);
+              // The aggregator also collects the first concrete
+              // binding per name so we have SOMETHING to seed the
+              // loop frame with (for non-chain slots like nested
+              // objects, we use the first element's slot binding
+              // as the prototype).
+              var _fiLeafPrototype = Object.create(null);
+              for (var _fde = 0; _fde < _forInOfKnownValues.length; _fde++) {
+                var _fdElem = _forInOfKnownValues[_fde];
+                if (!_fdElem) continue;
+                try {
+                  await applyPatternBindings(_forInOfDestructure.pattern, _fdElem, function (name, val) {
+                    if (!val) return;
+                    if (!(name in _fiLeafPrototype)) _fiLeafPrototype[name] = val;
+                    if (val.kind === 'chain') {
+                      if (!_fiLeafTaint[name]) _fiLeafTaint[name] = [];
+                      _fiLeafTaint[name].push(val.toks);
+                    } else if (val.kind === 'array') {
+                      // Nested array: collect taint from every
+                      // chain element inside.
+                      for (var _fdai = 0; _fdai < val.elems.length; _fdai++) {
+                        if (val.elems[_fdai] && val.elems[_fdai].kind === 'chain') {
+                          if (!_fiLeafTaint[name]) _fiLeafTaint[name] = [];
+                          _fiLeafTaint[name].push(val.elems[_fdai].toks);
+                        }
+                      }
+                    } else if (val.kind === 'object') {
+                      // Nested object: collect taint from every
+                      // chain prop inside.
+                      for (var _fdop in val.props) {
+                        if (val.props[_fdop] && val.props[_fdop].kind === 'chain') {
+                          if (!_fiLeafTaint[name]) _fiLeafTaint[name] = [];
+                          _fiLeafTaint[name].push(val.props[_fdop].toks);
+                        }
+                      }
+                    }
+                  });
+                } catch (_) { /* skip malformed elements */ }
+              }
+              // Bind each leaf name in the loop frame. Use the
+              // prototype binding for structured (non-chain) leaves;
+              // for chain leaves, wrap the union of slot-token
+              // arrays in a single deriveExprRef so body reads see
+              // the aggregate taint.
+              for (var _fdli = 0; _fdli < _forInOfDestructure.names.length; _fdli++) {
+                var _fdln = _forInOfDestructure.names[_fdli];
+                var _fdProto = _fiLeafPrototype[_fdln];
+                if (_fdProto && _fdProto.kind !== 'chain') {
+                  loopFrame.bindings[_fdln] = _fdProto;
+                } else if (_fiLeafTaint[_fdln] && _fiLeafTaint[_fdln].length > 0) {
+                  loopFrame.bindings[_fdln] = chainBinding([
+                    deriveExprRef.apply(null, [_fdln].concat(_fiLeafTaint[_fdln])),
+                  ]);
+                } else if (_fdProto) {
+                  loopFrame.bindings[_fdln] = _fdProto;
+                }
+              }
             }
             // Pre-populate the may-be lattice for variables assigned
             // from the for-of/for-in loop variable. For a body like

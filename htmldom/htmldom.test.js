@@ -4032,6 +4032,19 @@ await (async function () {
   await checkTaint('set.values for-of', { 'a.js': 'var s = new Set(); s.add(location.hash); for (var v of s.values()) { document.getElementById("o").innerHTML = v; }' }, 1, { sources: ['url'] });
   await checkTaint('set.forEach', { 'a.js': 'var s = new Set(); s.add(location.hash); s.forEach(v => { document.getElementById("o").innerHTML = v; });' }, 1, { sources: ['url'] });
 
+  // Destructure-in-for-of: loop variable is a destructure pattern
+  // (`[k, v]` or `{prop}`) applied to each iterable element. Leaf
+  // names get opaque chains carrying the union of labels from
+  // their matching slot across every known element.
+  await checkTaint('destruct map entries', { 'a.js': 'var m = new Map(); m.set("k", location.hash); for (var [k, v] of m.entries()) { document.getElementById("o").innerHTML = v; }' }, 1, { sources: ['url'] });
+  await checkTaint('destruct array of arrays', { 'a.js': 'for (var [k, v] of [["a", location.hash]]) { document.getElementById("o").innerHTML = v; }' }, 1, { sources: ['url'] });
+  await checkTaint('destruct array of objects', { 'a.js': 'for (var {prop} of [{prop: location.hash}]) { document.getElementById("o").innerHTML = prop; }' }, 1, { sources: ['url'] });
+  await checkTaint('destruct object rename', { 'a.js': 'for (var {prop: p} of [{prop: location.hash}]) { document.getElementById("o").innerHTML = p; }' }, 1, { sources: ['url'] });
+  // Position sensitivity: `[k, v]` with tainted key slot only flags
+  // when reading k, not v.
+  await checkTaint('destruct key slot only', { 'a.js': 'for (var [k, v] of [[location.hash, "v"]]) { document.getElementById("o").innerHTML = k; }' }, 1, { sources: ['url'] });
+  await checkTaint('destruct val slot clean', { 'a.js': 'for (var [k, v] of [[location.hash, "v"]]) { document.getElementById("o").innerHTML = v; }' }, 0);
+
   // --- filter(...).map(...).join: chain on opaque filter result ---
   await checkTaint('filter map join chain', { 'a.js': 'document.getElementById("o").innerHTML = ["a", location.hash].filter(x => x).map(x => x).join("");' }, 1, { sources: ['url'] });
 

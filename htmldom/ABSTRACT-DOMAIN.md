@@ -1192,14 +1192,21 @@ The statement-level walker also routes `m.forEach(cb)`,
 bare-statement calls fire the same iteration handlers as
 expression-position ones.
 
-The for-of loop handler was extended to bind loop variables to
-structured elements (array / object / element) when iterating an
-array of such elements — so `for (var pair of m.entries()) pair[1]`
-resolves `pair[1]` correctly. Sub-gap: **destructure-in-for-of**
-(`for (var [k, v] of m.entries())`) is not yet implemented —
-the for-of loop variable parser only extracts single identifiers
-and doesn't apply `applyPatternBindings` per iteration. Tracked
-as a separate gap.
+The for-of loop handler was extended along two axes:
+
+  1. Loop variables bind to structured elements (array / object
+     / element) when iterating an array of such elements — so
+     `for (var pair of m.entries()) pair[1]` resolves `pair[1]`
+     correctly.
+  2. **Destructure-in-for-of** is now supported: when the loop
+     variable is a destructure pattern like `var [k, v]` or
+     `var {prop}`, `readDestructurePattern` parses the pattern,
+     `applyPatternBindings` maps each known element through it,
+     and each leaf name is bound in the loop frame to an opaque
+     chain carrying the union of labels from its matching slot
+     across every known element. Position sensitivity holds:
+     `for (var [k, v] of [[tainted, "v"]])` flags reads of `k`
+     but not `v`.
 
 ### G4. `Symbol.iterator` protocol on plain objects
 
