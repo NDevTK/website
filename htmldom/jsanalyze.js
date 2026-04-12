@@ -9260,6 +9260,16 @@
     };
 
     const chainAsExprText = (chain) => {
+      // Defensive guard: callers throughout the walker pass
+      // bindings of various kinds (chain, object, array, element,
+      // function) into this renderer. Only chain bindings have a
+      // `toks` array — for everything else we return null, which
+      // callers already handle as "un-renderable, treat as opaque".
+      // Without this guard, real-world code patterns that pass an
+      // object or function binding through a unary operator / cond
+      // / arith expression crash with "Cannot read properties of
+      // undefined (reading 'length')" on chain.toks.
+      if (!chain || chain.kind !== 'chain' || !chain.toks) return null;
       // Render a single-token chain.
       const renderTok = (t) => {
         if (t.type === 'str') {
