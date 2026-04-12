@@ -1152,19 +1152,37 @@ fire (incorrectly: the wrapper does eventually reach the DOM).
 The following ECMAScript features are not modelled at all. Each is a
 candidate for a dedicated transfer function in §4.
 
-### G1. Generators (`function*` / `yield`)
+### G1. Generators (`function*` / `yield`) ✓ implemented
 
-`function* gen() { yield e₁; yield e₂; … }` should produce a value
-of type `Generator<T>` where `T = type(e₁) ⊔ type(e₂) ⊔ …`. Currently
-the analysis treats `function*` like a normal function and silently
-drops `yield`. `for (var v of gen())` therefore sees `v` as opaque
-with no labels.
+`functionBinding` carries an `isGenerator` flag set at parse time
+when the walker sees `function*` (as a separate `*` op token
+after `function`) in either a function declaration or a function
+expression. `instantiateFunction` for a generator body pushes a
+fresh entry onto `_yieldCaptureStack` before walking; the walker's
+`yield` handler reads the yielded expression via `readValue` and
+appends its binding to the top-of-stack accumulator. After the
+body walk the accumulator is popped and its contents become the
+elements of an `Array` binding — the generator's return value.
 
-**Sketch of fix.** During body walk, collect every `yield e` and the
-path condition reaching it into a `_pendingYields` list (analogous
-to the `_pendingReturns` list in §4.7.1). The function's return type
-becomes a synthetic `Iterable<T>` with `T = ⊔ᵢ type(eᵢ)`. The for-of
-loop then iterates each `yield`'d value as one element.
+The approximation is **eager materialisation**: we model
+`gen()` as if all yields had already happened, collapsing the
+iterator protocol into a concrete array. `for (var v of gen())`
+then iterates via the existing array-iteration path, destructure
+patterns work via the G3-sub-gap code, and `[...gen()]` works
+via a new spread-of-call extension in `_stepReadArrayLit`.
+
+Sound for taint: every yielded label reaches the consumer. May
+over-report when yields are path-dependent (we collect every
+reachable yield, not just ones reachable under a particular
+condition). Precise enough for real-world patterns; a truly lazy
+iterator abstraction would require treating `gen()` as a
+suspendable continuation with per-next() state.
+
+Not yet modeled: `yield*` delegation to another iterable (treated
+as a regular `yield` of the delegated expression for now);
+generator `.next()` / `.throw()` / `.return()` method calls —
+direct iteration via `for-of` and `spread` cover the common
+cases.
 
 ### G2. Async iterators (`for await (… of stream)`)
 

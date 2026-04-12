@@ -4045,6 +4045,23 @@ await (async function () {
   await checkTaint('destruct key slot only', { 'a.js': 'for (var [k, v] of [[location.hash, "v"]]) { document.getElementById("o").innerHTML = k; }' }, 1, { sources: ['url'] });
   await checkTaint('destruct val slot clean', { 'a.js': 'for (var [k, v] of [[location.hash, "v"]]) { document.getElementById("o").innerHTML = v; }' }, 0);
 
+  // Generator functions (ABSTRACT-DOMAIN.md §4.4 / G1 closure):
+  // `function* gen()` bodies push a fresh yield accumulator
+  // during their walk. Every `yield e` reached appends e's
+  // binding to the accumulator; after the body walk, the
+  // yielded values become the elements of an Array binding
+  // returned from instantiateFunction. This approximates the
+  // lazy iterator protocol with eager materialisation —
+  // sound for taint, may over-report when yields are path-
+  // dependent.
+  await checkTaint('generator for-of single yield', { 'a.js': 'function* gen() { yield location.hash; } for (var v of gen()) { document.getElementById("o").innerHTML = v; }' }, 1, { sources: ['url'] });
+  await checkTaint('generator multiple yields tainted 2nd', { 'a.js': 'function* gen() { yield "safe"; yield location.hash; } for (var v of gen()) { document.getElementById("o").innerHTML = v; }' }, 1, { sources: ['url'] });
+  await checkTaint('generator destructure', { 'a.js': 'function* gen() { yield ["k", location.hash]; } for (var [k, v] of gen()) { document.getElementById("o").innerHTML = v; }' }, 1, { sources: ['url'] });
+  await checkTaint('generator conditional yield', { 'a.js': 'function* gen(c) { if (c) yield location.hash; else yield "safe"; } for (var v of gen(true)) { document.getElementById("o").innerHTML = v; }' }, 1, { sources: ['url'] });
+  await checkTaint('spread generator into array', { 'a.js': 'function* gen() { yield location.hash; } var xs = [...gen()]; document.getElementById("o").innerHTML = xs[0];' }, 1, { sources: ['url'] });
+  // Generator with no taint stays clean.
+  await checkTaint('generator all-safe', { 'a.js': 'function* gen() { yield "a"; yield "b"; } for (var v of gen()) { document.getElementById("o").innerHTML = v; }' }, 0);
+
   // --- filter(...).map(...).join: chain on opaque filter result ---
   await checkTaint('filter map join chain', { 'a.js': 'document.getElementById("o").innerHTML = ["a", location.hash].filter(x => x).map(x => x).join("");' }, 1, { sources: ['url'] });
 

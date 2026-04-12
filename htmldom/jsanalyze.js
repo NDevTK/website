@@ -3210,8 +3210,9 @@
   var _nextObjId = 0;
   const objectBinding = (props) => ({ kind: 'object', props, __objId: ++_nextObjId });
   const arrayBinding = (elems) => ({ kind: 'array', elems, __objId: ++_nextObjId });
-  const functionBinding = (params, bodyStart, bodyEnd, isBlock, isAsync) => ({
-    kind: 'function', params, bodyStart, bodyEnd, isBlock, isAsync: !!isAsync,
+  const functionBinding = (params, bodyStart, bodyEnd, isBlock, isAsync, isGenerator) => ({
+    kind: 'function', params, bodyStart, bodyEnd, isBlock,
+    isAsync: !!isAsync, isGenerator: !!isGenerator,
   });
   // Virtual DOM element binding factories. Each `buildScopeState` invocation
   // maintains its own element-id counter via a closure (see below). The
@@ -5088,6 +5089,35 @@
         if (tk.type === 'other' && tk.text.startsWith('...')) {
           const name = tk.text.slice(3);
           if (IDENT_OR_PATH_RE.test(name)) {
+            // Check for `...<name>(...)` — spread of a function
+            // call result (e.g. `[...gen()]` over a generator).
+            // When the call produces an Array binding, we can
+            // spread its elements directly.
+            var _spreadNext = tks[frame.i + 1];
+            if (_spreadNext && _spreadNext.type === 'open' && _spreadNext.char === '(') {
+              var _spreadCallResult = await readValue(frame.i + 1, frame.stop, TERMS_ARR);
+              // Re-evaluate as a call: resolve the identifier,
+              // instantiate if it's a function, spread the result.
+              var _spreadFnBind = await resolvePath(name);
+              if (_spreadFnBind && _spreadFnBind.kind === 'function' && _spreadCallResult) {
+                var _spreadCallArgs = await readCallArgBindings(frame.i + 1, frame.stop);
+                if (_spreadCallArgs) {
+                  var _spreadCallRes = await instantiateFunction(_spreadFnBind, _spreadCallArgs.bindings);
+                  // Generator functions return an arrayBinding;
+                  // async functions return a chain; regular
+                  // functions return tokens.
+                  if (_spreadCallRes && _spreadCallRes.kind === 'array') {
+                    for (var _spci = 0; _spci < _spreadCallRes.elems.length; _spci++) {
+                      if (_spreadCallRes.elems[_spci]) frame.elems.push(_spreadCallRes.elems[_spci]);
+                    }
+                    frame.i = _spreadCallArgs.next;
+                    const sep2 = tks[frame.i];
+                    if (sep2 && sep2.type === 'sep' && sep2.char === ',') { frame.i++; continue; }
+                    break;
+                  }
+                }
+              }
+            }
             const b = await resolvePath(name);
             if (b && b.kind === 'array') { for (const e of b.elems) frame.elems.push(e); frame.i++; const sep = tks[frame.i]; if (sep && sep.type === 'sep' && sep.char === ',') { frame.i++; continue; } break; }
           }
@@ -5254,6 +5284,14 @@
       }
       if (ft.text !== 'function') return null;
       var fk = k + 1;
+      // Optional `*` suffix for generator functions: `function* name()`
+      // or `function *()`. Records isGenerator so instantiateFunction
+      // can materialise yielded values into the returned iterable.
+      var _readFnIsGenerator = false;
+      if (tks[fk] && tks[fk].type === 'op' && tks[fk].text === '*') {
+        _readFnIsGenerator = true;
+        fk++;
+      }
       // Optional function name.
       if (tks[fk] && tks[fk].type === 'other' && IDENT_RE.test(tks[fk].text) && tks[fk].text !== 'function') fk++;
       // Parameter list.
@@ -5334,7 +5372,7 @@
         else if (tks[bodyEnd].type === 'close' && tks[bodyEnd].char === '}') depth--;
         bodyEnd++;
       }
-      var _fnBind = functionBinding(params, fj, bodyEnd, true, _readFnIsAsync);
+      var _fnBind = functionBinding(params, fj, bodyEnd, true, _readFnIsAsync, _readFnIsGenerator);
       // Closure capture: snapshot every binding visible at function-
       // expression creation time. When the function is later called
       // (potentially after the creating scope has returned), the
@@ -7772,6 +7810,18 @@
       return out;
     };
 
+    // Walker-driven yield accumulator stack (ABSTRACT-DOMAIN.md
+    // §4.4 / G1 closure). Each entry is a list of bindings
+    // collected from every `yield e` reached during a generator
+    // function body walk. instantiateFunction for a generator
+    // function pushes a fresh entry before walking the body and
+    // pops it afterward; the yielded values become the elements
+    // of the returned Array binding (our eager approximation of
+    // the lazy generator protocol). Nested generators push
+    // their own entry so their yields don't contaminate an
+    // outer generator's captured list.
+    var _yieldCaptureStack = [];
+
     // Walker-driven throw accumulator stack (ABSTRACT-DOMAIN.md
     // §4.5, G6 closure). Each entry is a `Set<label>` representing
     // the union of taint labels carried by every `throw e` reached
@@ -8060,6 +8110,17 @@
           _asyncRejectAcc = new Set();
           _tryThrowAccStack.push(_asyncRejectAcc);
         }
+        // For generator function bodies, push a fresh yield
+        // accumulator onto _yieldCaptureStack so every `yield e`
+        // reached during the body walk appends e's binding to
+        // the top. After the walk, the accumulator is popped
+        // and its contents become the elements of the returned
+        // Array binding (G1 closure).
+        var _yieldAcc = null;
+        if (taintEnabled && fn.isGenerator) {
+          _yieldAcc = [];
+          _yieldCaptureStack.push(_yieldAcc);
+        }
         await walkRange(bodyStart, bodyEnd);
         // Pop the async rejection accumulator now the body walk
         // is complete. Its contents are the union of every
@@ -8069,6 +8130,16 @@
           if (_tryThrowAccStack.length > 0
               && _tryThrowAccStack[_tryThrowAccStack.length - 1] === _asyncRejectAcc) {
             _tryThrowAccStack.pop();
+          }
+        }
+        // Pop the yield accumulator. Its contents become the
+        // return value of the generator function: an arrayBinding
+        // of the captured yielded values, approximating the
+        // lazy generator protocol with eager materialisation.
+        if (_yieldAcc != null) {
+          if (_yieldCaptureStack.length > 0
+              && _yieldCaptureStack[_yieldCaptureStack.length - 1] === _yieldAcc) {
+            _yieldCaptureStack.pop();
           }
         }
         var _walkerReturns = _returnCapture.entries;
@@ -8321,6 +8392,17 @@
       // Return non-chain binding directly (object/array from return statement).
       var _finalResult = result;
       if (!result && fnReturnBinding) _finalResult = fnReturnBinding;
+      // Generator result: approximate the lazy iterator protocol
+      // by returning an Array binding containing every yielded
+      // value collected during the body walk. for-of over
+      // `gen()` then picks up each yielded value via the
+      // existing array-iteration path; direct index reads
+      // (`gen()[0]`) also work. Nested yields from different
+      // paths contribute all possible yielded values —
+      // over-approximation but sound for taint (§4.4, G1).
+      if (fn.isGenerator && _yieldAcc != null) {
+        _finalResult = arrayBinding(_yieldAcc.slice());
+      }
       // Async-function rejection labels: attach the accumulated
       // set to the token-array result so the caller's chain
       // wrapper propagates it as `chain.rejectionLabels`. The
@@ -9832,6 +9914,41 @@
       // call watchers and sink classifiers inside the throw
       // expression still fire because readValue itself walks
       // expressions through the same handlers.
+      // Walker-driven yield capture (ABSTRACT-DOMAIN.md §4.4 /
+      // G1 closure). When a generator function's body walk is
+      // active, every `yield e` reached unions e's binding into
+      // the top-of-stack yield accumulator. Plain `yield` (no
+      // argument) is treated as yielding `undefined` (not tracked
+      // in the accumulator). The handler CONSUMES the yield
+      // expression so the walker doesn't double-process it.
+      if (t.text === 'yield' && _yieldCaptureStack.length > 0) {
+        // `yield*` delegates to another iterable. We don't model
+        // delegation precisely; fall through to treat it as an
+        // opaque yield that still captures the RHS's top-level
+        // expression binding.
+        var _ykYieldStart = i + 1;
+        if (tokens[_ykYieldStart] && tokens[_ykYieldStart].type === 'op' && tokens[_ykYieldStart].text === '*') {
+          _ykYieldStart++;
+        }
+        // yield without an expression (just `yield;` or `yield\n`)
+        // has nothing to capture; advance past the keyword and
+        // let the walker pick up the statement terminator.
+        var _ykPeek = tokens[_ykYieldStart];
+        if (!_ykPeek || (_ykPeek.type === 'sep' && (_ykPeek.char === ';' || _ykPeek.char === ','))) {
+          i = _ykYieldStart - 1;
+          continue;
+        }
+        var _ykR = await readValue(_ykYieldStart, _rangeEnd, TERMS_TOP);
+        if (_ykR && _ykR.binding) {
+          var _ykTop = _yieldCaptureStack[_yieldCaptureStack.length - 1];
+          _ykTop.push(_ykR.binding);
+          i = _ykR.next - 1;
+        } else {
+          i = _ykYieldStart - 1;
+        }
+        continue;
+      }
+
       if (t.text === 'throw' && _tryThrowAccStack.length > 0) {
         var _twR = await readValue(i + 1, _rangeEnd, TERMS_TOP);
         if (_twR && _twR.binding) {
@@ -10985,13 +11102,22 @@
       if (t.text === 'function') {
         var _fnDeclIsAsync = _pendingAsyncFunctionDecl;
         _pendingAsyncFunctionDecl = false;
+        // Generator-function declaration: `function* NAME(params) { body }`.
+        // The `*` is a separate op token after `function`; skip it and
+        // record isGenerator so instantiateFunction tracks yields.
+        var _fnDeclIsGenerator = false;
+        var _fnDeclOffset = 1;
+        if (tokens[i + 1] && tokens[i + 1].type === 'op' && tokens[i + 1].text === '*') {
+          _fnDeclIsGenerator = true;
+          _fnDeclOffset = 2;
+        }
         // Try to capture a function declaration: `function NAME(params) { body }`.
-        const nameTok = tokens[i + 1];
-        const openParen = tokens[i + 2];
+        const nameTok = tokens[i + _fnDeclOffset];
+        const openParen = tokens[i + _fnDeclOffset + 1];
         if (nameTok && nameTok.type === 'other' && IDENT_RE.test(nameTok.text) &&
             openParen && openParen.type === 'open' && openParen.char === '(') {
           const params = [];
-          let j = i + 3;
+          let j = i + _fnDeclOffset + 2;
           const firstP = tokens[j];
           if (firstP && firstP.type === 'close' && firstP.char === ')') { j++; }
           else {
@@ -11019,7 +11145,7 @@
               k++;
             }
             if (depth === 0) {
-              declFunction(nameTok.text, functionBinding(params, j + 1, k - 1, true, _fnDeclIsAsync));
+              declFunction(nameTok.text, functionBinding(params, j + 1, k - 1, true, _fnDeclIsAsync, _fnDeclIsGenerator));
               // Fall through to let the walker traverse the body in a new
               // function scope, so inner `var`/`let`/`const` and assignments
               // (including `this.innerHTML = ...` sites) remain visible to
