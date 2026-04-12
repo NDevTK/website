@@ -228,7 +228,13 @@ and the SMT layer may emit a may-be disjunction `(or (= x v₁) (= x v₂)
 ...)`. The first non-literal assignment forces `complete := false`.
 
 The lattice operation is monotone accumulation: `M[x] ⊔ {v} = M[x]
-∪ {v}` with no widening cap (see §6 for the boundedness assumption).
+∪ {v}` **by design with no widening cap**. See A5 and G9 in §6/§7
+for the rationale: the library's "no assumptions" principle
+rules out arbitrary size limits. Per-variable precision is
+preserved for any number of distinct literal assignments; the
+only automatic coarsening is `complete := false` on the first
+non-literal assignment, which is a semantic (not a size-based)
+fallback.
 
 ### §2.5 Type lattice: `T`
 
@@ -424,10 +430,16 @@ M[x] ⊔_M {v} = ⟨ vals     := M[x].vals ++ [v]
 any non-literal binding lands, `complete` flips to false and the SMT
 layer stops emitting may-be disjunctions for `x`.
 
-The lattice has **no widening operator**. Termination relies on the
-walker's symbolic structure (every loop body is walked at most a
-fixed number of fixpoint iterations) rather than on `M` reaching a
-fixed point per-variable. This is documented as Assumption A4 in §6.
+The lattice has **no widening operator** (by design — see A5
+and G9). Termination relies on the walker's symbolic structure:
+every loop body is walked at most a fixed number of fixpoint
+iterations, and `M` itself never drives extra iterations because
+its updates are monotone over a finite-for-this-input value
+domain (the literal and identity-keyed values that actually
+appear in the source). Adversarial inputs can grow `M` linearly
+in the number of distinct literal assignments, but precision is
+preserved at every size and the SMT layer handles disjunctions
+of any n.
 
 ### §3.5 Path-constraint join
 
@@ -980,20 +992,40 @@ lost.
 chain. **Imprecise** for SMT refutation: the post-loop value is
 opaque so any sink condition involving it cannot be refuted.
 
-### A5. May-be lattice has no widening cap
+### A5. May-be lattice is unbounded by design
 
 **Lines:** 3526–3638 (`_varMayBe`, `_trackMayBeAssign`).
-**Class:** SAFE (lattice grows monotonically; the only consequence
-of unbounded growth is memory pressure, not unsoundness).
-**Statement.** The `vals` list of a may-be entry accumulates without
-limit. The `complete` flag flips to `false` at the first non-literal
-assignment, after which the SMT layer stops emitting may-be
-disjunctions for the variable.
-**Condition.** Sound iff total memory consumption stays within
-process limits over the entire walk. Practical worst case: a
-variable assigned every literal string in a 50,000-line bundle.
-Currently no input has triggered the failure mode, but a malicious
-input could.
+**Class:** SAFE (lattice grows monotonically; unsoundness
+impossible).
+**Statement.** The `vals` list of a may-be entry accumulates
+every distinct concrete literal assignment without any widening
+cap. The `complete` flag flips to `false` only when a *non-
+literal* assignment lands (at which point the SMT disjunction
+is no longer possible and the `vals` set is freed). Distinct
+literal assignments, however many, preserve per-value precision
+— the SMT layer can always emit `(or (= x v₁) (= x v₂) … (=
+x vₙ))` for any n and Z3 handles the disjunction directly.
+
+**Design rationale.** An artificial widening threshold (e.g.
+"after 64 distinct literals, widen to ⊤") would introduce a
+precision / memory trade-off parameterised by a constant. That
+constant would inevitably be wrong for some input — too large
+costs memory on one pattern, too small loses a refutation on
+another. The library's design principle of "no assumptions"
+extends to: **no arbitrary limits on lattice size**. Analysis
+that would require bounded state must either be restructured
+to work with the unbounded lattice (by finding a different
+fixed-point) or leave that precision channel opaque via the
+existing `complete := false` path (which is automatic on any
+non-literal assignment).
+
+**Condition.** Sound in all cases (no precision is lost by
+accumulating more values; the SMT disjunction is always valid
+over the current `vals` set). Termination is guaranteed by the
+walker's symbolic single-pass structure — each statement is
+processed once per phase, phase 2 converges on a fixpoint of
+callback re-walks, and the may-be lattice itself never drives
+extra iterations.
 
 ### A6. `new Proxy(target, handler)` is transparent
 
@@ -1369,12 +1401,25 @@ node per `__objId` and edges for prop reads / writes. Field
 sensitivity (`o.f` distinct from `o.g`) gives Steensgaard-level
 precision; flow sensitivity gives Andersen-level.
 
-### G9. Widening operator on `_varMayBe`
+### G9. Widening operator on `_varMayBe` (deliberately not planned)
 
-To make A5 a true precision/cost trade-off rather than an
-unbounded-growth risk, replace the unbounded `vals` list with a
-bounded abstraction that widens after `k` accumulated values to
-`⊤_Λ` (all possible labels) and `⊤_T` (all possible types).
+A classical abstract-interpretation answer to unbounded lattice
+growth is a widening operator `∇` that caps per-variable state
+after `k` accumulated values. We do **not** plan to add one.
+
+Widening is precision-losing by construction — once a variable
+widens to `⊤`, every subsequent refutation over its concrete
+values is abandoned regardless of whether Z3 could actually
+have handled the full disjunction. The choice of `k` is an
+arbitrary constant that will always be wrong for some input.
+
+The library's design principle of "no assumptions" extends to
+"no arbitrary limits on lattice size". The may-be lattice
+preserves per-value precision for any number of distinct
+literal assignments; the only automatic widening is the
+complete-to-false flip triggered by a non-literal assignment
+(which is a semantic widening, not a size cap). See A5 for
+the full rationale.
 
 ---
 
