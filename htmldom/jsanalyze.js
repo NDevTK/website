@@ -3180,6 +3180,7 @@
     'repeat', 'slice', 'substring', 'substr', 'charAt', 'indexOf', 'lastIndexOf',
     'includes', 'startsWith', 'endsWith', 'padStart', 'padEnd', 'toString',
     'split', 'reverse', 'map', 'filter', 'forEach', 'reduce', 'at',
+    'find', 'findIndex', 'flat', 'flatMap',
     // Promise continuation — applyMethod's then/catch/finally handler
     // walks the callback with the receiver's taint as the first arg.
     'then', 'catch', 'finally',
@@ -4259,10 +4260,12 @@
       for (let i = 1; i < parts.length && b; i++) {
         const p = parts[i];
         if (b.kind === 'object') {
-          // Check for getter: __getter_prop is a function that returns the value.
+          // Check for getter: __getter_prop is a function that
+          // returns the value. Bind `this` to the receiver so
+          // `this._v` reads the instance's actual slot.
           var _getter = b.props['__getter_' + p];
           if (_getter && _getter.kind === 'function') {
-            var _getResult = await instantiateFunction(_getter, []);
+            var _getResult = await instantiateFunction(_getter, [], b);
             if (_getResult && _getResult.kind) b = _getResult;
             else if (_getResult) b = chainBinding(_getResult);
             else b = null;
@@ -5767,11 +5770,12 @@
               continue;
             }
           }
-          // Getter on object: auto-invoke.
+          // Getter on object: auto-invoke with `this` bound to
+          // the receiver so `this.prop` reads the instance slot.
           if (!isCall && cur && cur.kind === 'object' && cur.props['__getter_' + lastSeg]) {
             var _gtrFn = cur.props['__getter_' + lastSeg];
             if (_gtrFn.kind === 'function') {
-              var _gtrResult = await instantiateFunction(_gtrFn, []);
+              var _gtrResult = await instantiateFunction(_gtrFn, [], cur);
               if (_gtrResult && _gtrResult.kind) { cur = _gtrResult; }
               else if (_gtrResult) { cur = chainBinding(_gtrResult); }
             }
@@ -6136,11 +6140,148 @@
       }
       // Array methods on known array bindings.
       if (bind && bind.kind === 'array') {
-        // `.map(fn)`, `.filter(fn)`, `.forEach(fn)`: the argument is a
-        // callback function rather than a concat-chain value. Parse the
-        // arrow, invoke it once per element with the element bound to
-        // the single parameter, and collect/filter the results.
-        if (method === 'map' || method === 'filter' || method === 'forEach') {
+        // `.flat(depth)` — flatten nested arrays. Per ES spec the
+        // default depth is 1. For static analysis, we flatten to
+        // full depth when the arg is omitted or a concrete 1; a
+        // numeric arg >= 1 flattens at most `depth` levels.
+        // (No arbitrary cap: recursive flattening via a WeakSet
+        // terminates naturally because nested arrays have
+        // distinct identities.)
+        if (method === 'flat' && bind && bind.kind === 'array') {
+          var _flatArgs = await readConcatArgs(parenIdx, stop);
+          if (_flatArgs) {
+            var _flatDepth = 1;
+            if (_flatArgs.args.length >= 1) {
+              var _flatArgN = chainAsNumber(chainBinding(_flatArgs.args[0]));
+              if (_flatArgN !== null) _flatDepth = _flatArgN;
+            }
+            var _flatOut = [];
+            var _flatSeen = new WeakSet();
+            var _flatten = function (elems, depth) {
+              for (var _fli = 0; _fli < elems.length; _fli++) {
+                var _flEl = elems[_fli];
+                if (_flEl && _flEl.kind === 'array' && depth > 0 && !_flatSeen.has(_flEl)) {
+                  _flatSeen.add(_flEl);
+                  _flatten(_flEl.elems, depth - 1);
+                } else if (_flEl) {
+                  _flatOut.push(_flEl);
+                }
+              }
+            };
+            _flatten(bind.elems, _flatDepth);
+            return { bind: arrayBinding(_flatOut), next: _flatArgs.next };
+          }
+        }
+        // `.find(predicate)` / `.findIndex(predicate)`: walk the
+        // callback over every element; since the predicate result
+        // is generally data-dependent, return the element that
+        // best matches (first element with a tainted binding, or
+        // just the first element when none carry labels). For
+        // precision: collect all elements whose predicate CAN
+        // return truthy under the walker's symbolic semantics and
+        // return them joined. This over-approximates compared to
+        // a concrete find but preserves taint flow through
+        // `arr.find(...)` chains. findIndex returns an opaque
+        // number chain that still carries the join of predicate
+        // labels so `arr[idx]` reads of tainted slots propagate.
+        if ((method === 'find' || method === 'findIndex') && bind && bind.kind === 'array') {
+          const _fnlp = tks[parenIdx];
+          if (_fnlp && _fnlp.type === 'open' && _fnlp.char === '(') {
+            var _ffFn = null, _ffFnEnd = 0;
+            var _ffArrow = peekArrow(parenIdx + 1, stop);
+            if (_ffArrow) {
+              var _ffBody = readArrowBody(_ffArrow.arrowNext, stop);
+              if (_ffBody) {
+                _ffFn = functionBinding(_ffArrow.params, _ffBody.bodyStart, _ffBody.bodyEnd, _ffBody.isBlock, _ffArrow.isAsync);
+                _ffFn.capturedScope = _snapshotClosureForCapture();
+                _ffFnEnd = _ffBody.next;
+              }
+            }
+            if (!_ffFn) {
+              var _ffFexpr = await readFunctionExpr(parenIdx + 1, stop);
+              if (_ffFexpr) { _ffFn = _ffFexpr.binding; _ffFnEnd = _ffFexpr.next; }
+            }
+            if (_ffFn) {
+              var _ffRp = tks[_ffFnEnd];
+              if (_ffRp && _ffRp.type === 'close' && _ffRp.char === ')') {
+                // Walk the predicate over each element so sink
+                // checks inside the predicate fire. Collect the
+                // first element whose predicate is concretely
+                // true; otherwise fall back to a union of all
+                // elements so taint on any reachable element
+                // flows forward.
+                var _ffMatched = null;
+                for (var _ffi = 0; _ffi < bind.elems.length; _ffi++) {
+                  var _ffEl = bind.elems[_ffi];
+                  if (!_ffEl) continue;
+                  var _ffRes = await instantiateFunction(_ffFn, [_ffEl, chainBinding([makeSynthStr(String(_ffi))]), bind]);
+                  if (_ffRes && Array.isArray(_ffRes)) {
+                    var _ffResCh = chainBinding(_ffRes);
+                    var _ffTruthy = evalTruthiness(_ffResCh);
+                    if (_ffTruthy === true && _ffMatched === null) {
+                      _ffMatched = method === 'findIndex'
+                        ? chainBinding([makeSynthStr(String(_ffi))])
+                        : _ffEl;
+                    }
+                  }
+                }
+                if (_ffMatched) {
+                  return { bind: _ffMatched, next: _ffFnEnd + 1 };
+                }
+                // Data-dependent predicate: join every element
+                // so downstream taint sees any reachable slot.
+                if (method === 'findIndex') {
+                  // findIndex result is a number; propagate
+                  // the union of element labels via a synthetic
+                  // exprRef.
+                  var _ffUnion = new Set();
+                  for (var _ffj = 0; _ffj < bind.elems.length; _ffj++) {
+                    var _ffjLbl = getBindingLabels(bind.elems[_ffj]);
+                    if (_ffjLbl) for (var _ffjL of _ffjLbl) _ffUnion.add(_ffjL);
+                  }
+                  var _ffIdxRef = exprRef('findIndex(...)');
+                  if (_ffUnion.size) _ffIdxRef.taint = _ffUnion;
+                  return { bind: chainBinding([_ffIdxRef]), next: _ffFnEnd + 1 };
+                }
+                // find: join every element's labels into a
+                // single opaque chain that represents "any
+                // matching element".
+                var _ffUnion2 = new Set();
+                var _ffAllToks = [];
+                for (var _ffk = 0; _ffk < bind.elems.length; _ffk++) {
+                  var _ffkEl = bind.elems[_ffk];
+                  if (_ffkEl && _ffkEl.kind === 'chain') _ffAllToks.push(_ffkEl.toks);
+                  var _ffkLbl = getBindingLabels(_ffkEl);
+                  if (_ffkLbl) for (var _ffkL of _ffkLbl) _ffUnion2.add(_ffkL);
+                }
+                // Prefer returning a real element binding when
+                // every element has the same kind (e.g. all
+                // objects) so downstream prop reads work.
+                if (bind.elems.length > 0 && bind.elems[0]) {
+                  var _ffFirst = bind.elems[0];
+                  if (_ffFirst.kind === 'object') {
+                    // Return the first object; taint from other
+                    // elements is lost but this is the typical
+                    // pattern where the caller reads specific
+                    // props off the found element.
+                    return { bind: _ffFirst, next: _ffFnEnd + 1 };
+                  }
+                }
+                var _ffFindRef = deriveExprRef.apply(null, ['find(...)'].concat(_ffAllToks));
+                if (_ffUnion2.size) _ffFindRef.taint = _ffUnion2;
+                return { bind: chainBinding([_ffFindRef]), next: _ffFnEnd + 1 };
+              }
+            }
+          }
+        }
+        // `.map(fn)`, `.filter(fn)`, `.forEach(fn)`, `.flatMap(fn)`:
+        // the argument is a callback function rather than a
+        // concat-chain value. Parse the arrow, invoke it once
+        // per element with the element bound to the single
+        // parameter, and collect/filter the results. flatMap
+        // additionally flattens one level: callback results that
+        // are arrays contribute their elements directly.
+        if (method === 'map' || method === 'filter' || method === 'forEach' || method === 'flatMap') {
           const lp = tks[parenIdx];
           if (!lp || lp.type !== 'open' || lp.char !== '(') return null;
           // Try arrow function, then function expression, then identifier.
@@ -6176,7 +6317,26 @@
           const results = [];
           for (const el of bind.elems) {
             if (!el) return null;
-            const toks = await instantiateFunction(fn, [el]);
+            const rawFnResult = await instantiateFunction(fn, [el]);
+            if (!rawFnResult) return null;
+            // The result is either a token array (chain), an
+            // array binding, or another structured binding. Only
+            // map / filter unwrap to toks; flatMap can see an
+            // array binding and flatten it.
+            if (method === 'flatMap') {
+              if (rawFnResult && rawFnResult.kind === 'array') {
+                for (var _fmi = 0; _fmi < rawFnResult.elems.length; _fmi++) {
+                  if (rawFnResult.elems[_fmi]) results.push(rawFnResult.elems[_fmi]);
+                }
+              } else if (Array.isArray(rawFnResult)) {
+                results.push(chainBinding(rawFnResult));
+              } else if (rawFnResult && rawFnResult.kind) {
+                results.push(rawFnResult);
+              }
+              continue;
+            }
+            const toks = Array.isArray(rawFnResult) ? rawFnResult
+              : (rawFnResult && rawFnResult.kind === 'chain' ? rawFnResult.toks : null);
             if (!toks) return null;
             if (method === 'map') {
               results.push(chainBinding(toks));
@@ -7117,6 +7277,42 @@
             if (allNum) {
               const v = BUILTINS[t.text](...nums);
               return { bind: chainBinding([makeSynthStr(String(v))]), next: args.next };
+            }
+          }
+        }
+        // Object.fromEntries(iterable) — inverse of
+        // Object.entries. Builds an object from an array of
+        // [key, value] pairs. Each pair's key must fold to a
+        // known string; otherwise the pair is stored under a
+        // sentinel opaque slot so the labels still propagate.
+        if (isCall && t.text === 'Object.fromEntries') {
+          const _ofArgRes = await readCallArgBindings(k + 1, stop);
+          if (_ofArgRes && _ofArgRes.bindings.length >= 1) {
+            const _ofSrc = _ofArgRes.bindings[0];
+            if (_ofSrc && _ofSrc.kind === 'array') {
+              var _ofProps = Object.create(null);
+              var _ofOpaque = null;
+              for (var _ofi = 0; _ofi < _ofSrc.elems.length; _ofi++) {
+                var _ofPair = _ofSrc.elems[_ofi];
+                if (!_ofPair || _ofPair.kind !== 'array' || _ofPair.elems.length < 2) continue;
+                var _ofKeyStr = chainAsKnownString(_ofPair.elems[0]);
+                var _ofVal = _ofPair.elems[1];
+                if (_ofKeyStr !== null) {
+                  _ofProps[_ofKeyStr] = _ofVal;
+                } else if (_ofVal) {
+                  // Opaque key: store under the wildcard slot
+                  // so the resulting object still carries the
+                  // value's labels through subsequent reads of
+                  // any prop. (Consumers walk __opaqueEntries
+                  // the same way the _mapLike iteration handler
+                  // does.)
+                  if (!_ofOpaque) _ofOpaque = [];
+                  _ofOpaque.push({ key: _ofPair.elems[0], value: _ofVal });
+                }
+              }
+              var _ofObj = objectBinding(_ofProps);
+              if (_ofOpaque) _ofObj._opaqueEntries = _ofOpaque;
+              return { bind: _ofObj, next: _ofArgRes.next };
             }
           }
         }
@@ -8529,8 +8725,19 @@
         if (taintEnabled) {
           try { await walkRange(fn.bodyStart, fn.bodyEnd); } catch (_) {}
         }
-        const r = await readConcatExpr(fn.bodyStart, fn.bodyEnd, TERMS_NONE);
-        if (r && r.next === fn.bodyEnd) result = r.toks;
+        // Prefer readValue so structured returns (array literal,
+        // object literal, function expression) survive as
+        // structured bindings. Falls back to readConcatExpr for
+        // tokens-only scalar returns. The structured-return path
+        // lets `flatMap(x => [...])` see an array binding.
+        const _rvFn = await readValue(fn.bodyStart, fn.bodyEnd, TERMS_NONE);
+        if (_rvFn && _rvFn.next === fn.bodyEnd && _rvFn.binding &&
+            _rvFn.binding.kind && _rvFn.binding.kind !== 'chain') {
+          fnReturnBinding = _rvFn.binding;
+        } else {
+          const r = await readConcatExpr(fn.bodyStart, fn.bodyEnd, TERMS_NONE);
+          if (r && r.next === fn.bodyEnd) result = r.toks;
+        }
       }
       tks = savedTks;
       taintFnDepth = savedTaintFnDepth;

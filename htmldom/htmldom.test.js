@@ -4128,6 +4128,26 @@ await (async function () {
   await checkTaint('proxy set routes through handler', { 'a.js': 'var log = {}; var p = new Proxy({}, { set: function(t, k, v) { log[k] = v; } }); p.x = location.hash; document.getElementById("o").innerHTML = log.x;' }, 1, { sources: ['url'] });
   await checkTaint('proxy set sanitizes', { 'a.js': 'var t = {}; var p = new Proxy(t, { set: function(target, k, v) { target[k] = "sanitized"; } }); p.x = location.hash; document.getElementById("o").innerHTML = t.x;' }, 0);
 
+  // Array.prototype.find / findIndex: walk the predicate over
+  // every element so sink checks inside fire; return the
+  // matching element (find) or index (findIndex).
+  await checkTaint('array.find returns tainted element', { 'a.js': 'var arr = [{id:1, u: location.hash}, {id:2, u: "safe"}]; var r = arr.find(x => x.id === 1); document.getElementById("o").innerHTML = r.u;' }, 1, { sources: ['url'] });
+  await checkTaint('array.findIndex + index read', { 'a.js': 'var arr = [{id:1, u: location.hash}, {id:2, u: "safe"}]; var i = arr.findIndex(x => x.id === 1); document.getElementById("o").innerHTML = arr[i].u;' }, 1, { sources: ['url'] });
+
+  // Array.prototype.flat / flatMap: recursive flatten via
+  // WeakSet cycle detection (no arbitrary depth cap).
+  await checkTaint('array.flat preserves taint', { 'a.js': 'var nested = [[location.hash], ["safe"]]; var flat = nested.flat(); document.getElementById("o").innerHTML = flat[0];' }, 1, { sources: ['url'] });
+  await checkTaint('array.flatMap arrow returning array', { 'a.js': 'var arr = [1, 2]; var flat = arr.flatMap(x => [location.hash, "safe"]); document.getElementById("o").innerHTML = flat[0];' }, 1, { sources: ['url'] });
+
+  // Object.fromEntries: inverse of Object.entries, builds an
+  // object from an iterable of [key, value] pairs.
+  await checkTaint('Object.fromEntries', { 'a.js': 'var xs = [["k", location.hash]]; var o = Object.fromEntries(xs); document.getElementById("o").innerHTML = o.k;' }, 1, { sources: ['url'] });
+
+  // Class getter / setter with `this` binding: the getter's
+  // body walks with `this` bound to the receiver instance so
+  // `this._v` reads the instance slot the setter populated.
+  await checkTaint('class getter/setter with this._v', { 'a.js': 'class C { get v() { return this._v; } set v(x) { this._v = x; } } var c = new C(); c.v = location.hash; document.getElementById("o").innerHTML = c.v;' }, 1, { sources: ['url'] });
+
   // --- filter(...).map(...).join: chain on opaque filter result ---
   await checkTaint('filter map join chain', { 'a.js': 'document.getElementById("o").innerHTML = ["a", location.hash].filter(x => x).map(x => x).join("");' }, 1, { sources: ['url'] });
 
