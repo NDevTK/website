@@ -4122,6 +4122,11 @@ await (async function () {
   await checkTaint('proxy get conditional branch (other) - refuted', { 'a.js': 'var p = new Proxy({}, { get: function(t, k) { if (k === "admin") return location.hash; return "safe"; } }); document.getElementById("o").innerHTML = p.other;' }, 0);
   // Empty handler still falls through to transparent pass-through.
   await checkTaint('proxy empty handler', { 'a.js': 'var p = new Proxy({u: location.hash}, {}); document.getElementById("o").innerHTML = p.u;' }, 1, { sources: ['url'] });
+  // Proxy set-trap: writes to a proxied property route through
+  // handler.set(target, prop, value, receiver) rather than
+  // landing directly on target.props[prop].
+  await checkTaint('proxy set routes through handler', { 'a.js': 'var log = {}; var p = new Proxy({}, { set: function(t, k, v) { log[k] = v; } }); p.x = location.hash; document.getElementById("o").innerHTML = log.x;' }, 1, { sources: ['url'] });
+  await checkTaint('proxy set sanitizes', { 'a.js': 'var t = {}; var p = new Proxy(t, { set: function(target, k, v) { target[k] = "sanitized"; } }); p.x = location.hash; document.getElementById("o").innerHTML = t.x;' }, 0);
 
   // --- filter(...).map(...).join: chain on opaque filter result ---
   await checkTaint('filter map join chain', { 'a.js': 'document.getElementById("o").innerHTML = ["a", location.hash].filter(x => x).map(x => x).join("");' }, 1, { sources: ['url'] });

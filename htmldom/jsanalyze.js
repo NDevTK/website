@@ -12393,6 +12393,23 @@
               const r = await readValue(i + 2, stop, TERMS_TOP);
               if (r && r.binding) {
                 var _leaf = parts[parts.length - 1];
+                // Proxy set-trap dispatch (A6 closure). When the
+                // container has a `_proxyHandler.set` function,
+                // the write routes through it with arguments
+                // `[target, propName, value, receiver]`. The
+                // trap's return value is ignored (ES semantics:
+                // only the side effects matter).
+                if (_container._proxyHandler && _container._proxyHandler.set) {
+                  await instantiateFunction(_container._proxyHandler.set, [
+                    _container._proxyHandler.target,
+                    chainBinding([makeSynthStr(_leaf)]),
+                    r.binding,
+                    _container,
+                  ]);
+                  _trackMayBeAssign(t.text, r.binding);
+                  i = skipExpr(i + 2, stop) - 1;
+                  continue;
+                }
                 // Setter dispatch: if the container has a
                 // `__setter_<leaf>` function, invoke it with
                 // the RHS as its first arg and `this` bound to

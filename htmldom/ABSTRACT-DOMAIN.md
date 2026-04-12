@@ -1027,14 +1027,15 @@ processed once per phase, phase 2 converges on a fixpoint of
 callback re-walks, and the may-be lattice itself never drives
 extra iterations.
 
-### A6. `new Proxy(target, handler)` traps ✓ implemented (partial)
+### A6. `new Proxy(target, handler)` traps ✓ implemented (get + set)
 
 **Lines:** 6764–6811 (handler detection & stamping),
 5657–5679 (applySuffixes dotted-path get dispatch),
-4271–4285 (resolvePath get dispatch).
-**Class:** SAFE for modelled traps (`get`); unchanged behaviour
-for unmodelled traps (`set`, `has`, `deleteProperty`, `apply`,
-`construct`).
+4271–4285 (resolvePath get dispatch), 12395–12410
+(statement-level path-assignment set dispatch).
+**Class:** SAFE for modelled traps (`get`, `set`); unchanged
+behaviour for unmodelled traps (`has`, `deleteProperty`,
+`apply`, `construct`).
 **Statement.** `new Proxy(target, handler)` now inspects
 `handler` for a `get` function. When present, the target is
 cloned and a `_proxyHandler` record `{target, get, set, has}`
@@ -1057,15 +1058,18 @@ only) the walker falls through to the original transparent
 pass-through, preserving the already-correct behaviour for
 the common case.
 
-**Partial**: `set`, `has`, `deleteProperty`, `apply`, and
-`construct` traps are stamped on `_proxyHandler` but not yet
-dispatched. `set` would need to route prop writes through the
-trap (currently stored directly on the clone); `has` would
-need to route `in` checks; `apply` and `construct` would need
-to route function-call and new-expression syntax. Each is a
-small self-contained addition following the same
-`instantiateFunction(trap, [target, ..., receiver])` pattern
-as `get`.
+**Set trap**: property writes on a proxied object now route
+through `handler.set(target, prop, value, receiver)` at the
+statement-level path-assignment handler. The trap's return
+value is ignored (ES semantics: only side effects matter).
+Sanitising traps (`target[k] = "safe"`) correctly neutralise
+taint because the walker sees the actual target mutation inside
+the trap body, not the caller's RHS.
+
+**Partial**: `has`, `deleteProperty`, `apply`, and `construct`
+traps are stamped on `_proxyHandler` but not yet dispatched.
+Each is a small self-contained addition following the same
+`instantiateFunction(trap, [target, ..., receiver])` pattern.
 
 ### A7. Class `extends` is copy-at-definition
 
