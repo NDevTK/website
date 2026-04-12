@@ -684,14 +684,30 @@ Properties:
 - **Sound for taint** by §3.3.1: `collectChainTaint` recurses into
   the cond tokens and unions every reachable branch's labels.
 - **Structurally precise**: each `Cond.condExpr` carries the
-  actual taintCondStack slice captured at the return site, so a
-  future SMT pass that substitutes call-site arg values into the
-  function's cond chain can refute branches whose `condExpr`
-  contradicts the substituted argument constants. **This
-  substitution is not yet implemented at the call site** — the
-  current SMT layer treats chains containing cond tokens as
-  opaque values for refutation purposes. Closing this gap is the
-  natural follow-up to this refactor.
+  control-dependence condition computed by
+  `_enclosingConditionsAt` (a static AST scan that walks every
+  enclosing `if`/`else`/`while` block lexically containing the
+  return statement) — falling back to the walker-captured
+  taintCondStack slice when the static scan finds nothing.
+- **Call-site SMT refutation (implemented)**: after the cond
+  chain is built, the reduction substitutes the call site's
+  concretely-bound argument values into each `cond.condExpr`
+  via `_simplifyCondToksAtCallSite` and asks `smtCheckCondition`
+  whether the substituted formula is concretely true, false, or
+  unknown. Refuted branches collapse to the surviving arm in
+  place; unknown conds are kept verbatim with both arms
+  recursively simplified. This eliminates the would-be false
+  positive on
+  ```
+  function f(a) { if (a > 5) return "safe"; return location.hash; }
+  document.body.innerHTML = f(10);
+  ```
+  by refuting the second branch (10 > 5 is true → ifTrue arm
+  survives, ifFalse arm dropped → result is `"safe"` with no
+  taint). The substitution is regex-based with word boundaries;
+  numeric and known-string arguments substitute as the literal
+  text, opaque arg bindings are skipped (and the cond is
+  preserved with both arms intact).
 - **No-taint shortcut (A3)**: when no return carries taint labels,
   the cond fold would lose the recursion-arithmetic precision
   shortcut. The reduction instead takes only the first return so
@@ -842,59 +858,81 @@ fails. The recursion test
 `f(3) === 99` because the **first** return is concretely 0 — not
 because the analysis reasoned about the recursion.
 
-### A3. Multi-return reduction is path-sensitive in structure but not in SMT exploitation
+### A3. Multi-return reduction with call-site SMT refutation
 
-**Lines:** 7551–7711 (instantiateFunction reduction); 9105–9127
-(walker `return` capture handler).
-**Class:** SAFE in the tainted case (over-approximates: all
-reachable return branches contribute their labels via
-`collectChainTaint`); UNSAFE in the no-taint case (under-
-approximates: only the first return is propagated).
-**Statement.** The walker now installs a `_returnCapture` slot at
-the start of each `instantiateFunction` body walk. Every `return`
+**Lines:** 7551–7720 (instantiateFunction reduction); 7178–7340
+(`_enclosingConditionsAt`, `_evalCondAtCallSite`,
+`_simplifyCondToksAtCallSite`); 9105–9127 (walker `return`
+capture handler).
+**Class:** SAFE in the tainted case (over-approximates after
+SMT refutation: all surviving branches contribute labels via
+`collectChainTaint`); UNSAFE in the no-taint case
+(first-return shortcut for recursive-arithmetic SMT refutation).
+**Statement.** The walker installs a `_returnCapture` slot at the
+start of each `instantiateFunction` body walk; every `return`
 keyword encountered records `(position, taintCondStack slice,
 pathConstraints slice)` into the slot — without consuming the
 return expression, so embedded calls (`return fetch(...)`) still
 fire the statement-level call watchers. After `walkRange`, a
 syntactic post-walk scan enumerates every top-level return
-binding and matches it against the captured entries by position
-to attach real path conditions. The reduction then produces:
+binding. The reduction then produces:
 
 | # returns | Any tainted? | Result                                       |
 |-----------|--------------|----------------------------------------------|
 | 0         | n/a          | `⊥` (void function)                          |
 | 1         | n/a          | the single return                            |
-| ≥ 2       | yes          | right-associative `Cond` chain (§4.7.1)      |
+| ≥ 2       | yes          | call-site-specialised `Cond` chain (§4.7.1)  |
 | ≥ 2       | no           | **first return only** (recursion shortcut)   |
 
-The any-tainted case is now **structurally** path-sensitive: each
-`Cond` token carries the captured per-branch condition expression
-in its `condExpr` field, so a future SMT pass that substitutes
-call-site argument values into the cond can refute individual
-branches. The current SMT layer does **not** yet perform this
-substitution — chains containing cond tokens are treated as opaque
-for refutation purposes — so the observable improvement over the
-old `plus`-join behaviour is structural only. Closing the SMT
-exploitation gap is the natural follow-up.
+The any-tainted case fold is now **call-site specialised**:
+
+1. Each cond's `condExpr` is the conjunction of static enclosing
+   conditions computed by `_enclosingConditionsAt` (a reverse AST
+   scan from `bodyStart` that walks `if`/`else`/`while` blocks
+   to determine which lexical control predicates dominate each
+   return position). The walker capture's taintCondStack is used
+   as a fallback when the static scan returns nothing (e.g. for
+   returns inside `for`/`switch` constructs the static scanner
+   doesn't yet model).
+2. After the fold, `_simplifyCondToksAtCallSite` walks the cond
+   chain. Each cond's `condExpr` is substituted via
+   `_evalCondAtCallSite`: every concretely-bound argument's
+   literal text is regex-substituted (word-boundary) for its
+   parameter name, the result is tokenised, and
+   `smtCheckCondition` is asked whether the substituted formula
+   is satisfiable / unsatisfiable.
+3. Concretely-true conds collapse to their `ifTrue` arm,
+   concretely-false conds collapse to their `ifFalse` arm, and
+   unknown conds keep both arms (recursively simplified).
+
+This eliminates the would-be false positive on
+```
+function f(a) { if (a > 5) return "safe"; return location.hash; }
+document.body.innerHTML = f(10);
+```
+because the cond `(a > 5)` substitutes to `(10 > 5)` and SMT
+evaluates it to true, so the second return drops out and the
+caller sees only `"safe"`.
 
 The no-taint case still falls back to the first return so SMT
 refutation on numeric-only recursive arithmetic (`function f(n)
 {if(n<=0)return 0; return f(n-1)+1;}` followed by
 `if (f(3) === 99) sink(...)`) continues to terminate. Replacing
-this shortcut with a sound principled join requires either (a) the
-SMT layer to symbolically reduce cond chains at call sites with
-concrete argument substitution, or (b) per-call-site
-specialization of function summaries by argument constants. Both
-are open work items.
+this shortcut with a sound principled join requires either (a)
+recursive specialisation of function summaries (partial
+evaluation that bottoms out the recursion at concrete base cases),
+or (b) the SMT layer to symbolically reduce opaque recursive
+calls. Both remain open work items.
 
-**Condition.** Sound for taint flow whenever the syntactic post-
-walk scan finds every return statement (it does; the scan walks
-`[bodyStart, bodyEnd)` skipping nested `{}` blocks). UNSAFE in the
-specific case where a function has multiple non-tainted returns
-that differ structurally and the second return's structure carries
-a sink-relevant value the first return does not — e.g.
-`if (a) return EMPTY_OBJ; return obj_with_dom_handle;` would
-report only the empty object to callers, hiding the DOM handle.
+**Condition.** Sound for taint flow whenever the syntactic
+post-walk scan finds every return statement (it does; the scan
+walks `[bodyStart, bodyEnd)` skipping nested `{}` blocks) AND
+`_enclosingConditionsAt` correctly identifies the dominating
+control predicates (it handles `if`/`else`/`while`; `for` and
+`switch case` are approximated by the walker capture fallback).
+UNSAFE in the specific case where the no-taint shortcut hides a
+sink-relevant return value, and in the case where a refuted
+branch was only refuted spuriously (an SMT layer false negative).
 
 ### A4. Loop variables collapse to opaque post-loop
 

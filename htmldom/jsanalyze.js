@@ -7312,6 +7312,289 @@
     // assignName writes to a frame other than the current
     // function's top frame.
     var _outerMutCount = 0;
+
+    // SMT call-site cond-chain simplification (ABSTRACT-DOMAIN.md
+    // §4.7.1, A3 closure). After instantiateFunction builds a
+    // cond-bearing chain via the multi-return fold, the caller's
+    // concrete arguments are substituted into each cond.condExpr
+    // and the SMT layer is asked whether the condition is
+    // concretely true, concretely false, or unknown. Refuted
+    // branches are dropped from the chain in place; surviving
+    // conds are kept verbatim. The substitution happens at the
+    // CALL site (inside instantiateFunction with access to the
+    // bound argBindings) so distinct call sites can specialise
+    // the same function body to different concrete inputs.
+    //
+    // The substitution is regex-based with word boundaries: each
+    // param name is replaced with the literal text of its
+    // concrete value (numeric or quoted-string). Arg bindings
+    // that aren't concrete literals are skipped, so a partial
+    // substitution still simplifies any cond whose condExpr only
+    // mentions concretely-bound params.
+    //
+    // Returns one of: true, false, null (unknown).
+    const _evalCondAtCallSite = async (condExpr, paramMap) => {
+      if (!taintEnabled || !condExpr) return null;
+      var subbed = condExpr;
+      for (var p in paramMap) {
+        var v = paramMap[p];
+        if (v == null) continue;
+        var re = new RegExp(
+          '\\b' + p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b',
+          'g'
+        );
+        subbed = subbed.replace(re, v);
+      }
+      // If nothing got substituted, no point asking SMT —
+      // the condExpr is the same as before.
+      if (subbed === condExpr) return null;
+      var condToks;
+      try { condToks = tokenize(subbed); } catch (_) { return null; }
+      if (!condToks || condToks.length === 0) return null;
+      var emptyResolve = function () { return null; };
+      try {
+        var smtResult = await smtCheckCondition(
+          condToks, emptyResolve, emptyResolve, []
+        );
+        if (!smtResult) return null;
+        if (smtResult.sat && !smtResult.unsat) return true;
+        if (!smtResult.sat && smtResult.unsat) return false;
+        return null;
+      } catch (_) { return null; }
+    };
+
+    // Static enclosing-condition scanner: given a function body
+    // token range and a return statement's position, walks the
+    // body's tokens to determine which `if`/`else`/`while`/`for`
+    // /`switch case` blocks lexically enclose that position, and
+    // returns the conjoined condition expression as a string.
+    //
+    // This is the academic dataflow notion of "control dependence":
+    // a statement at position p is reached only when every
+    // syntactically-enclosing control predicate evaluates to true.
+    // The resulting condition is the conjunction of those
+    // predicates. For a return inside `if (a > 5) return safe;` the
+    // result is "(a > 5)"; for a return in the fall-through after
+    // such an if, the result is "(!(a > 5))".
+    //
+    // Returns a list of condition strings (each one a single
+    // predicate); the cond fold joins them with ` && `.
+    const _enclosingConditionsAt = (bodyStart, bodyEnd, targetPos) => {
+      var stack = []; // [{ kind, condStr, endIdx }]
+      var i = bodyStart;
+      while (i < bodyEnd && i < targetPos) {
+        // Pop completed control entries.
+        while (stack.length > 0 && stack[stack.length - 1].endIdx <= i) {
+          stack.pop();
+        }
+        var t = tks[i];
+        if (!t) { i++; continue; }
+        // `if (cond) <body> [else <else>]`
+        if (t.type === 'other' && t.text === 'if') {
+          var lp = tks[i + 1];
+          if (lp && lp.type === 'open' && lp.char === '(') {
+            // Find matching `)`.
+            var pd = 1, pj = i + 2;
+            while (pj < bodyEnd && pd > 0) {
+              if (tks[pj].type === 'open' && tks[pj].char === '(') pd++;
+              else if (tks[pj].type === 'close' && tks[pj].char === ')') pd--;
+              if (pd === 0) break;
+              pj++;
+            }
+            if (pd !== 0) { i++; continue; }
+            // Render the condition source text.
+            var condStr = '';
+            if (tks[i + 2] && tks[pj - 1] && tks[i + 2]._src) {
+              condStr = tks[i + 2]._src.slice(tks[i + 2].start, tks[pj - 1].end);
+            }
+            // Find the if-body extent.
+            var bodyTok = tks[pj + 1];
+            var ifEnd;
+            if (bodyTok && bodyTok.type === 'open' && bodyTok.char === '{') {
+              var bd = 1, bk = pj + 2;
+              while (bk < bodyEnd && bd > 0) {
+                if (tks[bk].type === 'open' && tks[bk].char === '{') bd++;
+                else if (tks[bk].type === 'close' && tks[bk].char === '}') bd--;
+                bk++;
+              }
+              ifEnd = bk;
+            } else {
+              // single-statement body
+              var sd = 0, sk = pj + 1;
+              while (sk < bodyEnd) {
+                var stk = tks[sk];
+                if (!stk) break;
+                if (stk.type === 'open') sd++;
+                else if (stk.type === 'close') sd--;
+                else if (sd === 0 && stk.type === 'sep' && stk.char === ';') { sk++; break; }
+                sk++;
+              }
+              ifEnd = sk;
+            }
+            // Find optional else range.
+            var elseStart = -1, elseEnd = -1;
+            if (tks[ifEnd] && tks[ifEnd].type === 'other' && tks[ifEnd].text === 'else') {
+              var nt = tks[ifEnd + 1];
+              if (nt && nt.type === 'open' && nt.char === '{') {
+                var ed = 1, ek = ifEnd + 2;
+                while (ek < bodyEnd && ed > 0) {
+                  if (tks[ek].type === 'open' && tks[ek].char === '{') ed++;
+                  else if (tks[ek].type === 'close' && tks[ek].char === '}') ed--;
+                  ek++;
+                }
+                elseStart = ifEnd + 2;
+                elseEnd = ek;
+              } else {
+                var esd = 0, eek = ifEnd + 1;
+                while (eek < bodyEnd) {
+                  var ekt = tks[eek];
+                  if (!ekt) break;
+                  if (ekt.type === 'open') esd++;
+                  else if (ekt.type === 'close') esd--;
+                  else if (esd === 0 && ekt.type === 'sep' && ekt.char === ';') { eek++; break; }
+                  eek++;
+                }
+                elseStart = ifEnd + 1;
+                elseEnd = eek;
+              }
+            }
+            // Decide which branch contains targetPos.
+            if (targetPos >= pj + 1 && targetPos < ifEnd) {
+              stack.push({ kind: 'if-then', condStr: '(' + condStr + ')', endIdx: ifEnd });
+              i = pj + 1;
+              continue;
+            } else if (elseStart > 0 && targetPos >= elseStart && targetPos < elseEnd) {
+              stack.push({ kind: 'if-else', condStr: '(!(' + condStr + '))', endIdx: elseEnd });
+              i = elseStart;
+              continue;
+            } else {
+              // targetPos is past this if entirely; the post-if
+              // fall-through is reached when EITHER the then-branch
+              // didn't return OR (more usefully for our case) the
+              // condition was false. We model the fall-through path
+              // condition as `!(cond)` since the typical pattern is
+              //    if (a) return X;
+              //    return Y;   // reached only when !a
+              // Push a "fall-through" marker with a condition that
+              // applies until we exit any enclosing scope. The
+              // marker's endIdx is bodyEnd so it persists for the
+              // rest of the function body, joining with any deeper
+              // control structures we encounter on the way to
+              // targetPos.
+              stack.push({ kind: 'if-fallthrough', condStr: '(!(' + condStr + '))', endIdx: bodyEnd });
+              i = (elseEnd > 0 ? elseEnd : ifEnd);
+              continue;
+            }
+          }
+        }
+        // `while (cond) body` — for loop body, the condition holds
+        if (t.type === 'other' && t.text === 'while') {
+          var wp = tks[i + 1];
+          if (wp && wp.type === 'open' && wp.char === '(') {
+            var wpd = 1, wpj = i + 2;
+            while (wpj < bodyEnd && wpd > 0) {
+              if (tks[wpj].type === 'open' && tks[wpj].char === '(') wpd++;
+              else if (tks[wpj].type === 'close' && tks[wpj].char === ')') wpd--;
+              if (wpd === 0) break;
+              wpj++;
+            }
+            if (wpd !== 0) { i++; continue; }
+            var wcondStr = '';
+            if (tks[i + 2] && tks[wpj - 1] && tks[i + 2]._src) {
+              wcondStr = tks[i + 2]._src.slice(tks[i + 2].start, tks[wpj - 1].end);
+            }
+            var wBody = tks[wpj + 1];
+            var wEnd;
+            if (wBody && wBody.type === 'open' && wBody.char === '{') {
+              var wbd = 1, wbk = wpj + 2;
+              while (wbk < bodyEnd && wbd > 0) {
+                if (tks[wbk].type === 'open' && tks[wbk].char === '{') wbd++;
+                else if (tks[wbk].type === 'close' && tks[wbk].char === '}') wbd--;
+                wbk++;
+              }
+              wEnd = wbk;
+            } else { wEnd = bodyEnd; }
+            if (targetPos >= wpj + 1 && targetPos < wEnd) {
+              stack.push({ kind: 'while', condStr: '(' + wcondStr + ')', endIdx: wEnd });
+              i = wpj + 1;
+              continue;
+            }
+            i = wEnd;
+            continue;
+          }
+        }
+        // Skip nested function declarations / expressions — their
+        // returns belong to a different function scope.
+        if (t.type === 'other' && (t.text === 'function' || t.text === 'function*')) {
+          // Skip past `function name? (...) { ... }`.
+          var fk = i + 1;
+          if (tks[fk] && tks[fk].type === 'other' && IDENT_RE.test(tks[fk].text)) fk++;
+          if (tks[fk] && tks[fk].type === 'open' && tks[fk].char === '(') {
+            var fd = 1; fk++;
+            while (fk < bodyEnd && fd > 0) {
+              if (tks[fk].type === 'open' && tks[fk].char === '(') fd++;
+              else if (tks[fk].type === 'close' && tks[fk].char === ')') fd--;
+              fk++;
+            }
+          }
+          if (tks[fk] && tks[fk].type === 'open' && tks[fk].char === '{') {
+            var ffd = 1; fk++;
+            while (fk < bodyEnd && ffd > 0) {
+              if (tks[fk].type === 'open' && tks[fk].char === '{') ffd++;
+              else if (tks[fk].type === 'close' && tks[fk].char === '}') ffd--;
+              fk++;
+            }
+          }
+          i = fk;
+          continue;
+        }
+        i++;
+      }
+      // Return the surviving stack as a list of condition strings.
+      var conds = [];
+      for (var ci = 0; ci < stack.length; ci++) conds.push(stack[ci].condStr);
+      return conds;
+    };
+
+    // Recursively simplify a token list by evaluating embedded
+    // cond tokens against the call-site's concrete param map.
+    // Concretely-true conds collapse to their ifTrue arm,
+    // concretely-false conds collapse to their ifFalse arm, and
+    // unknown conds are kept with both arms recursively
+    // simplified. The walk preserves token order so the
+    // resulting chain remains a valid Chain.toks sequence.
+    const _simplifyCondToksAtCallSite = async (toks, paramMap) => {
+      if (!toks || !Array.isArray(toks)) return toks;
+      var out = [];
+      for (var i = 0; i < toks.length; i++) {
+        var tk = toks[i];
+        if (tk && tk.type === 'cond' && tk.condExpr) {
+          var verdict = await _evalCondAtCallSite(tk.condExpr, paramMap);
+          if (verdict === true) {
+            var subT = await _simplifyCondToksAtCallSite(tk.ifTrue, paramMap);
+            if (subT) for (var jt = 0; jt < subT.length; jt++) out.push(subT[jt]);
+            continue;
+          }
+          if (verdict === false) {
+            var subF = await _simplifyCondToksAtCallSite(tk.ifFalse, paramMap);
+            if (subF) for (var jf = 0; jf < subF.length; jf++) out.push(subF[jf]);
+            continue;
+          }
+          var newT = await _simplifyCondToksAtCallSite(tk.ifTrue, paramMap);
+          var newF = await _simplifyCondToksAtCallSite(tk.ifFalse, paramMap);
+          out.push({
+            type: 'cond',
+            condExpr: tk.condExpr,
+            ifTrue: newT || tk.ifTrue,
+            ifFalse: newF || tk.ifFalse,
+          });
+          continue;
+        }
+        out.push(tk);
+      }
+      return out;
+    };
+
     // Path-sensitive multi-return capture (see ABSTRACT-DOMAIN.md
     // §4.7.1). When non-null, the walker's `return` handler
     // captures each return statement's value AND the current
@@ -7672,10 +7955,21 @@
             //   Cond(C₀, r₀, Cond(C₁, r₁, … Cond(Cₙ₋₁, rₙ₋₁, rₙ)))
             // collectChainTaint recurses into cond tokens so labels
             // from every reachable branch propagate via the
-            // standard ⊔_Λ rule. The condExpr on each cond is the
-            // captured path condition for that return when the
-            // walker reached it; otherwise "true" so the cond
-            // unconditionally favours the if-true arm.
+            // standard ⊔_Λ rule.
+            //
+            // Each cond's `condExpr` is the conjunction of:
+            //   1. The static enclosing-condition stack at the
+            //      return statement's source position (computed
+            //      by `_enclosingConditionsAt`, the academic
+            //      "control dependence" of the return). This is
+            //      the source of truth and works regardless of
+            //      whether the walker took a concrete or opaque
+            //      branch at runtime.
+            //   2. The walker-captured taintCondStack slice for
+            //      that return (used as a tiebreaker when the
+            //      static scan returns no conditions).
+            //   3. Default to "true" only when neither source
+            //      provides any condition.
             var _condChain = null;
             for (var _ci = _returnBindings.length - 1; _ci >= 0; _ci--) {
               var _eRb = _returnBindings[_ci];
@@ -7684,10 +7978,12 @@
               if (_condChain === null) {
                 _condChain = _eToks;
               } else {
-                var _eConds = _returnConds[_ePos];
-                var _condExpr = (_eConds && _eConds.length)
-                  ? _eConds.join(' && ')
-                  : 'true';
+                var _staticConds = _enclosingConditionsAt(bodyStart, bodyEnd, _ePos);
+                var _walkerConds = _returnConds[_ePos];
+                var _allConds = (_staticConds && _staticConds.length)
+                  ? _staticConds
+                  : (_walkerConds && _walkerConds.length ? _walkerConds : []);
+                var _condExpr = _allConds.length ? _allConds.join(' && ') : 'true';
                 var _condTok = {
                   type: 'cond',
                   condExpr: _condExpr,
@@ -7695,6 +7991,48 @@
                   ifFalse: _condChain,
                 };
                 _condChain = [_condTok];
+              }
+            }
+            // SMT call-site simplification (A3 closure). Build a
+            // paramName → literal-text map from the concretely-
+            // bound argument bindings, then walk the cond chain
+            // and refute branches whose substituted condExpr is
+            // unsatisfiable. For non-recursive functions called
+            // with concrete args this eliminates the false
+            // positive `f(10).innerHTML = location.hash` on
+            //
+            //   function f(a) {
+            //     if (a > 5) return "safe";
+            //     return location.hash;
+            //   }
+            //
+            // by refuting the second arm (a > 5 substituted to
+            // 10 > 5 → true → ifTrue arm survives).
+            if (fn.params && argBindings) {
+              var _csMap = Object.create(null);
+              var _csHave = false;
+              for (var _csI = 0; _csI < fn.params.length; _csI++) {
+                var _csName = fn.params[_csI] && fn.params[_csI].name;
+                var _csArg = argBindings[_csI];
+                if (!_csName || !_csArg || _csArg.kind !== 'chain') continue;
+                var _csN = chainAsNumber(_csArg);
+                if (_csN !== null) {
+                  _csMap[_csName] = String(_csN);
+                  _csHave = true;
+                  continue;
+                }
+                var _csS = chainAsKnownString(_csArg);
+                if (_csS !== null) {
+                  // Quote the string so the substituted expression
+                  // tokenises to a string literal rather than an
+                  // identifier.
+                  _csMap[_csName] = JSON.stringify(_csS);
+                  _csHave = true;
+                  continue;
+                }
+              }
+              if (_csHave) {
+                _condChain = await _simplifyCondToksAtCallSite(_condChain, _csMap);
               }
             }
             result = _condChain;

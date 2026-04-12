@@ -3978,6 +3978,22 @@ await (async function () {
   // result still terminates.
   await checkTaint('recursion shortcut still works', { 'a.js': 'function f(n){if(n<=0)return 0; return f(n-1)+1;} var x=f(3); if(x===99) document.getElementById("o").innerHTML=location.hash;' }, 0);
 
+  // Call-site cond refutation (ABSTRACT-DOMAIN.md §4.7.1, A3 closure).
+  // For a function whose body has multiple returns guarded by an if,
+  // the analyzer should substitute the call site's concrete arg
+  // values into the cond chain's condExpr and refute branches whose
+  // substituted condition is unsatisfiable. Concretely:
+  //   f(10) where `if (a > 5) return "safe"; return location.hash;`
+  // should refute the second branch (10 > 5 is true) and return only
+  // "safe", eliminating the would-be url finding.
+  await checkTaint('call-site refutes tainted branch (concrete arg true)', { 'a.js': 'function f(a) { if (a > 5) return "safe"; return location.hash; } document.getElementById("o").innerHTML = f(10);' }, 0);
+  await checkTaint('call-site refutes safe branch (concrete arg false)', { 'a.js': 'function f(a) { if (a > 5) return "safe"; return location.hash; } document.getElementById("o").innerHTML = f(2);' }, 1, { sources: ['url'] });
+  // String equality refutation: substituted JSON-quoted string survives
+  // SMT evaluation as a known constant.
+  await checkTaint('call-site refutes via string equality', { 'a.js': 'function f(s) { if (s === "admin") return location.hash; return "safe"; } document.getElementById("o").innerHTML = f("user");' }, 0);
+  // Opaque arg blocks substitution → both branches retained → finding fires.
+  await checkTaint('opaque arg leaves both branches reachable', { 'a.js': 'function f(a) { if (a > 5) return "safe"; return location.hash; } document.getElementById("o").innerHTML = f(unknown);' }, 1, { sources: ['url'] });
+
   // --- filter(...).map(...).join: chain on opaque filter result ---
   await checkTaint('filter map join chain', { 'a.js': 'document.getElementById("o").innerHTML = ["a", location.hash].filter(x => x).map(x => x).join("");' }, 1, { sources: ['url'] });
 
