@@ -4110,6 +4110,19 @@ await (async function () {
   await checkTaint('Symbol.iterator multiple yields', { 'a.js': 'var it = { [Symbol.iterator]: function*() { yield "safe"; yield location.hash; } }; for (var v of it) { document.getElementById("o").innerHTML = v; }' }, 1, { sources: ['url'] });
   await checkTaint('Symbol.asyncIterator for await', { 'a.js': 'async function f() { var it = { [Symbol.asyncIterator]: function*() { yield location.hash; } }; for await (var v of it) { document.getElementById("o").innerHTML = v; } } f();' }, 1, { sources: ['url'] });
 
+  // Proxy handler.get trap (ABSTRACT-DOMAIN.md §4.9 / A6 closure).
+  // `new Proxy(target, {get: fn})` stamps the handler onto a
+  // cloned target; subsequent property reads on the proxy
+  // invoke the get trap via instantiateFunction with
+  // (target, propName, receiver) arguments. The trap's return
+  // value becomes the prop value.
+  await checkTaint('proxy get returns tainted', { 'a.js': 'var p = new Proxy({}, { get: function(t, k) { return location.hash; } }); document.getElementById("o").innerHTML = p.anything;' }, 1, { sources: ['url'] });
+  await checkTaint('proxy get delegates to target', { 'a.js': 'var p = new Proxy({x: location.hash}, { get: function(t, k) { return t[k]; } }); document.getElementById("o").innerHTML = p.x;' }, 1, { sources: ['url'] });
+  await checkTaint('proxy get conditional branch (admin)', { 'a.js': 'var p = new Proxy({}, { get: function(t, k) { if (k === "admin") return location.hash; return "safe"; } }); document.getElementById("o").innerHTML = p.admin;' }, 1, { sources: ['url'] });
+  await checkTaint('proxy get conditional branch (other) - refuted', { 'a.js': 'var p = new Proxy({}, { get: function(t, k) { if (k === "admin") return location.hash; return "safe"; } }); document.getElementById("o").innerHTML = p.other;' }, 0);
+  // Empty handler still falls through to transparent pass-through.
+  await checkTaint('proxy empty handler', { 'a.js': 'var p = new Proxy({u: location.hash}, {}); document.getElementById("o").innerHTML = p.u;' }, 1, { sources: ['url'] });
+
   // --- filter(...).map(...).join: chain on opaque filter result ---
   await checkTaint('filter map join chain', { 'a.js': 'document.getElementById("o").innerHTML = ["a", location.hash].filter(x => x).map(x => x).join("");' }, 1, { sources: ['url'] });
 

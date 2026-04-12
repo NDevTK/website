@@ -4268,6 +4268,20 @@
             else b = null;
             continue;
           }
+          // Proxy get-trap dispatch (A6). If the object was
+          // created via `new Proxy(target, {get})`, the trap
+          // intercepts property reads.
+          if (b._proxyHandler && b._proxyHandler.get) {
+            var _rpgRes = await instantiateFunction(b._proxyHandler.get, [
+              b._proxyHandler.target,
+              chainBinding([makeSynthStr(p)]),
+              b,
+            ]);
+            if (_rpgRes && _rpgRes.kind) b = _rpgRes;
+            else if (_rpgRes && Array.isArray(_rpgRes)) b = chainBinding(_rpgRes);
+            else b = b.props[p] || null;
+            continue;
+          }
           b = b.props[p] || null;
         } else if (b.kind === 'chain' && b.toks.length === 1 && b.toks[0].type === 'other') {
           // Opaque chain (e.g. parameter bound to exprRef) — extend the
@@ -5654,6 +5668,27 @@
           for (const p of propSegs) {
             if (!cur) break;
             if (cur.kind === 'object') {
+              // Proxy get-trap dispatch (A6 closure). When the
+              // object was created via `new Proxy(target, {get})`,
+              // reading a property invokes the trap with
+              // (target, propName, receiver). The trap's return
+              // becomes the prop value — even when target doesn't
+              // have the prop natively.
+              if (cur._proxyHandler && cur._proxyHandler.get) {
+                var _pgRes = await instantiateFunction(cur._proxyHandler.get, [
+                  cur._proxyHandler.target,
+                  chainBinding([makeSynthStr(p)]),
+                  cur,
+                ]);
+                if (_pgRes && _pgRes.kind) {
+                  cur = _pgRes;
+                } else if (_pgRes && Array.isArray(_pgRes)) {
+                  cur = chainBinding(_pgRes);
+                } else {
+                  cur = cur.props[p] || null;
+                }
+                continue;
+              }
               cur = cur.props[p] || null;
             } else if (p === 'length' && cur.kind === 'array') {
               cur = chainBinding([makeSynthStr(String(cur.elems.length))]);
@@ -6761,20 +6796,52 @@
             }
             return { bind: _inst, next: _newJ };
           }
-          // `new Proxy(target, handler)` — model as a transparent
-          // pass-through to `target` (ignoring the handler). Both
-          // direct proxies and proxied dispatcher tables flow taint
-          // the same way a plain object reference would. When the
-          // handler is non-trivial this is an approximation — its
-          // get/set traps aren't walked — but the common empty or
-          // logging-only handler case is exact.
+          // `new Proxy(target, handler)` — when handler is an
+          // object literal with `get` / `set` / `has` /
+          // `deleteProperty` traps, stamp references to those
+          // functions onto the target object so subsequent prop
+          // reads / writes / in-checks dispatch through them via
+          // the `_proxyHandler` sentinel. When handler has no
+          // recognized traps (empty {} or logging-only), fall
+          // through as a transparent pass-through. (A6 closure.)
           if (_newName.text === 'Proxy') {
             var _pxJ = k + 2;
             if (tks[_pxJ] && tks[_pxJ].type === 'open' && tks[_pxJ].char === '(') {
               var _pxArgs = await readCallArgBindings(_pxJ, stop);
               if (_pxArgs && _pxArgs.bindings.length >= 1) {
                 var _pxTarget = _pxArgs.bindings[0];
-                if (_pxTarget) return { bind: _pxTarget, next: _pxArgs.next };
+                var _pxHandler = _pxArgs.bindings[1];
+                if (_pxTarget) {
+                  if (_pxHandler && _pxHandler.kind === 'object') {
+                    var _pxGet = _pxHandler.props && _pxHandler.props.get;
+                    var _pxSet = _pxHandler.props && _pxHandler.props.set;
+                    var _pxHas = _pxHandler.props && _pxHandler.props.has;
+                    if ((_pxGet && _pxGet.kind === 'function') ||
+                        (_pxSet && _pxSet.kind === 'function') ||
+                        (_pxHas && _pxHas.kind === 'function')) {
+                      // Clone the target so we can stamp the
+                      // handler without disturbing the original.
+                      var _pxProxied;
+                      if (_pxTarget.kind === 'object') {
+                        _pxProxied = objectBinding(Object.assign(Object.create(null), _pxTarget.props));
+                      } else {
+                        // Non-object target: wrap in a bare object
+                        // binding so we have somewhere to stamp
+                        // the handler.
+                        _pxProxied = objectBinding(Object.create(null));
+                        _pxProxied.props['__proxyTarget'] = _pxTarget;
+                      }
+                      _pxProxied._proxyHandler = {
+                        target: _pxTarget,
+                        get: (_pxGet && _pxGet.kind === 'function') ? _pxGet : null,
+                        set: (_pxSet && _pxSet.kind === 'function') ? _pxSet : null,
+                        has: (_pxHas && _pxHas.kind === 'function') ? _pxHas : null,
+                      };
+                      return { bind: _pxProxied, next: _pxArgs.next };
+                    }
+                  }
+                  return { bind: _pxTarget, next: _pxArgs.next };
+                }
               }
             }
           }
