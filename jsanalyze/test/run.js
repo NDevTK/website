@@ -24,6 +24,7 @@ const testFiles = [
   'source-classification.test.js',
   'sink-classification.test.js',
   'smt.test.js',
+  'formula.test.js',
 ];
 
 async function main() {

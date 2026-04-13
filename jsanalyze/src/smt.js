@@ -116,17 +116,28 @@ function isStringSide(o) {
 
 // --- Public formula constructors ---------------------------------------
 
-// mkSym(name) — fresh symbolic variable. Default sort is Int;
-// later operations may upgrade to String via sort propagation.
-function mkSym(name) {
+// mkSym(name, sort) — fresh symbolic variable. Sort defaults to
+// 'Int'; pass 'String' explicitly when the caller knows the
+// underlying value is a string (e.g. a property whose TypeDB
+// readType is 'String'). Later operations may still upgrade
+// from Int to String via sort propagation if the caller didn't
+// hint, but starting at the right sort lets binary-op formula
+// construction pick `str.++` over `+` on the very first use,
+// without waiting for an external comparison to drive the
+// upgrade. Passing 'Bool' is also accepted; it sets isBool so
+// the sym can be used directly in conjunctions.
+function mkSym(name, sort) {
+  const s = sort || 'Int';
   const sorts = Object.create(null);
-  sorts[name] = 'Int';
-  return {
+  sorts[name] = s;
+  const out = {
     expr: quoteName(name),
     sorts,
-    isBool: false,
+    isBool: s === 'Bool',
     symName: name,
   };
+  if (s === 'String') out.stringResult = true;
+  return out;
 }
 
 // mkConst(value) — constant primitive. Boolean / number / string

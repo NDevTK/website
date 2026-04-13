@@ -104,6 +104,42 @@ function cloneWithLabels(value, labels) {
   return Object.freeze(base);
 }
 
+// --- SMT formula attachment ---------------------------------------------
+//
+// Every Value can optionally carry a `formula` field — an SMT
+// formula record (from src/smt.js) that represents the value
+// symbolically. For pure concrete values this is the SMT-LIB
+// literal; for opaque source reads it's a fresh symbolic
+// variable; for binary-op results it's the symbolic combination
+// of operand formulas.
+//
+// The formula is the bridge to Phase D's Z3 layer: when the
+// engine asks "is this branch reachable", it conjoins the path
+// condition (built from branch formulas) with the negation of
+// the condition under test. Z3 returns sat/unsat/unknown.
+//
+// `withFormula(v, f)` returns a new frozen Value with the
+// formula attached. The Value's lattice kind is preserved.
+function withFormula(value, formula) {
+  if (!value || value.kind === V.BOTTOM) return value;
+  if (!formula) return value;
+  const base = Object.assign({}, value);
+  base.formula = formula;
+  return Object.freeze(base);
+}
+
+// Read a Value's formula. Falls back to a const formula for
+// concrete primitives so callers don't need to special-case.
+// Returns null only when the value has no symbolic representation
+// (e.g. opaque without an attached symbol, top, bottom).
+function valueFormula(value) {
+  if (!value) return null;
+  if (value.formula) return value.formula;
+  // No formula attached. The caller (smt.js) handles null
+  // correctly — formulas built from null operands produce null.
+  return null;
+}
+
 function bottom() {
   return Object.freeze({ kind: V.BOTTOM, labels: EMPTY_LABELS });
 }
@@ -702,6 +738,7 @@ module.exports = {
   bottom, top, concrete, oneOf, interval, strPattern, objectRef, closure, opaque,
   join, leq, equals, truthiness,
   withLabels, unionLabels, freezeLabels, EMPTY_LABELS,
+  withFormula, valueFormula,
   createState, setReg, getReg, joinStates, stateLeq, stateEquals,
   unfreezeState, freezeState,
   overlayGet, overlayHas, overlayEntries, overlaySize, overlayFlatten,

@@ -14,6 +14,66 @@ const { OP } = require('./ir.js');
 const D = require('./domain.js');
 const { REASONS } = require('./assumptions.js');
 const TDB = require('./typedb.js');
+const SMT = require('./smt.js');
+
+// Allocate (or look up) an SMT symbolic name for a source read.
+// The name is tagged with the source label so a consumer that
+// inspects the formula can tell which source it represents.
+//
+// Uses ctx.nextSymId for global uniqueness across the analysis
+// and ctx._symCache as a memoization map keyed by
+// `loc.pos + ':' + discriminator + ':' + label`. The
+// discriminator distinguishes multiple source reads at the
+// same source position (e.g. the IR builder records both
+// `GetGlobal location` and the immediately following
+// `GetProp .hash` at the same MemberExpression start position
+// — without a discriminator they'd share a sym, which would
+// make `location.hash` and `location.search` indistinguishable
+// to the SMT layer).
+//
+// Two reads of the SAME source at the SAME logical address
+// (e.g. two reads of `location.hash` in the same program)
+// SHOULD share a sym — that's what makes path-condition
+// correlation work. So the discriminator captures the address,
+// not the call site.
+function allocSourceSym(ctx, label, loc, discriminator, sort) {
+  if (!ctx._symCache) ctx._symCache = new Map();
+  const disc = discriminator || '';
+  // Address-based key: same source, same address, same sym.
+  // We deliberately ignore the loc.pos so that `location.hash`
+  // read in two different statements still gets the same sym
+  // and downstream branches can correlate them.
+  const key = label + ':' + disc;
+  let entry = ctx._symCache.get(key);
+  if (entry) return SMT.mkSym(entry.name, entry.sort);
+  if (ctx.nextSymId == null) ctx.nextSymId = 1;
+  const name = (disc || label) + '_' + (ctx.nextSymId++);
+  const s = sort || 'Int';
+  ctx._symCache.set(key, { name, sort: s });
+  return SMT.mkSym(name, s);
+}
+
+// Map a TypeDB readType string to the SMT sort used for the
+// symbolic variable that represents the value. Anything other
+// than `String` falls back to Int — Z3 can still solve
+// arithmetic / comparison constraints on Int-sorted syms even
+// when the underlying JS value is e.g. a number-like opaque.
+function readTypeToSort(readType) {
+  if (readType === 'String') return 'String';
+  return 'Int';
+}
+
+// Produce the SMT formula for a Value: the value's attached
+// formula if any, or a const-literal if the value is concrete,
+// or null otherwise.
+function formulaOf(value) {
+  if (!value) return null;
+  if (value.formula) return value.formula;
+  if (value.kind === D.V.CONCRETE) {
+    return SMT.mkConst(value.value);
+  }
+  return null;
+}
 
 // Map a TypeDB source label (from DB descriptors like
 // `source: 'url'`) to the assumption reason code that explains
@@ -162,7 +222,13 @@ function applyInstruction(ctx, state, instr) {
 
 function applyConst(ctx, state, instr) {
   const loc = instrLoc(ctx, instr);
-  return D.setReg(state, instr.dest, D.concrete(instr.value, undefined, loc));
+  // Concrete literals get an SMT formula immediately so any
+  // downstream expression involving this register has a complete
+  // symbolic representation. Booleans / numbers / strings all
+  // fold to mkConst.
+  const v = D.concrete(instr.value, undefined, loc);
+  const withForm = D.withFormula(v, SMT.mkConst(instr.value));
+  return D.setReg(state, instr.dest, withForm);
 }
 
 // --- BinOp --------------------------------------------------------------
@@ -200,26 +266,29 @@ function computeBinOp(op, a, b, loc) {
     }
   }
 
-  // Both concrete → fold directly. The folded result inherits
-  // the unioned labels even though the value is now a literal —
-  // a tainted concat result is still tainted at the value level.
+  // B2: build the SMT formula for the result by combining the
+  // operands' formulas. This is the symbolic representation
+  // Phase D's Z3 layer queries to refute infeasible flows.
+  // The formula is constructed even when the value-level
+  // result folds to a concrete: a concrete `"<a>" + tainted`
+  // still produces a (str.++ "<a>" |sym|) formula so a
+  // downstream branch can ask "is this string equal to
+  // a specific literal?"
+  const formula = buildBinOpFormula(op, a, b);
+
+  const attach = (v) => formula ? D.withFormula(v, formula) : v;
+
+  // Both concrete → fold directly.
   if (a && a.kind === D.V.CONCRETE && b && b.kind === D.V.CONCRETE) {
     const folded = evalJsBinOp(op, a.value, b.value);
     if (folded !== undefined) {
-      // If the labels are non-empty, return an Opaque value
-      // tagged with the labels and the folded concrete in the
-      // provenance — taint must dominate concreteness for
-      // sink classification to work. Otherwise return the
-      // straight concrete.
       if (labels && labels.size > 0) {
-        return D.opaque(chainIds, undefined, loc, labels);
+        return attach(D.opaque(chainIds, undefined, loc, labels));
       }
-      return D.concrete(folded, undefined, loc);
+      return attach(D.concrete(folded, undefined, loc));
     }
   }
-  // Both OneOf → compute the full pairwise cartesian product.
-  // No size cap. For large OneOfs this produces a large result,
-  // which is the precise answer.
+  // Both OneOf → cartesian product.
   if (a && a.kind === D.V.ONE_OF && b && b.kind === D.V.ONE_OF) {
     const results = [];
     for (const va of a.values) {
@@ -230,13 +299,13 @@ function computeBinOp(op, a, b, loc) {
     }
     if (results.length > 0) {
       if (labels && labels.size > 0) {
-        return D.opaque(chainIds, undefined, loc, labels);
+        return attach(D.opaque(chainIds, undefined, loc, labels));
       }
-      if (results.length === 1) return D.concrete(results[0], undefined, loc);
-      return D.oneOf(results, undefined, loc);
+      if (results.length === 1) return attach(D.concrete(results[0], undefined, loc));
+      return attach(D.oneOf(results, undefined, loc));
     }
   }
-  // Concrete × OneOf → broadcast across every element.
+  // Concrete × OneOf → broadcast.
   if (a && a.kind === D.V.CONCRETE && b && b.kind === D.V.ONE_OF) {
     const results = [];
     for (const vb of b.values) {
@@ -245,10 +314,10 @@ function computeBinOp(op, a, b, loc) {
     }
     if (results.length > 0) {
       if (labels && labels.size > 0) {
-        return D.opaque(chainIds, undefined, loc, labels);
+        return attach(D.opaque(chainIds, undefined, loc, labels));
       }
-      if (results.length === 1) return D.concrete(results[0], undefined, loc);
-      return D.oneOf(results, undefined, loc);
+      if (results.length === 1) return attach(D.concrete(results[0], undefined, loc));
+      return attach(D.oneOf(results, undefined, loc));
     }
   }
   if (b && b.kind === D.V.CONCRETE && a && a.kind === D.V.ONE_OF) {
@@ -259,23 +328,73 @@ function computeBinOp(op, a, b, loc) {
     }
     if (results.length > 0) {
       if (labels && labels.size > 0) {
-        return D.opaque(chainIds, undefined, loc, labels);
+        return attach(D.opaque(chainIds, undefined, loc, labels));
       }
-      if (results.length === 1) return D.concrete(results[0], undefined, loc);
-      return D.oneOf(results, undefined, loc);
+      if (results.length === 1) return attach(D.concrete(results[0], undefined, loc));
+      return attach(D.oneOf(results, undefined, loc));
     }
   }
   // Opaque on either side propagates with merged chain + labels.
   if (a && a.kind === D.V.OPAQUE) {
-    return D.opaque(chainIds, null, loc, labels);
+    return attach(D.opaque(chainIds, null, loc, labels));
   }
   if (b && b.kind === D.V.OPAQUE) {
-    return D.opaque(chainIds, null, loc, labels);
+    return attach(D.opaque(chainIds, null, loc, labels));
   }
   // Operands are of kinds we don't know how to combine for this
   // operator (e.g. Interval + StrPattern). Result is Top with
   // the merged labels.
-  return D.top(loc, labels);
+  return attach(D.top(loc, labels));
+}
+
+// --- Build an SMT formula for a binary op result -------------------------
+//
+// Given two operand Values and a JS operator, produce the SMT
+// formula representing the result. The formula composes the
+// operand formulas via the appropriate SMT-LIB primitive:
+//
+//   '+'  on string operands → str.++
+//   '+'  on numeric operands → +
+//   '-', '*', '/', '%'        → arith
+//   '==', '===', '<', etc.    → cmp
+//   logical / bitwise         → not yet (returns null)
+//
+// Returns null when no operand has a formula or when the op
+// doesn't have an SMT translation. Callers handle null by
+// leaving the result without a formula (which makes it opaque
+// to the SMT layer — consumers fall back to label-based
+// reasoning).
+function buildBinOpFormula(op, a, b) {
+  const fa = formulaOf(a);
+  const fb = formulaOf(b);
+  if (!fa && !fb) return null;
+  // If one side has no formula, we can't translate the op
+  // soundly. Return null and let the value-side handling carry
+  // labels alone.
+  if (!fa || !fb) return null;
+  // String concat: + when at least one side is a string
+  // formula. mkConcat handles the const-fold internally.
+  if (op === '+') {
+    const aStr = (fa.value && fa.value.kind === 'str') ||
+      (fa.symName && fa.sorts && fa.sorts[fa.symName] === 'String') ||
+      fa.stringResult;
+    const bStr = (fb.value && fb.value.kind === 'str') ||
+      (fb.symName && fb.sorts && fb.sorts[fb.symName] === 'String') ||
+      fb.stringResult;
+    if (aStr || bStr) return SMT.mkConcat(fa, fb);
+    return SMT.mkArith('+', fa, fb);
+  }
+  if (op === '-' || op === '*' || op === '/' || op === '%') {
+    return SMT.mkArith(op, fa, fb);
+  }
+  if (op === '==' || op === '===' || op === '!=' || op === '!==' ||
+      op === '<' || op === '<=' || op === '>' || op === '>=') {
+    return SMT.mkCmp(op, fa, fb);
+  }
+  if (op === '&&') return SMT.mkAnd(fa, fb);
+  if (op === '||') return SMT.mkOr(fa, fb);
+  // Bitwise / shift / nullish — no SMT translation yet.
+  return null;
 }
 
 // Evaluate a JavaScript binary op on two concrete primitive
@@ -416,8 +535,19 @@ function applyGetGlobal(ctx, state, instr) {
         loc,
         { affects: instr.name }
       );
-      return D.setReg(state, instr.dest,
-        D.opaque([assumption.id], typeName, loc, [selfSource]));
+      // B2: allocate a fresh SMT symbol for this source read so
+      // downstream branches and sinks can refer to it. Two
+      // reads of the same global (e.g. two bare `localStorage`
+      // reads) share the same sym — which is what makes
+      // correlation work across multiple read sites. The bare
+      // global is the host object itself (Location, Storage,
+      // …); when used in a sink context the consumer typically
+      // calls toString on it, but the value at the IR level is
+      // not a String yet. Default to Int sort here and let
+      // sort upgrades occur naturally on the first comparison.
+      const sym = allocSourceSym(ctx, selfSource, loc, instr.name);
+      const v = D.opaque([assumption.id], typeName, loc, [selfSource]);
+      return D.setReg(state, instr.dest, D.withFormula(v, sym));
     }
     // Non-source root (e.g. `document`, `window`): return an
     // opaque value with the TypeDB type but no taint label. The
@@ -495,6 +625,7 @@ function applyGetProp(ctx, state, instr) {
         const existingLabels = obj.labels || D.EMPTY_LABELS;
         let resultLabels = existingLabels;
         const chainIds = obj.assumptionIds ? obj.assumptionIds.slice() : [];
+        let resultFormula = null;
         if (desc.source) {
           const reason = sourceLabelToReason(desc.source);
           const assumption = ctx.assumptions.raise(
@@ -511,9 +642,36 @@ function applyGetProp(ctx, state, instr) {
           merged.add(desc.source);
           resultLabels = Object.freeze(merged);
           chainIds.push(assumption.id);
+          // B2: allocate an SMT symbol for this source read.
+          // The discriminator combines the receiver type and
+          // property name so `location.hash` and `location.search`
+          // get distinct syms, but two reads of `location.hash`
+          // anywhere in the program share the same sym (which is
+          // what makes path-condition correlation work). The
+          // sort is derived from `desc.readType` so that a
+          // String-typed source produces a String-sorted sym
+          // immediately — this lets `a + b` (both string-typed
+          // sources) build `(str.++ ...)` rather than arithmetic
+          // `+` without waiting for an external comparison to
+          // drive the sort upgrade.
+          resultFormula = allocSourceSym(ctx, desc.source, loc,
+            obj.typeName + '.' + instr.propName,
+            readTypeToSort(desc.readType));
+        } else if (obj.formula) {
+          // Non-source property read on a value with a formula:
+          // for now we don't construct a structural formula for
+          // the property access (no `(get-field |obj| "p")`
+          // syntax in standard SMT-LIB without quantified
+          // theories). The property's value is symbolically a
+          // fresh variable; downstream correlations work via
+          // labels and assumption chain rather than the formula.
+          //
+          // A future commit may introduce a heap-aware formula
+          // syntax here.
         }
+        const v = D.opaque(chainIds, resultType, loc, resultLabels);
         return D.setReg(state, instr.dest,
-          D.opaque(chainIds, resultType, loc, resultLabels));
+          resultFormula ? D.withFormula(v, resultFormula) : v);
       }
     }
     // No TypeDB info about this property — propagate the
