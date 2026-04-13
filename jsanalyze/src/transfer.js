@@ -176,17 +176,50 @@ function applyBinOp(ctx, state, instr) {
 }
 
 function computeBinOp(op, a, b, loc) {
-  // Both concrete → fold directly.
+  // Taint labels propagate through every binary operation. The
+  // result inherits the union of both operands' label sets,
+  // regardless of whether the value itself folded to a concrete.
+  // This is critical for soundness: `"<a>" + location.hash`
+  // must produce a string-valued result that still carries the
+  // `url` label.
+  const labels = D.unionLabels(a, b);
+
+  // Opaque assumption ids propagate too — both operands' chains
+  // are unioned so the consumer can audit "what assumptions does
+  // this binary operation depend on".
+  const aIds = (a && a.kind === D.V.OPAQUE) ? a.assumptionIds : [];
+  const bIds = (b && b.kind === D.V.OPAQUE) ? b.assumptionIds : [];
+  let chainIds = aIds;
+  if (bIds.length > 0) {
+    if (chainIds.length === 0) {
+      chainIds = bIds;
+    } else {
+      const seen = new Set(aIds);
+      chainIds = aIds.slice();
+      for (const i of bIds) if (!seen.has(i)) { seen.add(i); chainIds.push(i); }
+    }
+  }
+
+  // Both concrete → fold directly. The folded result inherits
+  // the unioned labels even though the value is now a literal —
+  // a tainted concat result is still tainted at the value level.
   if (a && a.kind === D.V.CONCRETE && b && b.kind === D.V.CONCRETE) {
     const folded = evalJsBinOp(op, a.value, b.value);
     if (folded !== undefined) {
+      // If the labels are non-empty, return an Opaque value
+      // tagged with the labels and the folded concrete in the
+      // provenance — taint must dominate concreteness for
+      // sink classification to work. Otherwise return the
+      // straight concrete.
+      if (labels && labels.size > 0) {
+        return D.opaque(chainIds, undefined, loc, labels);
+      }
       return D.concrete(folded, undefined, loc);
     }
   }
   // Both OneOf → compute the full pairwise cartesian product.
   // No size cap. For large OneOfs this produces a large result,
-  // which is the precise answer. If the result is too large to
-  // reason about downstream, subsequent joins will handle it.
+  // which is the precise answer.
   if (a && a.kind === D.V.ONE_OF && b && b.kind === D.V.ONE_OF) {
     const results = [];
     for (const va of a.values) {
@@ -196,6 +229,9 @@ function computeBinOp(op, a, b, loc) {
       }
     }
     if (results.length > 0) {
+      if (labels && labels.size > 0) {
+        return D.opaque(chainIds, undefined, loc, labels);
+      }
       if (results.length === 1) return D.concrete(results[0], undefined, loc);
       return D.oneOf(results, undefined, loc);
     }
@@ -208,6 +244,9 @@ function computeBinOp(op, a, b, loc) {
       if (r !== undefined) results.push(r);
     }
     if (results.length > 0) {
+      if (labels && labels.size > 0) {
+        return D.opaque(chainIds, undefined, loc, labels);
+      }
       if (results.length === 1) return D.concrete(results[0], undefined, loc);
       return D.oneOf(results, undefined, loc);
     }
@@ -219,18 +258,24 @@ function computeBinOp(op, a, b, loc) {
       if (r !== undefined) results.push(r);
     }
     if (results.length > 0) {
+      if (labels && labels.size > 0) {
+        return D.opaque(chainIds, undefined, loc, labels);
+      }
       if (results.length === 1) return D.concrete(results[0], undefined, loc);
       return D.oneOf(results, undefined, loc);
     }
   }
-  // Opaque propagates.
-  if (a && a.kind === D.V.OPAQUE) return D.opaque(a.assumptionIds, null, loc);
-  if (b && b.kind === D.V.OPAQUE) return D.opaque(b.assumptionIds, null, loc);
+  // Opaque on either side propagates with merged chain + labels.
+  if (a && a.kind === D.V.OPAQUE) {
+    return D.opaque(chainIds, null, loc, labels);
+  }
+  if (b && b.kind === D.V.OPAQUE) {
+    return D.opaque(chainIds, null, loc, labels);
+  }
   // Operands are of kinds we don't know how to combine for this
-  // operator (e.g. Interval + StrPattern). Result is Top. No
-  // assumption raised because this is a valid lattice join, not
-  // an information loss.
-  return D.top(loc);
+  // operator (e.g. Interval + StrPattern). Result is Top with
+  // the merged labels.
+  return D.top(loc, labels);
 }
 
 // Evaluate a JavaScript binary op on two concrete primitive

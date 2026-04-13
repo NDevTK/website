@@ -130,6 +130,66 @@ const tests = [
       assert(sourceLabelsOf(flows[0]).includes('url'));
     },
   },
+  // --- BinOp label propagation (G2) ---
+  {
+    name: 'BinOp: concat with tainted right operand',
+    fn: async () => {
+      const flows = await flowsFor(
+        'document.body.innerHTML = "<a>" + location.hash + "</a>";'
+      );
+      assertEqual(flows.length, 1);
+      assert(sourceLabelsOf(flows[0]).includes('url'));
+    },
+  },
+  {
+    name: 'BinOp: concat with tainted left operand',
+    fn: async () => {
+      const flows = await flowsFor(
+        'document.body.innerHTML = location.hash + "_suffix";'
+      );
+      assertEqual(flows.length, 1);
+      assert(sourceLabelsOf(flows[0]).includes('url'));
+    },
+  },
+  {
+    name: 'BinOp: concat through intermediate variable',
+    fn: async () => {
+      const flows = await flowsFor(
+        'var a = location.hash; var b = a + "x"; document.body.innerHTML = b;'
+      );
+      assertEqual(flows.length, 1);
+      assert(sourceLabelsOf(flows[0]).includes('url'));
+    },
+  },
+  {
+    name: 'BinOp: empty-string concat does not lose taint',
+    fn: async () => {
+      const flows = await flowsFor(
+        'document.body.innerHTML = location.hash + "";'
+      );
+      assertEqual(flows.length, 1);
+    },
+  },
+  {
+    name: 'BinOp: nested concat in eval',
+    fn: async () => {
+      const flows = await flowsFor(
+        'eval("alert(" + document.cookie + ")");'
+      );
+      assertEqual(flows.length, 1);
+      assertEqual(sinkKindOf(flows[0]), 'code');
+      assert(sourceLabelsOf(flows[0]).includes('cookie'));
+    },
+  },
+  {
+    name: 'BinOp: untainted concat produces no flow',
+    fn: async () => {
+      const flows = await flowsFor(
+        'document.body.innerHTML = "<a>" + "hi" + "</a>";'
+      );
+      assertEqual(flows.length, 0);
+    },
+  },
 
   // --- TaintFlow shape ---
   {
