@@ -272,6 +272,100 @@ const tests = [
     },
   },
 
+  // --- Sanitizer / call-fallback behavior (G5) ---
+  //
+  // Sanitizers are declared in the TypeDB via `sanitizer: true`
+  // (or by simply not having `preservesLabels*` flags — the
+  // default behavior is to clear). User functions and unknown
+  // callees fall through to the conservative path which
+  // propagates ALL argument labels (sound over-approximation).
+  {
+    name: 'G5: encodeURIComponent clears labels',
+    fn: async () => {
+      const flows = await flowsFor(
+        'document.body.innerHTML = encodeURIComponent(location.hash);'
+      );
+      assertEqual(flows.length, 0);
+    },
+  },
+  {
+    name: 'G5: parseInt clears labels',
+    fn: async () => {
+      const flows = await flowsFor(
+        'document.body.innerHTML = parseInt(location.hash);'
+      );
+      assertEqual(flows.length, 0);
+    },
+  },
+  {
+    name: 'G5: DOMPurify.sanitize clears labels',
+    fn: async () => {
+      const flows = await flowsFor(
+        'document.body.innerHTML = DOMPurify.sanitize(location.hash);'
+      );
+      assertEqual(flows.length, 0);
+    },
+  },
+  {
+    name: 'G5: decodeURIComponent does NOT clear (not a sanitizer)',
+    fn: async () => {
+      const flows = await flowsFor(
+        'document.body.innerHTML = decodeURIComponent(location.hash);'
+      );
+      assertEqual(flows.length, 1);
+    },
+  },
+  {
+    name: 'G5: String.slice preserves taint via receiver flag',
+    fn: async () => {
+      const flows = await flowsFor(
+        'document.body.innerHTML = location.hash.slice(1);'
+      );
+      assertEqual(flows.length, 1);
+    },
+  },
+  {
+    name: 'G5: String.toLowerCase preserves taint',
+    fn: async () => {
+      const flows = await flowsFor(
+        'document.body.innerHTML = location.hash.toLowerCase();'
+      );
+      assertEqual(flows.length, 1);
+    },
+  },
+  {
+    name: 'G5: String.replace preserves taint',
+    fn: async () => {
+      const flows = await flowsFor(
+        'document.body.innerHTML = location.hash.replace("a", "b");'
+      );
+      assertEqual(flows.length, 1);
+    },
+  },
+  {
+    name: 'G5: user wrapper conservatively propagates labels',
+    fn: async () => {
+      // function id(s) { return s; } is a user-defined wrapper.
+      // The engine doesn't yet walk callee bodies (Phase C), so
+      // applyCall falls through to the conservative path which
+      // assumes ANY argument label could flow to the return.
+      // Soundness wins: report the flow.
+      const flows = await flowsFor(
+        'function id(s) { return s; } document.body.innerHTML = id(location.hash);'
+      );
+      assertEqual(flows.length, 1);
+    },
+  },
+  {
+    name: 'G5: concat with sanitized still produces no flow',
+    fn: async () => {
+      const flows = await flowsFor(
+        'document.body.innerHTML = "safe-" + encodeURIComponent(location.hash);'
+      );
+      assertEqual(flows.length, 0);
+    },
+  },
+
   // --- TaintFlow shape ---
   {
     name: 'TaintFlow records have stable ids',

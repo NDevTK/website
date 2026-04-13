@@ -765,14 +765,55 @@ function applyCall(ctx, state, instr) {
   if (tdbResult) {
     return D.setReg(state, instr.dest, tdbResult);
   }
-  // Fallback: truly unresolved callee. This is a soundness gap
-  // until we have interprocedural analysis (Phase C).
+  // Fallback: truly unresolved callee. We don't know what the
+  // function does, so the conservative SOUND behavior is to
+  // assume any argument's labels could flow to the return
+  // value AND any argument's assumption chain could carry
+  // forward. A user function that wraps a tainted input and
+  // returns it would otherwise silently launder the taint —
+  // which is the opposite of sound.
+  //
+  // This is over-approximation: pure functions (which most
+  // wrappers AREN'T) get reported with spurious labels. The
+  // fix is interprocedural analysis (Phase C): once we walk
+  // the callee's body and compute its actual return-label
+  // semantics, the over-approximation is replaced with the
+  // true answer.
+  //
+  // The receiver's labels (this) are also carried over since
+  // method calls on a tainted receiver can produce a tainted
+  // result through any path the method takes.
+  let conservativeLabels = D.EMPTY_LABELS;
+  const conservativeChain = [];
+  if (thisValue && thisValue.labels && thisValue.labels.size > 0) {
+    conservativeLabels = thisValue.labels;
+    if (thisValue.assumptionIds) {
+      for (const id of thisValue.assumptionIds) conservativeChain.push(id);
+    }
+  }
+  for (const arg of argValues) {
+    if (arg && arg.labels && arg.labels.size > 0) {
+      if (conservativeLabels.size === 0) {
+        conservativeLabels = arg.labels;
+      } else if (conservativeLabels !== arg.labels) {
+        const merged = new Set(conservativeLabels);
+        for (const l of arg.labels) merged.add(l);
+        conservativeLabels = Object.freeze(merged);
+      }
+    }
+    if (arg && arg.assumptionIds) {
+      for (const id of arg.assumptionIds) conservativeChain.push(id);
+    }
+  }
   const a = ctx.assumptions.raise(
     REASONS.OPAQUE_CALL,
-    'call to unresolved or unanalysed callee',
-    loc
+    'call to unresolved or unanalysed callee — return value conservatively inherits all argument labels',
+    loc,
+    { chain: conservativeChain.length > 0 ? conservativeChain : undefined }
   );
-  return D.setReg(state, instr.dest, D.opaque([a.id], null, loc));
+  conservativeChain.push(a.id);
+  return D.setReg(state, instr.dest,
+    D.opaque(conservativeChain, null, loc, conservativeLabels));
 }
 
 // --- Resolve a call's return value via the TypeDB ------------------------
