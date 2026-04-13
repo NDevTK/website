@@ -373,6 +373,9 @@ function stepStmtTask(ctx, task) {
     case 'hoist_decls':      return hoistDeclarationsStep(ctx, task);
     case 'finish_loop_body': return finishLoopBodyStep(ctx, task);
     case 'finish_do_while_cond': return finishDoWhileCondStep(ctx, task);
+    case 'finish_try_body':    return finishTryBodyStep(ctx, task);
+    case 'finish_try_catch':   return finishTryCatchStep(ctx, task);
+    case 'finish_try_finally': return finishTryFinallyStep(ctx, task);
     default:
       throw new Error('ir: unknown statement task ' + task.kind);
   }
@@ -578,6 +581,8 @@ function lowerStatement(ctx, node) {
     case 'ForStatement':       return beginFor(ctx, node, loc);
     case 'BreakStatement':     return lowerBreak(ctx, node, loc);
     case 'ContinueStatement':  return lowerContinue(ctx, node, loc);
+    case 'TryStatement':       return beginTry(ctx, node, loc);
+    case 'ThrowStatement':     return lowerThrow(ctx, node, loc);
     case 'EmptyStatement':      return;
     case 'UnimplementedStatement': {
       const dest = newRegister(ctx.module);
@@ -1281,6 +1286,323 @@ function lowerContinue(ctx, node, loc) {
     block: ctx.currentBlock,
     scope: snapshotScope(ctx.scope),
   });
+}
+
+// emitScopePhis — merges a set of predecessor scopes at a merge
+// block and emits phi nodes for any name whose value differs
+// between predecessors. Updates ctx.scope to bind each name to
+// either the single common register (if all preds agree) or the
+// newly-emitted phi dest.
+//
+// `preds` is an array of {block, scope} records. Each scope is
+// a snapshot (see snapshotScope). The merge block is where
+// phis get emitted.
+//
+// This is the factored-out version of ifMergeStep's phi logic,
+// used by try/catch/finally merges so the same algorithm handles
+// every 2+-way join. The if-merge still uses its own inline
+// version for now to avoid churning a well-tested code path.
+function emitScopePhis(ctx, mergeBlock, preds, loc) {
+  const allNames = new Set();
+  for (const p of preds) {
+    for (const k of allNamesInSnapshot(p.scope)) allNames.add(k);
+  }
+  for (const name of allNames) {
+    const incoming = [];
+    for (const p of preds) {
+      const reg = lookupInSnapshot(p.scope, name);
+      if (reg != null) incoming.push({ pred: p.block.id, value: reg });
+    }
+    if (incoming.length === 0) continue;
+    const first = incoming[0].value;
+    const allSame = incoming.every(i => i.value === first);
+    if (allSame) {
+      updateName(ctx.scope, name, first);
+      continue;
+    }
+    const dest = newRegister(ctx.module);
+    emit(ctx.module, mergeBlock, {
+      op: OP.PHI, dest, incoming,
+    }, loc);
+    updateName(ctx.scope, name, dest);
+  }
+}
+
+// --- try / catch / finally lowering -------------------------------------
+//
+// CFG shape for `try { A } catch/e/ { B } finally { C }`:
+//
+//     predBlock → tryBlock
+//     tryBlock exits (normal)  → finallyBlock (if finally exists)
+//                                 OR mergeBlock
+//     tryBlock "throws"        → catchBlock (if catch exists)
+//                                 OR finallyBlock
+//     catchBlock exits         → finallyBlock (if finally exists)
+//                                 OR mergeBlock
+//     catchBlock "throws"      → finallyBlock / outer handler
+//                                 (re-raised)
+//     finallyBlock exits       → mergeBlock (normal) OR outer
+//                                 handler (re-raised)
+//     mergeBlock               → subsequent code
+//
+// Approximation: we conservatively model every statement in the
+// try block as potentially throwing. Since we can't enumerate
+// per-statement exception edges without exploding the CFG, we
+// add ONE edge from tryBlock's entry to catchBlock (catch sees
+// the pre-try scope) AND one edge from tryBlock's exit to
+// catchBlock (catch sees the post-try scope). The catch block's
+// phis merge both — a safe upper bound on the reachable
+// assignments.
+//
+// Throw routing: ctx._catchStack is a stack of catch targets.
+// `throw` emits a Jump to the top-of-stack catch block, or a
+// THROW terminator if no catch is in scope (uncaught).
+//
+// The catch parameter is bound as an Opaque value at catch
+// entry. For soundness we mark it with an assumption so
+// consumers see the imprecision.
+
+function beginTry(ctx, node, loc) {
+  const tryBlock = createBlock(ctx.module);
+  ctx.blocks.set(tryBlock.id, tryBlock);
+  addEdge(ctx.currentBlock, tryBlock);
+  emit(ctx.module, ctx.currentBlock, {
+    op: OP.JUMP, target: tryBlock.id,
+  }, loc);
+  const entryScope = snapshotScope(ctx.scope);
+  const predBlock = ctx.currentBlock;
+
+  const catchBlock = node.handler ? createBlock(ctx.module) : null;
+  if (catchBlock) ctx.blocks.set(catchBlock.id, catchBlock);
+
+  const finallyBlock = node.finalizer ? createBlock(ctx.module) : null;
+  if (finallyBlock) ctx.blocks.set(finallyBlock.id, finallyBlock);
+
+  const mergeBlock = createBlock(ctx.module);
+  ctx.blocks.set(mergeBlock.id, mergeBlock);
+
+  // Add the "any statement in try may throw" edge from predBlock
+  // to catchBlock. The catch sees the pre-try scope through this.
+  if (catchBlock) {
+    addEdge(predBlock, catchBlock);
+  } else if (finallyBlock) {
+    addEdge(predBlock, finallyBlock);
+  }
+
+  // Push the catch target onto the catch stack so any `throw`
+  // inside the try body routes to it (or to finally if no catch).
+  if (!ctx._catchStack) ctx._catchStack = [];
+  const throwTarget = catchBlock || finallyBlock || null;
+  ctx._catchStack.push({ block: throwTarget, scope: entryScope });
+
+  // Lower the try body in tryBlock.
+  ctx.currentBlock = tryBlock;
+  ctx._work.push({
+    kind: 'finish_try_body',
+    loc,
+    tryBlock,
+    catchBlock,
+    finallyBlock,
+    mergeBlock,
+    entryScope,
+    handler: node.handler,
+    finalizer: node.finalizer,
+  });
+  ctx._work.push({ kind: 'after_stmt' });
+  ctx._work.push({ kind: 'lower_stmt', node: node.block });
+}
+
+// finish_try_body — runs after the try body has been lowered.
+// Records the try-exit scope, sets up the catch block (binding
+// the catch parameter as an opaque value), and queues the
+// catch body lowering.
+function finishTryBodyStep(ctx, task) {
+  const tryExitBlock = ctx.currentBlock;
+  const tryExitScope = snapshotScope(ctx.scope);
+
+  // Pop the catch-stack entry we pushed at beginTry.
+  if (ctx._catchStack && ctx._catchStack.length > 0) {
+    ctx._catchStack.pop();
+  }
+
+  // Route the try exit: normally we'd Jump to finally/merge,
+  // but we also need the catch block to be reachable by the
+  // worklist (to model the "any stmt may throw" over-
+  // approximation). We emit an Opaque "maybe-threw" cond and
+  // a Branch to { catch, normal-target }. Both successors are
+  // reachable (the cond is opaque), so the catch block gets
+  // visited and its phis see the try-exit state.
+  //
+  // For programs that throw partway through the try body, this
+  // is unsound at the per-statement granularity (catch won't
+  // see partial assignments before the throw point). A precise
+  // model would split the try body into one block per potentially
+  // -throwing statement; we defer that until consumers need it.
+  if (!tryExitBlock.terminator) {
+    const normalTarget = task.finallyBlock || task.mergeBlock;
+    if (task.catchBlock) {
+      const condReg = newRegister(ctx.module);
+      emit(ctx.module, tryExitBlock, {
+        op: OP.OPAQUE,
+        dest: condReg,
+        reason: REASONS.UNIMPLEMENTED,
+        details: 'try body may throw — both catch and normal targets modeled',
+        affects: null,
+      }, task.loc);
+      emit(ctx.module, tryExitBlock, {
+        op: OP.BRANCH,
+        cond: condReg,
+        trueTarget: task.catchBlock.id,
+        falseTarget: normalTarget.id,
+      }, task.loc);
+      addEdge(tryExitBlock, task.catchBlock);
+      addEdge(tryExitBlock, normalTarget);
+    } else {
+      emit(ctx.module, tryExitBlock, {
+        op: OP.JUMP, target: normalTarget.id,
+      }, task.loc);
+      addEdge(tryExitBlock, normalTarget);
+    }
+  }
+
+  if (task.catchBlock && task.handler) {
+    // Switch to the catch block, bind the catch parameter, and
+    // queue the catch body lowering.
+    ctx.currentBlock = task.catchBlock;
+    // Restore the pre-try scope: the catch sees names as they
+    // were before try started. This is the conservative
+    // approximation — precise modeling would phi each name
+    // between the pre-try and try-exit scopes.
+    restoreScope(ctx.scope, task.entryScope);
+    pushBlockFrame(ctx.scope);
+
+    // Bind the catch parameter.
+    if (task.handler.param && task.handler.param.type === 'Identifier') {
+      const paramReg = newRegister(ctx.module);
+      emit(ctx.module, task.catchBlock, {
+        op: OP.OPAQUE, dest: paramReg,
+        reason: REASONS.UNIMPLEMENTED,
+        details: 'catch parameter binding: exception value is opaque',
+        affects: task.handler.param.name,
+      }, task.loc);
+      defineLexical(ctx.scope, task.handler.param.name, paramReg, BIND.LET);
+    }
+
+    ctx._work.push({
+      kind: 'finish_try_catch',
+      loc: task.loc,
+      catchBlock: task.catchBlock,
+      finallyBlock: task.finallyBlock,
+      mergeBlock: task.mergeBlock,
+      tryExitScope,
+      tryExitBlock,
+      finalizer: task.finalizer,
+      entryScope: task.entryScope,
+    });
+    ctx._work.push({ kind: 'after_stmt' });
+    ctx._work.push({ kind: 'lower_stmt', node: task.handler.body });
+    return;
+  }
+
+  // No catch — jump straight to finish_try_finally (or merge).
+  if (task.finallyBlock) {
+    ctx.currentBlock = task.finallyBlock;
+    restoreScope(ctx.scope, tryExitScope);
+    ctx._work.push({
+      kind: 'finish_try_finally',
+      loc: task.loc,
+      finallyBlock: task.finallyBlock,
+      mergeBlock: task.mergeBlock,
+    });
+    ctx._work.push({ kind: 'after_stmt' });
+    ctx._work.push({ kind: 'lower_stmt', node: task.finalizer });
+    return;
+  }
+  ctx.currentBlock = task.mergeBlock;
+}
+
+function finishTryCatchStep(ctx, task) {
+  const catchExitBlock = ctx.currentBlock;
+  // Snapshot the catch-exit scope BEFORE popping the block frame
+  // so the catch param's register is still visible (if we ever
+  // needed it). We don't currently use param-from-catch-scope
+  // after this point.
+  const catchExitScope = snapshotScope(ctx.scope);
+  popFrame(ctx.scope);  // pop the block frame we pushed for catch param
+
+  // Jump from catch exit to finally (or merge).
+  const afterCatchTarget = task.finallyBlock || task.mergeBlock;
+  if (!catchExitBlock.terminator) {
+    emit(ctx.module, catchExitBlock, {
+      op: OP.JUMP, target: afterCatchTarget.id,
+    }, task.loc);
+    addEdge(catchExitBlock, afterCatchTarget);
+  }
+
+  if (task.finallyBlock) {
+    // Enter the finally block. Finally must run on every
+    // reachable exit path. The finally block's in-state is the
+    // join of try-exit and catch-exit — we model this by
+    // emitting phis at finally-entry for any name that differs
+    // between the two scopes.
+    ctx.currentBlock = task.finallyBlock;
+    emitScopePhis(ctx, task.finallyBlock, [
+      { block: task.tryExitBlock,  scope: task.tryExitScope },
+      { block: catchExitBlock,     scope: catchExitScope },
+    ], task.loc);
+    ctx._work.push({
+      kind: 'finish_try_finally',
+      loc: task.loc,
+      finallyBlock: task.finallyBlock,
+      mergeBlock: task.mergeBlock,
+    });
+    ctx._work.push({ kind: 'after_stmt' });
+    ctx._work.push({ kind: 'lower_stmt', node: task.finalizer });
+    return;
+  }
+
+  // No finally — merge try-exit and catch-exit scopes at
+  // mergeBlock. Emit phis for any name that differs.
+  ctx.currentBlock = task.mergeBlock;
+  emitScopePhis(ctx, task.mergeBlock, [
+    { block: task.tryExitBlock, scope: task.tryExitScope },
+    { block: catchExitBlock,    scope: catchExitScope },
+  ], task.loc);
+}
+
+function finishTryFinallyStep(ctx, task) {
+  const finallyExitBlock = ctx.currentBlock;
+  if (!finallyExitBlock.terminator) {
+    emit(ctx.module, finallyExitBlock, {
+      op: OP.JUMP, target: task.mergeBlock.id,
+    }, task.loc);
+    addEdge(finallyExitBlock, task.mergeBlock);
+  }
+  ctx.currentBlock = task.mergeBlock;
+}
+
+function lowerThrow(ctx, node, loc) {
+  // Lower the argument expression (its side effects may matter
+  // for taint propagation even though the value is thrown).
+  if (node.argument) {
+    lowerExpression(ctx, node.argument);
+  }
+  // Route to the enclosing catch if any.
+  if (ctx._catchStack && ctx._catchStack.length > 0) {
+    const target = ctx._catchStack[ctx._catchStack.length - 1].block;
+    if (target) {
+      emit(ctx.module, ctx.currentBlock, {
+        op: OP.JUMP, target: target.id,
+      }, loc);
+      addEdge(ctx.currentBlock, target);
+      return;
+    }
+  }
+  // Uncaught throw: emit a THROW terminator so the worklist
+  // stops walking this path. We don't model where it goes.
+  emit(ctx.module, ctx.currentBlock, {
+    op: OP.THROW,
+  }, loc);
 }
 
 // --- Helpers for loop lowering ------------------------------------------

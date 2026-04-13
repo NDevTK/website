@@ -29,12 +29,13 @@ const tests = [
     },
   },
   {
-    name: 'analyze: unimplemented try-statement raises soundness assumption',
+    name: 'analyze: unimplemented with-statement raises soundness assumption',
     fn: async () => {
-      // `try` is still unimplemented in Wave 3 (Wave 4 lands it).
-      // For-loops became supported in Wave 3 so we switched to
-      // a statement kind that still raises unimplemented.
-      const t = await analyze('try { x = 1; } catch (e) { x = 2; }');
+      // `with` is still unimplemented (and likely to stay that way
+      // — it's legacy JS). For-loops became supported in Wave 3
+      // and try/catch in Wave 4, so we use `with` as the
+      // canonical unimplemented marker.
+      const t = await analyze('with (obj) { x = 1; }');
       const unimpl = query.assumptions(t, { reason: ['unimplemented'], severity: 'soundness' });
       assert(unimpl.length >= 1, 'expected unimplemented soundness assumption');
     },
@@ -67,10 +68,10 @@ const tests = [
   {
     name: 'query.assumptions: filter by reason',
     fn: async () => {
-      // Use a try-statement (still unimplemented) instead of a
-      // for-loop for the unimplemented probe — Wave 3 implements
-      // for-loops.
-      const t = await analyze('var x = someGlobal; try { y = 1; } catch (e) { y = 2; }');
+      // `with` is still unimplemented in Wave 4; use it for the
+      // unimplemented-assumption probe. `someGlobal` remains the
+      // canonical opaque-call probe.
+      const t = await analyze('var x = someGlobal; with (obj) { y = 1; }');
       const opaque = query.assumptions(t, { reason: ['opaque-call'] });
       const unimpl = query.assumptions(t, { reason: ['unimplemented'] });
       assert(opaque.length >= 1);

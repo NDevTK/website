@@ -32,6 +32,7 @@ const testFiles = [
   'type-narrow.test.js',
   'scope.test.js',
   'loop.test.js',
+  'try.test.js',
 ];
 
 async function main() {

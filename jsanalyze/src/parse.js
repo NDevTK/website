@@ -288,6 +288,50 @@ function mkForStatement(init, test, update, body, startTok) {
   };
 }
 
+function mkTryStatement(block, handler, finalizer, startTok) {
+  return {
+    type: 'TryStatement',
+    block,
+    handler,
+    finalizer,
+    loc: startTok && startTok.loc
+      ? { start: startTok.loc.start,
+          end: (finalizer || handler || block || {loc:null}).loc
+            ? (finalizer || handler || block).loc.end
+            : startTok.loc.end }
+      : null,
+    start: startTok ? startTok.start : 0,
+    end:   (finalizer || handler || block)
+      ? (finalizer || handler || block).end
+      : 0,
+  };
+}
+
+function mkCatchClause(param, body, startTok) {
+  return {
+    type: 'CatchClause',
+    param,
+    body,
+    loc: startTok && startTok.loc && body && body.loc
+      ? { start: startTok.loc.start, end: body.loc.end }
+      : null,
+    start: startTok ? startTok.start : 0,
+    end:   body ? body.end : 0,
+  };
+}
+
+function mkThrowStatement(argument, startTok) {
+  return {
+    type: 'ThrowStatement',
+    argument,
+    loc: startTok && startTok.loc
+      ? { start: startTok.loc.start, end: argument && argument.loc ? argument.loc.end : startTok.loc.end }
+      : null,
+    start: startTok ? startTok.start : 0,
+    end:   argument ? argument.end : (startTok ? startTok.end : 0),
+  };
+}
+
 function mkBreakStatement(label, startTok) {
   return {
     type: 'BreakStatement',
@@ -1021,6 +1065,15 @@ function parseStatement(lexer) {
       case 'finish_for':
         finishFor(task, outputs);
         break;
+      case 'finish_try_body':
+        finishTryBody(lexer, task, tasks, outputs);
+        break;
+      case 'finish_try_catch':
+        finishTryCatch(lexer, task, tasks, outputs);
+        break;
+      case 'finish_try_finally':
+        finishTryFinally(task, outputs);
+        break;
       case 'block_body':
         blockBodyStep(lexer, task, tasks, outputs);
         break;
@@ -1190,6 +1243,22 @@ function beginStatement(lexer, tasks, outputs) {
     tasks.push({ kind: 'parse_stmt' });
     return;
   }
+  // --- try / catch / finally ---
+  if (label === 'try') {
+    lexer.advance();
+    // Body: expect a BlockStatement.
+    tasks.push({ kind: 'finish_try_body', startTok: t });
+    tasks.push({ kind: 'parse_stmt' });
+    return;
+  }
+  // --- throw ---
+  if (label === 'throw') {
+    lexer.advance();
+    const arg = parseExpression(lexer);
+    if (lexer.peek() && lexer.peek().type.label === ';') lexer.advance();
+    outputs.push(mkThrowStatement(arg, t));
+    return;
+  }
   // --- break / continue ---
   if (label === 'break' || label === 'continue') {
     lexer.advance();
@@ -1230,7 +1299,7 @@ function beginStatement(lexer, tasks, outputs) {
 // implemented yet. Each becomes an UnimplementedStatement marker
 // until the corresponding transfer function is written.
 const UNHANDLED_STATEMENT_KEYWORDS = new Set([
-  'switch', 'try', 'throw',
+  'switch',
   'with', 'class', 'import', 'export',
 ]);
 
@@ -1397,6 +1466,104 @@ function finishDoWhileTest(task, outputs) {
 function finishFor(task, outputs) {
   const body = outputs.pop();
   outputs.push(mkForStatement(task.init, task.test, task.update, body, task.startTok));
+}
+
+// --- try / catch / finally parsing -------------------------------------
+//
+// Grammar:
+//   TryStatement:
+//     try Block Catch
+//     try Block Finally
+//     try Block Catch Finally
+//   Catch:
+//     catch/CatchParameter/ Block
+//     catch Block                    // ES2019 optional-catch-binding
+//
+// We use three tasks that run sequentially over the outputs
+// stack so the parser stays iterative: finish_try_body,
+// finish_try_catch, finish_try_finally.
+
+function finishTryBody(lexer, task, tasks, outputs) {
+  // Body block is at outputs top.
+  const block = outputs.pop();
+  const next = lexer.peek();
+  let hasCatch = false;
+  let hasFinally = false;
+  let catchStartTok = null;
+  let catchParam = null;
+  if (next && next.type.label === 'catch') {
+    hasCatch = true;
+    catchStartTok = next;
+    lexer.advance();
+    // Optional catch-binding: `catch /e/` or `catch`.
+    if (lexer.peek() && lexer.peek().type.label === '(') {
+      lexer.advance();
+      const paramTok = lexer.peek();
+      if (paramTok && paramTok.type.label === 'name') {
+        catchParam = mkIdentifier(paramTok.value, paramTok);
+        lexer.advance();
+      }
+      // Destructuring patterns in catch param not yet supported.
+      expect(lexer, ')');
+    }
+  }
+  const afterCatch = hasCatch ? lexer.peek() : next;
+  if (afterCatch && afterCatch.type.label === 'finally') {
+    hasFinally = true;
+    // Consume `finally` here if no handler was present, so
+    // finish_try_catch can detect it as already-consumed.
+    // Otherwise leave it for finish_try_catch to see.
+  }
+  if (hasCatch) {
+    // Parse the catch body, then return via finish_try_catch.
+    tasks.push({
+      kind: 'finish_try_catch',
+      startTok: task.startTok,
+      block,
+      catchStartTok,
+      catchParam,
+    });
+    tasks.push({ kind: 'parse_stmt' });
+    return;
+  }
+  // No catch — must have finally.
+  if (hasFinally) {
+    lexer.advance();  // consume 'finally'
+    tasks.push({
+      kind: 'finish_try_finally',
+      startTok: task.startTok,
+      block,
+      handler: null,
+    });
+    tasks.push({ kind: 'parse_stmt' });
+    return;
+  }
+  // Neither catch nor finally — parse error.
+  throw parseError(lexer, 'expected `catch` or `finally` after `try` block');
+}
+
+function finishTryCatch(lexer, task, tasks, outputs) {
+  const catchBody = outputs.pop();
+  const handler = mkCatchClause(task.catchParam, catchBody, task.catchStartTok);
+  // Check for finally.
+  if (lexer.peek() && lexer.peek().type.label === 'finally') {
+    lexer.advance();
+    tasks.push({
+      kind: 'finish_try_finally',
+      startTok: task.startTok,
+      block: task.block,
+      handler,
+    });
+    tasks.push({ kind: 'parse_stmt' });
+    return;
+  }
+  // catch only, no finally.
+  outputs.push(mkTryStatement(task.block, handler, null, task.startTok));
+}
+
+function finishTryFinally(task, outputs) {
+  const finalizer = outputs.pop();
+  outputs.push(mkTryStatement(task.block, task.handler, finalizer, task.startTok));
 }
 
 // parseVarDeclarationsInFor — like parseVarDeclarations but does
