@@ -138,10 +138,19 @@ function sourceLabelToReason(label) {
 //     path from source to sink. Consumers use this to audit the
 //     trust floor for each finding.
 //
-// The current implementation does NOT yet record path
-// conditions or SMT formulas — those land when path-sensitive
-// analysis is wired up. The fields are left empty arrays so the
-// Trace schema stays stable.
+// B3: when a flow fires, the worklist exposes the current
+// block's accumulated path condition via `ctx.currentPathCond`.
+// We attach BOTH the block-level pathCond AND the value's own
+// formula (built up by computeBinOp / source reads) so a Phase D
+// consumer has the full SMT context needed to refute the flow:
+//
+//   refutable iff
+//     (pathCond ∧ valueFormula ∧ <sink-shape-predicate>) is unsat
+//
+// The `pathConditions` array is the legacy shape (a list of
+// human-readable strings) and is left empty for now. The
+// machine-readable formulas live on `pathFormula` (current
+// block) and `valueFormula` (the value at the sink).
 function emitTaintFlow(ctx, sinkInfo, sinkLoc, value) {
   if (!ctx.taintFlows) return;
   if (!value || !value.labels || value.labels.size === 0) return;
@@ -167,8 +176,9 @@ function emitTaintFlow(ctx, sinkInfo, sinkLoc, value) {
       location: sinkLoc,
     },
     severity: sinkInfo.severity,
-    pathConditions: [],  // populated when path-sensitive analysis lands
-    pathFormulas: [],    // populated when SMT integration lands
+    pathConditions: [],            // legacy human-readable list — unused in B3
+    pathFormula: ctx.currentPathCond || null,  // SMT formula for the block's reachability
+    valueFormula: (value.formula) || null,     // SMT formula for the value at the sink
     assumptionIds: value.assumptionIds ? value.assumptionIds.slice() : [],
   };
   ctx.taintFlows.push(flow);

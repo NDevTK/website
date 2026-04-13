@@ -14,6 +14,7 @@
 const { OP } = require('./ir.js');
 const D = require('./domain.js');
 const { applyInstruction } = require('./transfer.js');
+const SMT = require('./smt.js');
 
 // Analyse one function to a fixpoint. Returns:
 //   { blockStates: Map<BlockId, State>, exitState: State }
@@ -35,6 +36,25 @@ function analyseFunction(module, fn, initialState, ctx) {
   const blockStates = new Map();     // BlockId → in-state (joined across all predecessors)
   const outStates = new Map();       // BlockId → out-state (after transfer)
 
+  // B3: per-block path conditions. Each entry is an SMT formula
+  // representing the disjunction of the conditions under which
+  // the block is reachable (one disjunct per incoming edge).
+  // The entry block has pathCond = null which represents
+  // unconditional reachability ("true").
+  //
+  // Tracked as a side channel so it does NOT participate in the
+  // data-lattice fixpoint check — the lattice convergence is on
+  // register/heap shape only. Path conditions are derived
+  // information used by sink classification, taint flow refutation,
+  // and the future SMT layer (Phase D).
+  //
+  // Stable-when-the-lattice-is-stable: every time a block is
+  // re-enqueued because its data lattice grew, we re-derive the
+  // edge condition and OR it into the target's pathCond. Once
+  // the data lattice reaches fixpoint, no new edges get added
+  // and the path conditions also stabilise.
+  const pathConds = new Map();       // BlockId → Formula | null
+
   // Compute reverse postorder once so the worklist visits blocks
   // in topological-forward order. blockOrder[blockId] → integer
   // index; lower = process earlier.
@@ -45,7 +65,53 @@ function analyseFunction(module, fn, initialState, ctx) {
   // relative to a full heap's overhead.
   const pending = [];    // sorted by blockOrder ascending
   const queued = new Set();
-  function enqueue(blockId, incoming) {
+
+  // OR a new edge formula into the target block's path
+  // condition. `edgePathCond` is the formula representing the
+  // condition under which control flow reaches `blockId` along
+  // the edge being processed (typically: the source block's
+  // pathCond conjoined with the edge's branch condition). A
+  // null `edgePathCond` represents unconditional reachability
+  // and collapses the target's pathCond to null too.
+  //
+  // Returns true iff the target's pathCond grew, so callers can
+  // decide whether downstream consumers need a refresh. (The
+  // worklist itself only re-enqueues based on the data lattice;
+  // pathConds are read-only for the fixpoint.)
+  function orPathCond(blockId, edgePathCond) {
+    if (!pathConds.has(blockId)) {
+      pathConds.set(blockId, edgePathCond);
+      return true;
+    }
+    const existing = pathConds.get(blockId);
+    if (existing === null) return false;       // already top
+    if (edgePathCond === null) {
+      pathConds.set(blockId, null);
+      return true;
+    }
+    // Both non-null: union them via OR. Cheap dedup: if the
+    // existing expression already contains the new one verbatim
+    // (e.g. successive iterations of the same edge), don't
+    // re-OR.
+    if (existing.expr === edgePathCond.expr) return false;
+    const merged = SMT.mkOr(existing, edgePathCond);
+    if (merged && merged.expr === existing.expr) return false;
+    pathConds.set(blockId, merged);
+    return true;
+  }
+
+  // enqueue(blockId, incoming, edgePathCond?)
+  //
+  // edgePathCond, when present, is the formula that must hold
+  // for control flow to reach `blockId` along this edge. The
+  // target block's accumulated pathCond is ORed with this value.
+  // Default (omitted) means "unconditional edge" — the target's
+  // pathCond becomes null (top).
+  function enqueue(blockId, incoming, edgePathCond) {
+    // Update pathConds first; this is independent of whether
+    // the data lattice grew.
+    orPathCond(blockId, edgePathCond === undefined ? null : edgePathCond);
+
     const existing = blockStates.get(blockId);
     const joined = existing ? D.joinStates(existing, incoming) : incoming;
     if (existing && D.stateEquals(existing, joined)) return;
@@ -68,7 +134,8 @@ function analyseFunction(module, fn, initialState, ctx) {
     return b;
   }
 
-  enqueue(cfg.entry, initialState);
+  // Entry block is unconditionally reachable.
+  enqueue(cfg.entry, initialState, null);
 
   // No iteration cap. The lattice is monotone with finite height
   // — each register draws from a Value lattice whose height is
@@ -85,6 +152,15 @@ function analyseFunction(module, fn, initialState, ctx) {
     const inState = blockStates.get(blockId);
     let state = resolvePhis(block, inState, blockStates, outStates);
 
+    // Expose the current block's path condition to the transfer
+    // functions so sink emission can attach it to the resulting
+    // taint flow record. This is a side channel — transfer.js
+    // is not allowed to mutate it; it's read-only context.
+    const currentPathCond = pathConds.has(blockId) ? pathConds.get(blockId) : null;
+    const prevPathCond = ctx.currentPathCond;
+    ctx.currentPathCond = currentPathCond;
+    ctx.currentBlockId = blockId;
+
     // Intra-block fast path: unfreeze the state so register writes
     // mutate the Map in place instead of cloning on every instr.
     // This turns the per-block transfer cost from O(instrs × regs)
@@ -96,33 +172,64 @@ function analyseFunction(module, fn, initialState, ctx) {
     }
     state = D.freezeState(state);
 
+    ctx.currentPathCond = prevPathCond;
+
     outStates.set(blockId, state);
 
     // Handle the terminator: queue successors with their appropriate
-    // incoming state.
+    // incoming state. Each enqueue also propagates a per-edge
+    // path-condition formula derived from this block's accumulated
+    // pathCond and (for branches) the branch test.
     const term = block.terminator;
     if (!term) continue;
+
+    // The path condition under which control flow reaches this
+    // block. null = unconditionally reachable.
+    const blockPathCond = pathConds.has(blockId) ? pathConds.get(blockId) : null;
+
     switch (term.op) {
       case OP.JUMP: {
-        enqueue(term.target, state);
+        // Unconditional edge: target inherits this block's pathCond.
+        enqueue(term.target, state, blockPathCond);
         break;
       }
       case OP.BRANCH: {
         const cond = D.getReg(state, term.cond);
         const truthy = D.truthiness(cond);
         // Layer 1-2 reachability: concrete truth value decides both
-        // successors unambiguously.
+        // successors unambiguously. The "taken" successor inherits
+        // the block's pathCond unchanged; the other side is dead.
         if (truthy === true) {
-          enqueue(term.trueTarget, state);
+          enqueue(term.trueTarget, state, blockPathCond);
         } else if (truthy === false) {
-          enqueue(term.falseTarget, state);
+          enqueue(term.falseTarget, state, blockPathCond);
         } else {
-          // Unknown: both successors are reachable. A future
-          // refinement pass will narrow the state on each side
-          // (refineWithCondition) — for now we pass the same state
-          // to both, which is sound but not maximally precise.
-          enqueue(term.trueTarget, state);
-          enqueue(term.falseTarget, state);
+          // Unknown: both successors are reachable. Build the
+          // edge formula from the cond value's symbolic formula
+          // (B2 ensures most condition values carry one) and
+          // conjoin it with the source block's pathCond.
+          //
+          // True edge:  blockPathCond ∧ cond
+          // False edge: blockPathCond ∧ ¬cond
+          //
+          // If cond has no formula, we fall back to passing the
+          // source pathCond unchanged on both sides — which is
+          // sound (we just lose precision on this branch).
+          const condForm = (cond && cond.formula) ? cond.formula : null;
+          if (condForm) {
+            const trueEdge = blockPathCond
+              ? SMT.mkAnd(blockPathCond, condForm)
+              : condForm;
+            const negCond = SMT.mkNot(condForm);
+            const falseEdge = blockPathCond
+              ? SMT.mkAnd(blockPathCond, negCond)
+              : negCond;
+            enqueue(term.trueTarget, state, trueEdge);
+            enqueue(term.falseTarget, state, falseEdge);
+          } else {
+            enqueue(term.trueTarget, state, blockPathCond);
+            enqueue(term.falseTarget, state, blockPathCond);
+          }
         }
         break;
       }
@@ -137,8 +244,11 @@ function analyseFunction(module, fn, initialState, ctx) {
         break;
       }
       case OP.SWITCH: {
-        for (const c of term.cases) enqueue(c.target, state);
-        if (term.default) enqueue(term.default, state);
+        // Switch-case path conditions are not yet refined per
+        // case (B3 only handles binary branches). Each successor
+        // inherits the source pathCond unchanged.
+        for (const c of term.cases) enqueue(c.target, state, blockPathCond);
+        if (term.default) enqueue(term.default, state, blockPathCond);
         break;
       }
       case OP.UNREACHABLE: break;
@@ -160,7 +270,7 @@ function analyseFunction(module, fn, initialState, ctx) {
   }
   if (!exitState) exitState = outStates.get(cfg.exit) || initialState;
 
-  return { blockStates, outStates, exitState };
+  return { blockStates, outStates, exitState, pathConds };
 }
 
 // Compute reverse postorder of CFG blocks starting from the

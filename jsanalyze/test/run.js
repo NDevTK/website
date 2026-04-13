@@ -25,6 +25,7 @@ const testFiles = [
   'sink-classification.test.js',
   'smt.test.js',
   'formula.test.js',
+  'path-cond.test.js',
 ];
 
 async function main() {
