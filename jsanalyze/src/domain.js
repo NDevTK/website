@@ -289,6 +289,196 @@ function strictEq(a, b) {
   return a === b;
 }
 
+// --- typeof / instanceof refinement -------------------------------------
+//
+// These helpers back Wave 1's B5 extension for runtime type-check
+// predicates. They narrow a Value to the subset of shapes that
+// are consistent with `typeof v === typeStr` (refineByType) or
+// `v instanceof ctorName` (refineInstanceof). Disjunct variants
+// are filtered one at a time and the factory collapses or drops
+// incompatible variants automatically.
+//
+// Rules for refineByType(value, typeStr):
+//   Concrete:    jsTypeof(value) === typeStr ? keep : Bottom
+//   OneOf:       filter values by jsTypeof
+//   Opaque:      if typeName is in the db and maps to a
+//                JS typeof category that differs from typeStr,
+//                Bottom. Otherwise preserve (the formula carries
+//                the constraint into the SMT layer).
+//   Object:      typeof === 'object' (or 'function' for Closure)
+//   Closure:     typeof === 'function'
+//   Interval:    typeof === 'number'
+//   StrPattern:  typeof === 'string'
+//   Disjunct:    map over variants
+//   Top/Bottom:  unchanged
+function refineByType(value, typeStr) {
+  if (!value) return value;
+  if (value.kind === V.BOTTOM) return value;
+  if (value.kind === V.DISJUNCT) {
+    return disjunctMap(value, (v) => refineByType(v, typeStr));
+  }
+  if (value.kind === V.CONCRETE) {
+    return jsTypeof(value.value) === typeStr ? value : bottom();
+  }
+  if (value.kind === V.ONE_OF) {
+    const remaining = [];
+    for (const v of value.values) {
+      if (jsTypeof(v) === typeStr) remaining.push(v);
+    }
+    if (remaining.length === 0) return bottom();
+    if (remaining.length === 1) {
+      const c = concrete(remaining[0], value.typeName, value.provenance, value.labels);
+      return value.formula ? withFormula(c, value.formula) : c;
+    }
+    return oneOf(remaining, value.typeName, value.provenance, value.labels);
+  }
+  if (value.kind === V.OBJECT)  return typeStr === 'object' ? value : bottom();
+  if (value.kind === V.CLOSURE) return typeStr === 'function' ? value : bottom();
+  if (value.kind === V.INTERVAL)    return typeStr === 'number' ? value : bottom();
+  if (value.kind === V.STR_PATTERN) return typeStr === 'string' ? value : bottom();
+  if (value.kind === V.OPAQUE && value.typeName) {
+    const expected = typeNameToTypeof(value.typeName);
+    if (expected && expected !== typeStr) return bottom();
+    return value;
+  }
+  // Opaque(null), Top: can't decide, preserve.
+  return value;
+}
+
+function refineNotByType(value, typeStr) {
+  if (!value) return value;
+  if (value.kind === V.BOTTOM) return value;
+  if (value.kind === V.DISJUNCT) {
+    return disjunctMap(value, (v) => refineNotByType(v, typeStr));
+  }
+  if (value.kind === V.CONCRETE) {
+    return jsTypeof(value.value) === typeStr ? bottom() : value;
+  }
+  if (value.kind === V.ONE_OF) {
+    const remaining = [];
+    for (const v of value.values) {
+      if (jsTypeof(v) !== typeStr) remaining.push(v);
+    }
+    if (remaining.length === 0) return bottom();
+    if (remaining.length === 1) {
+      const c = concrete(remaining[0], value.typeName, value.provenance, value.labels);
+      return value.formula ? withFormula(c, value.formula) : c;
+    }
+    return oneOf(remaining, value.typeName, value.provenance, value.labels);
+  }
+  if (value.kind === V.OBJECT)  return typeStr === 'object' ? bottom() : value;
+  if (value.kind === V.CLOSURE) return typeStr === 'function' ? bottom() : value;
+  if (value.kind === V.INTERVAL)    return typeStr === 'number' ? bottom() : value;
+  if (value.kind === V.STR_PATTERN) return typeStr === 'string' ? bottom() : value;
+  if (value.kind === V.OPAQUE && value.typeName) {
+    const expected = typeNameToTypeof(value.typeName);
+    if (expected && expected === typeStr) return bottom();
+    return value;
+  }
+  return value;
+}
+
+// jsTypeof — mirror of JS `typeof` on a concrete primitive.
+function jsTypeof(v) {
+  if (v === null) return 'object';
+  if (v === undefined) return 'undefined';
+  return typeof v;
+}
+
+// typeNameToTypeof — best-effort map from a TypeDB type name to
+// the JS typeof category of values of that type. DOM / host types
+// all map to 'object'. Primitive wrappers map to their category.
+function typeNameToTypeof(typeName) {
+  if (!typeName) return null;
+  if (typeName === 'string' || typeName === 'String') return 'string';
+  if (typeName === 'number' || typeName === 'Number') return 'number';
+  if (typeName === 'boolean' || typeName === 'Boolean') return 'boolean';
+  if (typeName === 'undefined') return 'undefined';
+  if (typeName === 'function' || typeName === 'Function') return 'function';
+  if (typeName === 'bigint' || typeName === 'BigInt') return 'bigint';
+  if (typeName === 'symbol' || typeName === 'Symbol') return 'symbol';
+  if (typeName === 'null') return 'object';
+  // Everything else is 'object' (DOM types, host objects, etc.)
+  return 'object';
+}
+
+// --- instanceof refinement ----------------------------------------------
+//
+// refineInstanceof(value, ctorName, db) narrows `value` to the
+// branch where `value instanceof ctorName` holds. The
+// refinement walks the TypeDB `extends` chain (and optionally
+// `interfaces`) to decide whether a typeName satisfies
+// `instanceof ctorName`.
+//
+// Primitives never satisfy instanceof (refine → Bottom on the
+// positive side; preserve on the negative side). Disjunct
+// variants are filtered per-variant, enabling the key use case:
+//
+//   var el = cond ? createElement('a') : createElement('iframe');
+//   if (el instanceof HTMLAnchorElement) {
+//       el.href = ...;   // only the anchor variant survives here
+//   }
+function refineInstanceof(value, ctorName, db) {
+  if (!value) return value;
+  if (value.kind === V.BOTTOM) return value;
+  if (value.kind === V.DISJUNCT) {
+    return disjunctMap(value, (v) => refineInstanceof(v, ctorName, db));
+  }
+  if (value.kind === V.CONCRETE) return bottom();  // primitives fail
+  if (value.kind === V.ONE_OF)   return bottom();  // all-primitive collapse
+  if (value.kind === V.INTERVAL || value.kind === V.STR_PATTERN) return bottom();
+  if (value.kind === V.OBJECT || value.kind === V.OPAQUE || value.kind === V.CLOSURE) {
+    if (!value.typeName) return value;     // unknown — preserve
+    if (typeChainIncludes(db, value.typeName, ctorName)) return value;
+    return bottom();
+  }
+  return value;
+}
+
+function refineNotInstanceof(value, ctorName, db) {
+  if (!value) return value;
+  if (value.kind === V.BOTTOM) return value;
+  if (value.kind === V.DISJUNCT) {
+    return disjunctMap(value, (v) => refineNotInstanceof(v, ctorName, db));
+  }
+  // Primitives never satisfy instanceof, so the negation always
+  // holds for them — preserve.
+  if (value.kind === V.CONCRETE || value.kind === V.ONE_OF ||
+      value.kind === V.INTERVAL || value.kind === V.STR_PATTERN) {
+    return value;
+  }
+  if (value.kind === V.OBJECT || value.kind === V.OPAQUE || value.kind === V.CLOSURE) {
+    if (!value.typeName) return value;
+    if (typeChainIncludes(db, value.typeName, ctorName)) return bottom();
+    return value;
+  }
+  return value;
+}
+
+// True iff typeName transitively extends or implements ctorName
+// in the TypeDB. Walks the `extends` chain and the optional
+// `interfaces` array.
+function typeChainIncludes(db, typeName, ctorName) {
+  if (!typeName || !ctorName) return false;
+  if (typeName === ctorName) return true;
+  if (!db || !db.types) return false;
+  const seen = new Set();
+  let cur = typeName;
+  while (cur && !seen.has(cur)) {
+    seen.add(cur);
+    if (cur === ctorName) return true;
+    const desc = db.types[cur];
+    if (!desc) return false;
+    if (desc.interfaces) {
+      for (const iface of desc.interfaces) {
+        if (iface === ctorName) return true;
+      }
+    }
+    cur = desc.extends || null;
+  }
+  return false;
+}
+
 function bottom() {
   return Object.freeze({ kind: V.BOTTOM, labels: EMPTY_LABELS });
 }
@@ -1118,7 +1308,8 @@ module.exports = {
   join, leq, equals, truthiness,
   withLabels, unionLabels, freezeLabels, EMPTY_LABELS,
   withFormula, valueFormula,
-  refineEq, refineNeq,
+  refineEq, refineNeq, refineByType, refineNotByType,
+  refineInstanceof, refineNotInstanceof, typeChainIncludes,
   createState, setReg, getReg, joinStates, stateLeq, stateEquals,
   unfreezeState, freezeState,
   overlayGet, overlayHas, overlayEntries, overlaySize, overlayFlatten,

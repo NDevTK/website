@@ -247,14 +247,15 @@ function analyseFunction(module, fn, initialState, ctx) {
             falseEdge = blockPathCond;
           }
 
-          // B5: refine the operand registers on each successor.
-          // Look up the def of `term.cond` to see if it's a BinOp
-          // we can refine across (=== / !== / == / !=). If yes,
-          // narrow the operand registers on each successor so a
-          // contradictory branch becomes Bottom (eliminating the
-          // false-positive flow on that side).
-          const trueState = refineForBranch(state, term.cond, defs, true);
-          const falseState = refineForBranch(state, term.cond, defs, false);
+          // B5 + Wave 1: refine the operand registers on each
+          // successor. Look up the def of `term.cond` to see if
+          // it's a refinable comparison (=== / !== / == / !=),
+          // an `instanceof`, or a `typeof x === "..."` pattern.
+          // If yes, narrow the operand (or the inner typeof
+          // operand) so a contradictory branch becomes Bottom
+          // and the dead successor is dropped from the worklist.
+          const trueState = refineForBranch(state, term.cond, defs, true, ctx.typeDB);
+          const falseState = refineForBranch(state, term.cond, defs, false, ctx.typeDB);
 
           // After refinement, check whether a successor's state
           // contains a Bottom register that the branch test
@@ -328,11 +329,34 @@ function analyseFunction(module, fn, initialState, ctx) {
 //
 // Returns a fresh State (the input is untouched) so the caller
 // can pass refined states to each successor independently.
-function refineForBranch(state, condReg, defs, taken) {
+function refineForBranch(state, condReg, defs, taken, db) {
   const def = defs.get(condReg);
   if (!def) return state;
   if (def.op !== OP.BIN_OP) return state;
   const op = def.operator;
+
+  // --- instanceof refinement ---
+  //
+  // `x instanceof Ctor` — the BinOp's left is the value, right
+  // is the constructor reference. On the true successor x is
+  // narrowed via refineInstanceof; on the false successor via
+  // refineNotInstanceof. The constructor name is recovered by
+  // walking back to the def of the right operand (typically a
+  // GetGlobal whose `name` is the ctor identifier).
+  if (op === 'instanceof') {
+    const ctorName = resolveCtorName(state, defs, def.right);
+    if (!ctorName) return state;
+    const varReg = def.left;
+    const varValue = D.getReg(state, varReg);
+    if (!varValue) return state;
+    const refined = taken
+      ? D.refineInstanceof(varValue, ctorName, db)
+      : D.refineNotInstanceof(varValue, ctorName, db);
+    if (refined === varValue) return state;
+    return D.setReg(state, varReg, refined);
+  }
+
+  // --- equality / inequality refinement (+ typeof) ---
   const isEq  = (op === '===' || op === '==');
   const isNeq = (op === '!==' || op === '!=');
   if (!isEq && !isNeq) return state;
@@ -355,18 +379,56 @@ function refineForBranch(state, condReg, defs, taken) {
   const varValue = D.getReg(state, varReg);
   if (!varValue) return state;
 
+  // --- typeof refinement ---
+  //
+  // If the variable side's def is a UnOp(typeof, x), and the
+  // literal is a string, this is `typeof x === "string"`. Refine
+  // x by type instead of by equality on the typeof result — the
+  // underlying register is x, not the result of typeof.
+  const varDef = defs.get(varReg);
+  if (varDef && varDef.op === OP.UN_OP && varDef.operator === 'typeof' &&
+      typeof lit === 'string') {
+    const innerReg = varDef.operand;
+    const innerValue = D.getReg(state, innerReg);
+    if (!innerValue) return state;
+    let refined;
+    if (isEq) {
+      refined = taken
+        ? D.refineByType(innerValue, lit)
+        : D.refineNotByType(innerValue, lit);
+    } else {
+      refined = taken
+        ? D.refineNotByType(innerValue, lit)
+        : D.refineByType(innerValue, lit);
+    }
+    if (refined === innerValue) return state;
+    return D.setReg(state, innerReg, refined);
+  }
+
   let refined;
   if (isEq) {
     refined = taken ? D.refineEq(varValue, lit) : D.refineNeq(varValue, lit);
   } else {
-    // isNeq
     refined = taken ? D.refineNeq(varValue, lit) : D.refineEq(varValue, lit);
   }
   if (refined === varValue) return state;
 
-  // setReg returns a new (still frozen) state with the refinement
-  // applied to varReg only.
   return D.setReg(state, varReg, refined);
+}
+
+// Resolve the constructor name on the right-hand side of an
+// `instanceof` expression. The right side is typically a
+// reference to a global constructor like `HTMLAnchorElement`,
+// which the IR lowers as a GetGlobal whose `name` is the
+// identifier. We look through the def chain to recover the name.
+// A single level of GetProp (`window.HTMLAnchorElement`) is also
+// resolved.
+function resolveCtorName(state, defs, ctorReg) {
+  const ctorDef = defs.get(ctorReg);
+  if (!ctorDef) return null;
+  if (ctorDef.op === OP.GET_GLOBAL) return ctorDef.name;
+  if (ctorDef.op === OP.GET_PROP)   return ctorDef.propName;
+  return null;
 }
 
 // True iff a primitive lattice value is a non-object — these are

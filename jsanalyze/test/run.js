@@ -29,6 +29,7 @@ const testFiles = [
   'refine.test.js',
   'interproc.test.js',
   'per-path-type.test.js',
+  'type-narrow.test.js',
 ];
 
 async function main() {
