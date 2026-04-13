@@ -136,6 +136,22 @@ const tests = [
     },
   },
   {
+    name: 'analyse: terminates on 5000-deep nested function declarations',
+    fn: () => {
+      // Stress test for the iterative function lowering. The
+      // legacy code recursed via `lowerFunctionDecl → drainWork
+      // → lower_stmt → lowerFunctionDecl` and overflowed at
+      // ~5000 nesting levels. After G1 the lowering pushes
+      // enter_function / leave_function tasks onto the shared
+      // work stack, so any depth works in flat time.
+      let src = '';
+      for (let i = 0; i < 5000; i++) src += 'function f' + i + '(){';
+      for (let i = 0; i < 5000; i++) src += '}';
+      const r = analyse(src);
+      assert(r.result.exitState, 'produced exit state for 5000-deep nested fns');
+    },
+  },
+  {
     name: 'analyse: terminates on 5000 sequential statements',
     fn: () => {
       // Flat-but-long program: this is the workload where the

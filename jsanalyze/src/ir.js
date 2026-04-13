@@ -286,6 +286,8 @@ function stepStmtTask(ctx, task) {
     case 'if_after_else':    return ifAfterElseStep(ctx, task);
     case 'if_merge':         return ifMergeStep(ctx, task);
     case 'set_block':        ctx.currentBlock = task.block; return;
+    case 'enter_function':   return enterFunctionStep(ctx, task);
+    case 'leave_function':   return leaveFunctionStep(ctx, task);
     default:
       throw new Error('ir: unknown statement task ' + task.kind);
   }
@@ -530,8 +532,21 @@ function lowerReturn(ctx, node, loc) {
   ctx.fn.returns.push(reg);
 }
 
+// lowerFunctionDecl — emit a FUNC instruction in the OUTER block
+// immediately, then defer the body lowering by pushing
+// `enter_function`, body tasks, and `leave_function` onto
+// ctx._work.
+//
+// The function is iterative: no JS recursion. drainWork pops
+// the deferred tasks in order, switching ctx into the function's
+// scope at enter_function and back out at leave_function. Nested
+// function declarations push more tasks the same way, so any
+// depth of nesting works without growing the JS call stack.
+//
+// Returns the FUNC instruction's `dest` register so callers
+// (function declarations and function expressions) can
+// immediately use the closure value.
 function lowerFunctionDecl(ctx, node, loc) {
-  // Hoist the declaration: create the function and bind the name.
   const params = node.params.map(p =>
     p.type === 'Identifier' ? p.name : null
   );
@@ -540,45 +555,83 @@ function lowerFunctionDecl(ctx, node, loc) {
   fn.isGenerator = !!node.generator;
   fn.location = loc;
 
-  // Build the function body with a fresh scope.
-  const savedFn = ctx.fn;
-  const savedScope = ctx.scope;
-  const savedBlocks = ctx.blocks;
-  const savedCurrent = ctx.currentBlock;
-  const savedCatch = ctx.catchStack;
-
-  ctx.fn = fn;
-  ctx.scope = createScopeMap();
+  // Allocate the function's own CFG with an entry block. The
+  // body tasks (run later via the deferred work stack) will
+  // populate it.
   const fnEntry = createBlock(ctx.module);
   fn.cfg = { entry: fnEntry.id, exit: null, blocks: new Map([[fnEntry.id, fnEntry]]) };
-  ctx.blocks = fn.cfg.blocks;
-  ctx.currentBlock = fnEntry;
-  ctx.catchStack = [];
 
-  // Bind params as fresh registers in the entry block.
+  // Emit the FUNC instruction in the OUTER block right now so
+  // the closure value is available to subsequent statements at
+  // declaration order. The captures list is empty until closure
+  // capture tracking lands in Phase C.
+  const dest = newRegister(ctx.module);
+  emit(ctx.module, ctx.currentBlock, {
+    op: OP.FUNC, dest, functionId: fn.id, captures: [],
+  }, loc);
+  // For function declarations, bind the source name in the
+  // outer scope right away. For function expressions
+  // (node.id === null) the caller pushes `dest` onto its own
+  // results stack.
+  if (node.id) defineName(ctx.scope, node.id.name, dest);
+
+  // Push the deferred body tasks onto the SHARED work stack.
+  // LIFO order so they pop in this sequence:
+  //
+  //   1. enter_function — install fn / fresh scope / params /
+  //      currentBlock=fnEntry
+  //   2. body statements (each followed by after_stmt)
+  //   3. leave_function — implicit return + restore outer ctx
+  //
+  // No recursion: drainWork's existing while-loop processes
+  // them in order.
+  ctx._work.push({ kind: 'leave_function', fn });
+  if (node.body && node.body.type === 'BlockStatement') {
+    for (let i = node.body.body.length - 1; i >= 0; i--) {
+      ctx._work.push({ kind: 'after_stmt' });
+      ctx._work.push({ kind: 'lower_stmt', node: node.body.body[i] });
+    }
+  }
+  ctx._work.push({ kind: 'enter_function', fn });
+  return dest;
+}
+
+// enter_function — called when the deferred function-body
+// tasks reach the top of the work stack. Snapshots the outer
+// ctx state, installs the function's own state (fresh scope,
+// the function's blocks Map, currentBlock = entry), and binds
+// the parameters as fresh registers in the new scope.
+function enterFunctionStep(ctx, task) {
+  if (!ctx._funcStack) ctx._funcStack = [];
+  ctx._funcStack.push({
+    fn: ctx.fn,
+    scope: ctx.scope,
+    blocks: ctx.blocks,
+    currentBlock: ctx.currentBlock,
+    catchStack: ctx.catchStack,
+  });
+  const fn = task.fn;
+  ctx.fn = fn;
+  ctx.scope = createScopeMap();
+  ctx.blocks = fn.cfg.blocks;
+  ctx.currentBlock = fn.cfg.blocks.get(fn.cfg.entry);
+  ctx.catchStack = [];
+  // Bind params in the new scope. The param register list on
+  // `fn.params` is appended here so it's populated by the time
+  // any caller starts walking the body.
   for (const name of fn.paramNames) {
     if (!name) continue;
     const reg = newRegister(ctx.module);
     fn.params.push(reg);
     defineName(ctx.scope, name, reg);
   }
+}
 
-  if (node.body && node.body.type === 'BlockStatement') {
-    // Save the outer work stack, give the function body its own
-    // drainable stack, then restore after. This keeps the
-    // iterative drive loop non-recursive while still allowing
-    // nested function bodies to run their own lowering to
-    // completion before the outer lowering resumes.
-    const savedWork = ctx._work;
-    ctx._work = [];
-    for (let i = node.body.body.length - 1; i >= 0; i--) {
-      ctx._work.push({ kind: 'after_stmt' });
-      ctx._work.push({ kind: 'lower_stmt', node: node.body.body[i] });
-    }
-    drainWork(ctx);
-    ctx._work = savedWork;
-  }
-  // Implicit return at end of body.
+// leave_function — adds the implicit `return undefined` at end
+// of body, sets fn.cfg.exit, then restores the outer ctx state
+// from the snapshot pushed at enter_function time.
+function leaveFunctionStep(ctx, task) {
+  const fn = task.fn;
   if (ctx.currentBlock && !ctx.currentBlock.terminator) {
     const undefReg = newRegister(ctx.module);
     emit(ctx.module, ctx.currentBlock, {
@@ -589,21 +642,16 @@ function lowerFunctionDecl(ctx, node, loc) {
     }, null);
     fn.returns.push(undefReg);
   }
-  fn.cfg.exit = ctx.currentBlock ? ctx.currentBlock.id : fnEntry.id;
-
-  ctx.fn = savedFn;
-  ctx.scope = savedScope;
-  ctx.blocks = savedBlocks;
-  ctx.currentBlock = savedCurrent;
-  ctx.catchStack = savedCatch;
-
-  // Emit a Func instruction in the outer scope that creates a
-  // closure value for this function. Bind the name.
-  const dest = newRegister(ctx.module);
-  emit(ctx.module, ctx.currentBlock, {
-    op: OP.FUNC, dest, functionId: fn.id, captures: [],
-  }, loc);
-  if (node.id) defineName(ctx.scope, node.id.name, dest);
+  fn.cfg.exit = ctx.currentBlock ? ctx.currentBlock.id : fn.cfg.entry;
+  if (!ctx._funcStack || ctx._funcStack.length === 0) {
+    throw new Error('ir: leave_function with empty _funcStack');
+  }
+  const saved = ctx._funcStack.pop();
+  ctx.fn = saved.fn;
+  ctx.scope = saved.scope;
+  ctx.blocks = saved.blocks;
+  ctx.currentBlock = saved.currentBlock;
+  ctx.catchStack = saved.catchStack;
 }
 
 function lowerUnimplementedStmt(ctx, node, loc) {
@@ -1015,11 +1063,19 @@ function visitNode(ctx, node, tasks, results) {
     }
     case 'FunctionExpression':
     case 'ArrowFunctionExpression': {
-      // Function expressions are lowered via the statement-level
-      // function declaration path, which is itself recursive in its
-      // outer function body traversal — but only at most once per
-      // literal function occurrence in the source, so this is
-      // bounded and safe for stack depth.
+      // Function expressions reuse the same lowering path as
+      // function declarations: lowerFunctionDecl emits the FUNC
+      // instruction in the CURRENT (outer) block immediately
+      // and returns its dest register, then defers the body
+      // lowering by pushing enter_function / body / leave_function
+      // tasks onto ctx._work. The deferred body runs later when
+      // drainWork pops those tasks; the expression iterator just
+      // needs the dest register, which is valid right now.
+      //
+      // Iterative: no recursive drainWork call. Nested function
+      // expressions push more deferred tasks the same way; any
+      // nesting depth is supported without growing the JS call
+      // stack.
       const syntheticDecl = {
         type: 'FunctionDeclaration',
         id: null,
@@ -1033,22 +1089,7 @@ function visitNode(ctx, node, tasks, results) {
         start: node.start,
         end: node.end,
       };
-      const savedBlock = ctx.currentBlock;
-      lowerFunctionDecl(ctx, syntheticDecl, loc);
-      const instrs = savedBlock.instructions;
-      for (let i = instrs.length - 1; i >= 0; i--) {
-        if (instrs[i].op === OP.FUNC) {
-          results.push(instrs[i].dest);
-          return;
-        }
-      }
-      const dest = newRegister(ctx.module);
-      emit(ctx.module, ctx.currentBlock, {
-        op: OP.OPAQUE, dest,
-        reason: REASONS.UNIMPLEMENTED,
-        details: 'function expression lowering returned no FUNC',
-        affects: null,
-      }, loc);
+      const dest = lowerFunctionDecl(ctx, syntheticDecl, loc);
       results.push(dest);
       return;
     }
