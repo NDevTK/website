@@ -144,38 +144,114 @@ function addEdge(src, dst) {
 
 // --- Scope map: source names → current SSA register --------------------
 //
-// The AST→IR lowering is purely syntactic but needs to resolve
-// identifier references to the register holding the most recent
-// value. A ScopeMap is a stack of frames (one per lexical scope).
-// Variable lookups walk outward.
+// Each scope frame is tagged with its lexical kind:
 //
-// Captures: when an inner function references an outer name, the
-// outer register is added to the inner function's captures list so
-// the closure knows what to copy at call time.
+//   { kind: 'function', bindings: { name → binding } }
+//   { kind: 'block',    bindings: { name → binding } }
+//
+// A binding records both the current SSA register AND the
+// declaration kind that created it:
+//
+//   { reg, kind: 'var' | 'let' | 'const' | 'function' | 'param' }
+//
+// Declaration kind drives several JS semantics:
+//
+//   * `var` and `function` are FUNCTION-scoped: defineVar walks
+//     outward until it finds the nearest 'function' frame, so
+//     `{ var x = 1; } x` is visible.
+//   * `let` and `const` are BLOCK-scoped: defineLet/defineConst
+//     only touch the innermost (block or function) frame. A
+//     post-pop reference becomes unbound.
+//   * Reassigning a `const` binding raises an explicit
+//     assumption — the value lattice still updates (we stay
+//     sound) but the imprecision is visible.
+//   * TDZ: let/const declarations seed the binding with a
+//     frozen Opaque(TDZ) sentinel at block entry; a reference
+//     that hits the sentinel instead of a real value carries
+//     the TDZ assumption forward.
+
+const BIND = Object.freeze({
+  VAR:      'var',
+  LET:      'let',
+  CONST:    'const',
+  FUNCTION: 'function',
+  PARAM:    'param',
+});
 
 function createScopeMap() {
-  return { frames: [Object.create(null)] };
+  return { frames: [{ kind: 'function', bindings: Object.create(null) }] };
 }
-function pushFrame(scope) { scope.frames.push(Object.create(null)); }
-function popFrame(scope)  { scope.frames.pop(); }
+function pushFunctionFrame(scope) {
+  scope.frames.push({ kind: 'function', bindings: Object.create(null) });
+}
+function pushBlockFrame(scope) {
+  scope.frames.push({ kind: 'block', bindings: Object.create(null) });
+}
+function popFrame(scope) { scope.frames.pop(); }
+
+// Find the nearest enclosing 'function' frame index (or 0 if none).
+function nearestFunctionFrame(scope) {
+  for (let i = scope.frames.length - 1; i >= 0; i--) {
+    if (scope.frames[i].kind === 'function') return i;
+  }
+  return 0;
+}
+
+// var / function / param binding: define in the nearest function frame.
+function defineHoisted(scope, name, reg, kind) {
+  const i = nearestFunctionFrame(scope);
+  scope.frames[i].bindings[name] = { reg, kind };
+}
+// let / const binding: define in the innermost (block or function) frame.
+function defineLexical(scope, name, reg, kind) {
+  const i = scope.frames.length - 1;
+  scope.frames[i].bindings[name] = { reg, kind };
+}
+
+// Legacy catch-all. Defaults to var-style (function-scoped).
 function defineName(scope, name, reg) {
-  scope.frames[scope.frames.length - 1][name] = reg;
+  defineHoisted(scope, name, reg, BIND.VAR);
 }
+
+// Walk frames innermost-outward; return the register only.
 function lookupName(scope, name) {
   for (let i = scope.frames.length - 1; i >= 0; i--) {
-    if (name in scope.frames[i]) return scope.frames[i][name];
+    const b = scope.frames[i].bindings[name];
+    if (b) return b.reg;
   }
   return null;
 }
+
+// Full lookup: returns the binding record ({reg, kind}) or null.
+function lookupBinding(scope, name) {
+  for (let i = scope.frames.length - 1; i >= 0; i--) {
+    const b = scope.frames[i].bindings[name];
+    if (b) return b;
+  }
+  return null;
+}
+
 // Update (reassignment) — finds the nearest existing binding and
-// replaces its register. If none exists, creates a new binding in
-// the current frame (covers implicit globals in sloppy mode).
+// replaces it with a fresh record. We do NOT mutate the existing
+// binding object because scope snapshots hold shallow references
+// to the same binding objects; mutating in place would retroactively
+// change the captured then/else scopes used to emit phis.
+//
+// const reassignment is tolerated at the IR level (the transfer
+// still tracks the new value), but the caller may want to raise an
+// assumption about it. If no binding exists we create one in the
+// nearest FUNCTION frame (implicit global in sloppy mode).
 function updateName(scope, name, reg) {
   for (let i = scope.frames.length - 1; i >= 0; i--) {
-    if (name in scope.frames[i]) { scope.frames[i][name] = reg; return i; }
+    const b = scope.frames[i].bindings[name];
+    if (b) {
+      scope.frames[i].bindings[name] = { reg, kind: b.kind };
+      return { frameIndex: i, kind: b.kind };
+    }
   }
-  scope.frames[scope.frames.length - 1][name] = reg;
-  return scope.frames.length - 1;
+  const fi = nearestFunctionFrame(scope);
+  scope.frames[fi].bindings[name] = { reg, kind: BIND.VAR };
+  return { frameIndex: fi, kind: BIND.VAR };
 }
 
 // --- Iterative AST walker -----------------------------------------------
@@ -262,6 +338,12 @@ function lowerProgram(ctx, programNode) {
     ctx._work.push({ kind: 'prog_after_stmt' });
     ctx._work.push({ kind: 'lower_stmt', node: programNode.body[i] });
   }
+  // Hoist var and function declarations at the program level so
+  // they are visible to any earlier reference (matches JS's
+  // hoisting semantics: `f(); function f(){}` and `x = 1; var x`
+  // both work). The hoist task runs first because it's at the
+  // bottom of the LIFO stack.
+  ctx._work.push({ kind: 'hoist_decls', bodyNodes: programNode.body });
   drainWork(ctx);
 }
 
@@ -278,7 +360,7 @@ function drainWork(ctx) {
 function stepStmtTask(ctx, task) {
   switch (task.kind) {
     case 'lower_stmt':       return lowerStatement(ctx, task.node);
-    case 'block_enter':      pushFrame(ctx.scope); return;
+    case 'block_enter':      pushBlockFrame(ctx.scope); return;
     case 'block_exit':       popFrame(ctx.scope); return;
     case 'after_stmt':       return afterStmtStep(ctx);
     case 'prog_after_stmt':  return progAfterStmtStep(ctx);
@@ -288,8 +370,171 @@ function stepStmtTask(ctx, task) {
     case 'set_block':        ctx.currentBlock = task.block; return;
     case 'enter_function':   return enterFunctionStep(ctx, task);
     case 'leave_function':   return leaveFunctionStep(ctx, task);
+    case 'hoist_decls':      return hoistDeclarationsStep(ctx, task);
     default:
       throw new Error('ir: unknown statement task ' + task.kind);
+  }
+}
+
+// --- Hoisting ----------------------------------------------------------
+//
+// `hoist_decls` pre-scans a list of statement AST nodes for:
+//
+//   1. FunctionDeclarations at this level (not inside inner
+//      functions): creates each function, emits its Func instr in
+//      the current block, and binds the name in the enclosing
+//      function frame.
+//
+//   2. VariableDeclarations with kind === 'var': pre-binds each
+//      name to an `undefined` concrete in the enclosing function
+//      frame. This matches JS var-hoisting: `x` is defined from
+//      the top of the function, with value `undefined` until the
+//      init runs.
+//
+// Recursion: we walk down into nested block-like statements
+// (BlockStatement, IfStatement, TryStatement, etc.) to find
+// hoisted declarations, but STOP at any FunctionDeclaration or
+// FunctionExpression or ArrowFunctionExpression because those
+// start a new function scope.
+function hoistDeclarationsStep(ctx, task) {
+  const bodyNodes = task.bodyNodes || [];
+  // Step 1: pre-scan for var names and hoist them as undefined.
+  const varNames = new Set();
+  collectHoistedVarNames(bodyNodes, varNames);
+  for (const name of varNames) {
+    // Skip names that are already bound (e.g. parameter names).
+    // Parameter bindings take precedence over a `var` of the
+    // same name; the var just becomes a no-op.
+    if (lookupBinding(ctx.scope, name)) continue;
+    const reg = newRegister(ctx.module);
+    emit(ctx.module, ctx.currentBlock, {
+      op: OP.CONST, dest: reg, value: undefined,
+    }, null);
+    defineHoisted(ctx.scope, name, reg, BIND.VAR);
+  }
+  // Step 2: pre-scan for FunctionDeclarations. For each, create
+  // the function, emit its Func instr in the current block, bind
+  // the name, and push the body-lowering tasks so the nested
+  // function's CFG gets populated in the same drain loop.
+  //
+  // The walk stops at any inner function boundary.
+  const fnDecls = [];
+  collectHoistedFunctionDecls(bodyNodes, fnDecls);
+  for (const fnNode of fnDecls) {
+    // Re-use lowerFunctionDecl: it creates the function, emits
+    // Func in ctx.currentBlock, binds the name, and pushes the
+    // enter/body/leave tasks. We just need to make sure the
+    // function's name doesn't get rebound by the regular
+    // FunctionDeclaration case of lowerStatement later — we
+    // handle that with the `_hoisted` set below.
+    if (!ctx._hoistedFnNodes) ctx._hoistedFnNodes = new Set();
+    ctx._hoistedFnNodes.add(fnNode);
+    lowerFunctionDecl(ctx, fnNode, locFromNode(fnNode, ctx.filename));
+  }
+}
+
+// Collect var names from a statement list. Descends into nested
+// BlockStatement / IfStatement / LabeledStatement / SwitchStatement
+// / TryStatement (the places where `var` might appear), but
+// stops at any function boundary.
+function collectHoistedVarNames(nodes, out) {
+  const stack = nodes.slice().reverse();
+  while (stack.length > 0) {
+    const n = stack.pop();
+    if (!n) continue;
+    if (n.type === 'VariableDeclaration' && n.kind === 'var') {
+      for (const d of n.declarations) {
+        if (d.id && d.id.type === 'Identifier') out.add(d.id.name);
+      }
+      continue;
+    }
+    if (n.type === 'BlockStatement') {
+      for (let i = n.body.length - 1; i >= 0; i--) stack.push(n.body[i]);
+      continue;
+    }
+    if (n.type === 'IfStatement') {
+      if (n.alternate) stack.push(n.alternate);
+      if (n.consequent) stack.push(n.consequent);
+      continue;
+    }
+    if (n.type === 'LabeledStatement') {
+      stack.push(n.body);
+      continue;
+    }
+    if (n.type === 'ForStatement' || n.type === 'ForInStatement' ||
+        n.type === 'ForOfStatement' || n.type === 'WhileStatement' ||
+        n.type === 'DoWhileStatement') {
+      if (n.init && n.init.type === 'VariableDeclaration' && n.init.kind === 'var') {
+        for (const d of n.init.declarations) {
+          if (d.id && d.id.type === 'Identifier') out.add(d.id.name);
+        }
+      }
+      if (n.body) stack.push(n.body);
+      continue;
+    }
+    if (n.type === 'SwitchStatement') {
+      for (const c of n.cases) {
+        for (let i = c.consequent.length - 1; i >= 0; i--) stack.push(c.consequent[i]);
+      }
+      continue;
+    }
+    if (n.type === 'TryStatement') {
+      if (n.block) stack.push(n.block);
+      if (n.handler && n.handler.body) stack.push(n.handler.body);
+      if (n.finalizer) stack.push(n.finalizer);
+      continue;
+    }
+    // Function boundaries stop the walk: FunctionDeclaration /
+    // FunctionExpression / ArrowFunctionExpression. We DO walk
+    // into the function's body separately when we hoist it.
+    // Other statement kinds (Expression, Return, Break, etc.)
+    // don't contain `var` bindings we care about.
+  }
+}
+
+// Collect FunctionDeclaration nodes at the current function's
+// top level (not inside nested functions). Walks the same shape
+// tree as collectHoistedVarNames but matches FunctionDeclaration
+// instead. Order is preserved so hoisted functions appear in
+// source-order in the IR.
+function collectHoistedFunctionDecls(nodes, out) {
+  // BFS to preserve source order at each level; DFS into blocks.
+  const stack = nodes.slice().reverse();
+  while (stack.length > 0) {
+    const n = stack.pop();
+    if (!n) continue;
+    if (n.type === 'FunctionDeclaration') {
+      out.push(n);
+      continue;
+    }
+    if (n.type === 'BlockStatement') {
+      for (let i = n.body.length - 1; i >= 0; i--) stack.push(n.body[i]);
+      continue;
+    }
+    if (n.type === 'IfStatement') {
+      if (n.alternate) stack.push(n.alternate);
+      if (n.consequent) stack.push(n.consequent);
+      continue;
+    }
+    if (n.type === 'LabeledStatement') { stack.push(n.body); continue; }
+    if (n.type === 'ForStatement' || n.type === 'ForInStatement' ||
+        n.type === 'ForOfStatement' || n.type === 'WhileStatement' ||
+        n.type === 'DoWhileStatement') {
+      if (n.body) stack.push(n.body);
+      continue;
+    }
+    if (n.type === 'SwitchStatement') {
+      for (const c of n.cases) {
+        for (let i = c.consequent.length - 1; i >= 0; i--) stack.push(c.consequent[i]);
+      }
+      continue;
+    }
+    if (n.type === 'TryStatement') {
+      if (n.block) stack.push(n.block);
+      if (n.handler && n.handler.body) stack.push(n.handler.body);
+      if (n.finalizer) stack.push(n.finalizer);
+      continue;
+    }
   }
 }
 
@@ -318,7 +563,14 @@ function lowerStatement(ctx, node) {
     case 'BlockStatement': return enqueueBlock(ctx, node);
     case 'IfStatement':         return beginIf(ctx, node, loc);
     case 'ReturnStatement':     return lowerReturn(ctx, node, loc);
-    case 'FunctionDeclaration': return lowerFunctionDecl(ctx, node, loc);
+    case 'FunctionDeclaration': {
+      // If this declaration was already hoisted by a hoist_decls
+      // task, skip it — the function has been created, its Func
+      // instr emitted, and its body tasks queued. Re-lowering
+      // would create a duplicate function and clobber the binding.
+      if (ctx._hoistedFnNodes && ctx._hoistedFnNodes.has(node)) return;
+      return lowerFunctionDecl(ctx, node, loc);
+    }
     case 'EmptyStatement':      return;
     case 'UnimplementedStatement': {
       const dest = newRegister(ctx.module);
@@ -473,7 +725,7 @@ function ifMergeStep(ctx, task) {
 
   const allNames = new Set();
   for (const [, s] of phiBlocks) {
-    for (const f of s.frames) for (const k in f) allNames.add(k);
+    for (const k of allNamesInSnapshot(s)) allNames.add(k);
   }
   for (const name of allNames) {
     const incoming = [];
@@ -497,7 +749,14 @@ function ifMergeStep(ctx, task) {
 }
 
 function lowerVarDecl(ctx, node, loc) {
-  // `var x = 1, y = 2;` → one emit per declarator.
+  // node.kind is 'var', 'let', or 'const'. The parser sets it to
+  // 'var' by default if not explicitly tagged (historical node
+  // shape).
+  const declKind = node.kind || 'var';
+  const bindingKind = declKind === 'let' ? BIND.LET
+    : declKind === 'const' ? BIND.CONST
+    : BIND.VAR;
+
   for (const decl of node.declarations) {
     if (decl.id.type !== 'Identifier') {
       // Destructuring — not yet implemented.
@@ -513,7 +772,13 @@ function lowerVarDecl(ctx, node, loc) {
         op: OP.CONST, dest: reg, value: undefined,
       }, loc);
     }
-    defineName(ctx.scope, decl.id.name, reg);
+    // var / function  → hoisted into the nearest function frame.
+    // let / const     → block-scoped in the innermost frame.
+    if (bindingKind === BIND.VAR) {
+      defineHoisted(ctx.scope, decl.id.name, reg, BIND.VAR);
+    } else {
+      defineLexical(ctx.scope, decl.id.name, reg, bindingKind);
+    }
   }
 }
 
@@ -570,10 +835,11 @@ function lowerFunctionDecl(ctx, node, loc) {
     op: OP.FUNC, dest, functionId: fn.id, captures: [],
   }, loc);
   // For function declarations, bind the source name in the
-  // outer scope right away. For function expressions
-  // (node.id === null) the caller pushes `dest` onto its own
-  // results stack.
-  if (node.id) defineName(ctx.scope, node.id.name, dest);
+  // outer scope right away AS a 'function' binding (hoisted
+  // into the nearest function frame — ES semantics). Function
+  // expressions (node.id === null) have no outer binding; the
+  // caller pushes `dest` onto its own results stack.
+  if (node.id) defineHoisted(ctx.scope, node.id.name, dest, BIND.FUNCTION);
 
   // Push the deferred body tasks onto the SHARED work stack.
   // LIFO order so they pop in this sequence:
@@ -591,6 +857,11 @@ function lowerFunctionDecl(ctx, node, loc) {
       ctx._work.push({ kind: 'after_stmt' });
       ctx._work.push({ kind: 'lower_stmt', node: node.body.body[i] });
     }
+    // Hoist nested function/var declarations in this function's
+    // body so they're visible from the top of the body. Runs
+    // after enter_function (pops above it on the LIFO stack) and
+    // before the body statements.
+    ctx._work.push({ kind: 'hoist_decls', bodyNodes: node.body.body });
   }
   ctx._work.push({ kind: 'enter_function', fn });
   return dest;
@@ -616,14 +887,17 @@ function enterFunctionStep(ctx, task) {
   ctx.blocks = fn.cfg.blocks;
   ctx.currentBlock = fn.cfg.blocks.get(fn.cfg.entry);
   ctx.catchStack = [];
-  // Bind params in the new scope. The param register list on
-  // `fn.params` is appended here so it's populated by the time
-  // any caller starts walking the body.
+  // Bind params in the new scope AS 'param' bindings. The
+  // param register list on `fn.params` is appended here so it's
+  // populated by the time any caller starts walking the body.
+  // Params live in the function frame (kind='function') so
+  // later `var` declarations with the same name rebind them
+  // rather than shadow.
   for (const name of fn.paramNames) {
     if (!name) continue;
     const reg = newRegister(ctx.module);
     fn.params.push(reg);
-    defineName(ctx.scope, name, reg);
+    defineHoisted(ctx.scope, name, reg, BIND.PARAM);
   }
 }
 
@@ -1115,17 +1389,41 @@ function lowerUnimplementedExpr(ctx, node, loc) {
 
 // --- Scope snapshots for phi generation ---------------------------------
 
+// Shallow-clone each frame so the snapshot captures the current
+// binding registers without aliasing future mutations. Frames
+// are now {kind, bindings}; we copy both.
 function snapshotScope(scope) {
-  return { frames: scope.frames.map(f => Object.assign(Object.create(null), f)) };
+  return {
+    frames: scope.frames.map(f => ({
+      kind: f.kind,
+      bindings: Object.assign(Object.create(null), f.bindings),
+    })),
+  };
 }
 function restoreScope(scope, snap) {
-  scope.frames = snap.frames.map(f => Object.assign(Object.create(null), f));
+  scope.frames = snap.frames.map(f => ({
+    kind: f.kind,
+    bindings: Object.assign(Object.create(null), f.bindings),
+  }));
 }
+// Walk a snapshot (innermost first) and return the register for
+// `name`, or null. Mirrors lookupName but operates on a frozen
+// snapshot captured at a specific program point.
 function lookupInSnapshot(snap, name) {
   for (let i = snap.frames.length - 1; i >= 0; i--) {
-    if (name in snap.frames[i]) return snap.frames[i][name];
+    const b = snap.frames[i].bindings[name];
+    if (b) return b.reg;
   }
   return null;
+}
+// Iterate all bound names in a snapshot. Used by if-merge to
+// compute the set of names that need phi merging.
+function allNamesInSnapshot(snap) {
+  const out = new Set();
+  for (const f of snap.frames) {
+    for (const k in f.bindings) out.add(k);
+  }
+  return out;
 }
 
 // --- Module validation --------------------------------------------------

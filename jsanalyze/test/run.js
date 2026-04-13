@@ -30,6 +30,7 @@ const testFiles = [
   'interproc.test.js',
   'per-path-type.test.js',
   'type-narrow.test.js',
+  'scope.test.js',
 ];
 
 async function main() {

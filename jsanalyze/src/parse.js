@@ -49,23 +49,42 @@ function createLexer(source, filename) {
     source,
     filename,
     current: null,    // peeked token
+    lookahead: null,  // one-token lookahead buffer (null if not yet fetched)
     prev: null,       // most recently consumed token
   };
   function advance() {
     state.prev = state.current;
-    // Tokenizer exceptions propagate. A tokenizer failure means
-    // the source contains invalid lexical structure (unterminated
-    // string, bad escape, etc.); parse.js converts this into a
-    // visible error at the parseModule boundary where the caller
-    // sees it in `trace.warnings`. No silent recovery.
-    state.current = iter.getToken();
+    // If we had a lookahead token buffered, promote it; otherwise
+    // pull a fresh one from the tokenizer. Tokenizer exceptions
+    // propagate: a failure means the source contains invalid
+    // lexical structure (unterminated string, bad escape, etc.);
+    // parse.js converts this into a visible error at the
+    // parseModule boundary where the caller sees it in
+    // `trace.warnings`. No silent recovery.
+    if (state.lookahead) {
+      state.current = state.lookahead;
+      state.lookahead = null;
+    } else {
+      state.current = iter.getToken();
+    }
     return state.prev;
+  }
+  // Return the token AFTER `current` without consuming either.
+  // Used by contextual-keyword disambiguation (e.g. deciding
+  // whether `let` at statement position is a declaration keyword
+  // or a plain identifier reference).
+  function peek2() {
+    if (!state.lookahead) {
+      state.lookahead = iter.getToken();
+    }
+    return state.lookahead;
   }
   // Prime with the first token.
   advance();
   return {
     state,
     peek()  { return state.current; },
+    peek2,
     advance,
     eof()   { return state.current && state.current.type.label === 'eof'; },
     filename,
@@ -854,6 +873,30 @@ function parseBinary(lexer) {
 // The entry point pushes a single `parse_stmt` task and drains
 // the loop. When the loop terminates the outputs stack holds
 // exactly one node — the parsed statement.
+// `let` is a contextual keyword: at statement-start position it
+// introduces a VariableDeclaration when followed by an Identifier,
+// `[`, or `{`. Any other follow-up (`let + 1`, `let.foo`, `let[0]`
+// in an expression context, `let()`, etc.) means `let` is a
+// plain identifier reference. We peek two tokens to decide.
+//
+// This conservative rule matches ES6 grammar exactly: the only
+// ambiguity is at the first token of a statement, and only when
+// the second token is an Identifier or a destructuring opener.
+// The `[` case for destructuring is what makes `let [a,b] = x`
+// a declaration rather than a computed member access. We handle
+// it the same way the spec does — treat `let [`as a declaration.
+// (The engine's destructuring lowering is not yet implemented;
+// it raises an unimplemented assumption at IR-build time.)
+function isLetDeclarationStart(lexer) {
+  const next = lexer.peek2();
+  if (!next) return false;
+  const lbl = next.type.label;
+  if (lbl === 'name') return true;     // `let foo = ...`
+  if (lbl === '[')    return true;     // `let [a, b] = ...`
+  if (lbl === '{')    return true;     // `let {a, b} = ...`
+  return false;
+}
+
 function parseStatement(lexer) {
   const tasks = [{ kind: 'parse_stmt' }];
   const outputs = [];
@@ -915,8 +958,17 @@ function beginStatement(lexer, tasks, outputs) {
     tasks.push({ kind: 'block_body' });
     return;
   }
-  if (label === 'var' || label === 'let' || label === 'const') {
-    const kind = label;
+  if (label === 'var' || label === 'const' ||
+      (label === 'name' && t.value === 'let' && isLetDeclarationStart(lexer))) {
+    // `let` is a contextual keyword — acorn tokenizes it as
+    // 'name'. We only treat it as a declaration when the next
+    // token can legally follow `let` in a VariableDeclaration
+    // context (an Identifier, `[`, or `{` for destructuring).
+    // In expression position (`let + 1`, `let.foo`) it remains a
+    // plain identifier reference.
+    const kind = label === 'var' ? 'var'
+      : label === 'const' ? 'const'
+      : 'let';
     lexer.advance();
     parseVarDeclarations(lexer, kind, t, outputs);
     return;

@@ -44,9 +44,12 @@ const tests = [
     fn: () => {
       const m = buildModule('var x = 1 + 2;', 'a.js');
       const ops = opsOf(m);
-      // Two Const for the literals (1 and 2) plus one for the
-      // implicit `undefined` returned at the end of the program.
-      assertEqual(ops.filter(o => o === OP.CONST).length, 3, 'three Const instrs (two literals + implicit undefined return)');
+      // Four Const: one for the hoisted `var x = undefined`
+      // emitted at program entry (Wave 2 hoisting), two for the
+      // literals 1 and 2, and one for the implicit `undefined`
+      // returned at end of program.
+      assertEqual(ops.filter(o => o === OP.CONST).length, 4,
+        'four Const instrs (hoisted undef + two literals + return undef)');
       assert(ops.includes(OP.BIN_OP), 'has BinOp');
     },
   },
@@ -103,10 +106,13 @@ const tests = [
     name: 'buildModule: sourceMap populated',
     fn: () => {
       const m = buildModule('var x = 1;', 'a.js');
-      const firstConst = allInstructions(m).find(i => i.op === OP.CONST);
-      assert(firstConst._id, 'instr has _id');
-      const loc = m.sourceMap.get(firstConst._id);
-      assert(loc, 'location recorded in sourceMap');
+      // The first Const is the hoisted `var x = undefined` emit
+      // which is synthetic and has no source location. Find the
+      // first Const with a source location instead.
+      const consts = allInstructions(m).filter(i => i.op === OP.CONST);
+      const withLoc = consts.find(i => m.sourceMap.get(i._id));
+      assert(withLoc, 'at least one Const has a source location');
+      const loc = m.sourceMap.get(withLoc._id);
       assertEqual(loc.file, 'a.js');
     },
   },
