@@ -191,6 +191,87 @@ const tests = [
     },
   },
 
+  // --- TypeDB return-type resolution (G3) ---
+  //
+  // createElement and getElementById return typed values via
+  // the TypeDB's `returnType` field. Subsequent property access
+  // resolves through the returned type's prop descriptors.
+  {
+    name: 'G3: createElement("iframe") → iframe.src is url sink',
+    fn: async () => {
+      const flows = await flowsFor(
+        'var f = document.createElement("iframe"); f.src = location.hash;'
+      );
+      assertEqual(flows.length, 1);
+      assertEqual(sinkKindOf(flows[0]), 'url');
+      assertEqual(sinkPropOf(flows[0]), 'src');
+    },
+  },
+  {
+    name: 'G3: createElement("script") → script.src is url sink',
+    fn: async () => {
+      const flows = await flowsFor(
+        'var s = document.createElement("script"); s.src = location.hash;'
+      );
+      assertEqual(flows.length, 1);
+      assertEqual(sinkKindOf(flows[0]), 'url');
+    },
+  },
+  {
+    name: 'G3: createElement("a") → anchor.href is url sink',
+    fn: async () => {
+      const flows = await flowsFor(
+        'var a = document.createElement("a"); a.href = location.hash;'
+      );
+      assertEqual(flows.length, 1);
+      assertEqual(sinkKindOf(flows[0]), 'url');
+      assertEqual(sinkPropOf(flows[0]), 'href');
+    },
+  },
+  {
+    name: 'G3: createElement("div") → div.innerHTML is html sink',
+    fn: async () => {
+      const flows = await flowsFor(
+        'var d = document.createElement("div"); d.innerHTML = location.hash;'
+      );
+      assertEqual(flows.length, 1);
+      assertEqual(sinkKindOf(flows[0]), 'html');
+    },
+  },
+  {
+    name: 'G3: getElementById return is typed HTMLElement',
+    fn: async () => {
+      const flows = await flowsFor(
+        'var el = document.getElementById("x"); el.innerHTML = location.hash;'
+      );
+      assertEqual(flows.length, 1);
+      assertEqual(sinkKindOf(flows[0]), 'html');
+    },
+  },
+  {
+    name: 'G3: querySelector return is typed Element',
+    fn: async () => {
+      const flows = await flowsFor(
+        'document.querySelector(".x").innerHTML = location.hash;'
+      );
+      assertEqual(flows.length, 1);
+      assertEqual(sinkKindOf(flows[0]), 'html');
+    },
+  },
+  {
+    name: 'G3: createElement non-sink prop is safe',
+    fn: async () => {
+      const flows = await flowsFor(
+        'var d = document.createElement("div"); d.id = location.hash;'
+      );
+      // HTMLElement.id has no `sink` field in the TypeDB so
+      // assigning to it is not classified as a sink. (Sound:
+      // setting an id from a tainted value is not by itself a
+      // security hole.)
+      assertEqual(flows.length, 0);
+    },
+  },
+
   // --- TaintFlow shape ---
   {
     name: 'TaintFlow records have stable ids',

@@ -729,12 +729,130 @@ function applyCall(ctx, state, instr) {
     );
     if (result) return D.setReg(result.state || state, instr.dest, result.value);
   }
+  // --- TypeDB return-type resolution (G3) ---
+  //
+  // Before falling through to a typeless opaque, see if the
+  // TypeDB can tell us the return type and source/label
+  // semantics of this call. The IR attached `methodName` /
+  // `calleeName` hints at lowering time; we use those to find
+  // the descriptor and then `resolveReturnType` to compute the
+  // return type (handling the dynamic `{ fromArg, map, default }`
+  // form for createElement-style APIs).
+  //
+  // Three flow paths from the receiver and arguments:
+  //
+  //   1. The descriptor has `source: 'X'` — the return value
+  //      itself is a labeled source (e.g. `decodeURIComponent`
+  //      doesn't have this but `crypto.randomUUID` could).
+  //      Raise the matching assumption and tag the return.
+  //
+  //   2. The descriptor has `preservesLabelsFromReceiver: true`
+  //      — the return inherits all labels from the receiver
+  //      (e.g. `String.prototype.slice` preserves taint).
+  //
+  //   3. The descriptor has `preservesLabelsFromArg: N` — the
+  //      return inherits labels from a specific argument
+  //      (e.g. `decodeURIComponent(arg0)` preserves arg0's
+  //      labels).
+  //
+  // The default behaviour (no `preserves*` field) is to NOT
+  // inherit argument or receiver labels. This is the standard
+  // "function call narrows taint" semantics — pure functions
+  // like `parseInt` don't propagate labels even though their
+  // arg is tainted. The TypeDB's `sanitizer: true` flag (handled
+  // in G5) makes this explicit.
+  const tdbResult = resolveCallReturnViaDB(ctx, instr, thisValue, argValues, loc);
+  if (tdbResult) {
+    return D.setReg(state, instr.dest, tdbResult);
+  }
+  // Fallback: truly unresolved callee. This is a soundness gap
+  // until we have interprocedural analysis (Phase C).
   const a = ctx.assumptions.raise(
     REASONS.OPAQUE_CALL,
     'call to unresolved or unanalysed callee',
     loc
   );
   return D.setReg(state, instr.dest, D.opaque([a.id], null, loc));
+}
+
+// --- Resolve a call's return value via the TypeDB ------------------------
+//
+// Returns a Value (the typed return) or null if the callee
+// cannot be resolved. The Value is an Opaque tagged with the
+// return type name and any propagated labels.
+function resolveCallReturnViaDB(ctx, instr, thisValue, argValues, loc) {
+  const db = ctx.typeDB;
+  if (!db) return null;
+
+  // Resolve the descriptor — same logic as the sink classifier.
+  let desc = null;
+  if (instr.methodName && thisValue && thisValue.typeName) {
+    desc = TDB.lookupMethod(db, thisValue.typeName, instr.methodName);
+  } else if (instr.calleeName && db.roots && db.roots[instr.calleeName]) {
+    const rootType = db.roots[instr.calleeName];
+    const typeDesc = db.types[rootType];
+    desc = typeDesc && (typeDesc.call || typeDesc.construct);
+  }
+  if (!desc) return null;
+
+  // Compute the return type. Concrete-string args feed
+  // dynamic `fromArg` mappings so `createElement('iframe')`
+  // returns `HTMLIFrameElement` not the default `HTMLElement`.
+  const argStrings = argValues.map(v => {
+    if (v && v.kind === D.V.CONCRETE && typeof v.value === 'string') return v.value;
+    return null;
+  });
+  const returnType = TDB.resolveReturnType(desc, argStrings);
+
+  // Compute the labels that propagate to the return value.
+  // Default: no propagation (function call narrows taint).
+  // `preservesLabelsFromReceiver: true` inherits the receiver's
+  // labels. `preservesLabelsFromArg: N` inherits arg N's labels.
+  // A descriptor `source: 'X'` adds X to the return labels and
+  // raises the corresponding assumption.
+  let resultLabels = D.EMPTY_LABELS;
+  const chainIds = [];
+  if (desc.preservesLabelsFromReceiver === true && thisValue && thisValue.labels) {
+    if (thisValue.labels.size > 0) resultLabels = thisValue.labels;
+    if (thisValue.assumptionIds) {
+      for (const id of thisValue.assumptionIds) chainIds.push(id);
+    }
+  }
+  if (typeof desc.preservesLabelsFromArg === 'number') {
+    const arg = argValues[desc.preservesLabelsFromArg];
+    if (arg && arg.labels && arg.labels.size > 0) {
+      if (resultLabels.size === 0) {
+        resultLabels = arg.labels;
+      } else {
+        const merged = new Set(resultLabels);
+        for (const l of arg.labels) merged.add(l);
+        resultLabels = Object.freeze(merged);
+      }
+    }
+    if (arg && arg.assumptionIds) {
+      for (const id of arg.assumptionIds) chainIds.push(id);
+    }
+  }
+  if (desc.source) {
+    const reason = sourceLabelToReason(desc.source);
+    const callName = instr.methodName || instr.calleeName || '<call>';
+    const assumption = ctx.assumptions.raise(
+      reason,
+      'call result of `' + callName + '` carries source label `' + desc.source + '`',
+      loc,
+      { chain: chainIds.length > 0 ? chainIds : undefined }
+    );
+    chainIds.push(assumption.id);
+    if (resultLabels.size === 0) {
+      resultLabels = Object.freeze(new Set([desc.source]));
+    } else {
+      const merged = new Set(resultLabels);
+      merged.add(desc.source);
+      resultLabels = Object.freeze(merged);
+    }
+  }
+
+  return D.opaque(chainIds, returnType, loc, resultLabels);
 }
 
 // --- Sink classification for call sites ----------------------------------
