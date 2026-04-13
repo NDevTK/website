@@ -31,10 +31,27 @@ const SMT = require('./smt.js');
 // in a single pass. Back-edge changes still re-enqueue successors
 // via the monotone-growth check, guaranteeing eventual fixpoint
 // termination.
+// Build (or reuse) the function's def map: register → instruction
+// that writes it. SSA gives us the invariant that every register
+// has at most one def, so this is a simple map. Cached on the
+// function so we only build it once.
+function buildDefs(fn) {
+  if (fn._defs) return fn._defs;
+  const defs = new Map();
+  for (const [, block] of fn.cfg.blocks) {
+    for (const instr of block.instructions) {
+      if (instr.dest != null) defs.set(instr.dest, instr);
+    }
+  }
+  fn._defs = defs;
+  return defs;
+}
+
 function analyseFunction(module, fn, initialState, ctx) {
   const cfg = fn.cfg;
   const blockStates = new Map();     // BlockId → in-state (joined across all predecessors)
   const outStates = new Map();       // BlockId → out-state (after transfer)
+  const defs = buildDefs(fn);
 
   // B3: per-block path conditions. Each entry is an SMT formula
   // representing the disjunction of the conditions under which
@@ -216,20 +233,39 @@ function analyseFunction(module, fn, initialState, ctx) {
           // source pathCond unchanged on both sides — which is
           // sound (we just lose precision on this branch).
           const condForm = (cond && cond.formula) ? cond.formula : null;
+          let trueEdge, falseEdge;
           if (condForm) {
-            const trueEdge = blockPathCond
+            trueEdge = blockPathCond
               ? SMT.mkAnd(blockPathCond, condForm)
               : condForm;
             const negCond = SMT.mkNot(condForm);
-            const falseEdge = blockPathCond
+            falseEdge = blockPathCond
               ? SMT.mkAnd(blockPathCond, negCond)
               : negCond;
-            enqueue(term.trueTarget, state, trueEdge);
-            enqueue(term.falseTarget, state, falseEdge);
           } else {
-            enqueue(term.trueTarget, state, blockPathCond);
-            enqueue(term.falseTarget, state, blockPathCond);
+            trueEdge = blockPathCond;
+            falseEdge = blockPathCond;
           }
+
+          // B5: refine the operand registers on each successor.
+          // Look up the def of `term.cond` to see if it's a BinOp
+          // we can refine across (=== / !== / == / !=). If yes,
+          // narrow the operand registers on each successor so a
+          // contradictory branch becomes Bottom (eliminating the
+          // false-positive flow on that side).
+          const trueState = refineForBranch(state, term.cond, defs, true);
+          const falseState = refineForBranch(state, term.cond, defs, false);
+
+          // After refinement, check whether a successor's state
+          // contains a Bottom register that the branch test
+          // depends on — that successor is dead. (We only mark
+          // a successor dead when refinement collapsed the
+          // refined register itself to Bottom, not other regs.)
+          const trueDead = refinementContradicts(state, trueState);
+          const falseDead = refinementContradicts(state, falseState);
+
+          if (!trueDead) enqueue(term.trueTarget, trueState, trueEdge);
+          if (!falseDead) enqueue(term.falseTarget, falseState, falseEdge);
         }
         break;
       }
@@ -271,6 +307,90 @@ function analyseFunction(module, fn, initialState, ctx) {
   if (!exitState) exitState = outStates.get(cfg.exit) || initialState;
 
   return { blockStates, outStates, exitState, pathConds };
+}
+
+// B5: refine the state across a branch edge. If `condReg` is
+// the result of a refinable BinOp (=== / !== / == / !=), narrow
+// the operand registers in the returned state so a contradiction
+// reduces them to Bottom. `taken` distinguishes the true vs
+// false successor.
+//
+// Refinement rules:
+//   x === lit  on true:  x ← refineEq(x, lit)
+//   x === lit  on false: x ← refineNeq(x, lit)
+//   x !== lit  on true:  x ← refineNeq(x, lit)
+//   x !== lit  on false: x ← refineEq(x, lit)
+//
+// "lit" is detected as a Concrete operand whose value type is
+// a primitive (string / number / boolean / null / undefined).
+// "x" is the OTHER operand register. If neither operand is a
+// concrete literal, no refinement is performed.
+//
+// Returns a fresh State (the input is untouched) so the caller
+// can pass refined states to each successor independently.
+function refineForBranch(state, condReg, defs, taken) {
+  const def = defs.get(condReg);
+  if (!def) return state;
+  if (def.op !== OP.BIN_OP) return state;
+  const op = def.operator;
+  const isEq  = (op === '===' || op === '==');
+  const isNeq = (op === '!==' || op === '!=');
+  if (!isEq && !isNeq) return state;
+
+  const lv = D.getReg(state, def.left);
+  const rv = D.getReg(state, def.right);
+  // Find the literal side and the variable side.
+  let varReg = null;
+  let lit = undefined;
+  if (lv && lv.kind === D.V.CONCRETE && isPrimitive(lv.value)) {
+    varReg = def.right;
+    lit = lv.value;
+  } else if (rv && rv.kind === D.V.CONCRETE && isPrimitive(rv.value)) {
+    varReg = def.left;
+    lit = rv.value;
+  } else {
+    return state;
+  }
+
+  const varValue = D.getReg(state, varReg);
+  if (!varValue) return state;
+
+  let refined;
+  if (isEq) {
+    refined = taken ? D.refineEq(varValue, lit) : D.refineNeq(varValue, lit);
+  } else {
+    // isNeq
+    refined = taken ? D.refineNeq(varValue, lit) : D.refineEq(varValue, lit);
+  }
+  if (refined === varValue) return state;
+
+  // setReg returns a new (still frozen) state with the refinement
+  // applied to varReg only.
+  return D.setReg(state, varReg, refined);
+}
+
+// True iff a primitive lattice value is a non-object — these are
+// the only operands B5 refines across (x === "admin", x === 1,
+// x === null, x === undefined, x === true).
+function isPrimitive(v) {
+  if (v === null || v === undefined) return true;
+  const t = typeof v;
+  return t === 'string' || t === 'number' || t === 'boolean';
+}
+
+// True iff `refined` contains a register that's been narrowed
+// to Bottom relative to `original`. We compare the entire reg
+// table for any new Bottom — a single bottom is enough to mark
+// the successor as unreachable.
+function refinementContradicts(original, refined) {
+  if (original === refined) return false;
+  for (const [reg, value] of D.overlayEntries(refined.regs)) {
+    if (value && value.kind === D.V.BOTTOM) {
+      const orig = D.getReg(original, reg);
+      if (!orig || orig.kind !== D.V.BOTTOM) return true;
+    }
+  }
+  return false;
 }
 
 // Compute reverse postorder of CFG blocks starting from the

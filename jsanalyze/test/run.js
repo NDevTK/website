@@ -26,6 +26,7 @@ const testFiles = [
   'smt.test.js',
   'formula.test.js',
   'path-cond.test.js',
+  'refine.test.js',
 ];
 
 async function main() {

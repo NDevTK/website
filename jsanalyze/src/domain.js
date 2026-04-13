@@ -140,6 +140,92 @@ function valueFormula(value) {
   return null;
 }
 
+// --- Branch refinement --------------------------------------------------
+//
+// Given a value and a constraint of the form `value === literal`
+// (or `!==`), return a refined value that's sound on the side
+// of the branch where the constraint holds. This is the Layer
+// 1-2 piece of branch sensitivity: values whose static lattice
+// representation contradicts the test become Bottom, eliminating
+// the false-positive flow.
+//
+// Rules:
+//   refineEq(Concrete c, lit) →
+//     c === lit ? Concrete(c) : Bottom
+//   refineEq(OneOf vs, lit) →
+//     lit ∈ vs ? Concrete(lit) : Bottom
+//   refineEq(Opaque, lit) → Opaque (cannot refine the lattice;
+//     the path-condition formula tracks the constraint instead)
+//   refineEq(Top, lit) → Top
+//   refineEq(Bottom, _) → Bottom
+//
+//   refineNeq(Concrete c, lit) →
+//     c === lit ? Bottom : Concrete(c)
+//   refineNeq(OneOf vs, lit) →
+//     OneOf (vs - {lit}) — collapses to Concrete when one element remains,
+//     Bottom when zero
+//   refineNeq(Opaque, lit) → Opaque (no lattice change)
+//   refineNeq(Top, lit) → Top
+//
+// Refinement preserves labels, formulas, and provenance — only the
+// shape narrows.
+function refineEq(value, literal) {
+  if (!value) return value;
+  if (value.kind === V.BOTTOM) return value;
+  if (value.kind === V.CONCRETE) {
+    return strictEq(value.value, literal) ? value : bottom();
+  }
+  if (value.kind === V.ONE_OF) {
+    for (const v of value.values) {
+      if (strictEq(v, literal)) {
+        // Build a concrete with the same labels/provenance/formula.
+        const c = concrete(literal, value.typeName, value.provenance, value.labels);
+        return value.formula ? withFormula(c, value.formula) : c;
+      }
+    }
+    return bottom();
+  }
+  // Opaque / Top / Object / Closure / Interval / StrPattern: leave alone.
+  // The path condition (B3) carries the equality constraint at the
+  // formula level for the SMT layer to consume.
+  return value;
+}
+
+function refineNeq(value, literal) {
+  if (!value) return value;
+  if (value.kind === V.BOTTOM) return value;
+  if (value.kind === V.CONCRETE) {
+    return strictEq(value.value, literal) ? bottom() : value;
+  }
+  if (value.kind === V.ONE_OF) {
+    const remaining = [];
+    for (const v of value.values) {
+      if (!strictEq(v, literal)) remaining.push(v);
+    }
+    if (remaining.length === 0) return bottom();
+    if (remaining.length === 1) {
+      const c = concrete(remaining[0], value.typeName, value.provenance, value.labels);
+      return value.formula ? withFormula(c, value.formula) : c;
+    }
+    const o = oneOf(remaining, value.typeName, value.provenance, value.labels);
+    return value.formula ? withFormula(o, value.formula) : o;
+  }
+  return value;
+}
+
+// JavaScript strict equality on lattice-extracted primitive
+// values. Mirrors `===` semantics including NaN inequality.
+function strictEq(a, b) {
+  if (a === null && b === null) return true;
+  if (a === undefined && b === undefined) return true;
+  if (typeof a !== typeof b) return false;
+  if (typeof a === 'number') {
+    if (Number.isNaN(a) || Number.isNaN(b)) return false;
+    return a === b;
+  }
+  return a === b;
+}
+
 function bottom() {
   return Object.freeze({ kind: V.BOTTOM, labels: EMPTY_LABELS });
 }
@@ -739,6 +825,7 @@ module.exports = {
   join, leq, equals, truthiness,
   withLabels, unionLabels, freezeLabels, EMPTY_LABELS,
   withFormula, valueFormula,
+  refineEq, refineNeq,
   createState, setReg, getReg, joinStates, stateLeq, stateEquals,
   unfreezeState, freezeState,
   overlayGet, overlayHas, overlayEntries, overlaySize, overlayFlatten,
