@@ -75,6 +75,13 @@ async function analyze(input, options) {
       typeDB: options.typeDB || null,
       nextObjId: 0,
       onCall: null,
+      // Taint flows emitted by sink classification in
+      // transfer.js. The trace projection below copies these
+      // into trace.taintFlows after the walk completes.
+      taintFlows: [],
+      // Flow id counter — assigned at emission time so flows
+      // have stable identity within a trace.
+      nextFlowId: 1,
     };
 
     const initialState = D.createState();
@@ -126,6 +133,13 @@ async function analyze(input, options) {
           trace.reachability.set(loc, reached ? 'reachable' : 'unreachable');
         }
       }
+    }
+
+    // Copy taint flows emitted during the walk into the trace.
+    // Each flow already has its source labels, sink info,
+    // assumption ids, and location attached.
+    for (const flow of ctx.taintFlows) {
+      trace.taintFlows.push(flow);
     }
   }
 

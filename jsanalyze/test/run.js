@@ -22,6 +22,7 @@ const testFiles = [
   'no-caps.test.js',
   'typedb.test.js',
   'source-classification.test.js',
+  'sink-classification.test.js',
 ];
 
 async function main() {

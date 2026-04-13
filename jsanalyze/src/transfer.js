@@ -62,6 +62,58 @@ function sourceLabelToReason(label) {
   }
 }
 
+// --- TaintFlow emission ---------------------------------------------------
+//
+// When a transfer function detects a tainted value reaching a
+// sink, it calls `emitTaintFlow` to record the flow into
+// `ctx.taintFlows`. The flow carries:
+//
+//   - A unique id (assigned from ctx.nextFlowId).
+//   - The source labels carried by the tainted value, each
+//     paired with a best-effort location. Label locations come
+//     from the value's `provenance` field; if absent, the sink
+//     location is used as a fallback.
+//   - The sink kind, prop name, severity, and location.
+//   - The list of assumption ids the value accumulated on its
+//     path from source to sink. Consumers use this to audit the
+//     trust floor for each finding.
+//
+// The current implementation does NOT yet record path
+// conditions or SMT formulas — those land when path-sensitive
+// analysis is wired up. The fields are left empty arrays so the
+// Trace schema stays stable.
+function emitTaintFlow(ctx, sinkInfo, sinkLoc, value) {
+  if (!ctx.taintFlows) return;
+  if (!value || !value.labels || value.labels.size === 0) return;
+  // Extract sources from the value's labels. Each label gets a
+  // location from the value's provenance (the deepest provenance
+  // entry is the most recent — use it as the source location).
+  const prov = (value.provenance && value.provenance.length > 0)
+    ? value.provenance
+    : [sinkLoc];
+  const sources = [];
+  for (const label of value.labels) {
+    sources.push({
+      label,
+      location: prov[prov.length - 1] || sinkLoc,
+    });
+  }
+  const flow = {
+    id: ctx.nextFlowId++,
+    source: sources,
+    sink: {
+      kind: sinkInfo.type,
+      prop: sinkInfo.prop,
+      location: sinkLoc,
+    },
+    severity: sinkInfo.severity,
+    pathConditions: [],  // populated when path-sensitive analysis lands
+    pathFormulas: [],    // populated when SMT integration lands
+    assumptionIds: value.assumptionIds ? value.assumptionIds.slice() : [],
+  };
+  ctx.taintFlows.push(flow);
+}
+
 // Look up the source location for an instruction, falling back to
 // a safe placeholder if the source map doesn't have an entry (tests
 // and synthetic instructions may lack locations). AssumptionTracker
@@ -470,6 +522,11 @@ function applySetProp(ctx, state, instr) {
   const loc = instrLoc(ctx, instr);
   const obj = D.getReg(state, instr.object);
   const val = D.getReg(state, instr.value);
+  // Sink classification: before writing, check whether this
+  // property on the receiver type is a known sink and whether
+  // the value we're writing carries any taint labels. A match
+  // emits a TaintFlow record.
+  maybeEmitSinkFlowForWrite(ctx, obj, instr.propName, val, loc);
   if (obj && obj.kind === D.V.OBJECT) {
     return writeHeapField(state, obj.objId, instr.propName, val);
   }
@@ -485,6 +542,22 @@ function applySetProp(ctx, state, instr) {
     return state;
   }
   return state;
+}
+
+// --- Sink classification helpers -----------------------------------------
+//
+// Called by applySetProp and applySetIndex to detect
+// tainted-value-reaches-sink patterns. Does nothing if:
+//   - The receiver has no TypeDB type (we don't know what it is).
+//   - The property isn't a sink on the receiver's type chain.
+//   - The value has no taint labels.
+// Otherwise emits a TaintFlow via emitTaintFlow.
+function maybeEmitSinkFlowForWrite(ctx, obj, propName, val, loc) {
+  if (!ctx.typeDB || !obj || !obj.typeName) return;
+  if (!val || !val.labels || val.labels.size === 0) return;
+  const sinkInfo = TDB.classifySinkByTypeViaDB(ctx.typeDB, obj.typeName, propName);
+  if (!sinkInfo) return;
+  emitTaintFlow(ctx, sinkInfo, loc, val);
 }
 
 function applySetIndex(ctx, state, instr) {
@@ -583,25 +656,31 @@ function applyFunc(ctx, state, instr) {
 function applyCall(ctx, state, instr) {
   const loc = instrLoc(ctx, instr);
   const callee = D.getReg(state, instr.callee);
-  // In this minimal slice we don't actually walk the callee's body.
-  // The worklist engine does that; this transfer function records
-  // that the call happened and returns an opaque result for the
-  // callee's return value unless it's a known pure builtin.
+  const argValues = instr.args.map(r => D.getReg(state, r));
+  const thisValue = instr.thisArg ? D.getReg(state, instr.thisArg) : null;
+
+  // --- Sink classification for the call site ---
   //
-  // The correct implementation invokes the worklist recursively
-  // with the callee's CFG and propagates the summary back. That's
-  // wired up in worklist.js when `onCall` is set; if not set, we
-  // return opaque.
+  // Before dispatching to the callee (whether via onCall hook
+  // or falling through to opaque), check whether this call is
+  // a known sink and whether any argument carries taint. The
+  // IR attached two syntactic hints at lowering time:
+  //
+  //   instr.methodName — for `obj.method(args)` calls
+  //   instr.calleeName — for bare-identifier `fn(args)` calls
+  //
+  // `maybeEmitSinkFlowForCall` uses those hints plus the
+  // TypeDB to resolve the sink and emit flows for any
+  // tainted arguments.
+  maybeEmitSinkFlowForCall(ctx, instr, thisValue, argValues, loc);
+
   if (ctx.onCall) {
     // If the consumer's onCall hook throws, the exception
     // propagates — it is a visible consumer bug, not a silent
     // precision issue. Analyses that want fault tolerance
     // should handle errors inside their own hook.
     const result = ctx.onCall(
-      callee,
-      instr.args.map(r => D.getReg(state, r)),
-      instr.thisArg ? D.getReg(state, instr.thisArg) : null,
-      state, loc, instr
+      callee, argValues, thisValue, state, loc, instr
     );
     if (result) return D.setReg(result.state || state, instr.dest, result.value);
   }
@@ -611,6 +690,81 @@ function applyCall(ctx, state, instr) {
     loc
   );
   return D.setReg(state, instr.dest, D.opaque([a.id], null, loc));
+}
+
+// --- Sink classification for call sites ----------------------------------
+//
+// Resolve a call to a TypeDB sink descriptor using the IR's
+// `methodName` / `calleeName` hints, then emit a TaintFlow for
+// each argument whose sink position carries taint.
+//
+// Two paths:
+//
+//   1. `obj.method(args)` — `instr.methodName` is set and
+//      `thisValue.typeName` names the receiver type. Look up
+//      the method on that type. The method descriptor may
+//      declare a call-level `sink` (e.g. `document.write` is
+//      an html sink on all args) or per-arg sinks (e.g.
+//      `setAttribute(name, value)` is a conditional sink
+//      based on the name arg — not yet implemented here).
+//
+//   2. `fn(args)` — `instr.calleeName` is set and names a
+//      global. Resolve through `db.roots[calleeName]` then
+//      check `.call.sink` / `.call.args[i].sink` on the
+//      resulting type (e.g. `eval(x)` → `GlobalEval.call`).
+//
+// Taint is checked per argument: an argument carrying labels
+// reaching a sink position produces one TaintFlow. A single
+// call can emit multiple flows if multiple arguments are
+// tainted.
+function maybeEmitSinkFlowForCall(ctx, instr, thisValue, argValues, loc) {
+  const db = ctx.typeDB;
+  if (!db) return;
+
+  // Resolve the method / call descriptor.
+  let desc = null;
+  let sinkProp = null;
+  if (instr.methodName && thisValue && thisValue.typeName) {
+    desc = TDB.lookupMethod(db, thisValue.typeName, instr.methodName);
+    sinkProp = instr.methodName;
+  } else if (instr.calleeName && db.roots && db.roots[instr.calleeName]) {
+    const rootType = db.roots[instr.calleeName];
+    const typeDesc = db.types[rootType];
+    desc = typeDesc && (typeDesc.call || typeDesc.construct);
+    sinkProp = instr.calleeName;
+  }
+  if (!desc) return;
+
+  // Method-level / call-level sink: every argument contributes
+  // to the sink. Report once per tainted argument.
+  if (desc.sink) {
+    const severity = desc.severity || TDB.defaultSinkSeverity(desc.sink);
+    if (severity !== 'safe') {
+      const sinkInfo = { type: desc.sink, severity, prop: sinkProp };
+      for (const arg of argValues) {
+        if (arg && arg.labels && arg.labels.size > 0) {
+          emitTaintFlow(ctx, sinkInfo, loc, arg);
+        }
+      }
+    }
+  }
+  // Per-argument sinks: check each descriptor's `args[i].sink`.
+  if (desc.args && Array.isArray(desc.args)) {
+    for (let i = 0; i < desc.args.length && i < argValues.length; i++) {
+      const argDesc = desc.args[i];
+      if (!argDesc || !argDesc.sink) continue;
+      const severity = argDesc.severity || TDB.defaultSinkSeverity(argDesc.sink);
+      if (severity === 'safe') continue;
+      const arg = argValues[i];
+      if (!arg || !arg.labels || arg.labels.size === 0) continue;
+      const sinkInfo = {
+        type: argDesc.sink,
+        severity,
+        prop: sinkProp + '.arg' + i,
+      };
+      emitTaintFlow(ctx, sinkInfo, loc, arg);
+    }
+  }
 }
 
 function applyNew(ctx, state, instr) {

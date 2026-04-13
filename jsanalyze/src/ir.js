@@ -706,6 +706,24 @@ function lowerExpressionIter(ctx, root) {
           callee: calleeReg,
           args: argRegs,
           thisArg: thisReg,
+          // Syntactic hints for sink classification:
+          //
+          //   methodName — when lowered from `obj.method(args)`,
+          //     names the method so the transfer function can
+          //     look up `thisType.methods[methodName].sink`
+          //     without re-walking the IR.
+          //
+          //   calleeName — when lowered from a bare-identifier
+          //     call like `eval(x)`, names the global so the
+          //     transfer function can resolve it through
+          //     `db.roots[calleeName]` and then check
+          //     `.call.sink` on the resulting type.
+          //
+          // These are optional and only used for classification;
+          // the call's runtime semantics still go through the
+          // callee register's Value as before.
+          methodName: task.methodName || null,
+          calleeName: task.calleeName || null,
         }, task.loc);
         results.push(dest);
         break;
@@ -774,6 +792,39 @@ function lowerExpressionIter(ctx, root) {
         }, task.loc);
         updateName(ctx.scope, task.name, dest);
         results.push(dest);
+        break;
+      }
+      case 'emit_set_prop': {
+        // `obj.prop = val` → tasks pushed: visit obj, visit val
+        // (in that order). When emit_set_prop runs, results holds
+        // [..., objReg, valReg]. Pop val, pop obj, emit SET_PROP.
+        // The expression's value is the RHS (JS semantics:
+        // assignment expressions evaluate to the assigned value),
+        // so we re-push the val register as the result.
+        const valReg = results.pop();
+        const objReg = results.pop();
+        emit(ctx.module, ctx.currentBlock, {
+          op: OP.SET_PROP,
+          object: objReg,
+          propName: task.propName,
+          value: valReg,
+        }, task.loc);
+        results.push(valReg);
+        break;
+      }
+      case 'emit_set_index': {
+        // `obj[key] = val` → tasks pushed: visit obj, visit key,
+        // visit val. Results: [..., objReg, keyReg, valReg].
+        const valReg = results.pop();
+        const keyReg = results.pop();
+        const objReg = results.pop();
+        emit(ctx.module, ctx.currentBlock, {
+          op: OP.SET_INDEX,
+          object: objReg,
+          key: keyReg,
+          value: valReg,
+        }, task.loc);
+        results.push(valReg);
         break;
       }
       default:
@@ -854,23 +905,52 @@ function visitNode(ctx, node, tasks, results) {
       return;
     }
     case 'AssignmentExpression': {
-      if (node.left.type !== 'Identifier') {
-        const dest = lowerUnimplementedExpr(ctx, node, loc);
-        results.push(dest);
+      // Identifier target: plain var reassignment. The value is
+      // bound to the identifier's SSA register and also returned
+      // as the expression's result.
+      if (node.left.type === 'Identifier') {
+        if (node.operator === '=') {
+          tasks.push({ kind: 'emit_assign', name: node.left.name, loc });
+          tasks.push({ kind: 'visit', node: node.right });
+        } else {
+          tasks.push({
+            kind: 'emit_assign_compound',
+            name: node.left.name,
+            operator: node.operator.slice(0, -1),
+            loc,
+          });
+          tasks.push({ kind: 'visit', node: node.right });
+        }
         return;
       }
-      if (node.operator === '=') {
-        tasks.push({ kind: 'emit_assign', name: node.left.name, loc });
-        tasks.push({ kind: 'visit', node: node.right });
-      } else {
-        tasks.push({
-          kind: 'emit_assign_compound',
-          name: node.left.name,
-          operator: node.operator.slice(0, -1),
-          loc,
-        });
-        tasks.push({ kind: 'visit', node: node.right });
+      // Member target: `obj.prop = val` or `obj[key] = val`.
+      // We only support `=` here; compound member assignments
+      // fall to the unimplemented path for now.
+      if (node.left.type === 'MemberExpression' && node.operator === '=') {
+        if (node.left.computed) {
+          // obj[key] = val → visit obj, visit key, visit val,
+          // then emit_set_index pops all three.
+          tasks.push({ kind: 'emit_set_index', loc });
+          tasks.push({ kind: 'visit', node: node.right });
+          tasks.push({ kind: 'visit', node: node.left.property });
+          tasks.push({ kind: 'visit', node: node.left.object });
+        } else {
+          // obj.prop = val → visit obj, visit val, emit_set_prop
+          // captures the prop name from the AST.
+          tasks.push({
+            kind: 'emit_set_prop',
+            propName: node.left.property.name,
+            loc,
+          });
+          tasks.push({ kind: 'visit', node: node.right });
+          tasks.push({ kind: 'visit', node: node.left.object });
+        }
+        return;
       }
+      // Anything else (destructuring targets, compound member
+      // assignment, ...) is currently unimplemented.
+      const dest = lowerUnimplementedExpr(ctx, node, loc);
+      results.push(dest);
       return;
     }
     case 'CallExpression': {
@@ -882,7 +962,12 @@ function visitNode(ctx, node, tasks, results) {
         //   peek this, GetProp → callee register; keep this
         //   visit each arg
         //   emit_call with hasThis=true
-        tasks.push({ kind: 'emit_call', nArgs, hasThis: true, loc });
+        // Thread the method name through so the CALL
+        // instruction carries it for sink classification.
+        const methodName = !node.callee.computed && node.callee.property
+          ? node.callee.property.name
+          : null;
+        tasks.push({ kind: 'emit_call', nArgs, hasThis: true, loc, methodName });
         for (let i = nArgs - 1; i >= 0; i--) {
           tasks.push({ kind: 'visit', node: node.arguments[i] });
         }
@@ -905,7 +990,13 @@ function visitNode(ctx, node, tasks, results) {
         tasks.push({ kind: 'visit', node: node.callee.object });
       } else {
         // plain call — visit callee, visit args, emit_call.
-        tasks.push({ kind: 'emit_call', nArgs, hasThis: false, loc });
+        // For a bare-identifier callee we capture the name so
+        // sink classification can resolve the global through
+        // the TypeDB (e.g. `eval(x)` → GlobalEval.call.sink).
+        const calleeName = node.callee.type === 'Identifier'
+          ? node.callee.name
+          : null;
+        tasks.push({ kind: 'emit_call', nArgs, hasThis: false, loc, calleeName });
         for (let i = nArgs - 1; i >= 0; i--) {
           tasks.push({ kind: 'visit', node: node.arguments[i] });
         }
