@@ -20,8 +20,42 @@ const V = Object.freeze({
   OBJECT:      'object',      // heap object reference
   CLOSURE:     'closure',     // function closure
   OPAQUE:      'opaque',      // unknown; records an assumption chain
+  DISJUNCT:    'disjunct',    // disjunction of incompatible-shape variants
   TOP:         'top',         // ⊤ — any value
 });
+
+// --- DISJUNCT (per-path type / shape tracking) --------------------------
+//
+// A Disjunct value represents the union of several "shape variants"
+// that cannot be cleanly merged into a single non-Top abstraction.
+// The motivating case: a register that holds an HTMLAnchorElement
+// on one path and an HTMLIFrameElement on another. Without
+// disjuncts, the join would collapse both to Opaque(typeName=null)
+// and downstream `el.href = ...` / `el.src = ...` sink lookups
+// would fail because they need a concrete typeName to consult
+// the TypeDB.
+//
+// A Disjunct's variants are themselves regular Values — each carries
+// its own kind, typeName, value/values, formula, labels, and
+// provenance. The Disjunct is essentially a tagged union; its
+// own labels field is the union of all variant labels (so taint
+// flows still work without iterating every variant).
+//
+// Operations on Disjuncts fan out: `applyGetProp` resolves the
+// property on each variant and rebuilds a Disjunct of the
+// per-variant results. `refineByType` filters variants whose
+// type doesn't match. Sink classification iterates every variant
+// (different element types may have different sinks under the
+// same property name).
+//
+// Variants are normalized at construction time: nested Disjuncts
+// are flattened, duplicate variants (by structural key) are
+// deduped, and a single-variant Disjunct collapses back to that
+// variant. A Disjunct never contains a Bottom variant — those
+// are filtered.
+//
+// The lattice ordering is "subset of variants": leq(a, b) if every
+// variant in a has a corresponding variant in b that's >= it.
 
 // --- Value constructors -------------------------------------------------
 //
@@ -84,6 +118,15 @@ function withLabels(value, labels) {
   const existing = value.labels || EMPTY_LABELS;
   const incoming = labels instanceof Set ? labels : new Set(labels || []);
   if (incoming.size === 0) return value;
+  // Disjuncts: propagate the labels into every variant so each
+  // variant carries its share of the taint and downstream
+  // operations on the disjunct see the full label set.
+  if (value.kind === V.DISJUNCT) {
+    const newVariants = value.variants.map(v => withLabels(v, incoming));
+    // Rebuild via factory to refresh the disjunct envelope's
+    // label set (factory recomputes it as the union).
+    return disjunct(newVariants, value.provenance);
+  }
   // Union in place is cheaper than rebuilding the set, but the
   // result must stay frozen. Allocate fresh.
   const out = new Set(existing);
@@ -120,9 +163,18 @@ function cloneWithLabels(value, labels) {
 //
 // `withFormula(v, f)` returns a new frozen Value with the
 // formula attached. The Value's lattice kind is preserved.
+//
+// For Disjuncts, the formula is attached to every variant so
+// each variant has the same SMT representation. (A future
+// refinement may keep per-variant formulas — for now the call
+// site has no way to distinguish them.)
 function withFormula(value, formula) {
   if (!value || value.kind === V.BOTTOM) return value;
   if (!formula) return value;
+  if (value.kind === V.DISJUNCT) {
+    const newVariants = value.variants.map(v => withFormula(v, formula));
+    return disjunct(newVariants, value.provenance);
+  }
   const base = Object.assign({}, value);
   base.formula = formula;
   return Object.freeze(base);
@@ -172,6 +224,14 @@ function valueFormula(value) {
 function refineEq(value, literal) {
   if (!value) return value;
   if (value.kind === V.BOTTOM) return value;
+  // Disjunct: refine every variant independently and recombine.
+  // A variant that contradicts the equality becomes Bottom and
+  // is dropped by the disjunct factory — this is how per-path
+  // type refinement works for mixed-type values like
+  // `x = cond ? "admin" : 42`.
+  if (value.kind === V.DISJUNCT) {
+    return disjunctMap(value, (v) => refineEq(v, literal));
+  }
   if (value.kind === V.CONCRETE) {
     return strictEq(value.value, literal) ? value : bottom();
   }
@@ -194,6 +254,9 @@ function refineEq(value, literal) {
 function refineNeq(value, literal) {
   if (!value) return value;
   if (value.kind === V.BOTTOM) return value;
+  if (value.kind === V.DISJUNCT) {
+    return disjunctMap(value, (v) => refineNeq(v, literal));
+  }
   if (value.kind === V.CONCRETE) {
     return strictEq(value.value, literal) ? bottom() : value;
   }
@@ -325,6 +388,130 @@ function opaque(assumptionIds, typeName, provenance, labels) {
   });
 }
 
+// Disjunct factory. Variants must be Values. The factory:
+//   * flattens any nested Disjuncts (a disjunct of disjuncts is a
+//     flat disjunct).
+//   * filters out Bottom variants (Bottom contributes nothing).
+//   * dedupes by `variantKey` (structural key over kind+typeName+
+//     value/values/objId/assumptionIds — captures the shape that
+//     matters for downstream operations).
+//   * collapses single-variant disjuncts back to that variant.
+//   * absorbs Top: a disjunct containing Top IS Top.
+//
+// The result's `labels` is the union of all variant labels — this
+// keeps taint-propagation correct without having to walk variants
+// at every label union site.
+//
+// `provenance` is the union of all variant provenance entries.
+function disjunct(variants, provenance) {
+  // Flatten + filter Bottom.
+  const flat = [];
+  for (const v of variants) {
+    if (!v) continue;
+    if (v.kind === V.BOTTOM) continue;
+    if (v.kind === V.TOP) {
+      // Absorbing element.
+      const labelsAcc = new Set();
+      for (const w of variants) {
+        if (w && w.labels) for (const l of w.labels) labelsAcc.add(l);
+      }
+      return top(provenance || (v.provenance || []),
+        labelsAcc.size > 0 ? Object.freeze(labelsAcc) : EMPTY_LABELS);
+    }
+    if (v.kind === V.DISJUNCT) {
+      for (const inner of v.variants) flat.push(inner);
+    } else {
+      flat.push(v);
+    }
+  }
+  if (flat.length === 0) return bottom();
+
+  // Dedupe.
+  const seen = new Map();
+  const unique = [];
+  for (const v of flat) {
+    const k = variantKey(v);
+    if (!seen.has(k)) {
+      seen.set(k, true);
+      unique.push(v);
+    }
+  }
+
+  if (unique.length === 1) return unique[0];
+
+  // Compute the union of variant labels for the disjunct envelope.
+  let unionLabelsSet = null;
+  for (const v of unique) {
+    if (v.labels && v.labels.size > 0) {
+      if (!unionLabelsSet) unionLabelsSet = new Set(v.labels);
+      else for (const l of v.labels) unionLabelsSet.add(l);
+    }
+  }
+  const labelsOut = unionLabelsSet ? Object.freeze(unionLabelsSet) : EMPTY_LABELS;
+
+  // Provenance: union of variant provenance.
+  let provOut;
+  if (provenance) {
+    provOut = freezeProvenance(provenance);
+  } else {
+    const allProv = [];
+    for (const v of unique) {
+      if (v.provenance) for (const p of v.provenance) allProv.push(p);
+    }
+    provOut = Object.freeze(allProv);
+  }
+
+  // Sort variants by key for canonical form (helps stateEquals).
+  unique.sort((a, b) => {
+    const ka = variantKey(a);
+    const kb = variantKey(b);
+    return ka < kb ? -1 : ka > kb ? 1 : 0;
+  });
+
+  return Object.freeze({
+    kind: V.DISJUNCT,
+    variants: Object.freeze(unique),
+    typeName: null,        // Disjuncts don't have a single typeName
+    provenance: provOut,
+    labels: labelsOut,
+  });
+}
+
+// Structural key for a Value variant. Two variants with the same
+// key are considered duplicates within a Disjunct. We include the
+// minimal fields that affect downstream operations (kind, typeName,
+// concrete value, OneOf values, ObjectRef objId, assumption chain).
+// Provenance and exact label set are NOT included — variants that
+// differ only in where they came from are merged.
+function variantKey(v) {
+  if (!v) return 'null';
+  switch (v.kind) {
+    case V.BOTTOM:    return 'B';
+    case V.TOP:       return 'T';
+    case V.CONCRETE:  return 'C:' + canonKey(v.value) + ':' + (v.typeName || '');
+    case V.ONE_OF: {
+      const ks = [];
+      for (const x of v.values) ks.push(canonKey(x));
+      return 'O:[' + ks.join(',') + ']:' + (v.typeName || '');
+    }
+    case V.INTERVAL:    return 'I:' + v.lo + ',' + v.hi;
+    case V.STR_PATTERN: return 'P:' + JSON.stringify(v.pattern);
+    case V.OBJECT:      return 'R:' + v.objId + ':' + (v.typeName || '');
+    case V.CLOSURE:     return 'F:' + v.functionId;
+    case V.OPAQUE:
+      // Include the assumption chain because two opaque results
+      // from different sources should remain distinct.
+      return 'X:' + (v.typeName || '') + ':[' + (v.assumptionIds || []).join(',') + ']';
+    case V.DISJUNCT: {
+      const ks = [];
+      for (const x of v.variants) ks.push(variantKey(x));
+      ks.sort();
+      return 'D:[' + ks.join('|') + ']';
+    }
+    default: return '?:' + v.kind;
+  }
+}
+
 // --- Helpers ------------------------------------------------------------
 
 function inferTypeName(value) {
@@ -368,19 +555,42 @@ function join(a, b) {
   if (a.kind === V.TOP || b.kind === V.TOP) {
     return top(mergeProvenance(a, b), mergedLabels);
   }
-  // Opaque propagates: joining opaque with anything yields opaque
-  // carrying the union of assumption chains. This preserves the
-  // audit trail: a consumer can ask "why did this value become
-  // unknown" and trace back through both branches.
-  if (a.kind === V.OPAQUE || b.kind === V.OPAQUE) {
-    const aIds = a.kind === V.OPAQUE ? a.assumptionIds : [];
-    const bIds = b.kind === V.OPAQUE ? b.assumptionIds : [];
+
+  // --- Disjunct fan-out ---
+  //
+  // If either side is already a Disjunct, fan the other side out
+  // across the variants. The result is the union of variants
+  // (possibly merging with existing variants of the same shape).
+  if (a.kind === V.DISJUNCT || b.kind === V.DISJUNCT) {
+    const aVariants = a.kind === V.DISJUNCT ? a.variants : [a];
+    const bVariants = b.kind === V.DISJUNCT ? b.variants : [b];
+    return disjunct(aVariants.concat(bVariants), mergeProvenance(a, b));
+  }
+
+  // Opaque + Opaque: if same typeName, merge into a single Opaque.
+  // If different typeNames AND both are non-null, build a Disjunct
+  // — this is the per-path type tracking the user asked for. The
+  // motivating case: `el = cond ? createElement('a') : createElement('iframe')`
+  // joins HTMLAnchorElement and HTMLIFrameElement opaques, and
+  // downstream `el.src = ...` / `el.href = ...` sink lookups need
+  // to see BOTH types so the right sink fires.
+  if (a.kind === V.OPAQUE && b.kind === V.OPAQUE) {
+    const aIds = a.assumptionIds;
+    const bIds = b.assumptionIds;
+    if (a.typeName && b.typeName && a.typeName !== b.typeName) {
+      return disjunct([a, b], mergeProvenance(a, b));
+    }
     const seen = new Set(aIds);
     const ids = aIds.slice();
     for (const i of bIds) if (!seen.has(i)) { seen.add(i); ids.push(i); }
-    const tn = (a.typeName && b.typeName && a.typeName === b.typeName)
-      ? a.typeName : null;
+    const tn = a.typeName || b.typeName || null;
     return opaque(ids, tn, mergeProvenance(a, b), mergedLabels);
+  }
+  // Mixed Opaque + non-Opaque: this is also a per-path-type
+  // situation if the non-Opaque side has a known shape. Wrap as
+  // a Disjunct rather than collapsing the type information.
+  if (a.kind === V.OPAQUE || b.kind === V.OPAQUE) {
+    return disjunct([a, b], mergeProvenance(a, b));
   }
   // Same kind, same value → return as is (but propagate labels if
   // they differ).
@@ -388,19 +598,34 @@ function join(a, b) {
     if (mergedLabels === (a.labels || EMPTY_LABELS)) return a;
     return concrete(a.value, a.typeName, mergeProvenance(a, b), mergedLabels);
   }
-  // Concrete + concrete with different values → oneOf.
+  // Concrete + concrete with different values → if same JS type,
+  // a OneOf is precise; if different JS types, a Disjunct preserves
+  // per-path type info (the SMT layer can use the variant whose
+  // formula matches the path it's reasoning about).
   if (a.kind === V.CONCRETE && b.kind === V.CONCRETE) {
-    return oneOf([a.value, b.value], null, mergeProvenance(a, b), mergedLabels);
+    if (typeof a.value === typeof b.value) {
+      return oneOf([a.value, b.value], a.typeName, mergeProvenance(a, b), mergedLabels);
+    }
+    return disjunct([a, b], mergeProvenance(a, b));
   }
-  // Concrete + oneOf → extended oneOf (if compatible).
+  // Concrete + oneOf → extended oneOf if same type, else Disjunct.
   if (a.kind === V.ONE_OF && b.kind === V.CONCRETE) {
-    return oneOf(a.values.concat([b.value]), a.typeName, mergeProvenance(a, b), mergedLabels);
+    if (a.typeName && a.typeName === b.typeName) {
+      return oneOf(a.values.concat([b.value]), a.typeName, mergeProvenance(a, b), mergedLabels);
+    }
+    return disjunct([a, b], mergeProvenance(a, b));
   }
   if (a.kind === V.CONCRETE && b.kind === V.ONE_OF) {
-    return oneOf(b.values.concat([a.value]), b.typeName, mergeProvenance(a, b), mergedLabels);
+    if (b.typeName && a.typeName === b.typeName) {
+      return oneOf(b.values.concat([a.value]), b.typeName, mergeProvenance(a, b), mergedLabels);
+    }
+    return disjunct([a, b], mergeProvenance(a, b));
   }
   if (a.kind === V.ONE_OF && b.kind === V.ONE_OF) {
-    return oneOf(a.values.concat(b.values), null, mergeProvenance(a, b), mergedLabels);
+    if (a.typeName && a.typeName === b.typeName) {
+      return oneOf(a.values.concat(b.values), a.typeName, mergeProvenance(a, b), mergedLabels);
+    }
+    return disjunct([a, b], mergeProvenance(a, b));
   }
   // Interval merges.
   if (a.kind === V.INTERVAL && b.kind === V.INTERVAL) {
@@ -412,24 +637,29 @@ function join(a, b) {
   if (b.kind === V.CONCRETE && typeof b.value === 'number' && a.kind === V.INTERVAL) {
     return interval(Math.min(b.value, a.lo), Math.max(b.value, a.hi), mergeProvenance(a, b), mergedLabels);
   }
-  // Object refs — same id means alias, different means the join has to
-  // widen to Top (or a "one-of object" if we add that shape later).
+  // Object refs — same id means alias, different means we keep
+  // both as a Disjunct so per-path heap-cell lookups still work.
   if (a.kind === V.OBJECT && b.kind === V.OBJECT) {
     if (a.objId === b.objId) {
       if (mergedLabels === (a.labels || EMPTY_LABELS)) return a;
       return objectRef(a.objId, a.typeName, mergeProvenance(a, b), mergedLabels);
     }
-    return top(mergeProvenance(a, b), mergedLabels);
+    return disjunct([a, b], mergeProvenance(a, b));
   }
-  // Same closure → same.
-  if (a.kind === V.CLOSURE && b.kind === V.CLOSURE && a.functionId === b.functionId) {
-    if (mergedLabels === (a.labels || EMPTY_LABELS)) return a;
-    return closure(a.functionId, a.captures, mergeProvenance(a, b), mergedLabels);
+  // Same closure → same; different closures → Disjunct so call
+  // resolution can fan out to both function bodies.
+  if (a.kind === V.CLOSURE && b.kind === V.CLOSURE) {
+    if (a.functionId === b.functionId) {
+      if (mergedLabels === (a.labels || EMPTY_LABELS)) return a;
+      return closure(a.functionId, a.captures, mergeProvenance(a, b), mergedLabels);
+    }
+    return disjunct([a, b], mergeProvenance(a, b));
   }
-  // Everything else → Top (conservative). This is where a more
-  // sophisticated implementation would introduce a disjunctive
-  // shape; for the minimal subset, Top is sound.
-  return top(mergeProvenance(a, b), mergedLabels);
+  // Anything else with mixed shapes (e.g. Concrete + Object,
+  // Closure + Concrete, StrPattern + Number) — keep them
+  // disjunctively so per-path type-aware operations remain
+  // precise. The Disjunct factory will normalize.
+  return disjunct([a, b], mergeProvenance(a, b));
 }
 
 function leq(a, b) {
@@ -437,6 +667,17 @@ function leq(a, b) {
   if (!b || b.kind === V.BOTTOM) return a.kind === V.BOTTOM;
   if (b.kind === V.TOP) return true;
   if (a.kind === V.TOP) return false;
+
+  // --- Disjunct handling ---
+  // a ⊑ b iff every variant of a has an b-variant ⊒ it.
+  if (a.kind === V.DISJUNCT) {
+    return a.variants.every(va => leq(va, b));
+  }
+  // a (non-disjunct) ⊑ b (disjunct) iff some variant of b ⊒ a.
+  if (b.kind === V.DISJUNCT) {
+    return b.variants.some(vb => leq(a, vb));
+  }
+
   if (a.kind === V.CONCRETE && b.kind === V.CONCRETE) {
     return canonKey(a.value) === canonKey(b.value);
   }
@@ -461,11 +702,45 @@ function leq(a, b) {
     return a.functionId === b.functionId;
   }
   if (a.kind === V.OPAQUE && b.kind === V.OPAQUE) {
-    // Opaque ⊑ opaque if b's chain is a superset of a's.
+    // Opaque ⊑ opaque if b's chain is a superset of a's AND the
+    // typeNames are compatible (b's is null or matches a's).
     const bids = new Set(b.assumptionIds);
-    return a.assumptionIds.every(i => bids.has(i));
+    if (!a.assumptionIds.every(i => bids.has(i))) return false;
+    if (b.typeName && a.typeName !== b.typeName) return false;
+    return true;
   }
   return false;
+}
+
+// Map a function over each variant of a (potentially disjunctive)
+// value. The function `fn(variant)` returns a new Value for each
+// variant; the results are recombined into a Disjunct. Bottom
+// results are dropped. Useful in transfer functions that need to
+// fan out per-type operations like property lookups and method
+// dispatch.
+//
+// If `value` is not a Disjunct, the function is called once on
+// the value itself.
+function disjunctMap(value, fn) {
+  if (!value || value.kind === V.BOTTOM) return value;
+  if (value.kind !== V.DISJUNCT) return fn(value);
+  const out = [];
+  for (const v of value.variants) {
+    const r = fn(v);
+    if (r && r.kind !== V.BOTTOM) out.push(r);
+  }
+  if (out.length === 0) return bottom();
+  if (out.length === 1) return out[0];
+  return disjunct(out);
+}
+
+// Iterate the variants of a value as an array. For non-disjunct
+// values, returns a single-element array. Useful in code that
+// needs to enumerate without rebuilding the result (sink emission).
+function disjunctVariants(value) {
+  if (!value || value.kind === V.BOTTOM) return [];
+  if (value.kind === V.DISJUNCT) return value.variants;
+  return [value];
 }
 
 function equals(a, b) {
@@ -534,6 +809,23 @@ function truthiness(v) {
     case V.OBJECT:
     case V.CLOSURE:
       return true;  // objects/closures are always truthy
+    case V.DISJUNCT: {
+      // The disjunct is truthy iff EVERY variant is truthy, falsy
+      // iff every variant is falsy, otherwise unknown. This is
+      // sound because each variant represents a different path;
+      // the worklist needs unanimous agreement to short-circuit.
+      let anyT = false, anyF = false, anyU = false;
+      for (const variant of v.variants) {
+        const t = truthiness(variant);
+        if (t === true) anyT = true;
+        else if (t === false) anyF = true;
+        else { anyU = true; break; }
+      }
+      if (anyU) return null;
+      if (anyT && !anyF) return true;
+      if (anyF && !anyT) return false;
+      return null;
+    }
     default:
       return null;
   }
@@ -822,6 +1114,7 @@ function stateEquals(a, b) {
 module.exports = {
   V,
   bottom, top, concrete, oneOf, interval, strPattern, objectRef, closure, opaque,
+  disjunct, disjunctMap, disjunctVariants, variantKey,
   join, leq, equals, truthiness,
   withLabels, unionLabels, freezeLabels, EMPTY_LABELS,
   withFormula, valueFormula,

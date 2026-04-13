@@ -42,13 +42,26 @@ const tests = [
     },
   },
   {
-    name: 'join oneOf + concrete extends set',
+    name: 'join oneOf + concrete extends set when types match',
     fn: () => {
-      const a = D.oneOf([1, 2]);
-      const b = D.concrete(3);
+      // Same JS type (number) → OneOf extension is precise.
+      const a = D.oneOf([1, 2], 'number');
+      const b = D.concrete(3, 'number');
       const r = D.join(a, b);
       assertEqual(r.kind, 'oneOf');
       assertEqual(r.values.length, 3);
+    },
+  },
+  {
+    name: 'join oneOf + concrete with mismatched types → disjunct',
+    fn: () => {
+      // String + number → must NOT collapse type info; produce a
+      // Disjunct so per-path type tracking survives the join.
+      const a = D.oneOf([1, 2], 'number');
+      const b = D.concrete('hi', 'string');
+      const r = D.join(a, b);
+      assertEqual(r.kind, 'disjunct');
+      assertEqual(r.variants.length, 2);
     },
   },
   {
@@ -76,13 +89,20 @@ const tests = [
     },
   },
   {
-    name: 'opaque propagates through join',
+    name: 'opaque + concrete → disjunct preserving per-variant shape',
     fn: () => {
+      // Mixed Opaque + Concrete must NOT collapse to opaque(null);
+      // we keep both variants so per-path type tracking and sink
+      // resolution can still see the concrete on its branch.
       const a = D.opaque([1, 2]);
       const b = D.concrete(5);
       const r = D.join(a, b);
-      assertEqual(r.kind, 'opaque');
-      assertEqual(r.assumptionIds.length, 2);
+      assertEqual(r.kind, 'disjunct');
+      assertEqual(r.variants.length, 2);
+      // Both variants are accessible.
+      const kinds = r.variants.map(v => v.kind).sort();
+      assertEqual(kinds[0], 'concrete');
+      assertEqual(kinds[1], 'opaque');
     },
   },
   {

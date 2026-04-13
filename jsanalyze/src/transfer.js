@@ -611,6 +611,14 @@ function applyGetArgs(ctx, state, instr) {
 }
 
 // --- GetProp / GetIndex -------------------------------------------------
+//
+// applyGetProp dispatches per-receiver-variant. When the receiver
+// is a Disjunct (e.g. `el = cond ? createElement('a') : createElement('iframe')`)
+// each variant has its own typeName and looks up its own
+// PropDescriptor. The result is rebuilt as a Disjunct so the
+// per-path type information survives the property read — a
+// downstream `el.src = ...` write sees both the iframe variant
+// (sink) and the anchor variant (no `src` property).
 
 function applyGetProp(ctx, state, instr) {
   const loc = instrLoc(ctx, instr);
@@ -618,31 +626,28 @@ function applyGetProp(ctx, state, instr) {
   if (!obj) {
     return D.setReg(state, instr.dest, D.top(loc));
   }
+  const result = D.disjunctMap(obj, (variant) =>
+    propLookupForVariant(ctx, state, variant, instr, loc));
+  return D.setReg(state, instr.dest, result);
+}
+
+// Resolve a single (non-disjunct) receiver variant against a
+// property name. Returns a Value. Extracted so applyGetProp can
+// fan out over Disjuncts via disjunctMap.
+function propLookupForVariant(ctx, state, obj, instr, loc) {
   if (obj.kind === D.V.OBJECT) {
     const cell = D.overlayGet(state.heap, obj.objId);
     if (cell && cell.fields[instr.propName]) {
-      return D.setReg(state, instr.dest, cell.fields[instr.propName]);
+      return cell.fields[instr.propName];
     }
-    // Property not set → undefined.
-    return D.setReg(state, instr.dest, D.concrete(undefined, undefined, loc));
+    return D.concrete(undefined, undefined, loc);
   }
   if (obj.kind === D.V.OPAQUE) {
-    // Receiver has a TypeDB type — resolve the property through
-    // the DB to produce a typed result. This is the main path
-    // for source detection: `location.hash` arrives here with
-    // `obj.typeName === 'Location'` and we look up `hash`
-    // against the Location descriptor. A matching PropDescriptor
-    // provides the result's type (via `readType`) and, if the
-    // descriptor carries a `source`, the taint label + the
-    // corresponding assumption reason.
     const db = ctx.typeDB;
     if (db && obj.typeName) {
       const desc = TDB.lookupProp(db, obj.typeName, instr.propName);
       if (desc) {
         const resultType = desc.readType || null;
-        // Accumulate existing labels (from the parent chain
-        // e.g. `window.location.hash` already has upstream) and
-        // add the new source label.
         const existingLabels = obj.labels || D.EMPTY_LABELS;
         let resultLabels = existingLabels;
         const chainIds = obj.assumptionIds ? obj.assumptionIds.slice() : [];
@@ -666,50 +671,59 @@ function applyGetProp(ctx, state, instr) {
           // B2: allocate an SMT symbol for this source read.
           // The discriminator combines the receiver type and
           // property name so `location.hash` and `location.search`
-          // get distinct syms, but two reads of `location.hash`
-          // anywhere in the program share the same sym (which is
-          // what makes path-condition correlation work). The
-          // sort is derived from `desc.readType` so that a
-          // String-typed source produces a String-sorted sym
-          // immediately — this lets `a + b` (both string-typed
-          // sources) build `(str.++ ...)` rather than arithmetic
-          // `+` without waiting for an external comparison to
-          // drive the sort upgrade.
+          // get distinct syms; two reads of `location.hash`
+          // anywhere in the program share the same sym (which
+          // is what makes path-condition correlation work). The
+          // sort is derived from `desc.readType` so a String-typed
+          // source produces a String-sorted sym immediately.
           resultFormula = allocSourceSym(ctx, desc.source, loc,
             obj.typeName + '.' + instr.propName,
             readTypeToSort(desc.readType));
-        } else if (obj.formula) {
-          // Non-source property read on a value with a formula:
-          // for now we don't construct a structural formula for
-          // the property access (no `(get-field |obj| "p")`
-          // syntax in standard SMT-LIB without quantified
-          // theories). The property's value is symbolically a
-          // fresh variable; downstream correlations work via
-          // labels and assumption chain rather than the formula.
-          //
-          // A future commit may introduce a heap-aware formula
-          // syntax here.
         }
         const v = D.opaque(chainIds, resultType, loc, resultLabels);
-        return D.setReg(state, instr.dest,
-          resultFormula ? D.withFormula(v, resultFormula) : v);
+        return resultFormula ? D.withFormula(v, resultFormula) : v;
       }
     }
-    // No TypeDB info about this property — propagate the
-    // receiver's opaqueness without adding new information.
-    return D.setReg(state, instr.dest,
-      D.opaque(obj.assumptionIds || [], null, loc, obj.labels));
+    // No TypeDB info → propagate the receiver's opaqueness.
+    return D.opaque(obj.assumptionIds || [], null, loc, obj.labels);
   }
-  // Reading a property off a primitive / top value — record an
-  // unimplemented assumption (we should be modeling autoboxing but
-  // aren't yet).
+  // Property access on a primitive: model autoboxing via the
+  // TypeDB's wrapper type when available.
+  if (obj.kind === D.V.CONCRETE) {
+    const db = ctx.typeDB;
+    const wrapperType = primitiveWrapperType(obj.value);
+    if (db && wrapperType) {
+      const desc = TDB.lookupProp(db, wrapperType, instr.propName);
+      if (desc) {
+        return D.opaque(obj.assumptionIds || [], desc.readType || null, loc,
+          obj.labels);
+      }
+    }
+    // Unknown property on a primitive: standard JS returns
+    // undefined (and throws on null/undefined receiver, which we
+    // don't model yet).
+    return D.concrete(undefined, undefined, loc);
+  }
+  // OneOf / Interval / StrPattern / Closure / Top: opaque result.
   const a = ctx.assumptions.raise(
     REASONS.UNIMPLEMENTED,
-    'property access on non-object value not yet modeled',
+    'property access on ' + obj.kind + ' value not yet modeled',
     loc,
     { affects: instr.propName }
   );
-  return D.setReg(state, instr.dest, D.opaque([a.id], null, loc));
+  return D.opaque([a.id], null, loc, obj.labels);
+}
+
+// Map a JS primitive value to its TypeDB wrapper type. Returns
+// null for null/undefined (no wrapper) or unmodeled types.
+function primitiveWrapperType(v) {
+  if (v === null || v === undefined) return null;
+  switch (typeof v) {
+    case 'string':  return 'String';
+    case 'number':  return 'Number';
+    case 'boolean': return 'Boolean';
+    default: return null;
+  }
 }
 
 function applyGetIndex(ctx, state, instr) {
@@ -746,26 +760,35 @@ function applySetProp(ctx, state, instr) {
   const loc = instrLoc(ctx, instr);
   const obj = D.getReg(state, instr.object);
   const val = D.getReg(state, instr.value);
-  // Sink classification: before writing, check whether this
-  // property on the receiver type is a known sink and whether
-  // the value we're writing carries any taint labels. A match
-  // emits a TaintFlow record.
-  maybeEmitSinkFlowForWrite(ctx, obj, instr.propName, val, loc);
-  if (obj && obj.kind === D.V.OBJECT) {
-    return writeHeapField(state, obj.objId, instr.propName, val);
+  // Sink classification: iterate over every receiver variant so a
+  // Disjunct of element types fires once per variant that has a
+  // sink descriptor for this property name. This is the
+  // per-path-type element case: if `el` is a Disjunct of anchor
+  // and iframe, writing `.src` fires the iframe's navigation sink
+  // but not the anchor (which has no `src`).
+  for (const variant of D.disjunctVariants(obj)) {
+    maybeEmitSinkFlowForWrite(ctx, variant, instr.propName, val, loc);
   }
-  if (obj && obj.kind === D.V.OPAQUE) {
-    // Write is lost — we don't know what object is being written.
-    // This is a soundness assumption.
-    ctx.assumptions.raise(
-      REASONS.HEAP_ESCAPE,
-      'property write on opaque object — mutation not tracked',
-      loc,
-      { affects: instr.propName, chain: obj.assumptionIds }
-    );
-    return state;
+  // Heap write: fan out over object-ref variants. We don't know
+  // which variant the runtime picks, so we model both being
+  // written. (This is sound: the worklist's subsequent reads see
+  // the most-recent write on every alias.)
+  let newState = state;
+  let any = false;
+  for (const variant of D.disjunctVariants(obj)) {
+    if (variant && variant.kind === D.V.OBJECT) {
+      newState = writeHeapField(newState, variant.objId, instr.propName, val);
+      any = true;
+    } else if (variant && variant.kind === D.V.OPAQUE) {
+      ctx.assumptions.raise(
+        REASONS.HEAP_ESCAPE,
+        'property write on opaque object — mutation not tracked',
+        loc,
+        { affects: instr.propName, chain: variant.assumptionIds }
+      );
+    }
   }
-  return state;
+  return newState;
 }
 
 // --- Sink classification helpers -----------------------------------------
@@ -885,18 +908,19 @@ function applyCall(ctx, state, instr) {
 
   // --- Sink classification for the call site ---
   //
-  // Before dispatching to the callee (whether via onCall hook
-  // or falling through to opaque), check whether this call is
-  // a known sink and whether any argument carries taint. The
-  // IR attached two syntactic hints at lowering time:
-  //
-  //   instr.methodName — for `obj.method(args)` calls
-  //   instr.calleeName — for bare-identifier `fn(args)` calls
-  //
-  // `maybeEmitSinkFlowForCall` uses those hints plus the
-  // TypeDB to resolve the sink and emit flows for any
-  // tainted arguments.
-  maybeEmitSinkFlowForCall(ctx, instr, thisValue, argValues, loc);
+  // When the receiver is a Disjunct (e.g. `(anchor|iframe).method()`),
+  // the sink classifier runs once per variant: each variant may
+  // have a different method descriptor in the TypeDB, and
+  // therefore a different sink profile. For non-disjunct
+  // receivers (and for free-function calls where thisValue is
+  // null) we run the classifier once with the original value.
+  if (thisValue && thisValue.kind === D.V.DISJUNCT) {
+    for (const thisVariant of thisValue.variants) {
+      maybeEmitSinkFlowForCall(ctx, instr, thisVariant, argValues, loc);
+    }
+  } else {
+    maybeEmitSinkFlowForCall(ctx, instr, thisValue, argValues, loc);
+  }
 
   if (ctx.onCall) {
     // If the consumer's onCall hook throws, the exception
@@ -1070,7 +1094,28 @@ function applyCall(ctx, state, instr) {
   // like `parseInt` don't propagate labels even though their
   // arg is tainted. The TypeDB's `sanitizer: true` flag (handled
   // in G5) makes this explicit.
-  const tdbResult = resolveCallReturnViaDB(ctx, instr, thisValue, argValues, loc);
+  // Fan out TypeDB resolution across receiver variants. For a
+  // Disjunct receiver, each variant has its own typeName and
+  // may resolve to a different method descriptor (different
+  // return type, different source label, different
+  // preservesLabelsFrom* flags). The per-variant return values
+  // are combined back into a Disjunct so the per-path type
+  // information survives the call.
+  let tdbResult = null;
+  if (thisValue && thisValue.kind === D.V.DISJUNCT) {
+    const perVariantResults = [];
+    for (const thisVariant of thisValue.variants) {
+      const r = resolveCallReturnViaDB(ctx, instr, thisVariant, argValues, loc);
+      if (r) perVariantResults.push(r);
+    }
+    if (perVariantResults.length > 0) {
+      tdbResult = perVariantResults.length === 1
+        ? perVariantResults[0]
+        : D.disjunct(perVariantResults, loc);
+    }
+  } else {
+    tdbResult = resolveCallReturnViaDB(ctx, instr, thisValue, argValues, loc);
+  }
   if (tdbResult) {
     return D.setReg(state, instr.dest, tdbResult);
   }
