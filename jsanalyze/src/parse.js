@@ -632,6 +632,84 @@ function parseOperand(lexer) {
 
 // A primary expression: literal, identifier, `this`, or a
 // parenthesised expression.
+// parseArrowBody — `=>` has already been consumed. Parses the
+// arrow body (block or expression) and returns an
+// ArrowFunctionExpression node with the provided params.
+function parseArrowBody(lexer, params, startTok) {
+  const t = lexer.peek();
+  if (t && t.type.label === '{') {
+    // Block-body arrow: parse a BlockStatement. We reuse the
+    // statement parser's block-body machinery by invoking
+    // parseStatement on the `{` token.
+    //
+    // parseStatement drives its own task loop; it returns a
+    // BlockStatement node.
+    const block = parseStatement(lexer);
+    return mkArrowFunctionExpression(params, block, false, startTok);
+  }
+  // Expression-body arrow: parse an AssignmentExpression
+  // (matches the ES grammar for concise arrow bodies).
+  const body = parseExpression(lexer);
+  return mkArrowFunctionExpression(params, body, true, startTok);
+}
+
+// exprToArrowParams — convert an expression parsed inside
+// `(...)` into an arrow-function parameter list. The grammar
+// requires each element to be either an Identifier,
+// AssignmentPattern (for defaults), RestElement, or a
+// destructuring pattern. We support the identifier case
+// precisely; other shapes raise an error. Destructuring and
+// default-params land in later Wave 5 sub-waves.
+//
+// The input is a SequenceExpression (for `(a, b)`), a single
+// Identifier (for `(a)`), or something else (error).
+function exprToArrowParams(expr) {
+  if (!expr) return [];
+  if (expr.type === 'Identifier') return [expr];
+  if (expr.type === 'SequenceExpression') {
+    const out = [];
+    for (const e of expr.expressions) {
+      if (e.type !== 'Identifier') {
+        throw new Error('arrow parameter must be an identifier (got ' + e.type + ')');
+      }
+      out.push(e);
+    }
+    return out;
+  }
+  throw new Error('arrow parameter list must be identifiers (got ' + expr.type + ')');
+}
+
+function mkSequenceExpression(expressions) {
+  const first = expressions[0];
+  const last = expressions[expressions.length - 1];
+  return {
+    type: 'SequenceExpression',
+    expressions,
+    loc: first && first.loc && last && last.loc
+      ? { start: first.loc.start, end: last.loc.end }
+      : null,
+    start: first ? first.start : 0,
+    end:   last ? last.end : 0,
+  };
+}
+
+function mkArrowFunctionExpression(params, body, expression, startTok) {
+  return {
+    type: 'ArrowFunctionExpression',
+    params,
+    body,
+    expression,                    // true iff body is a plain expression (not a block)
+    async: false,
+    generator: false,
+    id: null,                      // arrows are anonymous
+    loc: startTok && startTok.loc && body && body.loc
+      ? { start: startTok.loc.start, end: body.loc.end }
+      : null,
+    start: startTok ? startTok.start : 0,
+    end:   body ? body.end : 0,
+  };
+}
+
 function parsePrimary(lexer) {
   const t = lexer.peek();
   if (!t) throw parseError(lexer, 'unexpected end of input');
@@ -665,6 +743,16 @@ function parsePrimary(lexer) {
     return mkLiteral(null, 'null', t);
   }
   if (label === 'name') {
+    // Single-identifier arrow-function shortcut: `x => body`.
+    // Peek two tokens ahead; if the next non-name token is
+    // `=>`, parse as arrow function with one identifier param.
+    const next = lexer.peek2();
+    if (next && next.type.label === '=>') {
+      lexer.advance();                 // consume the name
+      lexer.advance();                 // consume `=>`
+      const paramIdent = mkIdentifier(t.value, t);
+      return parseArrowBody(lexer, [paramIdent], t);
+    }
     // Identifier, or contextual keyword handled as identifier.
     lexer.advance();
     if (t.value === 'undefined') {
@@ -681,10 +769,46 @@ function parsePrimary(lexer) {
     return mkThisExpression(t);
   }
   if (label === '(') {
+    // Parenthesised expression OR arrow-function parameter list.
+    // Ambiguous until we see the token after the closing `)`:
+    //   `(a + b)` → paren expression
+    //   `(a, b) => ...` → arrow with two params
+    //   `() => ...` → zero-param arrow
+    //
+    // Strategy: parse a comma-separated list of expressions
+    // inside the parens. If the list has exactly one element
+    // and the next token is NOT `=>`, return that element as the
+    // paren expression. Otherwise (multiple elements or `=>`
+    // follows) convert the list into arrow parameters.
     lexer.advance();
-    const expr = parseExpression(lexer);
+    if (lexer.peek() && lexer.peek().type.label === ')') {
+      lexer.advance();
+      if (lexer.peek() && lexer.peek().type.label === '=>') {
+        lexer.advance();
+        return parseArrowBody(lexer, [], t);
+      }
+      throw parseError(lexer, '`()` is not a valid expression');
+    }
+    const items = [parseExpression(lexer)];
+    while (lexer.peek() && lexer.peek().type.label === ',') {
+      lexer.advance();
+      items.push(parseExpression(lexer));
+    }
     expect(lexer, ')');
-    return expr;
+    if (lexer.peek() && lexer.peek().type.label === '=>') {
+      lexer.advance();
+      const params = items.map(e => {
+        if (e.type !== 'Identifier') {
+          throw new Error('arrow parameter must be an identifier (got ' + e.type + ')');
+        }
+        return e;
+      });
+      return parseArrowBody(lexer, params, t);
+    }
+    // Paren-expression. If multiple items, wrap as
+    // SequenceExpression (the comma operator).
+    if (items.length === 1) return items[0];
+    return mkSequenceExpression(items);
   }
   // Unknown primary. Emit an UnimplementedExpression marker so
   // the IR builder can raise an explicit `unimplemented`
