@@ -20,6 +20,7 @@ const testFiles = [
   'worklist.test.js',
   'analyze.test.js',
   'no-caps.test.js',
+  'typedb.test.js',
 ];
 
 async function main() {
