@@ -23,6 +23,7 @@ const testFiles = [
   'typedb.test.js',
   'source-classification.test.js',
   'sink-classification.test.js',
+  'smt.test.js',
 ];
 
 async function main() {
