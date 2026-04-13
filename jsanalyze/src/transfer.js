@@ -13,6 +13,54 @@
 const { OP } = require('./ir.js');
 const D = require('./domain.js');
 const { REASONS } = require('./assumptions.js');
+const TDB = require('./typedb.js');
+
+// Map a TypeDB source label (from DB descriptors like
+// `source: 'url'`) to the assumption reason code that explains
+// why the value is opaque. This keeps the taint vocabulary (the
+// labels attached to values) separate from the justification
+// vocabulary (why the analyzer can't see the value).
+//
+// The mapping follows from docs/ASSUMPTIONS.md:
+//
+//   url / referrer / postMessage / window.name → attacker-input
+//     (an attacker crafts the URL / source page / message and
+//     delivers it; the user doesn't type the URL)
+//
+//   cookie / storage → persistent-state
+//     (same-origin script writes to cookies / localStorage /
+//     sessionStorage / IndexedDB; the analyzer doesn't know
+//     what's there)
+//
+//   network → network
+//     (bytes from fetch / XHR / WebSocket response)
+//
+//   file / dragdrop / clipboard → ui-interaction
+//     (user actively drops a file, pastes data, picks a file
+//     — active user cooperation)
+//
+// Unknown labels fall through to opaque-call with the label
+// carried verbatim in the assumption details.
+function sourceLabelToReason(label) {
+  switch (label) {
+    case 'url':
+    case 'referrer':
+    case 'postMessage':
+    case 'window.name':
+      return REASONS.ATTACKER_INPUT;
+    case 'cookie':
+    case 'storage':
+      return REASONS.PERSISTENT_STATE;
+    case 'network':
+      return REASONS.NETWORK;
+    case 'file':
+    case 'dragdrop':
+    case 'clipboard':
+      return REASONS.UI_INTERACTION;
+    default:
+      return REASONS.OPAQUE_CALL;
+  }
+}
 
 // Look up the source location for an instruction, falling back to
 // a safe placeholder if the source map doesn't have an entry (tests
@@ -233,21 +281,55 @@ function applyUnOp(ctx, state, instr) {
 
 // --- GetGlobal ----------------------------------------------------------
 //
-// Unresolved identifier read. Treated as opaque with the appropriate
-// assumption reason. When a TypeDB is attached later, global reads
-// will resolve through the TypeDB roots.
+// Resolve a bare identifier against the TypeDB. There are three
+// outcomes:
+//
+//   1. Identifier is a known root (e.g. `location`, `document`,
+//      `window`). Emit an Opaque value typed to the root's
+//      declared type. If the type carries a `selfSource` (like
+//      `localStorage` → `storage`), attach the label and raise
+//      the corresponding source assumption.
+//
+//   2. Identifier is not a root but has a global scope entry in
+//      the DB (rare; most are handled by their enclosing type).
+//      Same as (1).
+//
+//   3. Identifier is unknown. Raise an `opaque-call` assumption
+//      and return a typeless opaque value.
+//
+// Source detection on the root itself is important: bare
+// `localStorage` carries the `storage` label without any
+// further property access, matching the legacy engine.
 
 function applyGetGlobal(ctx, state, instr) {
   const loc = instrLoc(ctx, instr);
   const db = ctx.typeDB;
   if (db && db.roots && db.roots[instr.name]) {
-    // Resolve via TypeDB: create an opaque value typed to the root's
-    // declared type. Values are taint-labeled by subsequent property
-    // reads (not yet implemented in this minimal slice).
+    const typeName = db.roots[instr.name];
+    // Check if the root type carries a selfSource — reading the
+    // bare binding already produces a labeled value (e.g.
+    // `localStorage` has selfSource: 'storage').
+    const typeDesc = db.types[typeName];
+    const selfSource = typeDesc && typeDesc.selfSource;
+    if (selfSource) {
+      const reason = sourceLabelToReason(selfSource);
+      const assumption = ctx.assumptions.raise(
+        reason,
+        'read from `' + instr.name + '` (TypeDB source: ' + selfSource + ')',
+        loc,
+        { affects: instr.name }
+      );
+      return D.setReg(state, instr.dest,
+        D.opaque([assumption.id], typeName, loc, [selfSource]));
+    }
+    // Non-source root (e.g. `document`, `window`): return an
+    // opaque value with the TypeDB type but no taint label. The
+    // type is enough to let subsequent property reads resolve
+    // through the TypeDB and pick up their own source labels.
     return D.setReg(state, instr.dest,
-      D.top(loc));  // placeholder; a later pass attaches typeName
+      D.opaque([], typeName, loc));
   }
-  // Truly unknown — this is an opaque read.
+  // Truly unknown identifier.
   const assumption = ctx.assumptions.raise(
     REASONS.OPAQUE_CALL,
     'global identifier `' + instr.name + '` is not in the TypeDB',
@@ -297,7 +379,50 @@ function applyGetProp(ctx, state, instr) {
     return D.setReg(state, instr.dest, D.concrete(undefined, undefined, loc));
   }
   if (obj.kind === D.V.OPAQUE) {
-    return D.setReg(state, instr.dest, D.opaque(obj.assumptionIds, null, loc));
+    // Receiver has a TypeDB type — resolve the property through
+    // the DB to produce a typed result. This is the main path
+    // for source detection: `location.hash` arrives here with
+    // `obj.typeName === 'Location'` and we look up `hash`
+    // against the Location descriptor. A matching PropDescriptor
+    // provides the result's type (via `readType`) and, if the
+    // descriptor carries a `source`, the taint label + the
+    // corresponding assumption reason.
+    const db = ctx.typeDB;
+    if (db && obj.typeName) {
+      const desc = TDB.lookupProp(db, obj.typeName, instr.propName);
+      if (desc) {
+        const resultType = desc.readType || null;
+        // Accumulate existing labels (from the parent chain
+        // e.g. `window.location.hash` already has upstream) and
+        // add the new source label.
+        const existingLabels = obj.labels || D.EMPTY_LABELS;
+        let resultLabels = existingLabels;
+        const chainIds = obj.assumptionIds ? obj.assumptionIds.slice() : [];
+        if (desc.source) {
+          const reason = sourceLabelToReason(desc.source);
+          const assumption = ctx.assumptions.raise(
+            reason,
+            'read `' + instr.propName + '` from ' + obj.typeName +
+              ' (TypeDB source: ' + desc.source + ')',
+            loc,
+            {
+              affects: instr.propName,
+              chain: chainIds.length > 0 ? chainIds : undefined,
+            }
+          );
+          const merged = new Set(existingLabels);
+          merged.add(desc.source);
+          resultLabels = Object.freeze(merged);
+          chainIds.push(assumption.id);
+        }
+        return D.setReg(state, instr.dest,
+          D.opaque(chainIds, resultType, loc, resultLabels));
+      }
+    }
+    // No TypeDB info about this property — propagate the
+    // receiver's opaqueness without adding new information.
+    return D.setReg(state, instr.dest,
+      D.opaque(obj.assumptionIds || [], null, loc, obj.labels));
   }
   // Reading a property off a primitive / top value — record an
   // unimplemented assumption (we should be modeling autoboxing but

@@ -29,27 +29,104 @@ const V = Object.freeze({
 // consumers cannot mutate lattice entries. Provenance is a list of
 // source Locations where the value acquired its current shape.
 
-function bottom() {
-  return Object.freeze({ kind: V.BOTTOM });
+// --- Taint labels ------------------------------------------------------
+//
+// Every value carries an optional frozen `labels` field — a
+// read-only Set<string> of taint labels it's accumulated. Labels
+// propagate through binary operations, property reads, and call
+// results via simple set union; sanitizers clear them. The
+// vocabulary is drawn from the TypeDB's `source` fields
+// ('url', 'cookie', 'referrer', 'network', 'postMessage', ...)
+// plus anything a consumer declares in a custom DB.
+//
+// Factories accept an optional `labels` argument. When omitted
+// the value has no labels. The `withLabels(v, set)` helper
+// returns a copy with a new label set attached.
+//
+// Why a Set<string> instead of an array: taint is unordered,
+// and unioning sets is O(|a|+|b|) with no dedup pass.
+const EMPTY_LABELS = Object.freeze(new Set());
+
+function freezeLabels(labels) {
+  if (!labels) return EMPTY_LABELS;
+  if (labels === EMPTY_LABELS) return labels;
+  if (labels instanceof Set) {
+    if (labels.size === 0) return EMPTY_LABELS;
+    // Freeze by wrapping in a new Set (Sets aren't freezable
+    // but references can be; we rely on the caller not
+    // mutating the returned Set — a convention enforced by
+    // `withLabels` being the only mutation API).
+    return Object.freeze(new Set(labels));
+  }
+  if (Array.isArray(labels)) {
+    if (labels.length === 0) return EMPTY_LABELS;
+    return Object.freeze(new Set(labels));
+  }
+  return EMPTY_LABELS;
 }
 
-function top(provenance) {
+function unionLabels(a, b) {
+  const la = (a && a.labels) || EMPTY_LABELS;
+  const lb = (b && b.labels) || EMPTY_LABELS;
+  if (la.size === 0) return lb;
+  if (lb.size === 0) return la;
+  if (la === lb) return la;
+  const out = new Set(la);
+  for (const x of lb) out.add(x);
+  return Object.freeze(out);
+}
+
+// Return a new value with `labels` added to its label set. Used
+// by transfer functions when a read or call produces a tainted
+// result.
+function withLabels(value, labels) {
+  if (!value || value.kind === V.BOTTOM) return value;
+  const existing = value.labels || EMPTY_LABELS;
+  const incoming = labels instanceof Set ? labels : new Set(labels || []);
+  if (incoming.size === 0) return value;
+  // Union in place is cheaper than rebuilding the set, but the
+  // result must stay frozen. Allocate fresh.
+  const out = new Set(existing);
+  for (const x of incoming) out.add(x);
+  const frozen = Object.freeze(out);
+  // Clone the value with the new label set. We rebuild via the
+  // appropriate factory so the frozen envelope is preserved.
+  return cloneWithLabels(value, frozen);
+}
+
+// Clone a value's envelope with a new labels field. All factory-
+// produced values are frozen; we can't mutate them, so we
+// reconstruct via a shallow copy. This is only called from
+// `withLabels` which has already computed the union.
+function cloneWithLabels(value, labels) {
+  const base = Object.assign({}, value);
+  base.labels = labels;
+  return Object.freeze(base);
+}
+
+function bottom() {
+  return Object.freeze({ kind: V.BOTTOM, labels: EMPTY_LABELS });
+}
+
+function top(provenance, labels) {
   return Object.freeze({
     kind: V.TOP,
     provenance: freezeProvenance(provenance),
+    labels: freezeLabels(labels),
   });
 }
 
-function concrete(value, typeName, provenance) {
+function concrete(value, typeName, provenance, labels) {
   return Object.freeze({
     kind: V.CONCRETE,
     value,
     typeName: typeName || inferTypeName(value),
     provenance: freezeProvenance(provenance),
+    labels: freezeLabels(labels),
   });
 }
 
-function oneOf(values, typeName, provenance) {
+function oneOf(values, typeName, provenance, labels) {
   // Normalise: sort + dedupe for canonical form.
   const seen = new Set();
   const clean = [];
@@ -67,56 +144,62 @@ function oneOf(values, typeName, provenance) {
     values: Object.freeze(clean),
     typeName: typeName || null,
     provenance: freezeProvenance(provenance),
+    labels: freezeLabels(labels),
   });
 }
 
-function interval(lo, hi, provenance) {
+function interval(lo, hi, provenance, labels) {
   if (lo > hi) throw new Error('domain: interval lo > hi');
   return Object.freeze({
     kind: V.INTERVAL,
     lo, hi,
     typeName: 'number',
     provenance: freezeProvenance(provenance),
+    labels: freezeLabels(labels),
   });
 }
 
-function strPattern(pattern, provenance) {
+function strPattern(pattern, provenance, labels) {
   return Object.freeze({
     kind: V.STR_PATTERN,
     pattern: Object.freeze({ ...pattern }),
     typeName: 'string',
     provenance: freezeProvenance(provenance),
+    labels: freezeLabels(labels),
   });
 }
 
-function objectRef(objId, typeName, provenance) {
+function objectRef(objId, typeName, provenance, labels) {
   return Object.freeze({
     kind: V.OBJECT,
     objId,
     typeName: typeName || null,
     provenance: freezeProvenance(provenance),
+    labels: freezeLabels(labels),
   });
 }
 
-function closure(functionId, captureValues, provenance) {
+function closure(functionId, captureValues, provenance, labels) {
   return Object.freeze({
     kind: V.CLOSURE,
     functionId,
     captures: Object.freeze(captureValues.slice()),
     typeName: 'Function',
     provenance: freezeProvenance(provenance),
+    labels: freezeLabels(labels),
   });
 }
 
 // Opaque values carry a chain of assumption ids explaining why they
 // are opaque. Consumers can walk backwards through the chain to find
 // the root cause.
-function opaque(assumptionIds, typeName, provenance) {
+function opaque(assumptionIds, typeName, provenance, labels) {
   return Object.freeze({
     kind: V.OPAQUE,
     assumptionIds: Object.freeze(assumptionIds.slice()),
     typeName: typeName || null,
     provenance: freezeProvenance(provenance),
+    labels: freezeLabels(labels),
   });
 }
 
@@ -159,8 +242,9 @@ function freezeProvenance(p) {
 function join(a, b) {
   if (!a || a.kind === V.BOTTOM) return b;
   if (!b || b.kind === V.BOTTOM) return a;
+  const mergedLabels = unionLabels(a, b);
   if (a.kind === V.TOP || b.kind === V.TOP) {
-    return top(mergeProvenance(a, b));
+    return top(mergeProvenance(a, b), mergedLabels);
   }
   // Opaque propagates: joining opaque with anything yields opaque
   // carrying the union of assumption chains. This preserves the
@@ -174,50 +258,56 @@ function join(a, b) {
     for (const i of bIds) if (!seen.has(i)) { seen.add(i); ids.push(i); }
     const tn = (a.typeName && b.typeName && a.typeName === b.typeName)
       ? a.typeName : null;
-    return opaque(ids, tn, mergeProvenance(a, b));
+    return opaque(ids, tn, mergeProvenance(a, b), mergedLabels);
   }
-  // Same kind, same value → return as is.
+  // Same kind, same value → return as is (but propagate labels if
+  // they differ).
   if (a.kind === V.CONCRETE && b.kind === V.CONCRETE && canonKey(a.value) === canonKey(b.value)) {
-    return a;
+    if (mergedLabels === (a.labels || EMPTY_LABELS)) return a;
+    return concrete(a.value, a.typeName, mergeProvenance(a, b), mergedLabels);
   }
   // Concrete + concrete with different values → oneOf.
   if (a.kind === V.CONCRETE && b.kind === V.CONCRETE) {
-    return oneOf([a.value, b.value], null, mergeProvenance(a, b));
+    return oneOf([a.value, b.value], null, mergeProvenance(a, b), mergedLabels);
   }
   // Concrete + oneOf → extended oneOf (if compatible).
   if (a.kind === V.ONE_OF && b.kind === V.CONCRETE) {
-    return oneOf(a.values.concat([b.value]), a.typeName, mergeProvenance(a, b));
+    return oneOf(a.values.concat([b.value]), a.typeName, mergeProvenance(a, b), mergedLabels);
   }
   if (a.kind === V.CONCRETE && b.kind === V.ONE_OF) {
-    return oneOf(b.values.concat([a.value]), b.typeName, mergeProvenance(a, b));
+    return oneOf(b.values.concat([a.value]), b.typeName, mergeProvenance(a, b), mergedLabels);
   }
   if (a.kind === V.ONE_OF && b.kind === V.ONE_OF) {
-    return oneOf(a.values.concat(b.values), null, mergeProvenance(a, b));
+    return oneOf(a.values.concat(b.values), null, mergeProvenance(a, b), mergedLabels);
   }
   // Interval merges.
   if (a.kind === V.INTERVAL && b.kind === V.INTERVAL) {
-    return interval(Math.min(a.lo, b.lo), Math.max(a.hi, b.hi), mergeProvenance(a, b));
+    return interval(Math.min(a.lo, b.lo), Math.max(a.hi, b.hi), mergeProvenance(a, b), mergedLabels);
   }
   if (a.kind === V.CONCRETE && typeof a.value === 'number' && b.kind === V.INTERVAL) {
-    return interval(Math.min(a.value, b.lo), Math.max(a.value, b.hi), mergeProvenance(a, b));
+    return interval(Math.min(a.value, b.lo), Math.max(a.value, b.hi), mergeProvenance(a, b), mergedLabels);
   }
   if (b.kind === V.CONCRETE && typeof b.value === 'number' && a.kind === V.INTERVAL) {
-    return interval(Math.min(b.value, a.lo), Math.max(b.value, a.hi), mergeProvenance(a, b));
+    return interval(Math.min(b.value, a.lo), Math.max(b.value, a.hi), mergeProvenance(a, b), mergedLabels);
   }
   // Object refs — same id means alias, different means the join has to
   // widen to Top (or a "one-of object" if we add that shape later).
   if (a.kind === V.OBJECT && b.kind === V.OBJECT) {
-    if (a.objId === b.objId) return a;
-    return top(mergeProvenance(a, b));
+    if (a.objId === b.objId) {
+      if (mergedLabels === (a.labels || EMPTY_LABELS)) return a;
+      return objectRef(a.objId, a.typeName, mergeProvenance(a, b), mergedLabels);
+    }
+    return top(mergeProvenance(a, b), mergedLabels);
   }
   // Same closure → same.
   if (a.kind === V.CLOSURE && b.kind === V.CLOSURE && a.functionId === b.functionId) {
-    return a;
+    if (mergedLabels === (a.labels || EMPTY_LABELS)) return a;
+    return closure(a.functionId, a.captures, mergeProvenance(a, b), mergedLabels);
   }
   // Everything else → Top (conservative). This is where a more
   // sophisticated implementation would introduce a disjunctive
   // shape; for the minimal subset, Top is sound.
-  return top(mergeProvenance(a, b));
+  return top(mergeProvenance(a, b), mergedLabels);
 }
 
 function leq(a, b) {
@@ -611,6 +701,7 @@ module.exports = {
   V,
   bottom, top, concrete, oneOf, interval, strPattern, objectRef, closure, opaque,
   join, leq, equals, truthiness,
+  withLabels, unionLabels, freezeLabels, EMPTY_LABELS,
   createState, setReg, getReg, joinStates, stateLeq, stateEquals,
   unfreezeState, freezeState,
   overlayGet, overlayHas, overlayEntries, overlaySize, overlayFlatten,

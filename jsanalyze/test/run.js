@@ -21,6 +21,7 @@ const testFiles = [
   'analyze.test.js',
   'no-caps.test.js',
   'typedb.test.js',
+  'source-classification.test.js',
 ];
 
 async function main() {
