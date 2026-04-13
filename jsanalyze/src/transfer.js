@@ -16,6 +16,17 @@ const { REASONS } = require('./assumptions.js');
 const TDB = require('./typedb.js');
 const SMT = require('./smt.js');
 
+// Lazy require for worklist.analyseFunction. We can't require it
+// at module-load time because worklist.js requires transfer.js,
+// creating a circular dependency. The first call resolves it.
+let _analyseFunction = null;
+function getAnalyseFunction() {
+  if (!_analyseFunction) {
+    _analyseFunction = require('./worklist.js').analyseFunction;
+  }
+  return _analyseFunction;
+}
+
 // Allocate (or look up) an SMT symbolic name for a source read.
 // The name is tagged with the source label so a consumer that
 // inspects the formula can tell which source it represents.
@@ -896,6 +907,136 @@ function applyCall(ctx, state, instr) {
       callee, argValues, thisValue, state, loc, instr
     );
     if (result) return D.setReg(result.state || state, instr.dest, result.value);
+  }
+
+  // --- Phase C1: walk user function calls ---
+  //
+  // If the callee resolves to a Closure pointing to a user
+  // function in this module, walk that function with the
+  // caller's argument values bound to its params. The callee's
+  // exit state's return value becomes this call's result.
+  //
+  // Cycle detection: we maintain ctx._callStack as a Set of
+  // function ids currently being analyzed. Re-entering a
+  // function on its own stack = recursion, which we don't
+  // model precisely yet — fall through to the conservative
+  // fallback with an explicit `unimplemented: recursion`
+  // assumption so consumers can see the precision floor.
+  //
+  // Sinks fired inside the callee already get appended to
+  // ctx.taintFlows because the callee shares ctx with the
+  // caller. The callee's per-block path conditions are local
+  // to its analysis run; the caller's pathCond at the call
+  // site is restored by the worklist's prevPathCond stash
+  // when this applyCall returns.
+  // Resolve the callee to a user function. There are two paths:
+  //
+  //   1. The callee value is a CLOSURE — the standard case for
+  //      `var f = function(){}; f();` and for function declarations
+  //      whose name is in scope at the call site.
+  //
+  //   2. The callee is opaque (typeName=null) but the call's
+  //      `calleeName` IR hint matches a top-level function in the
+  //      module. This is the "free reference" case: an inner
+  //      function references a name defined in the outer scope.
+  //      Without closure-capture support (Phase C2) the inner
+  //      reference produces a GetGlobal opaque, but the function
+  //      IS hoisted into module.functions and we can look it up
+  //      by name. This path is a stop-gap until C2 lands; once
+  //      captures are tracked, the inner reference produces a
+  //      proper Closure and this branch becomes unnecessary.
+  let calleeFn = null;
+  if (callee && callee.kind === D.V.CLOSURE && callee.functionId) {
+    calleeFn = ctx.module.functions.find(f => f.id === callee.functionId);
+  } else if (callee && callee.kind === D.V.OPAQUE && instr.calleeName) {
+    calleeFn = ctx.module.functions.find(f => f.name === instr.calleeName);
+  }
+  if (calleeFn && calleeFn.cfg) {
+    if (!ctx._callStack) ctx._callStack = new Set();
+    if (ctx._callStack.has(calleeFn.id)) {
+      // Recursion. Raise an explicit assumption so the
+      // imprecision is auditable, and conservatively union the
+      // argument labels into the return value — a recursive
+      // function might return any of its arguments through any
+      // depth of the recursion, so we have to assume it can.
+      const a = ctx.assumptions.raise(
+        REASONS.UNIMPLEMENTED,
+        'recursive call to `' + (calleeFn.name || calleeFn.id) +
+          '` not yet modeled — return value conservatively inherits all argument labels',
+        loc
+      );
+      let recLabels = D.EMPTY_LABELS;
+      const recChain = [a.id];
+      for (const arg of argValues) {
+        if (arg && arg.labels && arg.labels.size > 0) {
+          if (recLabels.size === 0) {
+            recLabels = arg.labels;
+          } else if (recLabels !== arg.labels) {
+            const merged = new Set(recLabels);
+            for (const l of arg.labels) merged.add(l);
+            recLabels = Object.freeze(merged);
+          }
+        }
+        if (arg && arg.assumptionIds) {
+          for (const id of arg.assumptionIds) recChain.push(id);
+        }
+      }
+      return D.setReg(state, instr.dest,
+        D.opaque(recChain, null, loc, recLabels));
+    }
+    // Build the callee's initial state. Bind each param
+    // register to the corresponding caller-side argValue.
+    // Captures: the Closure value's `captures` array stores
+    // the values captured at definition time; they need to
+    // be bound to the function's capture registers (Phase C2
+    // — for now closures capture nothing, so this is a
+    // no-op).
+    let calleeInit = D.createState();
+    for (let i = 0; i < calleeFn.params.length; i++) {
+      const paramReg = calleeFn.params[i];
+      const argValue = argValues[i] || D.concrete(undefined, undefined, loc);
+      calleeInit = D.setReg(calleeInit, paramReg, argValue);
+    }
+
+    // Save and restore worklist-level ctx fields so the
+    // callee's analysis runs in its own scope without
+    // leaking into the caller's. The fields the caller's
+    // worklist may have set:
+    //   currentPathCond, currentBlockId
+    const savedPathCond = ctx.currentPathCond;
+    const savedBlockId = ctx.currentBlockId;
+    ctx._callStack.add(calleeFn.id);
+    let calleeResult;
+    try {
+      const analyse = getAnalyseFunction();
+      calleeResult = analyse(ctx.module, calleeFn, calleeInit, ctx);
+    } finally {
+      ctx._callStack.delete(calleeFn.id);
+      ctx.currentPathCond = savedPathCond;
+      ctx.currentBlockId = savedBlockId;
+    }
+
+    // Pull the return value from the callee's exit state.
+    // `fn.returns` is the list of registers that flow into
+    // explicit `return` statements; their values from the
+    // exit state are joined to produce the call's result.
+    // If the function has no explicit returns (only the
+    // implicit `return undefined`), fn.returns may be empty
+    // or contain the synthesized undef register — either way,
+    // we fall back to `undefined`.
+    let returnValue = null;
+    if (calleeFn.returns && calleeFn.returns.length > 0 && calleeResult.exitState) {
+      for (const retReg of calleeFn.returns) {
+        const v = D.getReg(calleeResult.exitState, retReg);
+        if (v) {
+          returnValue = returnValue ? D.join(returnValue, v) : v;
+        }
+      }
+    }
+    if (!returnValue) {
+      returnValue = D.concrete(undefined, undefined, loc);
+    }
+    return D.setReg(state, instr.dest, returnValue);
   }
   // --- TypeDB return-type resolution (G3) ---
   //

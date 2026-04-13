@@ -27,6 +27,7 @@ const testFiles = [
   'formula.test.js',
   'path-cond.test.js',
   'refine.test.js',
+  'interproc.test.js',
 ];
 
 async function main() {
