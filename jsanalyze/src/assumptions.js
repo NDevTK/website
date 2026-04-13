@@ -212,6 +212,23 @@ class AssumptionTracker {
   constructor() {
     this._nextId = 1;
     this._assumptions = [];
+    // Cache of previously-raised assumptions keyed by
+    // (reason, location.file, location.pos, affects). A repeat
+    // raise at the same location returns the cached record so
+    // loop bodies that revisit the same source read don't
+    // produce a new id on every worklist iteration — which
+    // would prevent the lattice from reaching fixpoint because
+    // the Opaque values carrying fresh assumption chains would
+    // never compare equal.
+    //
+    // The cache is keyed only by structural position (not by
+    // the transfer-function call count), so two distinct AST
+    // sites that happen to resolve to the same reason + location
+    // (rare — usually impossible because pos differs) would
+    // collapse into one. That is the desired behaviour for the
+    // soundness floor: one "this read is opaque because X" per
+    // source location.
+    this._raisedCache = new Map();
   }
 
   // Raise a new assumption. Returns the assumption record so
@@ -237,6 +254,14 @@ class AssumptionTracker {
     if (severity !== SEVERITIES.SOUNDNESS && severity !== SEVERITIES.PRECISION) {
       throw new Error('AssumptionTracker: invalid severity ' + severity);
     }
+    // Look up the cache. Use a compact string key.
+    const affectsKey = o.affects || '';
+    const posKey = (location.pos != null ? location.pos : -1);
+    const fileKey = location.file || '';
+    const cacheKey = reason + '|' + fileKey + '|' + posKey + '|' + affectsKey;
+    const cached = this._raisedCache.get(cacheKey);
+    if (cached) return cached;
+
     const record = {
       id: this._nextId++,
       reason,
@@ -249,6 +274,7 @@ class AssumptionTracker {
     Object.freeze(record.chain);
     Object.freeze(record);
     this._assumptions.push(record);
+    this._raisedCache.set(cacheKey, record);
     return record;
   }
 

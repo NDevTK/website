@@ -138,6 +138,21 @@ function mkUnary(operator, argument, prefix, tok) {
   };
 }
 
+function mkUpdate(operator, argument, prefix, tok) {
+  return {
+    type: 'UpdateExpression',
+    operator,
+    prefix: !!prefix,
+    argument,
+    loc: tok && tok.loc && argument && argument.loc
+      ? { start: prefix ? tok.loc.start : argument.loc.start,
+          end:   prefix ? argument.loc.end : tok.loc.end }
+      : null,
+    start: (prefix ? tok : argument) ? (prefix ? tok.start : argument.start) : 0,
+    end:   (prefix ? argument : tok) ? (prefix ? argument.end : tok.end) : 0,
+  };
+}
+
 function mkMember(object, property, computed) {
   return {
     type: 'MemberExpression',
@@ -229,6 +244,71 @@ function mkExpressionStatement(expression) {
     loc: expression.loc,
     start: expression.start || 0,
     end:   expression.end   || 0,
+  };
+}
+
+function mkWhileStatement(test, body, startTok) {
+  return {
+    type: 'WhileStatement',
+    test,
+    body,
+    loc: startTok && startTok.loc && body && body.loc
+      ? { start: startTok.loc.start, end: body.loc.end }
+      : null,
+    start: startTok ? startTok.start : 0,
+    end:   body ? body.end : 0,
+  };
+}
+
+function mkDoWhileStatement(body, test, startTok) {
+  return {
+    type: 'DoWhileStatement',
+    body,
+    test,
+    loc: startTok && startTok.loc && test && test.loc
+      ? { start: startTok.loc.start, end: test.loc.end }
+      : null,
+    start: startTok ? startTok.start : 0,
+    end:   test ? test.end : (body ? body.end : 0),
+  };
+}
+
+function mkForStatement(init, test, update, body, startTok) {
+  return {
+    type: 'ForStatement',
+    init,
+    test,
+    update,
+    body,
+    loc: startTok && startTok.loc && body && body.loc
+      ? { start: startTok.loc.start, end: body.loc.end }
+      : null,
+    start: startTok ? startTok.start : 0,
+    end:   body ? body.end : 0,
+  };
+}
+
+function mkBreakStatement(label, startTok) {
+  return {
+    type: 'BreakStatement',
+    label: label ? mkIdentifier(label, startTok) : null,
+    loc: startTok && startTok.loc
+      ? { start: startTok.loc.start, end: startTok.loc.end }
+      : null,
+    start: startTok ? startTok.start : 0,
+    end:   startTok ? startTok.end : 0,
+  };
+}
+
+function mkContinueStatement(label, startTok) {
+  return {
+    type: 'ContinueStatement',
+    label: label ? mkIdentifier(label, startTok) : null,
+    loc: startTok && startTok.loc
+      ? { start: startTok.loc.start, end: startTok.loc.end }
+      : null,
+    start: startTok ? startTok.start : 0,
+    end:   startTok ? startTok.end : 0,
   };
 }
 
@@ -422,6 +502,13 @@ function parseOperand(lexer) {
       lexer.advance();
       continue;
     }
+    // Prefix ++ / --. acorn tokenizes these with label "++/--"
+    // and value "++" or "--".
+    if (t.type.label === '++/--') {
+      prefixes.push({ kind: 'update_prefix', op: t.value, tok: t });
+      lexer.advance();
+      continue;
+    }
     break;
   }
 
@@ -467,6 +554,13 @@ function parseOperand(lexer) {
       base = mkCall(base, args, closeTok ? closeTok.end : base.end);
       continue;
     }
+    // Postfix ++ / --. Binds tighter than any binary operator, so
+    // apply immediately to the current `base`.
+    if (label === '++/--') {
+      base = mkUpdate(t.value, base, false, t);
+      lexer.advance();
+      continue;
+    }
     break;
   }
 
@@ -475,6 +569,8 @@ function parseOperand(lexer) {
     const p = prefixes.pop();
     if (p.kind === 'unary') {
       base = mkUnary(p.op, base, true, p.tok);
+    } else if (p.kind === 'update_prefix') {
+      base = mkUpdate(p.op, base, true, p.tok);
     } else if (p.kind === 'new') {
       // `new X(args)`: if the base is already a CallExpression,
       // convert it in place to NewExpression; otherwise it's
@@ -913,6 +1009,18 @@ function parseStatement(lexer) {
       case 'finish_if_else':
         finishIfElse(task, outputs);
         break;
+      case 'finish_while':
+        finishWhile(task, outputs);
+        break;
+      case 'finish_do_while':
+        finishDoWhile(lexer, task, tasks, outputs);
+        break;
+      case 'finish_do_while_test':
+        finishDoWhileTest(task, outputs);
+        break;
+      case 'finish_for':
+        finishFor(task, outputs);
+        break;
       case 'block_body':
         blockBodyStep(lexer, task, tasks, outputs);
         break;
@@ -1011,6 +1119,94 @@ function beginStatement(lexer, tasks, outputs) {
     return;
   }
 
+  // --- while loop ---
+  if (label === 'while') {
+    lexer.advance();
+    expect(lexer, '(');
+    const test = parseExpression(lexer);
+    expect(lexer, ')');
+    tasks.push({ kind: 'finish_while', startTok: t, test });
+    tasks.push({ kind: 'parse_stmt' });
+    return;
+  }
+  // --- do-while loop ---
+  if (label === 'do') {
+    lexer.advance();
+    tasks.push({ kind: 'finish_do_while', startTok: t });
+    tasks.push({ kind: 'parse_stmt' });
+    return;
+  }
+  // --- for / for-in / for-of loop ---
+  if (label === 'for') {
+    lexer.advance();
+    expect(lexer, '(');
+    // Parse the init slot. It may be:
+    //   * empty (just `;`)
+    //   * a VariableDeclaration (`var/let/const i = 0`)
+    //   * an Expression
+    let init = null;
+    const initTok = lexer.peek();
+    if (initTok && initTok.type.label === ';') {
+      // empty init
+    } else if (initTok && (initTok.type.label === 'var' ||
+               initTok.type.label === 'const' ||
+               (initTok.type.label === 'name' && initTok.value === 'let' &&
+                isLetDeclarationStart(lexer)))) {
+      const kind = initTok.type.label === 'var' ? 'var'
+        : initTok.type.label === 'const' ? 'const'
+        : 'let';
+      lexer.advance();
+      // Parse a single declarator list (no trailing ';' — we'll
+      // consume it below ourselves).
+      const declBuf = [];
+      parseVarDeclarationsInFor(lexer, kind, initTok, declBuf);
+      init = declBuf[0] || null;
+    } else {
+      init = parseExpression(lexer);
+    }
+    // TODO: for-in / for-of detection. For now we assume `;`-style
+    // C loop and raise unimplemented if the next token is `in` or
+    // `of`.
+    const afterInit = lexer.peek();
+    if (afterInit && (afterInit.type.label === 'in' ||
+        (afterInit.type.label === 'name' && afterInit.value === 'of'))) {
+      // for-in / for-of. Skip to end of statement — not yet supported.
+      const endTok = skipToNextStatementBoundary(lexer);
+      outputs.push(mkUnimplementedStatement('for-' + afterInit.value, t, endTok));
+      return;
+    }
+    expect(lexer, ';');
+    let test = null;
+    if (lexer.peek() && lexer.peek().type.label !== ';') {
+      test = parseExpression(lexer);
+    }
+    expect(lexer, ';');
+    let update = null;
+    if (lexer.peek() && lexer.peek().type.label !== ')') {
+      update = parseExpression(lexer);
+    }
+    expect(lexer, ')');
+    tasks.push({ kind: 'finish_for', startTok: t, init, test, update });
+    tasks.push({ kind: 'parse_stmt' });
+    return;
+  }
+  // --- break / continue ---
+  if (label === 'break' || label === 'continue') {
+    lexer.advance();
+    // Optional label — not yet supported.
+    const next = lexer.peek();
+    let labelName = null;
+    if (next && next.type.label === 'name') {
+      labelName = next.value;
+      lexer.advance();
+    }
+    if (lexer.peek() && lexer.peek().type.label === ';') lexer.advance();
+    outputs.push(label === 'break'
+      ? mkBreakStatement(labelName, t)
+      : mkContinueStatement(labelName, t));
+    return;
+  }
+
   // Keywords not yet implemented: skip to the next `;` or to the
   // end of a balanced brace region, then emit a marker node. This
   // keeps the rest of the program analysable.
@@ -1034,8 +1230,8 @@ function beginStatement(lexer, tasks, outputs) {
 // implemented yet. Each becomes an UnimplementedStatement marker
 // until the corresponding transfer function is written.
 const UNHANDLED_STATEMENT_KEYWORDS = new Set([
-  'for', 'while', 'do', 'switch', 'try', 'throw',
-  'break', 'continue', 'with', 'class', 'import', 'export',
+  'switch', 'try', 'throw',
+  'with', 'class', 'import', 'export',
 ]);
 
 function isUnhandledStatementKeyword(label) {
@@ -1172,6 +1368,63 @@ function finishIf(lexer, task, tasks, outputs) {
 function finishIfElse(task, outputs) {
   const alternate = outputs.pop();
   outputs.push(mkIfStatement(task.test, task.consequent, alternate, task.startTok));
+}
+
+function finishWhile(task, outputs) {
+  const body = outputs.pop();
+  outputs.push(mkWhileStatement(task.test, body, task.startTok));
+}
+
+function finishDoWhile(lexer, task, tasks, outputs) {
+  // The body has just been parsed — it's at the top of outputs.
+  const body = outputs.pop();
+  // Now expect `while (test);`.
+  expect(lexer, 'while');
+  expect(lexer, '(');
+  const test = parseExpression(lexer);
+  expect(lexer, ')');
+  if (lexer.peek() && lexer.peek().type.label === ';') lexer.advance();
+  outputs.push(mkDoWhileStatement(body, test, task.startTok));
+}
+
+function finishDoWhileTest(task, outputs) {
+  // Unused hook placeholder kept for symmetry with tasks added in
+  // the parser dispatch; the actual do-while parsing completes in
+  // finishDoWhile above.
+  outputs;
+}
+
+function finishFor(task, outputs) {
+  const body = outputs.pop();
+  outputs.push(mkForStatement(task.init, task.test, task.update, body, task.startTok));
+}
+
+// parseVarDeclarationsInFor — like parseVarDeclarations but does
+// NOT consume a trailing `;` because the for-loop header handles
+// it explicitly.
+function parseVarDeclarationsInFor(lexer, kind, kindTok, outputs) {
+  const decls = [];
+  while (true) {
+    const nameTok = lexer.peek();
+    if (!nameTok || nameTok.type.label !== 'name') {
+      throw parseError(lexer, 'expected identifier after ' + kind);
+    }
+    const id = mkIdentifier(nameTok.value, nameTok);
+    lexer.advance();
+    let init = null;
+    const next = lexer.peek();
+    if (next && next.type.label === '=') {
+      lexer.advance();
+      init = parseExpression(lexer);
+    }
+    decls.push(mkVariableDeclarator(id, init, nameTok));
+    if (lexer.peek() && lexer.peek().type.label === ',') {
+      lexer.advance();
+      continue;
+    }
+    break;
+  }
+  outputs.push(mkVariableDeclaration(kind, decls, kindTok));
 }
 
 function finishFuncDecl(task, outputs) {

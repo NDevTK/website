@@ -165,6 +165,26 @@ function sourceLabelToReason(label) {
 function emitTaintFlow(ctx, sinkInfo, sinkLoc, value) {
   if (!ctx.taintFlows) return;
   if (!value || !value.labels || value.labels.size === 0) return;
+
+  // Dedup key: a single flow is identified by its sink location,
+  // sink kind+prop, and the set of source labels at the source
+  // location. The worklist re-processes a block every time its
+  // in-state grows (a normal consequence of loop fixpoint
+  // iteration), so a SetProp / Call instruction inside a loop
+  // body fires multiple times. Without dedup the trace gets N
+  // copies of the same flow. The key is stable across re-fires
+  // because the sink location is fixed by the instruction and
+  // the label set stabilises once the lattice reaches fixpoint.
+  if (!ctx._emittedFlowKeys) ctx._emittedFlowKeys = new Set();
+  const labelsList = [];
+  for (const l of value.labels) labelsList.push(l);
+  labelsList.sort();
+  const sinkKey = (sinkLoc ? sinkLoc.file + ':' + sinkLoc.pos : '?') +
+    '|' + (sinkInfo.type || '') + '|' + (sinkInfo.prop || '') +
+    '|' + labelsList.join(',');
+  if (ctx._emittedFlowKeys.has(sinkKey)) return;
+  ctx._emittedFlowKeys.add(sinkKey);
+
   // Extract sources from the value's labels. Each label gets a
   // location from the value's provenance (the deepest provenance
   // entry is the most recent — use it as the source location).

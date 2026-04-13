@@ -185,10 +185,12 @@ const tests = [
   {
     name: 'analyse: unimplemented statement raises soundness assumption',
     fn: () => {
-      const r = analyse('for (var i = 0; i < 3; i++) {}');
+      // `try` is still unimplemented (Wave 4 territory). Loops
+      // became supported in Wave 3.
+      const r = analyse('try { x = 1; } catch (e) { x = 2; }');
       const snap = r.ctx.assumptions.snapshot();
       const hasUnimpl = snap.some(a => a.reason === 'unimplemented');
-      assert(hasUnimpl, 'expected unimplemented assumption for for-loop');
+      assert(hasUnimpl, 'expected unimplemented assumption for try-statement');
       const unimpl = snap.find(a => a.reason === 'unimplemented');
       assertEqual(unimpl.severity, 'soundness');
     },

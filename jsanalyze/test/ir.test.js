@@ -87,10 +87,11 @@ const tests = [
   {
     name: 'buildModule: unimplemented node becomes Opaque',
     fn: () => {
-      // `for` loops aren't lowered yet → becomes an opaque stmt.
-      const m = buildModule('for (var i = 0; i < 3; i++) {}', 'a.js');
+      // `try` statements aren't lowered yet → becomes an opaque stmt.
+      // (`for` was implemented in Wave 3.)
+      const m = buildModule('try { x = 1; } catch (e) { x = 2; }', 'a.js');
       const ops = opsOf(m);
-      assert(ops.includes(OP.OPAQUE), 'has Opaque for unimplemented for-loop');
+      assert(ops.includes(OP.OPAQUE), 'has Opaque for unimplemented try-statement');
     },
   },
   {

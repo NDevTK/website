@@ -371,6 +371,8 @@ function stepStmtTask(ctx, task) {
     case 'enter_function':   return enterFunctionStep(ctx, task);
     case 'leave_function':   return leaveFunctionStep(ctx, task);
     case 'hoist_decls':      return hoistDeclarationsStep(ctx, task);
+    case 'finish_loop_body': return finishLoopBodyStep(ctx, task);
+    case 'finish_do_while_cond': return finishDoWhileCondStep(ctx, task);
     default:
       throw new Error('ir: unknown statement task ' + task.kind);
   }
@@ -571,6 +573,11 @@ function lowerStatement(ctx, node) {
       if (ctx._hoistedFnNodes && ctx._hoistedFnNodes.has(node)) return;
       return lowerFunctionDecl(ctx, node, loc);
     }
+    case 'WhileStatement':     return beginWhile(ctx, node, loc);
+    case 'DoWhileStatement':   return beginDoWhile(ctx, node, loc);
+    case 'ForStatement':       return beginFor(ctx, node, loc);
+    case 'BreakStatement':     return lowerBreak(ctx, node, loc);
+    case 'ContinueStatement':  return lowerContinue(ctx, node, loc);
     case 'EmptyStatement':      return;
     case 'UnimplementedStatement': {
       const dest = newRegister(ctx.module);
@@ -745,6 +752,650 @@ function ifMergeStep(ctx, task) {
       op: OP.PHI, dest, incoming,
     }, loc);
     updateName(ctx.scope, name, dest);
+  }
+}
+
+// --- Loop lowering ------------------------------------------------------
+//
+// All loop forms share the same CFG backbone:
+//
+//   predBlock (falls through) → headerBlock (branch on cond)
+//     headerBlock.trueTarget  = bodyBlock
+//     headerBlock.falseTarget = exitBlock
+//   bodyBlock → ... → headerBlock  (back edge)
+//
+// Phi nodes at the header merge the pre-loop values with the
+// body's output values. To insert them correctly we have to
+// precompute which names the body assigns — we walk the body
+// AST and collect written identifier names (stopping at
+// nested function boundaries).
+//
+// `break` and `continue` jump to the loop's exitBlock and
+// continueTarget respectively. We track these on a
+// ctx._loopStack so nested loops work.
+//
+// The worklist's monotone fixpoint handles loop convergence:
+// each back edge re-enqueues the header with the joined state,
+// and the finite-height Value lattice guarantees termination.
+// No iteration cap is needed — divergence would be a lattice
+// bug that should surface as a hang rather than silent
+// imprecision.
+
+function beginWhile(ctx, node, loc) {
+  const predBlock = ctx.currentBlock;
+
+  // Pre-scan the body AST for names that get assigned inside
+  // (not counting inner functions). These need phi nodes at
+  // the header so references inside the loop see a register
+  // that joins the pre-loop and body-exit values.
+  const loopDefs = new Set();
+  collectAssignedNames([node.body], loopDefs);
+
+  // Allocate header, body, and exit blocks.
+  const headerBlock = createBlock(ctx.module);
+  ctx.blocks.set(headerBlock.id, headerBlock);
+  addEdge(predBlock, headerBlock);
+
+  const bodyBlock = createBlock(ctx.module);
+  ctx.blocks.set(bodyBlock.id, bodyBlock);
+  addEdge(headerBlock, bodyBlock);
+
+  const exitBlock = createBlock(ctx.module);
+  ctx.blocks.set(exitBlock.id, exitBlock);
+  addEdge(headerBlock, exitBlock);
+
+  // Fall through from predBlock to header.
+  emit(ctx.module, predBlock, {
+    op: OP.JUMP, target: headerBlock.id,
+  }, loc);
+
+  // Emit a Phi at the header for each loop-def name, with one
+  // incoming entry (from predBlock) for now. The second incoming
+  // (from the body exit) is appended in finishLoopBodyStep.
+  const phis = [];  // { name, destReg, instr }
+  for (const name of loopDefs) {
+    const currentReg = lookupName(ctx.scope, name);
+    if (currentReg == null) continue;  // hoist should have bound it; skip
+    const destReg = newRegister(ctx.module);
+    const phiInstr = {
+      op: OP.PHI,
+      dest: destReg,
+      incoming: [{ pred: predBlock.id, value: currentReg }],
+    };
+    emit(ctx.module, headerBlock, phiInstr, loc);
+    updateName(ctx.scope, name, destReg);
+    phis.push({ name, destReg, instr: phiInstr });
+  }
+
+  // Now lower the cond in the header block. It reads phi-bound
+  // registers where applicable.
+  ctx.currentBlock = headerBlock;
+  const condReg = lowerExpression(ctx, node.test);
+  emit(ctx.module, headerBlock, {
+    op: OP.BRANCH,
+    cond: condReg,
+    trueTarget: bodyBlock.id,
+    falseTarget: exitBlock.id,
+  }, loc);
+
+  // Push the loop context so break/continue know their targets,
+  // and so finish_loop_body can find the phi list.
+  if (!ctx._loopStack) ctx._loopStack = [];
+  ctx._loopStack.push({
+    headerBlock,
+    bodyBlock,
+    exitBlock,
+    continueTarget: headerBlock,
+    phis,
+  });
+
+  // Switch to the body block and queue body lowering + finish.
+  ctx.currentBlock = bodyBlock;
+  ctx._work.push({ kind: 'finish_loop_body', loc });
+  ctx._work.push({ kind: 'after_stmt' });
+  ctx._work.push({ kind: 'lower_stmt', node: node.body });
+}
+
+function beginDoWhile(ctx, node, loc) {
+  const predBlock = ctx.currentBlock;
+
+  const loopDefs = new Set();
+  collectAssignedNames([node.body], loopDefs);
+
+  // do-while: bodyBlock runs first (always at least once), then
+  // condBlock evaluates the test, branches back to bodyBlock or
+  // forward to exitBlock.
+  //
+  //   predBlock → bodyBlock → condBlock (branch)
+  //     condBlock.trueTarget  = bodyBlock   (back edge)
+  //     condBlock.falseTarget = exitBlock
+  const bodyBlock = createBlock(ctx.module);
+  ctx.blocks.set(bodyBlock.id, bodyBlock);
+  addEdge(predBlock, bodyBlock);
+
+  const condBlock = createBlock(ctx.module);
+  ctx.blocks.set(condBlock.id, condBlock);
+  addEdge(bodyBlock, condBlock);
+
+  const exitBlock = createBlock(ctx.module);
+  ctx.blocks.set(exitBlock.id, exitBlock);
+  addEdge(condBlock, exitBlock);
+
+  emit(ctx.module, predBlock, {
+    op: OP.JUMP, target: bodyBlock.id,
+  }, loc);
+
+  // Phis at bodyBlock: pre-loop entry + back edge from condBlock.
+  const phis = [];
+  for (const name of loopDefs) {
+    const currentReg = lookupName(ctx.scope, name);
+    if (currentReg == null) continue;
+    const destReg = newRegister(ctx.module);
+    const phiInstr = {
+      op: OP.PHI,
+      dest: destReg,
+      incoming: [{ pred: predBlock.id, value: currentReg }],
+    };
+    emit(ctx.module, bodyBlock, phiInstr, loc);
+    updateName(ctx.scope, name, destReg);
+    phis.push({ name, destReg, instr: phiInstr });
+  }
+
+  if (!ctx._loopStack) ctx._loopStack = [];
+  ctx._loopStack.push({
+    headerBlock: bodyBlock,      // phis live here; continue re-enters body
+    bodyBlock,
+    exitBlock,
+    condBlock,
+    continueTarget: condBlock,
+    phis,
+    isDoWhile: true,
+    testNode: node.test,
+  });
+
+  ctx.currentBlock = bodyBlock;
+  ctx._work.push({ kind: 'finish_do_while_cond', loc });
+  ctx._work.push({ kind: 'after_stmt' });
+  ctx._work.push({ kind: 'lower_stmt', node: node.body });
+}
+
+function beginFor(ctx, node, loc) {
+  // For statement: `for (init; test; update) body`
+  //
+  // Any of init, test, update may be null. We desugar to a while
+  // loop by lowering init in the pred block, then building the
+  // same header/body/exit structure, with `update` lowered in a
+  // dedicated updateBlock that sits on the back edge:
+  //
+  //   predBlock → initLowered → headerBlock (branch on test)
+  //   bodyBlock → updateBlock → headerBlock
+  //
+  // If init is a VariableDeclaration, lower it as a regular
+  // statement (it may be var/let/const — for simple for-loops we
+  // don't create a separate lexical block, which is a known
+  // imprecision for `for (let i; ...)` but sound).
+  const predBlock = ctx.currentBlock;
+
+  // Lower init (if any) directly into the predBlock.
+  if (node.init) {
+    if (node.init.type === 'VariableDeclaration') {
+      lowerVarDecl(ctx, node.init, loc);
+    } else {
+      lowerExpression(ctx, node.init);
+    }
+  }
+
+  // Collect names assigned inside body OR update — both need phis
+  // at the header because they flow back through the header on
+  // the next iteration.
+  const loopDefs = new Set();
+  collectAssignedNames([node.body], loopDefs);
+  if (node.update) collectAssignedNamesFromExpression(node.update, loopDefs);
+
+  const headerBlock = createBlock(ctx.module);
+  ctx.blocks.set(headerBlock.id, headerBlock);
+  addEdge(ctx.currentBlock, headerBlock);
+
+  const bodyBlock = createBlock(ctx.module);
+  ctx.blocks.set(bodyBlock.id, bodyBlock);
+  addEdge(headerBlock, bodyBlock);
+
+  const updateBlock = createBlock(ctx.module);
+  ctx.blocks.set(updateBlock.id, updateBlock);
+  addEdge(bodyBlock, updateBlock);
+
+  const exitBlock = createBlock(ctx.module);
+  ctx.blocks.set(exitBlock.id, exitBlock);
+  addEdge(headerBlock, exitBlock);
+
+  emit(ctx.module, ctx.currentBlock, {
+    op: OP.JUMP, target: headerBlock.id,
+  }, loc);
+  const initExitBlock = ctx.currentBlock;
+
+  // Phis at header: incoming from init-exit + update-exit.
+  const phis = [];
+  for (const name of loopDefs) {
+    const currentReg = lookupName(ctx.scope, name);
+    if (currentReg == null) continue;
+    const destReg = newRegister(ctx.module);
+    const phiInstr = {
+      op: OP.PHI,
+      dest: destReg,
+      incoming: [{ pred: initExitBlock.id, value: currentReg }],
+    };
+    emit(ctx.module, headerBlock, phiInstr, loc);
+    updateName(ctx.scope, name, destReg);
+    phis.push({ name, destReg, instr: phiInstr });
+  }
+
+  // Lower test in header (it reads phi-bound regs).
+  ctx.currentBlock = headerBlock;
+  let condReg;
+  if (node.test) {
+    condReg = lowerExpression(ctx, node.test);
+  } else {
+    // No test → always true (infinite loop). Emit a constant true.
+    condReg = newRegister(ctx.module);
+    emit(ctx.module, headerBlock, {
+      op: OP.CONST, dest: condReg, value: true,
+    }, loc);
+  }
+  emit(ctx.module, headerBlock, {
+    op: OP.BRANCH,
+    cond: condReg,
+    trueTarget: bodyBlock.id,
+    falseTarget: exitBlock.id,
+  }, loc);
+
+  if (!ctx._loopStack) ctx._loopStack = [];
+  ctx._loopStack.push({
+    headerBlock,
+    bodyBlock,
+    updateBlock,       // where `continue` lands (runs update then header)
+    exitBlock,
+    continueTarget: updateBlock,
+    phis,
+    updateNode: node.update,
+  });
+
+  ctx.currentBlock = bodyBlock;
+  ctx._work.push({ kind: 'finish_loop_body', loc });
+  ctx._work.push({ kind: 'after_stmt' });
+  ctx._work.push({ kind: 'lower_stmt', node: node.body });
+}
+
+// finish_loop_body — runs after the body has been lowered for
+// while / for loops. Closes the back edge, appends incoming phi
+// entries for the body-exit and any `continue` sources, and
+// adds phi nodes at the exit block for `break`-source values
+// that disagree with the header-normal exit.
+function finishLoopBodyStep(ctx, task) {
+  const loop = ctx._loopStack.pop();
+  const bodyExitBlock = ctx.currentBlock;
+
+  // --- Body exit: route through updateBlock (for-loop) or
+  // directly back to the header (while).
+  let backEdgeSource = bodyExitBlock;
+  if (loop.updateBlock) {
+    if (!bodyExitBlock.terminator) {
+      emit(ctx.module, bodyExitBlock, {
+        op: OP.JUMP, target: loop.updateBlock.id,
+      }, task.loc);
+      addEdge(bodyExitBlock, loop.updateBlock);
+    }
+    // `continue` sources also jump to updateBlock, NOT header,
+    // for for-loops. They're already recorded in continueSources
+    // with a Jump to continueTarget (= updateBlock).
+    ctx.currentBlock = loop.updateBlock;
+    if (loop.updateNode) {
+      lowerExpression(ctx, loop.updateNode);
+    }
+    backEdgeSource = ctx.currentBlock;
+  }
+
+  if (!backEdgeSource.terminator) {
+    emit(ctx.module, backEdgeSource, {
+      op: OP.JUMP, target: loop.headerBlock.id,
+    }, task.loc);
+    addEdge(backEdgeSource, loop.headerBlock);
+  }
+
+  // --- Header phi completion.
+  //
+  // Each phi gets incoming entries for:
+  //   1. The body-exit path (via backEdgeSource).
+  //   2. For while-loops: each `continue` source block (those
+  //      jump directly to the header).
+  //   3. For for-loops: continue sources jump to updateBlock,
+  //      which then flows to backEdgeSource above, so they're
+  //      already covered.
+  for (const phi of loop.phis) {
+    const finalReg = lookupName(ctx.scope, phi.name);
+    if (finalReg != null) {
+      phi.instr.incoming.push({ pred: backEdgeSource.id, value: finalReg });
+    }
+    // For while-loops (no updateBlock), continue sources bypass
+    // the body-exit and reach the header directly.
+    if (!loop.updateBlock && loop.continueSources) {
+      for (const src of loop.continueSources) {
+        const reg = lookupInSnapshot(src.scope, phi.name);
+        if (reg != null) {
+          phi.instr.incoming.push({ pred: src.block.id, value: reg });
+        }
+      }
+    }
+  }
+
+  // --- Exit block phi nodes.
+  //
+  // The exit block has at least one predecessor (the header's
+  // false-target edge for while/for loops). For every `break`
+  // source, we also add an incoming edge. If a name's value at
+  // the break source differs from its header-out value, we emit
+  // a phi at the exit block to merge them.
+  //
+  // The header-out value of a name is just the phi dest (names
+  // in loop.phis) or the scope's current reg (names not in the
+  // phi list).
+  const exitPreds = [
+    { block: loop.headerBlock, kind: 'header-normal' },
+  ];
+  if (loop.breakSources) {
+    for (const src of loop.breakSources) {
+      exitPreds.push({ block: src.block, kind: 'break', scope: src.scope });
+    }
+  }
+
+  // Collect the set of names to reconcile at the exit block.
+  // For each loop-phi name, we always emit an exit phi if there
+  // are any break sources (the break side carries the body's
+  // assigned value, the header side carries the phi dest).
+  // Also reconcile names that the break sources touch but the
+  // header phis don't (rare in practice but sound).
+  const exitNames = new Set();
+  if (loop.breakSources && loop.breakSources.length > 0) {
+    for (const phi of loop.phis) exitNames.add(phi.name);
+    for (const src of loop.breakSources) {
+      for (const k of allNamesInSnapshot(src.scope)) exitNames.add(k);
+    }
+  }
+
+  for (const name of exitNames) {
+    const headerReg = lookupName(ctx.scope, name);   // phi dest or unchanged
+    const incomings = [];
+    if (headerReg != null) {
+      incomings.push({ pred: loop.headerBlock.id, value: headerReg });
+    }
+    for (const src of loop.breakSources) {
+      const reg = lookupInSnapshot(src.scope, name);
+      if (reg != null) {
+        incomings.push({ pred: src.block.id, value: reg });
+      }
+    }
+    if (incomings.length === 0) continue;
+    const allSame = incomings.every(i => i.value === incomings[0].value);
+    if (allSame) {
+      updateName(ctx.scope, name, incomings[0].value);
+      continue;
+    }
+    const dest = newRegister(ctx.module);
+    emit(ctx.module, loop.exitBlock, {
+      op: OP.PHI, dest, incoming: incomings,
+    }, task.loc);
+    updateName(ctx.scope, name, dest);
+  }
+
+  // For loops with no break sources, just restore the scope
+  // bindings to the phi dests so post-loop code sees the phi
+  // values.
+  if (!loop.breakSources || loop.breakSources.length === 0) {
+    for (const phi of loop.phis) {
+      updateName(ctx.scope, phi.name, phi.destReg);
+    }
+  }
+
+  ctx.currentBlock = loop.exitBlock;
+}
+
+// finish_do_while_cond — runs after a do-while's body has been
+// lowered. Falls through to condBlock, evaluates the test, emits
+// the Branch, and closes phis + break-exit reconciliation.
+function finishDoWhileCondStep(ctx, task) {
+  const loop = ctx._loopStack.pop();
+  const bodyExitBlock = ctx.currentBlock;
+
+  if (!bodyExitBlock.terminator) {
+    emit(ctx.module, bodyExitBlock, {
+      op: OP.JUMP, target: loop.condBlock.id,
+    }, task.loc);
+  }
+  ctx.currentBlock = loop.condBlock;
+  const condReg = lowerExpression(ctx, loop.testNode);
+  emit(ctx.module, loop.condBlock, {
+    op: OP.BRANCH,
+    cond: condReg,
+    trueTarget: loop.bodyBlock.id,    // back edge
+    falseTarget: loop.exitBlock.id,
+  }, task.loc);
+  addEdge(loop.condBlock, loop.bodyBlock);
+
+  // Body-exit phi incomings (via condBlock's back edge).
+  for (const phi of loop.phis) {
+    const finalReg = lookupName(ctx.scope, phi.name);
+    if (finalReg != null) {
+      phi.instr.incoming.push({ pred: loop.condBlock.id, value: finalReg });
+    }
+  }
+  // `continue` in do-while jumps to condBlock (the continueTarget),
+  // which then re-tests and may loop back. The condBlock's only
+  // active incoming is the body exit, so continues contribute
+  // values through that path already.
+
+  // Break reconciliation at the exit block (same pattern as
+  // finishLoopBodyStep). Exit preds: condBlock's false path
+  // plus each break source.
+  const exitPreds = [
+    { block: loop.condBlock, kind: 'cond-normal' },
+  ];
+  if (loop.breakSources) {
+    for (const src of loop.breakSources) {
+      exitPreds.push({ block: src.block, kind: 'break', scope: src.scope });
+    }
+  }
+  const exitNames = new Set();
+  if (loop.breakSources && loop.breakSources.length > 0) {
+    for (const phi of loop.phis) exitNames.add(phi.name);
+    for (const src of loop.breakSources) {
+      for (const k of allNamesInSnapshot(src.scope)) exitNames.add(k);
+    }
+  }
+  for (const name of exitNames) {
+    const headerReg = lookupName(ctx.scope, name);
+    const incomings = [];
+    if (headerReg != null) {
+      incomings.push({ pred: loop.condBlock.id, value: headerReg });
+    }
+    for (const src of loop.breakSources) {
+      const reg = lookupInSnapshot(src.scope, name);
+      if (reg != null) incomings.push({ pred: src.block.id, value: reg });
+    }
+    if (incomings.length === 0) continue;
+    const allSame = incomings.every(i => i.value === incomings[0].value);
+    if (allSame) { updateName(ctx.scope, name, incomings[0].value); continue; }
+    const dest = newRegister(ctx.module);
+    emit(ctx.module, loop.exitBlock, {
+      op: OP.PHI, dest, incoming: incomings,
+    }, task.loc);
+    updateName(ctx.scope, name, dest);
+  }
+  if (!loop.breakSources || loop.breakSources.length === 0) {
+    for (const phi of loop.phis) {
+      updateName(ctx.scope, phi.name, phi.destReg);
+    }
+  }
+
+  ctx.currentBlock = loop.exitBlock;
+}
+
+function lowerBreak(ctx, node, loc) {
+  if (!ctx._loopStack || ctx._loopStack.length === 0) {
+    lowerUnimplementedStmt(ctx, node, loc);
+    return;
+  }
+  const loop = ctx._loopStack[ctx._loopStack.length - 1];
+  emit(ctx.module, ctx.currentBlock, {
+    op: OP.JUMP, target: loop.exitBlock.id,
+  }, loc);
+  addEdge(ctx.currentBlock, loop.exitBlock);
+  // Record the break source: the block, and a snapshot of the
+  // current scope bindings. finishLoopBodyStep uses these to add
+  // phi nodes at the exit block for names that differ between the
+  // loop's normal exit path (header-false) and each break point.
+  if (!loop.breakSources) loop.breakSources = [];
+  loop.breakSources.push({
+    block: ctx.currentBlock,
+    scope: snapshotScope(ctx.scope),
+  });
+}
+
+function lowerContinue(ctx, node, loc) {
+  if (!ctx._loopStack || ctx._loopStack.length === 0) {
+    lowerUnimplementedStmt(ctx, node, loc);
+    return;
+  }
+  const loop = ctx._loopStack[ctx._loopStack.length - 1];
+  const target = loop.continueTarget;
+  emit(ctx.module, ctx.currentBlock, {
+    op: OP.JUMP, target: target.id,
+  }, loc);
+  addEdge(ctx.currentBlock, target);
+  // Record the continue source the same way. For while/do-while
+  // loops, continueTarget === headerBlock, so the header phi
+  // needs an extra incoming from this source. For for-loops,
+  // continueTarget is the updateBlock; the header phi will
+  // receive the value via the update→header back edge after
+  // update runs.
+  if (!loop.continueSources) loop.continueSources = [];
+  loop.continueSources.push({
+    block: ctx.currentBlock,
+    scope: snapshotScope(ctx.scope),
+  });
+}
+
+// --- Helpers for loop lowering ------------------------------------------
+
+// collectAssignedNames(nodes, out)
+//
+// Walks a list of statement AST nodes and collects the names of
+// all identifiers that are (a) declared via `var` (function-scoped)
+// or (b) the target of an AssignmentExpression. Stops at nested
+// function boundaries. Used by loop lowering to compute which
+// names need phi nodes at the loop header.
+function collectAssignedNames(nodes, out) {
+  const stack = nodes.slice().reverse();
+  while (stack.length > 0) {
+    const n = stack.pop();
+    if (!n) continue;
+    if (n.type === 'VariableDeclaration') {
+      for (const d of n.declarations) {
+        if (d.id && d.id.type === 'Identifier') out.add(d.id.name);
+      }
+      continue;
+    }
+    if (n.type === 'ExpressionStatement') {
+      collectAssignedNamesFromExpression(n.expression, out);
+      continue;
+    }
+    if (n.type === 'BlockStatement') {
+      for (let i = n.body.length - 1; i >= 0; i--) stack.push(n.body[i]);
+      continue;
+    }
+    if (n.type === 'IfStatement') {
+      if (n.consequent) stack.push(n.consequent);
+      if (n.alternate) stack.push(n.alternate);
+      continue;
+    }
+    if (n.type === 'ForStatement' || n.type === 'WhileStatement' ||
+        n.type === 'DoWhileStatement') {
+      if (n.init && n.init.type === 'VariableDeclaration') {
+        for (const d of n.init.declarations) {
+          if (d.id && d.id.type === 'Identifier') out.add(d.id.name);
+        }
+      }
+      if (n.update) collectAssignedNamesFromExpression(n.update, out);
+      if (n.body) stack.push(n.body);
+      continue;
+    }
+    if (n.type === 'ForInStatement' || n.type === 'ForOfStatement') {
+      if (n.left && n.left.type === 'VariableDeclaration') {
+        for (const d of n.left.declarations) {
+          if (d.id && d.id.type === 'Identifier') out.add(d.id.name);
+        }
+      } else if (n.left && n.left.type === 'Identifier') {
+        out.add(n.left.name);
+      }
+      if (n.body) stack.push(n.body);
+      continue;
+    }
+    if (n.type === 'LabeledStatement') { stack.push(n.body); continue; }
+    if (n.type === 'TryStatement') {
+      if (n.block) stack.push(n.block);
+      if (n.handler && n.handler.body) stack.push(n.handler.body);
+      if (n.finalizer) stack.push(n.finalizer);
+      continue;
+    }
+    if (n.type === 'SwitchStatement') {
+      for (const c of n.cases) {
+        for (let i = c.consequent.length - 1; i >= 0; i--) stack.push(c.consequent[i]);
+      }
+      continue;
+    }
+    // Function boundaries and other statements don't assign
+    // outer names we need to track.
+  }
+}
+
+function collectAssignedNamesFromExpression(node, out) {
+  // Recursive walk via stack to stay iterative.
+  const stack = [node];
+  while (stack.length > 0) {
+    const n = stack.pop();
+    if (!n) continue;
+    if (n.type === 'AssignmentExpression') {
+      if (n.left && n.left.type === 'Identifier') out.add(n.left.name);
+      stack.push(n.right);
+      continue;
+    }
+    if (n.type === 'UpdateExpression') {
+      // `i++` / `++i` / `i--` / `--i` all reassign i.
+      if (n.argument && n.argument.type === 'Identifier') out.add(n.argument.name);
+      continue;
+    }
+    if (n.type === 'BinaryExpression' || n.type === 'LogicalExpression') {
+      stack.push(n.left); stack.push(n.right); continue;
+    }
+    if (n.type === 'UnaryExpression') { stack.push(n.argument); continue; }
+    if (n.type === 'ConditionalExpression') {
+      stack.push(n.test); stack.push(n.consequent); stack.push(n.alternate);
+      continue;
+    }
+    if (n.type === 'CallExpression' || n.type === 'NewExpression') {
+      stack.push(n.callee);
+      if (n.arguments) for (const a of n.arguments) stack.push(a);
+      continue;
+    }
+    if (n.type === 'MemberExpression') {
+      stack.push(n.object);
+      if (n.computed && n.property) stack.push(n.property);
+      continue;
+    }
+    if (n.type === 'SequenceExpression') {
+      for (const e of n.expressions) stack.push(e);
+      continue;
+    }
+    // Identifiers, literals, function expressions, etc. don't
+    // assign to outer names.
   }
 }
 
@@ -1116,6 +1767,55 @@ function lowerExpressionIter(ctx, root) {
         results.push(dest);
         break;
       }
+      case 'emit_update_ident': {
+        // `x++` / `++x` / `x--` / `--x` on an Identifier target.
+        // Desugar: emit a Const(1), BinOp(+/-), bind result to x.
+        // Expression-result semantics (prefix returns new, postfix
+        // returns old) are approximated: we always push the new
+        // value onto `results`. A consumer that distinguishes
+        // prefix vs postfix semantically would need a richer
+        // model — tracked as an imprecision.
+        const lhsReg = lookupName(ctx.scope, task.name);
+        if (lhsReg == null) {
+          const dest = newRegister(ctx.module);
+          emit(ctx.module, ctx.currentBlock, {
+            op: OP.OPAQUE, dest,
+            reason: REASONS.UNIMPLEMENTED,
+            details: 'update on unresolved identifier ' + task.name,
+            affects: null,
+          }, task.loc);
+          results.push(dest);
+          break;
+        }
+        const oneReg = newRegister(ctx.module);
+        emit(ctx.module, ctx.currentBlock, {
+          op: OP.CONST, dest: oneReg, value: 1,
+        }, task.loc);
+        const newReg = newRegister(ctx.module);
+        emit(ctx.module, ctx.currentBlock, {
+          op: OP.BIN_OP,
+          dest: newReg,
+          operator: task.op,
+          left: lhsReg,
+          right: oneReg,
+        }, task.loc);
+        updateName(ctx.scope, task.name, newReg);
+        // Push the new value (prefix semantics). A post-increment
+        // would ideally push the old value; we approximate.
+        results.push(newReg);
+        break;
+      }
+      case 'emit_unimplemented_expr': {
+        const dest = newRegister(ctx.module);
+        emit(ctx.module, ctx.currentBlock, {
+          op: OP.OPAQUE, dest,
+          reason: REASONS.UNIMPLEMENTED,
+          details: task.details,
+          affects: null,
+        }, task.loc);
+        results.push(dest);
+        break;
+      }
       case 'emit_set_prop': {
         // `obj.prop = val` → tasks pushed: visit obj, visit val
         // (in that order). When emit_set_prop runs, results holds
@@ -1213,6 +1913,30 @@ function visitNode(ctx, node, tasks, results) {
     case 'UnaryExpression': {
       tasks.push({ kind: 'emit_unop', operator: node.operator, loc });
       tasks.push({ kind: 'visit', node: node.argument });
+      return;
+    }
+    case 'UpdateExpression': {
+      // `x++` / `++x` / `x--` / `--x`: desugar to an assignment.
+      // The semantics are:
+      //   prefix:  x = x + 1; return x
+      //   postfix: tmp = x; x = x + 1; return tmp
+      // For precision we only track the updated value of x. The
+      // return-value distinction between prefix and postfix is
+      // approximated — a future refinement can model it exactly
+      // by keeping a pre-update snapshot.
+      //
+      // The AST argument is usually an Identifier or a
+      // MemberExpression. For identifiers we emit a Const(1),
+      // a BinOp(+/-), and an assign-name. For member targets we
+      // currently fall through to unimplemented.
+      const op = node.operator === '++' ? '+' : '-';
+      if (node.argument.type === 'Identifier') {
+        tasks.push({ kind: 'emit_update_ident',
+          name: node.argument.name, op, prefix: node.prefix, loc });
+        return;
+      }
+      tasks.push({ kind: 'emit_unimplemented_expr',
+        details: 'UpdateExpression on non-identifier target', loc });
       return;
     }
     case 'MemberExpression': {

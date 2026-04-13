@@ -31,6 +31,7 @@ const testFiles = [
   'per-path-type.test.js',
   'type-narrow.test.js',
   'scope.test.js',
+  'loop.test.js',
 ];
 
 async function main() {

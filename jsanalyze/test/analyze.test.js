@@ -29,9 +29,12 @@ const tests = [
     },
   },
   {
-    name: 'analyze: unimplemented for-loop raises soundness assumption',
+    name: 'analyze: unimplemented try-statement raises soundness assumption',
     fn: async () => {
-      const t = await analyze('for (var i = 0; i < 3; i++) {}');
+      // `try` is still unimplemented in Wave 3 (Wave 4 lands it).
+      // For-loops became supported in Wave 3 so we switched to
+      // a statement kind that still raises unimplemented.
+      const t = await analyze('try { x = 1; } catch (e) { x = 2; }');
       const unimpl = query.assumptions(t, { reason: ['unimplemented'], severity: 'soundness' });
       assert(unimpl.length >= 1, 'expected unimplemented soundness assumption');
     },
@@ -64,7 +67,10 @@ const tests = [
   {
     name: 'query.assumptions: filter by reason',
     fn: async () => {
-      const t = await analyze('var x = someGlobal; for (var i = 0; i < 1; i++) {}');
+      // Use a try-statement (still unimplemented) instead of a
+      // for-loop for the unimplemented probe — Wave 3 implements
+      // for-loops.
+      const t = await analyze('var x = someGlobal; try { y = 1; } catch (e) { y = 2; }');
       const opaque = query.assumptions(t, { reason: ['opaque-call'] });
       const unimpl = query.assumptions(t, { reason: ['unimplemented'] });
       assert(opaque.length >= 1);
