@@ -94,28 +94,41 @@ truth.
 
 ### D5. SMT integration uses Z3 via the vendored `z3-solver` WASM
 
-Z3 is vendored under `jsanalyze/vendor/z3-solver/` as a symlink
-to `htmldom/vendor/z3-solver/`. The SMT layer imports Z3
-through a single `_initZ3()` function in `src/z3.js` that
-works in both Node (requires the vendored `node.js` entry via
-an absolute path rooted at `__dirname`) and the browser (via
-the existing `globalThis.__htmldomZ3Init` hook from
-`htmldom/jsanalyze-z3-browser.js`). Z3 is REQUIRED — there is
-no fallback; if the solver can't load, analysis fails loudly.
+Z3 is vendored as a real copy (not a symlink) under
+`jsanalyze/vendor/z3-solver/`. The directory is a verbatim
+copy of the `z3-solver` npm package's build output:
+`z3-built.js` + `z3-built.wasm` (the emscripten WASM module
+and its loader), `node.js` + `browser.js` (the Node and
+browser entry points), and the TypeScript high-level / low-
+level wrappers. The tree is checked into git so the engine
+has a self-contained copy that doesn't depend on `node_modules`
+at any consumer's level.
+
+The SMT layer imports Z3 through a single `_initZ3()` function
+in `src/z3.js` that works in both Node (requires the vendored
+`node.js` entry via an absolute path rooted at `__dirname`)
+and the browser (via the existing `globalThis.__htmldomZ3Init`
+hook from `htmldom/jsanalyze-z3-browser.js`, which itself
+loads the vendored `z3-built.js` and `browser.esm.js`). Z3 is
+REQUIRED — there is no fallback; if the solver can't load,
+analysis fails loudly.
 
 The Node path deliberately uses the vendored `node.js` entry
 directly (`vendor/z3-solver/node.js`) rather than
 `require('z3-solver')`, so the engine's behaviour is
 independent of whatever happens to sit in `node_modules` at
-the consumer's level. The vendor symlink is the sole source
+the consumer's level. The vendor directory is the sole source
 of truth for the Z3 binary.
 
-**Rationale.** One vendor copy, shared between the legacy
-engine and the new one. Z3 is heavy (33 MB WASM); we don't
-want two copies. The browser bootstrap already works; reuse
-it. Requiring it (no optional fallback) means the "proper
+**Rationale.** A real vendor copy (vs a symlink into the
+legacy engine's tree) means `jsanalyze/` is self-contained
+and moveable. Z3 is heavy (33 MB WASM) but the engine would
+need to ship its own copy for the browser bundle (D12) anyway,
+so duplication is inevitable — checking it in once avoids a
+build-time copy step and makes `git clone` enough to run the
+tests. Requiring Z3 (no optional fallback) means the "proper
 interprocedural, path-sensitive, state-correlated" contract
-holds in every deployment — consumers never silently downgrade
+holds in every deployment; consumers never silently downgrade
 to a weaker analysis because their install is incomplete.
 
 ### D6. Reachability is a 5-layer cascade with no layer skipped
