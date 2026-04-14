@@ -612,6 +612,61 @@ function parseOperand(lexer) {
       lexer.advance();
       continue;
     }
+    // Optional chaining: `a?.b`, `a?.[k]`, `a?.(args)`.
+    //
+    // We desugar by stripping the `?.` and treating the access
+    // as a regular member / index / call. This loses the
+    // "short-circuit to undefined if base is nullish" precision
+    // bit, which is fine for our analyzer: the result is
+    // already joined with undefined via the phi at the merge
+    // point, and taint flows propagate through both branches
+    // of the desugared form. The MemberExpression / CallExpression
+    // nodes gain an `optional` flag for consumers that want to
+    // distinguish.
+    if (label === '?.') {
+      lexer.advance();
+      const after = lexer.peek();
+      if (!after) throw parseError(lexer, 'unexpected end after `?.`');
+      if (after.type.label === '[') {
+        lexer.advance();
+        const keyExpr = parseExpression(lexer);
+        expect(lexer, ']');
+        base = mkMember(base, keyExpr, true);
+        base.optional = true;
+        continue;
+      }
+      if (after.type.label === '(') {
+        lexer.advance();
+        const args = [];
+        if (lexer.peek().type.label !== ')') {
+          while (true) {
+            if (lexer.peek().type.label === '...') {
+              const spreadTok = lexer.advance();
+              const inner = parseExpression(lexer);
+              args.push(mkSpreadElement(inner, spreadTok));
+            } else {
+              args.push(parseExpression(lexer));
+            }
+            if (lexer.peek().type.label === ',') { lexer.advance(); continue; }
+            break;
+          }
+        }
+        const closeTok = lexer.peek();
+        expect(lexer, ')');
+        base = mkCall(base, args, closeTok ? closeTok.end : base.end);
+        base.optional = true;
+        continue;
+      }
+      // `a?.name` — the name is after the `?.`.
+      if (after.type.label !== 'name' && !after.type.keyword) {
+        throw parseError(lexer, 'expected property name after `?.`');
+      }
+      lexer.advance();
+      const propNode = mkIdentifier(after.value || after.type.label, after);
+      base = mkMember(base, propNode, false);
+      base.optional = true;
+      continue;
+    }
     break;
   }
 
@@ -721,6 +776,74 @@ function parseObjectExpression(lexer) {
   const endTok = lexer.peek();
   expect(lexer, '}');
   return mkObjectExpression(properties, startTok, endTok);
+}
+
+// parseTemplateLiteral — `` ` template ${ expr } template ` ``.
+//
+// Lexer state: the `` ` `` token is the CURRENT token. We
+// alternate consuming `template` tokens (the literal pieces)
+// and `${ ... }` placeholder expressions until we see the
+// closing backtick.
+//
+// We build a TemplateLiteral ESTree node whose `quasis`
+// (TemplateElement) and `expressions` are aligned: N+1 quasis
+// for N expressions (JS template semantics).
+function parseTemplateLiteral(lexer) {
+  const openTok = lexer.advance();  // consume leading `
+  const quasis = [];
+  const expressions = [];
+  while (true) {
+    const t = lexer.peek();
+    if (!t) throw parseError(lexer, 'unterminated template literal');
+    if (t.type.label === '`') {
+      // Closing backtick. If we never consumed any template
+      // piece, push an empty quasi so invariants hold.
+      if (quasis.length === 0) {
+        quasis.push(mkTemplateElement('', true, t));
+      }
+      lexer.advance();
+      return mkTemplateLiteral(quasis, expressions, openTok);
+    }
+    if (t.type.label === 'template') {
+      lexer.advance();
+      quasis.push(mkTemplateElement(t.value || '', false, t));
+      continue;
+    }
+    if (t.type.label === '${') {
+      lexer.advance();
+      const expr = parseExpression(lexer);
+      expressions.push(expr);
+      expect(lexer, '}');
+      continue;
+    }
+    throw parseError(lexer, 'unexpected token in template literal: `' + t.type.label + '`');
+  }
+}
+
+function mkTemplateLiteral(quasis, expressions, startTok) {
+  const last = quasis[quasis.length - 1];
+  return {
+    type: 'TemplateLiteral',
+    quasis,
+    expressions,
+    loc: startTok && startTok.loc
+      ? { start: startTok.loc.start,
+          end: last && last.loc ? last.loc.end : startTok.loc.end }
+      : null,
+    start: startTok ? startTok.start : 0,
+    end:   last ? last.end : 0,
+  };
+}
+
+function mkTemplateElement(cooked, tail, tok) {
+  return {
+    type: 'TemplateElement',
+    value: { cooked, raw: cooked },
+    tail: !!tail,
+    loc: tok && tok.loc ? { start: tok.loc.start, end: tok.loc.end } : null,
+    start: tok ? tok.start : 0,
+    end:   tok ? tok.end : 0,
+  };
 }
 
 function mkFunctionExpression(id, params, body, isAsync, isGenerator, tok) {
@@ -1064,6 +1187,19 @@ function parsePrimary(lexer) {
   // Object literal: `{ a: 1, b, ...rest, [k]: v }`.
   if (label === '{') {
     return parseObjectExpression(lexer);
+  }
+  // Template literal: `` `hello ${x} world` ``.
+  //
+  // Acorn tokenizes as:
+  //   `  template("hello ")  ${  <expr tokens>  }  template(" world")  `
+  //
+  // We desugar to a left-folded chain of string concatenations
+  // so the IR builder's existing BinOp('+') transfer handles
+  // taint propagation (a string op with any tainted operand
+  // keeps the labels). Tagged templates `tag`...`` fall back
+  // to opaque because their semantics are tag-specific.
+  if (label === '`') {
+    return parseTemplateLiteral(lexer);
   }
   // Unknown primary. Emit an UnimplementedExpression marker so
   // the IR builder can raise an explicit `unimplemented`

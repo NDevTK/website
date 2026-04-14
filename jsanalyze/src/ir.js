@@ -2198,6 +2198,56 @@ function lowerExpressionIter(ctx, root) {
         results.push(dest);
         break;
       }
+      case 'emit_template': {
+        // Pop nExprs expression regs (pushed in source order),
+        // then emit literal Consts for the quasi pieces and
+        // alternate BinOp('+') to build the final string.
+        //
+        // Pattern for N expressions (quasis = q0..qN):
+        //   acc = q0
+        //   acc = acc + e0
+        //   acc = acc + q1
+        //   acc = acc + e1
+        //   ... until acc = acc + qN
+        //
+        // If all operands are concrete strings, the BinOp
+        // transfer const-folds the whole thing to a single
+        // Concrete at the lattice level.
+        const exprRegs = [];
+        for (let i = 0; i < task.nExprs; i++) exprRegs.unshift(results.pop());
+        const quasiRegs = task.quasiValues.map(v => {
+          const r = newRegister(ctx.module);
+          emit(ctx.module, ctx.currentBlock, {
+            op: OP.CONST, dest: r, value: v,
+          }, task.loc);
+          return r;
+        });
+        let acc = quasiRegs[0];
+        for (let i = 0; i < task.nExprs; i++) {
+          // acc = acc + exprRegs[i]
+          let dest = newRegister(ctx.module);
+          emit(ctx.module, ctx.currentBlock, {
+            op: OP.BIN_OP, dest, operator: '+', left: acc, right: exprRegs[i],
+          }, task.loc);
+          acc = dest;
+          // acc = acc + quasiRegs[i+1]
+          dest = newRegister(ctx.module);
+          emit(ctx.module, ctx.currentBlock, {
+            op: OP.BIN_OP, dest, operator: '+', left: acc, right: quasiRegs[i + 1],
+          }, task.loc);
+          acc = dest;
+        }
+        results.push(acc);
+        break;
+      }
+      case 'emit_const': {
+        const dest = newRegister(ctx.module);
+        emit(ctx.module, ctx.currentBlock, {
+          op: OP.CONST, dest, value: task.value,
+        }, task.loc);
+        results.push(dest);
+        break;
+      }
       case 'emit_array_alloc': {
         // Pop nElements regs (pushed in source order). Build a
         // fields map keyed by integer string ("0", "1", ...)
@@ -2611,6 +2661,47 @@ function visitNode(ctx, node, tasks, results) {
       };
       const dest = lowerFunctionDecl(ctx, syntheticDecl, loc);
       results.push(dest);
+      return;
+    }
+    case 'TemplateLiteral': {
+      // Desugar `` `a ${x} b ${y} c` `` into:
+      //   "a" + x + "b" + y + "c"
+      // This routes through the existing BinOp('+') transfer
+      // which handles string concatenation + taint propagation
+      // + SMT formula construction (str.++ with per-operand
+      // formulas). Purely concrete pieces fold away via the
+      // normal const-fold path.
+      //
+      // Empty template `` `` `` lowers to a single Const string.
+      const quasis = node.quasis || [];
+      const exprs = node.expressions || [];
+      if (quasis.length === 0) {
+        tasks.push({ kind: 'emit_const', value: '', loc });
+        return;
+      }
+      // Build a post-order task sequence:
+      //   visit e0, emit_concat(quasi0, ...) — but we need left-
+      //   associative string concat with alternating literals and
+      //   expressions.
+      //
+      // Simpler approach: emit the first quasi as a Const, then
+      // for each (expr_i, quasi_{i+1}) pair, emit:
+      //   tmp = accum + expr_i     (BinOp +)
+      //   accum = tmp + quasi_{i+1}
+      //
+      // We express this on the task stack via an emit_template
+      // finish task that pops the expression regs and the quasi
+      // values (pre-materialized as const regs) and builds the
+      // concat chain.
+      tasks.push({
+        kind: 'emit_template',
+        quasiValues: quasis.map(q => q.value.cooked || ''),
+        nExprs: exprs.length,
+        loc,
+      });
+      for (let i = exprs.length - 1; i >= 0; i--) {
+        tasks.push({ kind: 'visit', node: exprs[i] });
+      }
       return;
     }
     case 'ArrayExpression': {

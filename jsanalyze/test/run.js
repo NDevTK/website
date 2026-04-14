@@ -35,6 +35,7 @@ const testFiles = [
   'try.test.js',
   'arrow.test.js',
   'destructure.test.js',
+  'modern-js.test.js',
 ];
 
 async function main() {
