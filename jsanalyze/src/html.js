@@ -262,6 +262,48 @@ function tokenize(src) {
       if (startTok) {
         tokens.push(startTok);
         i = startTok.end;
+        // Raw-text elements (script, style, textarea, title,
+        // iframe, noscript): everything from here up to the
+        // matching close tag is a single TEXT token. The
+        // inner content is NOT tokenized as HTML — this is
+        // required by the HTML5 parsing algorithm (§13.2.5
+        // "raw text elements" / "escapable raw text elements")
+        // AND by the DOM-convert consumer, which extracts
+        // inline <script> blocks via their single raw-text
+        // child and re-parses the JS independently.
+        //
+        // We scan forward looking for `</tagName` followed
+        // by whitespace or `>`, matching the legacy engine's
+        // htmldom tokenizer. Unterminated raw-text elements
+        // consume to the end of the input.
+        if (startTok.type === TOK_START && RAW_TEXT_ELEMENTS.has(startTok.tagName)) {
+          const closePrefix = '</' + startTok.tagName;
+          const rawStart = i;
+          let k = i;
+          while (k < n) {
+            if (src.charCodeAt(k) === 60 /* < */ &&
+                src.slice(k, k + closePrefix.length).toLowerCase() === closePrefix) {
+              // Peek past the close prefix to confirm it's a
+              // real end tag (followed by `>`, `/`, or
+              // whitespace — not a longer tag name).
+              let m = k + closePrefix.length;
+              while (m < n && isWs(src.charCodeAt(m))) m++;
+              if (m < n && (src.charCodeAt(m) === 62 /* > */ || src.charCodeAt(m) === 47 /* / */)) {
+                break;
+              }
+            }
+            k++;
+          }
+          if (k > rawStart) {
+            tokens.push({
+              type: TOK_TEXT,
+              start: rawStart,
+              end: k,
+              value: src.slice(rawStart, k),  // NOT entity-decoded
+            });
+          }
+          i = k;
+        }
         continue;
       }
       // Not a recognised tag — emit a literal `<` as text and advance.

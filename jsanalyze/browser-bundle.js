@@ -2995,6 +2995,48 @@ function tokenize(src) {
       if (startTok) {
         tokens.push(startTok);
         i = startTok.end;
+        // Raw-text elements (script, style, textarea, title,
+        // iframe, noscript): everything from here up to the
+        // matching close tag is a single TEXT token. The
+        // inner content is NOT tokenized as HTML — this is
+        // required by the HTML5 parsing algorithm (§13.2.5
+        // "raw text elements" / "escapable raw text elements")
+        // AND by the DOM-convert consumer, which extracts
+        // inline <script> blocks via their single raw-text
+        // child and re-parses the JS independently.
+        //
+        // We scan forward looking for `</tagName` followed
+        // by whitespace or `>`, matching the legacy engine's
+        // htmldom tokenizer. Unterminated raw-text elements
+        // consume to the end of the input.
+        if (startTok.type === TOK_START && RAW_TEXT_ELEMENTS.has(startTok.tagName)) {
+          const closePrefix = '</' + startTok.tagName;
+          const rawStart = i;
+          let k = i;
+          while (k < n) {
+            if (src.charCodeAt(k) === 60 /* < */ &&
+                src.slice(k, k + closePrefix.length).toLowerCase() === closePrefix) {
+              // Peek past the close prefix to confirm it's a
+              // real end tag (followed by `>`, `/`, or
+              // whitespace — not a longer tag name).
+              let m = k + closePrefix.length;
+              while (m < n && isWs(src.charCodeAt(m))) m++;
+              if (m < n && (src.charCodeAt(m) === 62 /* > */ || src.charCodeAt(m) === 47 /* / */)) {
+                break;
+              }
+            }
+            k++;
+          }
+          if (k > rawStart) {
+            tokens.push({
+              type: TOK_TEXT,
+              start: rawStart,
+              end: k,
+              value: src.slice(rawStart, k),  // NOT entity-decoded
+            });
+          }
+          i = k;
+        }
         continue;
       }
       // Not a recognised tag — emit a literal `<` as text and advance.
@@ -15941,6 +15983,20 @@ module.exports = {
 'use strict';
 
 const html = require('../src/html.js');
+// We use acorn directly (not via the engine's parse.js) for
+// consumer-side pattern matching on source AST. The engine's
+// parse.js wraps acorn with a tokenizer + hand-rolled parser;
+// here we just want the AST.
+function getAcorn() {
+  if (typeof globalThis !== 'undefined' && globalThis.acorn &&
+      typeof globalThis.acorn.parse === 'function') {
+    return globalThis.acorn;
+  }
+  const path = require('path');
+  // eslint-disable-next-line no-undef
+  const vendoredPath = path.join(__dirname, '..', 'vendor', 'acorn.js');
+  return require(vendoredPath);
+}
 
 // --- Runtime helper injected into rewritten JS ---------------------------
 //
@@ -16334,6 +16390,464 @@ function sliceStatement(source, loc) {
   return source.slice(loc.pos, loc.endPos);
 }
 
+// --- Loop-built innerHTML pattern matcher -------------------------------
+//
+// Detects the common pattern:
+//
+//   var H = '<tag0>';
+//   for (var i = 0; i < A.length; i++) {
+//     H += '<child>' + A[i] + '</child>';
+//   }
+//   H += '</tag0>';
+//   elem.innerHTML = H;
+//
+// and rewrites it as:
+//
+//   elem.replaceChildren();
+//   var __n0 = document.createElement('tag0');
+//   elem.appendChild(__n0);
+//   for (var i = 0; i < A.length; i++) {
+//     var __n1 = document.createElement('child');
+//     __n0.appendChild(__n1);
+//     __n1.appendChild(document.createTextNode(A[i]));
+//   }
+//
+// The detector works directly on the JS AST (via vendored
+// acorn). It matches a specific shape — any variation (two
+// loops, conditional append, nested templates) falls through
+// to the non-concrete "left alone" path. The goal is to
+// handle the user's navigation-builder example without
+// trying to solve the general string-to-DOM problem.
+//
+// Pattern match pieces:
+//
+//   [A] var H = <string literal containing an open tag>;
+//   [B] for (var i = <n>; i < <array>.length; i++) { ... }
+//       where the body is `H += <expr>` with expr being
+//       a string concatenation that includes a literal
+//       `<child>` start tag, an expression hole (the
+//       array-indexed value), and a literal `</child>` end
+//       tag (plus optional attribute fragments).
+//   [C] H += <string literal containing the matching close tag>;
+//   [D] <elem>.innerHTML = H;
+//
+// The matcher returns a replacement source range + the
+// imperative DOM-call replacement text when all four pieces
+// are found and correlated (same H variable, same close tag
+// matches the opening tag). On any mismatch it returns null.
+function detectLoopBuiltInnerHtml(jsSource, assignStmtPos) {
+  let ast;
+  // eslint-disable-next-line no-restricted-syntax
+  try {
+    ast = getAcorn().parse(jsSource, {
+      ecmaVersion: 'latest',
+      locations: true,
+      sourceType: 'script',
+    });
+  } catch (_) {
+    return null;
+  }
+
+  const stmts = ast.body;
+  // Find the assignment statement at `assignStmtPos` in the
+  // top-level body and its preceding statements.
+  let assignIdx = -1;
+  for (let i = 0; i < stmts.length; i++) {
+    if (stmts[i].start <= assignStmtPos && stmts[i].end > assignStmtPos) {
+      assignIdx = i;
+      break;
+    }
+  }
+  if (assignIdx < 0) return null;
+  const assignStmt = stmts[assignIdx];
+
+  // The assignment: must be `elem.innerHTML = H`.
+  if (assignStmt.type !== 'ExpressionStatement') return null;
+  const expr = assignStmt.expression;
+  if (!expr || expr.type !== 'AssignmentExpression' || expr.operator !== '=') return null;
+  const lhs = expr.left;
+  const rhs = expr.right;
+  if (!lhs || lhs.type !== 'MemberExpression') return null;
+  if (lhs.computed || !lhs.property || lhs.property.type !== 'Identifier') return null;
+  if (lhs.property.name !== 'innerHTML' && lhs.property.name !== 'outerHTML') return null;
+  if (!rhs || rhs.type !== 'Identifier') return null;
+  const htmlVarName = rhs.name;
+
+  // Walk backward from `assignIdx` to find [C] (X += '</tag>'),
+  // [B] (for loop), [A] (var X = '<tag>').
+  let closeStmtIdx = -1;
+  let loopStmtIdx = -1;
+  let openStmtIdx = -1;
+  for (let i = assignIdx - 1; i >= 0; i--) {
+    const s = stmts[i];
+    if (closeStmtIdx < 0) {
+      if (isAccumAssign(s, htmlVarName)) {
+        const lit = literalOfAccumAssign(s);
+        if (typeof lit === 'string' && /<\/[a-z][^>]*>/i.test(lit)) {
+          closeStmtIdx = i;
+          continue;
+        }
+      }
+    }
+    if (closeStmtIdx >= 0 && loopStmtIdx < 0) {
+      if (s.type === 'ForStatement' && s.body && s.body.type === 'BlockStatement') {
+        loopStmtIdx = i;
+        continue;
+      }
+    }
+    if (loopStmtIdx >= 0 && openStmtIdx < 0) {
+      if (s.type === 'VariableDeclaration') {
+        for (const d of s.declarations) {
+          if (d.id && d.id.type === 'Identifier' && d.id.name === htmlVarName &&
+              d.init && d.init.type === 'Literal' && typeof d.init.value === 'string') {
+            openStmtIdx = i;
+            break;
+          }
+        }
+        if (openStmtIdx >= 0) break;
+      }
+    }
+  }
+  if (openStmtIdx < 0 || loopStmtIdx < 0 || closeStmtIdx < 0) return null;
+
+  const openStmt = stmts[openStmtIdx];
+  const loopStmt = stmts[loopStmtIdx];
+  const closeStmt = stmts[closeStmtIdx];
+
+  // Extract the literal fragments.
+  const openInit = openStmt.declarations.find(d => d.id.name === htmlVarName).init;
+  const openLit = openInit.value;
+  const closeLit = literalOfAccumAssign(closeStmt);
+
+  // The open literal should be a single start tag; the close
+  // literal should be the matching end tag. Parse both via
+  // src/html.js to identify the outer-tag name.
+  const openTree = html.parse(openLit);
+  let outerTag = null;
+  for (const c of openTree.children) {
+    if (c.type === 'element') { outerTag = c.tag; break; }
+  }
+  if (!outerTag) return null;
+  const closeMatch = closeLit.match(/<\/([a-z][a-z0-9]*)/i);
+  if (!closeMatch || closeMatch[1].toLowerCase() !== outerTag) return null;
+
+  // The loop body must contain exactly one statement:
+  // `H += <concat expression>;`.
+  const body = loopStmt.body.body;
+  if (body.length !== 1) return null;
+  const bodyStmt = body[0];
+  if (!isAccumAssign(bodyStmt, htmlVarName)) return null;
+  const bodyExpr = bodyStmt.expression.right;
+  if (!bodyExpr) return null;
+
+  // Flatten the concat expression into a sequence of
+  // literal / expression fragments.
+  const frags = flattenConcat(bodyExpr);
+  if (!frags) return null;
+
+  // Scan the fragments to identify:
+  //   * the child tag (from the first literal's <childTag>)
+  //   * the text content hole (first non-literal)
+  //   * optionally, attribute hole(s)
+  //
+  // For the MVP we handle the shape:
+  //
+  //   '<child attr="/' + <attrExpr> + '">' + <textExpr> + '</child>'
+  //
+  // where there are at most one attribute hole and one text
+  // hole. This covers the navigation-builder example and
+  // the most common "list of items with a link" pattern.
+  const parsed = parseLoopBodyFragments(frags);
+  if (!parsed) return null;
+
+  // We now have enough to emit the DOM-call rewrite. Build
+  // the replacement source.
+  const loopBodySrc = buildReplacementSource({
+    jsSource,
+    outerTag,
+    outerAttrsStr: openLit,   // contains the opening tag + any attrs
+    loopStmt,
+    htmlVarName,
+    childTag: parsed.childTag,
+    childAttrs: parsed.childAttrs,  // array of {name, parts: [{type, value|expr}]}
+    textExpr: parsed.textExpr,
+    receiver: jsSource.slice(lhs.object.start, lhs.object.end),
+  });
+  if (!loopBodySrc) return null;
+
+  // Return the replacement range: from openStmt.start to
+  // assignStmt.end (the whole var + loop + close + assign).
+  return {
+    start: openStmt.start,
+    end: assignStmt.end,
+    replacement: loopBodySrc,
+  };
+}
+
+function isAccumAssign(stmt, varName) {
+  if (!stmt || stmt.type !== 'ExpressionStatement') return false;
+  const e = stmt.expression;
+  if (!e || e.type !== 'AssignmentExpression') return false;
+  if (e.operator !== '+=') return false;
+  if (!e.left || e.left.type !== 'Identifier' || e.left.name !== varName) return false;
+  return true;
+}
+
+function literalOfAccumAssign(stmt) {
+  if (!isAccumAssign(stmt, stmt.expression.left.name)) return null;
+  const r = stmt.expression.right;
+  if (r && r.type === 'Literal' && typeof r.value === 'string') return r.value;
+  return null;
+}
+
+// Flatten a left-associative chain of `+` expressions into a
+// list of { type: 'lit' | 'expr', value?: string, node?: AST }.
+function flattenConcat(node) {
+  const out = [];
+  function walk(n) {
+    if (n.type === 'BinaryExpression' && n.operator === '+') {
+      walk(n.left);
+      walk(n.right);
+      return;
+    }
+    if (n.type === 'Literal' && typeof n.value === 'string') {
+      out.push({ type: 'lit', value: n.value });
+      return;
+    }
+    out.push({ type: 'expr', node: n });
+  }
+  walk(node);
+  return out;
+}
+
+// parseLoopBodyFragments — recognises the common
+// `<child attr="prefix' + E + '">' + T + '</child>` shape
+// and returns { childTag, childAttrs, textExpr }.
+//
+// childAttrs is an array of { name, parts } where parts is a
+// list of { type: 'literal' | 'expr', value?: string, node? }
+// forming the value of the attribute. The MVP handles one
+// attribute hole per attribute.
+function parseLoopBodyFragments(rawFrags) {
+  // Coalesce adjacent literal fragments so `"\""` + `">"`
+  // (from source `"\"" + ">"`) becomes a single `"\">"`
+  // literal the state machine can parse as "close attribute
+  // then end of opening tag". Programmer-written concat
+  // expressions often split literals at arbitrary points
+  // and the matcher must be tolerant of that.
+  const frags = [];
+  for (const f of rawFrags) {
+    if (f.type === 'lit' && frags.length > 0 && frags[frags.length - 1].type === 'lit') {
+      frags[frags.length - 1] = {
+        type: 'lit',
+        value: frags[frags.length - 1].value + f.value,
+      };
+    } else {
+      frags.push(f);
+    }
+  }
+  // Require at least: literal opening, (optional expr), literal closing.
+  if (frags.length < 2) return null;
+  if (frags[0].type !== 'lit') return null;
+  const openingLit = frags[0].value;
+  // Find the child tag + attribute fragments by parsing the
+  // opening literal's HTML-ish prefix.
+  const childMatch = openingLit.match(/^<([a-z][a-z0-9]*)([^>]*?)(>)?$/i);
+  if (!childMatch) return null;
+  const childTag = childMatch[1].toLowerCase();
+  // The attribute portion (before any hole) may be a
+  // well-formed attr list, partial attr ending in `"`, or
+  // an open attr like `href="/`. For the MVP we parse it as
+  // a sequence of attrs — anything that doesn't form a clean
+  // split falls through to null so the consumer leaves the
+  // assignment alone.
+  const attrsStr = childMatch[2];
+  // Scan fragments after the opening literal. Look for the
+  // pattern: `attr="prefix` + E + `"` which builds one
+  // attribute's value from an expression.
+  //
+  // State machine:
+  //   'attrs' — we're still inside the opening tag, waiting
+  //             for the `>` that closes it.
+  //   'children' — the opening tag is done; we're collecting
+  //                text content until `</childTag>`.
+  const childAttrs = [];
+  let textExpr = null;
+  let state = 'attrs';
+  let i = 0;
+  // Handle the opening literal's attrs portion inline.
+  // If it already contains `>`, we're immediately in
+  // children state.
+  if (childMatch[3] === '>') {
+    state = 'children';
+  } else {
+    // The opening literal's attrs may contain static attrs;
+    // record them as literal-only parts.
+    const staticAttrs = parseStaticAttrsFragment(attrsStr);
+    for (const a of staticAttrs) childAttrs.push(a);
+    // If attrsStr ends with `attr="value-prefix`, we have a
+    // dangling attribute whose value is completed by
+    // subsequent fragments.
+    const dangling = attrsStr.match(/\s([a-z][a-z0-9-]*)\s*=\s*"([^"]*)$/i);
+    if (dangling) {
+      // Pop the last static attr if it's the same name (we
+      // may have mis-parsed it above) and start a new attr
+      // with a literal prefix.
+      childAttrs.push({
+        name: dangling[1].toLowerCase(),
+        parts: [{ type: 'literal', value: dangling[2] }],
+        _pending: true,
+      });
+    }
+  }
+  i = 1;
+  while (i < frags.length) {
+    const f = frags[i];
+    if (state === 'attrs') {
+      const pendingAttr = childAttrs[childAttrs.length - 1];
+      if (f.type === 'expr' && pendingAttr && pendingAttr._pending) {
+        pendingAttr.parts.push({ type: 'expr', node: f.node });
+        i++;
+        continue;
+      }
+      if (f.type === 'lit' && pendingAttr && pendingAttr._pending) {
+        // The literal closes the attribute value with `"`
+        // then possibly more attributes + the closing `>`.
+        const closeIdx = f.value.indexOf('"');
+        if (closeIdx < 0) return null;
+        if (closeIdx > 0) {
+          pendingAttr.parts.push({ type: 'literal', value: f.value.slice(0, closeIdx) });
+        }
+        delete pendingAttr._pending;
+        const after = f.value.slice(closeIdx + 1);
+        // after may have more attrs then `>`.
+        const gtIdx = after.indexOf('>');
+        if (gtIdx < 0) return null;
+        const moreAttrs = after.slice(0, gtIdx);
+        const rest = after.slice(gtIdx + 1);
+        const staticAttrs = parseStaticAttrsFragment(moreAttrs);
+        for (const a of staticAttrs) childAttrs.push(a);
+        // `rest` is the start of the children literal (text
+        // prefix). If non-empty, re-process frags[i] as the
+        // rest lit under children state. If empty, advance to
+        // the next fragment.
+        state = 'children';
+        if (rest.length > 0) {
+          frags[i] = { type: 'lit', value: rest };
+          continue;
+        }
+        i++;
+        continue;
+      }
+      return null;
+    }
+    if (state === 'children') {
+      if (f.type === 'expr' && textExpr == null) {
+        textExpr = f.node;
+        i++;
+        continue;
+      }
+      if (f.type === 'lit') {
+        // Must be `</childTag>` (possibly preceded by
+        // whitespace from the input's formatting).
+        const closingRe = new RegExp('</' + childTag + '\\s*>', 'i');
+        if (closingRe.test(f.value)) {
+          // Match the pattern. Confirm no more fragments follow.
+          i++;
+          if (i < frags.length) return null;
+          return { childTag, childAttrs, textExpr };
+        }
+        return null;
+      }
+      // Second expression in children — not supported by the MVP.
+      return null;
+    }
+    i++;
+  }
+  return null;
+}
+
+// parseStaticAttrsFragment — tolerant parser for an attribute
+// list fragment like `class="x" id="y"`. Returns an array of
+// { name, parts: [{type: 'literal', value}] } records. Any
+// attribute whose value starts but doesn't close inside the
+// fragment is NOT returned (the caller handles it as a
+// dangling attribute).
+function parseStaticAttrsFragment(s) {
+  const out = [];
+  const re = /\s*([a-z][a-z0-9-]*)\s*=\s*"([^"]*)"/gi;
+  let m;
+  while ((m = re.exec(s)) !== null) {
+    out.push({
+      name: m[1].toLowerCase(),
+      parts: [{ type: 'literal', value: m[2] }],
+    });
+  }
+  return out;
+}
+
+// buildReplacementSource — emit the imperative DOM-call
+// replacement for a matched loop-built innerHTML pattern.
+function buildReplacementSource(ctx) {
+  const jsSource = ctx.jsSource;
+  const outerTag = ctx.outerTag;
+  const receiver = ctx.receiver;
+  const loopStmt = ctx.loopStmt;
+  const childTag = ctx.childTag;
+  const childAttrs = ctx.childAttrs;
+  const textExpr = ctx.textExpr;
+
+  // Extract the loop's init / test / update / body source
+  // slices so we can reuse them verbatim in the emitted loop.
+  const initSrc = loopStmt.init ? jsSource.slice(loopStmt.init.start, loopStmt.init.end) : '';
+  const testSrc = loopStmt.test ? jsSource.slice(loopStmt.test.start, loopStmt.test.end) : '';
+  const updateSrc = loopStmt.update ? jsSource.slice(loopStmt.update.start, loopStmt.update.end) : '';
+
+  const lines = [];
+  lines.push(receiver + '.replaceChildren();');
+  // Parent container (outer tag).
+  lines.push('var __p = document.createElement(' + JSON.stringify(outerTag) + ');');
+  // Static outer attributes from the opening literal: we
+  // only honour the pure-attribute shape (no holes). Parse
+  // the opening literal once more via html.js to lift them.
+  const openTree = html.parse(ctx.outerAttrsStr);
+  const openElem = openTree.children.find(c => c.type === 'element' && c.tag === outerTag);
+  if (openElem && openElem.attrList) {
+    for (const a of openElem.attrList) {
+      lines.push('__p.setAttribute(' + JSON.stringify(a.name) + ', ' + JSON.stringify(a.value) + ');');
+    }
+  }
+  lines.push(receiver + '.appendChild(__p);');
+  // The for loop.
+  lines.push('for (' + initSrc + '; ' + testSrc + '; ' + updateSrc + ') {');
+  lines.push('  var __c = document.createElement(' + JSON.stringify(childTag) + ');');
+  // Child attributes: static ones emit plain setAttribute;
+  // ones with expression parts emit a concatenation.
+  for (const attr of childAttrs) {
+    const parts = attr.parts;
+    if (parts.length === 1 && parts[0].type === 'literal') {
+      lines.push('  __c.setAttribute(' + JSON.stringify(attr.name) + ', ' +
+        JSON.stringify(parts[0].value) + ');');
+      continue;
+    }
+    // Multi-part: build a concat expression at runtime.
+    const pieces = parts.map(p => {
+      if (p.type === 'literal') return JSON.stringify(p.value);
+      return '(' + jsSource.slice(p.node.start, p.node.end) + ')';
+    });
+    lines.push('  __c.setAttribute(' + JSON.stringify(attr.name) + ', ' +
+      pieces.join(' + ') + ');');
+  }
+  lines.push('  __p.appendChild(__c);');
+  if (textExpr) {
+    const textSrc = jsSource.slice(textExpr.start, textExpr.end);
+    lines.push('  __c.appendChild(document.createTextNode(' + textSrc + '));');
+  }
+  lines.push('}');
+
+  return lines.join('\n');
+}
+
 // convertJsFile(jsSource, trace, filename?) → string
 //
 // Applies every JS-side rewrite to `jsSource` based on what
@@ -16376,23 +16890,40 @@ function convertJsFile(jsSource, trace, filename) {
   for (const ih of trace.innerHtmlAssignments || []) {
     if (!matchesFile(ih.location)) continue;
     if (ih.kind !== 'innerHTML' && ih.kind !== 'outerHTML') continue;
-    if (!ih.parsedHtml) continue;   // non-concrete; out of scope for MVP
-    const stmtText = sliceStatement(jsSource, ih.location);
-    // Extract the receiver expression: everything before
-    // `.innerHTML` / `.outerHTML` =.
-    const m = stmtText.match(/^(.+?)\.(innerHTML|outerHTML)\s*=/);
-    if (!m) continue;
-    const receiver = m[1];
-    const body = emitDomCalls(ih.parsedHtml, receiver);
-    // Also emit a `receiver.replaceChildren();` before the
-    // DOM calls so the innerHTML semantic (clobber existing
-    // children) is preserved.
-    const replacement = receiver + '.replaceChildren();\n' + body;
-    replacements.push({
-      start: ih.location.pos,
-      end: ih.location.endPos,
-      replacement,
-    });
+
+    // Concrete case: the engine already parsed the string
+    // eagerly at trace-projection time and attached the HTML
+    // tree. Emit createElement / setAttribute / appendChild
+    // calls recursively.
+    if (ih.parsedHtml) {
+      const stmtText = sliceStatement(jsSource, ih.location);
+      const m = stmtText.match(/^(.+?)\.(innerHTML|outerHTML)\s*=/);
+      if (!m) continue;
+      const receiver = m[1];
+      const body = emitDomCalls(ih.parsedHtml, receiver);
+      const replacement = receiver + '.replaceChildren();\n' + body;
+      replacements.push({
+        start: ih.location.pos,
+        end: ih.location.endPos,
+        replacement,
+      });
+      continue;
+    }
+
+    // Non-concrete case: the assigned value was built at
+    // runtime. Try the loop-built innerHTML pattern matcher
+    // for the common navigation-builder shape
+    // `var H = '<tag>'; for (...) { H += '<child>' + … + '</child>'; } H += '</tag>'; elem.innerHTML = H;`.
+    // On a match we replace the entire var / loop / close /
+    // assign block with an iterative createElement loop.
+    // On any mismatch we leave the assignment alone (the
+    // consumer's caller sees the InnerHtmlAssignment record
+    // on the trace and can decide what to do).
+    const looped = detectLoopBuiltInnerHtml(jsSource, ih.location.pos);
+    if (looped) {
+      replacements.push(looped);
+      continue;
+    }
   }
 
   // --- 2. Tainted navigation → __safeNav wrap ---------------------------

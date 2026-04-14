@@ -396,6 +396,63 @@ const tests = [
       assert(!/document\.write\("Hello"\)/.test(out), 'original call removed');
     },
   },
+
+  // --- JS-side: loop-built innerHTML pattern ---
+  {
+    name: 'dom-convert js: loop-built nav → createElement + for loop',
+    fn: async () => {
+      // User-supplied navigation-builder example: the innerHTML
+      // value is constructed at runtime via a for loop that
+      // accumulates into an `html` variable. The pattern
+      // matcher detects this shape and rewrites to an
+      // iterative createElement loop.
+      const src = [
+        'var items = ["Home", "About", "Contact"];',
+        'var html = "<nav>";',
+        'for (var i = 0; i < items.length; i++) {',
+        '  html += "<a href=\\"/" + items[i].toLowerCase() + "\\"" + ">" + items[i] + "</a>";',
+        '}',
+        'html += "</nav>";',
+        'document.body.innerHTML = html;',
+      ].join('\n');
+      const out = await convertJs(src);
+      // The rewritten source has replaceChildren + createElement
+      // for nav + a for loop that creates anchors.
+      assert(/replaceChildren\(\)/.test(out), 'replaceChildren emitted');
+      assert(/createElement\("nav"\)/.test(out), 'nav created');
+      assert(/for \(var i = 0; i < items\.length; i\+\+\)/.test(out),
+        'loop preserved');
+      assert(/createElement\("a"\)/.test(out), 'anchor created inside loop');
+      assert(/setAttribute\("href"/.test(out), 'href attribute set');
+      assert(/createTextNode/.test(out), 'createTextNode for the label');
+      // The original string-concat assignment is gone.
+      assert(!/document\.body\.innerHTML = html/.test(out),
+        'original innerHTML assignment replaced');
+    },
+  },
+  {
+    name: 'dom-convert js: loop pattern with tainted text content still converts',
+    fn: async () => {
+      // The third item is location.search which taints `items`.
+      // The loop pattern matches regardless — the tainted
+      // value flows through createTextNode which is the safe
+      // DOM sink, so no separate sanitizer is needed.
+      const src = [
+        'var items = ["Home", "About", location.search];',
+        'var html = "<nav>";',
+        'for (var i = 0; i < items.length; i++) {',
+        '  html += "<a>" + items[i] + "</a>";',
+        '}',
+        'html += "</nav>";',
+        'document.body.innerHTML = html;',
+      ].join('\n');
+      const out = await convertJs(src);
+      assert(/createElement\("nav"\)/.test(out), 'nav created');
+      assert(/createElement\("a"\)/.test(out), 'anchors created');
+      assert(/createTextNode\(items\[i\]\)/.test(out),
+        'tainted value flows through createTextNode: ' + out.slice(0, 300));
+    },
+  },
 ];
 
 module.exports = { tests };
