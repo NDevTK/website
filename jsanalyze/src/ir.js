@@ -308,8 +308,51 @@ function buildModule(source, filename) {
   }
   topFn.cfg.exit = ctx.currentBlock ? ctx.currentBlock.id : entry.id;
 
+  // Fixup closure captures: each capture was recorded with
+  // outerReg = the declaring function's reg for the name at
+  // the moment tryCaptureFromOuterScope ran. That may be an
+  // obsolete register if the outer later reassigned the name.
+  // Walk every function and replace each capture's outerReg
+  // with the FINAL reg the name maps to in the declaring
+  // outer function's scope (captured at leaveFunctionStep
+  // time on fn._finalScope).
+  runCaptureFixup(module);
+
   validateModule(module);
   return module;
+}
+
+// runCaptureFixup — rewrite each function's capture list
+// (and the FUNC instruction's captures hint on the emitting
+// block) so outerReg points to the FINAL register the
+// declaring function binds to that name. The declaring
+// function snapshots its final scope to `_finalScope` in
+// leaveFunctionStep.
+//
+// For module top-level (no leave_function), we snapshot once
+// after drainWork completes in buildModule above — but
+// actually the top-level is implemented as a function too,
+// and its leave_function runs at the end of program lowering.
+// So _finalScope is populated for every function.
+function runCaptureFixup(module) {
+  for (const fn of module.functions) {
+    if (!fn.captures || fn.captures.length === 0) continue;
+    for (const c of fn.captures) {
+      const declaringFn = c.definingFn;
+      if (!declaringFn || !declaringFn._finalScope) continue;
+      const finalReg = declaringFn._finalScope[c.name];
+      if (finalReg != null) {
+        c.outerReg = finalReg;
+      }
+    }
+    // Also rewrite the FUNC instruction's captures hint.
+    if (fn._funcInstr) {
+      fn._funcInstr.captures = fn.captures.map(c => ({
+        outerReg: c.outerReg,
+        innerReg: c.innerReg,
+      }));
+    }
+  }
 }
 
 // --- Statement lowering (iterative) -------------------------------------
@@ -345,6 +388,9 @@ function lowerProgram(ctx, programNode) {
   // bottom of the LIFO stack.
   ctx._work.push({ kind: 'hoist_decls', bodyNodes: programNode.body });
   drainWork(ctx);
+  // Snapshot the top-level function's final scope so the
+  // capture fixup pass can resolve module-level names.
+  if (ctx.fn) ctx.fn._finalScope = snapshotFinalBindings(ctx.scope);
 }
 
 // drainWork — the central dispatch loop. Pops tasks from ctx._work
@@ -417,24 +463,35 @@ function hoistDeclarationsStep(ctx, task) {
     }, null);
     defineHoisted(ctx.scope, name, reg, BIND.VAR);
   }
-  // Step 2: pre-scan for FunctionDeclarations. For each, create
-  // the function, emit its Func instr in the current block, bind
-  // the name, and push the body-lowering tasks so the nested
-  // function's CFG gets populated in the same drain loop.
+  // Step 2: pre-scan for FunctionDeclarations. For each:
+  //   1. Create the function shell (fn record + CFG entry).
+  //   2. Reserve a destination register for its closure.
+  //   3. Pre-bind the name in the outer scope so hoisted reads
+  //      resolve to the reserved register (for JS hoisting
+  //      visibility).
+  //   4. Push the body-lowering tasks so the nested function's
+  //      CFG gets populated.
   //
-  // The walk stops at any inner function boundary.
+  // The Func instruction ITSELF is emitted later, at the
+  // source-order declaration point (via the normal
+  // FunctionDeclaration case in lowerStatement). This means
+  // the closure's capture-snapshot happens AFTER any
+  // preceding var initializers have run, so captures see
+  // their final values. Reads of the function name BEFORE
+  // the source-order declaration point resolve to the
+  // reserved register which at runtime is unassigned —
+  // such reads get undefined, matching the case where a
+  // call "hoists past" the declaration (rare in practice).
   const fnDecls = [];
   collectHoistedFunctionDecls(bodyNodes, fnDecls);
   for (const fnNode of fnDecls) {
-    // Re-use lowerFunctionDecl: it creates the function, emits
-    // Func in ctx.currentBlock, binds the name, and pushes the
-    // enter/body/leave tasks. We just need to make sure the
-    // function's name doesn't get rebound by the regular
-    // FunctionDeclaration case of lowerStatement later — we
-    // handle that with the `_hoisted` set below.
-    if (!ctx._hoistedFnNodes) ctx._hoistedFnNodes = new Set();
-    ctx._hoistedFnNodes.add(fnNode);
-    lowerFunctionDecl(ctx, fnNode, locFromNode(fnNode, ctx.filename));
+    if (!ctx._hoistedFnNodes) ctx._hoistedFnNodes = new Map();
+    // Create the shell; reserve a dest reg; queue body tasks.
+    // The Func instr emission is deferred to the source-order
+    // visit in lowerStatement's FunctionDeclaration case.
+    const shell = reserveFunctionShell(ctx, fnNode, locFromNode(fnNode, ctx.filename));
+    ctx._hoistedFnNodes.set(fnNode, shell);
+    if (fnNode.id) defineHoisted(ctx.scope, fnNode.id.name, shell.dest, BIND.FUNCTION);
   }
 }
 
@@ -569,11 +626,12 @@ function lowerStatement(ctx, node) {
     case 'IfStatement':         return beginIf(ctx, node, loc);
     case 'ReturnStatement':     return lowerReturn(ctx, node, loc);
     case 'FunctionDeclaration': {
-      // If this declaration was already hoisted by a hoist_decls
-      // task, skip it — the function has been created, its Func
-      // instr emitted, and its body tasks queued. Re-lowering
-      // would create a duplicate function and clobber the binding.
-      if (ctx._hoistedFnNodes && ctx._hoistedFnNodes.has(node)) return;
+      // Hoist_decls pre-reserved the function shell (fn record,
+      // dest reg, body tasks). At the source-order declaration
+      // point we emit the Func instruction into the current
+      // block so the closure is created after preceding var
+      // initializers have run — ensuring captures see the
+      // correct outer values.
       return lowerFunctionDecl(ctx, node, loc);
     }
     case 'ClassDeclaration':
@@ -873,25 +931,55 @@ function lowerClassDeclaration(ctx, node, loc) {
     end: node.end || 0,
   };
 
-  const ctorReg = lowerFunctionDecl(ctx, syntheticDecl, loc);
+  // Allocate the class object FIRST with an empty fields map
+  // and bind the class name to it immediately. This is
+  // critical for closure captures from inside methods:
+  // when a method references the class name (e.g.
+  // `static getIt() { return Foo.#counter; }` references
+  // `Foo`), the method's inner body captures the class
+  // object register via tryCaptureFromOuterScope. The capture
+  // snapshot at applyFunc time needs the class object
+  // register to be assigned — which requires the Alloc
+  // instruction to run BEFORE the method Func instructions.
+  //
+  // Methods, ctor, and static members are then emitted and
+  // stored on the class object via SetProp (not via the
+  // Alloc's initial fields map). __ctor__ and __parent__ get
+  // the same treatment.
+  const classObjReg = newRegister(ctx.module);
+  emit(ctx.module, ctx.currentBlock, {
+    op: OP.ALLOC,
+    dest: classObjReg,
+    kind: 'Class',
+    className: className || null,
+    fields: new Map(),   // populated via SetProp below
+  }, loc);
+  if (className) {
+    defineHoisted(ctx.scope, className, classObjReg, BIND.FUNCTION);
+  }
 
-  // Build a heap-allocated "class object" that holds both the
-  // constructor closure (under the reserved `__ctor__` field)
-  // and every static method / field. This makes static members
-  // work precisely: `ClassName.staticMethod()` becomes a
-  // regular member access on a real ObjectRef, which applyCall
-  // already resolves to the stored closure and walks.
-  //
-  // The class NAME is bound to this class object (not to the
-  // bare constructor closure). `new ClassName(args)` sees an
-  // ObjectRef at the ctor position and applyNew's ObjectRef
-  // branch reads `__ctor__` to recover the real constructor.
-  //
-  // Pre-lower each static member into its register so we can
-  // build the ALLOC's fields map atomically.
-  const fields = new Map();
-  fields.set('__ctor__', ctorReg);
-  if (parentReg != null) fields.set('__parent__', parentReg);
+  const ctorReg = lowerFunctionDecl(ctx, syntheticDecl, loc);
+  // lowerFunctionDecl rebinds `className` → ctorReg because the
+  // synthetic decl has id=className. Restore the class-object
+  // binding so references to the class name inside method
+  // bodies capture the class object (not the bare ctor).
+  if (className) {
+    updateName(ctx.scope, className, classObjReg);
+  }
+  emit(ctx.module, ctx.currentBlock, {
+    op: OP.SET_PROP,
+    object: classObjReg,
+    propName: '__ctor__',
+    value: ctorReg,
+  }, loc);
+  if (parentReg != null) {
+    emit(ctx.module, ctx.currentBlock, {
+      op: OP.SET_PROP,
+      object: classObjReg,
+      propName: '__parent__',
+      value: parentReg,
+    }, loc);
+  }
   for (const m of staticMembers) {
     const keyName = m.key.type === 'Identifier' ? m.key.name : null;
     if (!keyName) continue;
@@ -901,22 +989,12 @@ function lowerClassDeclaration(ctx, node, loc) {
     } else {
       valueReg = m.value ? lowerExpression(ctx, m.value) : emitUndefinedConst(ctx, loc);
     }
-    fields.set(keyName, valueReg);
-  }
-  const classObjReg = newRegister(ctx.module);
-  emit(ctx.module, ctx.currentBlock, {
-    op: OP.ALLOC,
-    dest: classObjReg,
-    kind: 'Class',
-    // Attach the class name so applyNew can use it as the
-    // `typeName` of the instance it creates.
-    className: className || null,
-    fields,
-  }, loc);
-
-  // Bind the class name to the class object in the outer scope.
-  if (className) {
-    defineHoisted(ctx.scope, className, classObjReg, BIND.FUNCTION);
+    emit(ctx.module, ctx.currentBlock, {
+      op: OP.SET_PROP,
+      object: classObjReg,
+      propName: keyName,
+      value: valueReg,
+    }, loc);
   }
 
   // ClassExpression case: push the register onto the expression
@@ -1996,6 +2074,99 @@ function collectAssignedNamesFromExpression(node, out) {
   }
 }
 
+// tryCaptureFromOuterScope — if `name` is bound in any enclosing
+// function's scope (recorded on ctx._funcStack), mark the
+// current function as capturing that register, bind the name
+// in the inner scope to a fresh "capture register", and return
+// the inner register. Returns null if the name isn't found in
+// any outer scope.
+//
+// Captures are threaded at call time: applyCall reads each
+// captured outer register's value from the caller's state and
+// binds it to the inner register in the callee's initial state.
+// This models JavaScript closure semantics where an inner
+// function "sees" the outer variables via reference.
+//
+// Note: since our SSA registers are immutable, captures
+// snapshot the outer register at the point of the inner
+// function's invocation (not at the point of its definition).
+// This matches JS semantics when the outer variable isn't
+// reassigned between closure creation and invocation, which is
+// the dominant case. For correct mutation-across-closure
+// modeling a future refinement would introduce "cell" boxes.
+function tryCaptureFromOuterScope(ctx, name, loc) {
+  if (!ctx._funcStack || ctx._funcStack.length === 0) return null;
+
+  // Find the frame where the name is defined (walking from
+  // the immediate parent up to the module top).
+  let frameIdx = -1;
+  for (let i = ctx._funcStack.length - 1; i >= 0; i--) {
+    if (lookupName(ctx._funcStack[i].scope, name) != null) {
+      frameIdx = i;
+      break;
+    }
+  }
+  if (frameIdx === -1) return null;
+
+  // The name is defined at frameIdx. For each function in the
+  // chain between that level and the CURRENT function (ctx.fn),
+  // record a capture so the value flows through:
+  //
+  //   defining fn (at frameIdx) →
+  //     intermediate fn at frameIdx+1 captures from defining fn →
+  //     intermediate fn at frameIdx+2 captures from frameIdx+1 →
+  //     ... →
+  //     ctx.fn captures from _funcStack[len-1]
+  //
+  // Each intermediate gets a fresh inner register keyed by
+  // name, and its capture's outerReg is the PREVIOUS level's
+  // register for that name (which the previous level might
+  // have bound directly or via its own capture).
+  //
+  // We walk outermost-to-innermost so each level can look up
+  // the name in the (now-updated) next-outer frame.
+  for (let level = frameIdx + 1; level <= ctx._funcStack.length; level++) {
+    const levelFn = (level === ctx._funcStack.length)
+      ? ctx.fn
+      : ctx._funcStack[level].fn;
+    const levelScope = (level === ctx._funcStack.length)
+      ? ctx.scope
+      : ctx._funcStack[level].scope;
+
+    // Skip if this level already has the name bound (either
+    // directly or from a previous capture).
+    if (lookupName(levelScope, name) != null) continue;
+
+    // Compute outerReg = the NEXT-OUTER frame's reg for name.
+    const parentScope = ctx._funcStack[level - 1].scope;
+    const parentFn = ctx._funcStack[level - 1].fn;
+    const outerReg = lookupName(parentScope, name);
+    if (outerReg == null) continue;
+
+    if (!levelFn._captureMap) levelFn._captureMap = Object.create(null);
+    if (levelFn._captureMap[name] != null) {
+      // Already captured — just ensure scope binding exists.
+      if (lookupName(levelScope, name) == null) {
+        defineHoisted(levelScope, name, levelFn._captureMap[name], BIND.VAR);
+      }
+      continue;
+    }
+    const innerReg = newRegister(ctx.module);
+    levelFn._captureMap[name] = innerReg;
+    if (!levelFn.captures) levelFn.captures = [];
+    levelFn.captures.push({
+      name,
+      outerReg,
+      innerReg,
+      definingFn: parentFn,
+    });
+    defineHoisted(levelScope, name, innerReg, BIND.VAR);
+  }
+
+  // Return the current function's captured register.
+  return lookupName(ctx.scope, name);
+}
+
 // exprToPattern — convert an ArrayExpression / ObjectExpression
 // into an ArrayPattern / ObjectPattern for destructuring
 // assignment. Mirrors the post-hoc "cover grammar" fixup that
@@ -2348,63 +2519,69 @@ function lowerReturn(ctx, node, loc) {
 // Returns the FUNC instruction's `dest` register so callers
 // (function declarations and function expressions) can
 // immediately use the closure value.
-function lowerFunctionDecl(ctx, node, loc) {
+// reserveFunctionShell — creates the function record + CFG
+// entry + reserved destination register + pushes body tasks.
+// Does NOT emit the Func instruction. Used by hoist_decls
+// (for hoisted FunctionDeclarations) and by lowerFunctionDecl
+// (for function expressions, which emit the Func right away).
+//
+// Returns { fn, dest } — the caller is responsible for
+// emitting the Func instruction into the current block when
+// appropriate (source-order declaration point for decls, or
+// inline for expressions).
+function reserveFunctionShell(ctx, node, loc) {
   const params = node.params.map(p =>
     p.type === 'Identifier' ? p.name : null
   );
   const fn = createFunction(ctx.module, node.id && node.id.name, params);
-  // Attach the full param AST nodes so enterFunctionStep can do
-  // destructuring / default / rest binding, not just simple
-  // identifier params.
   fn.paramNodes = node.params.slice();
   fn.isAsync = !!node.async;
   fn.isGenerator = !!node.generator;
   fn.location = loc;
-
-  // Allocate the function's own CFG with an entry block. The
-  // body tasks (run later via the deferred work stack) will
-  // populate it.
   const fnEntry = createBlock(ctx.module);
   fn.cfg = { entry: fnEntry.id, exit: null, blocks: new Map([[fnEntry.id, fnEntry]]) };
-
-  // Emit the FUNC instruction in the OUTER block right now so
-  // the closure value is available to subsequent statements at
-  // declaration order. The captures list is empty until closure
-  // capture tracking lands in Phase C.
   const dest = newRegister(ctx.module);
-  emit(ctx.module, ctx.currentBlock, {
-    op: OP.FUNC, dest, functionId: fn.id, captures: [],
-  }, loc);
-  // For function declarations, bind the source name in the
-  // outer scope right away AS a 'function' binding (hoisted
-  // into the nearest function frame — ES semantics). Function
-  // expressions (node.id === null) have no outer binding; the
-  // caller pushes `dest` onto its own results stack.
-  if (node.id) defineHoisted(ctx.scope, node.id.name, dest, BIND.FUNCTION);
-
-  // Push the deferred body tasks onto the SHARED work stack.
-  // LIFO order so they pop in this sequence:
-  //
-  //   1. enter_function — install fn / fresh scope / params /
-  //      currentBlock=fnEntry
-  //   2. body statements (each followed by after_stmt)
-  //   3. leave_function — implicit return + restore outer ctx
-  //
-  // No recursion: drainWork's existing while-loop processes
-  // them in order.
+  // Push the body-lowering tasks onto _work. They run after
+  // the outer's current statement completes (or after
+  // hoist_decls, for hoisted decls).
   ctx._work.push({ kind: 'leave_function', fn });
   if (node.body && node.body.type === 'BlockStatement') {
     for (let i = node.body.body.length - 1; i >= 0; i--) {
       ctx._work.push({ kind: 'after_stmt' });
       ctx._work.push({ kind: 'lower_stmt', node: node.body.body[i] });
     }
-    // Hoist nested function/var declarations in this function's
-    // body so they're visible from the top of the body. Runs
-    // after enter_function (pops above it on the LIFO stack) and
-    // before the body statements.
     ctx._work.push({ kind: 'hoist_decls', bodyNodes: node.body.body });
   }
   ctx._work.push({ kind: 'enter_function', fn });
+  return { fn, dest };
+}
+
+function lowerFunctionDecl(ctx, node, loc) {
+  // For hoisted function declarations, hoist_decls already
+  // reserved the shell (fn + dest + body tasks) and pre-bound
+  // the name. We just emit the Func instruction here — at
+  // source-order position — so captures snapshot the outer
+  // state AFTER any preceding var initializers have run.
+  let fn, dest;
+  if (ctx._hoistedFnNodes && ctx._hoistedFnNodes.has(node)) {
+    const shell = ctx._hoistedFnNodes.get(node);
+    fn = shell.fn;
+    dest = shell.dest;
+  } else {
+    // Function expression (or non-hoisted context). Reserve
+    // shell inline, emit Func now, bind name if the
+    // expression has one (named function expressions bind
+    // inside their own scope, not the outer).
+    const shell = reserveFunctionShell(ctx, node, loc);
+    fn = shell.fn;
+    dest = shell.dest;
+    if (node.id) defineHoisted(ctx.scope, node.id.name, dest, BIND.FUNCTION);
+  }
+  const funcInstr = {
+    op: OP.FUNC, dest, functionId: fn.id, captures: [],
+  };
+  emit(ctx.module, ctx.currentBlock, funcInstr, loc);
+  fn._funcInstr = funcInstr;
   return dest;
 }
 
@@ -2482,6 +2659,11 @@ function leaveFunctionStep(ctx, task) {
     fn.returns.push(undefReg);
   }
   fn.cfg.exit = ctx.currentBlock ? ctx.currentBlock.id : fn.cfg.entry;
+  // Snapshot the function's FINAL scope (name → final reg)
+  // so the post-build runCaptureFixup can resolve captures
+  // against the register the outer assigned LAST, not the
+  // register that was current at capture-creation time.
+  fn._finalScope = snapshotFinalBindings(ctx.scope);
   if (!ctx._funcStack || ctx._funcStack.length === 0) {
     throw new Error('ir: leave_function with empty _funcStack');
   }
@@ -2491,6 +2673,17 @@ function leaveFunctionStep(ctx, task) {
   ctx.blocks = saved.blocks;
   ctx.currentBlock = saved.currentBlock;
   ctx.catchStack = saved.catchStack;
+}
+
+// snapshotFinalBindings — flatten a scope's frames into a
+// name→reg map. Used by runCaptureFixup to look up the final
+// register a name was bound to in the outer function.
+function snapshotFinalBindings(scope) {
+  const out = Object.create(null);
+  for (const f of scope.frames) {
+    for (const k in f.bindings) out[k] = f.bindings[k].reg;
+  }
+  return out;
 }
 
 function lowerUnimplementedStmt(ctx, node, loc) {
@@ -3067,6 +3260,12 @@ function visitNode(ctx, node, tasks, results) {
     case 'Identifier': {
       const existing = lookupName(ctx.scope, node.name);
       if (existing != null) { results.push(existing); return; }
+      // Not found in the current function's scope — check
+      // whether the name is bound in an enclosing function via
+      // _funcStack. If yes, record a capture so applyCall binds
+      // it at call time from the caller's state.
+      const captured = tryCaptureFromOuterScope(ctx, node.name, loc);
+      if (captured != null) { results.push(captured); return; }
       const dest = newRegister(ctx.module);
       emit(ctx.module, ctx.currentBlock, {
         op: OP.GET_GLOBAL, dest, name: node.name,
@@ -3356,6 +3555,78 @@ function visitNode(ctx, node, tasks, results) {
       };
       const dest = lowerFunctionDecl(ctx, syntheticDecl, loc);
       results.push(dest);
+      return;
+    }
+    case 'ConditionalExpression': {
+      // `cond ? consequent : alternate`. Desugar into
+      // branching IR with a phi at the merge block so the
+      // result register reflects both sides with the same
+      // path-sensitivity as a regular if-statement.
+      //
+      // We handle this inline in the expression visitor (not
+      // via emit_* tasks) because we need to mutate
+      // ctx.currentBlock and ctx.scope between lowering the
+      // two branches. That's what beginIf does for statements;
+      // we use a direct call here for simplicity.
+      const condReg = lowerExpression(ctx, node.test);
+      const predBlock = ctx.currentBlock;
+      const thenBlock = createBlock(ctx.module);
+      ctx.blocks.set(thenBlock.id, thenBlock);
+      addEdge(predBlock, thenBlock);
+      const elseBlock = createBlock(ctx.module);
+      ctx.blocks.set(elseBlock.id, elseBlock);
+      addEdge(predBlock, elseBlock);
+      const mergeBlock = createBlock(ctx.module);
+      ctx.blocks.set(mergeBlock.id, mergeBlock);
+      emit(ctx.module, predBlock, {
+        op: OP.BRANCH,
+        cond: condReg,
+        trueTarget: thenBlock.id,
+        falseTarget: elseBlock.id,
+      }, loc);
+      // Lower consequent in thenBlock.
+      ctx.currentBlock = thenBlock;
+      const entryScope = snapshotScope(ctx.scope);
+      const thenReg = lowerExpression(ctx, node.consequent);
+      const thenExitBlock = ctx.currentBlock;
+      const thenScope = snapshotScope(ctx.scope);
+      if (!thenExitBlock.terminator) {
+        emit(ctx.module, thenExitBlock, {
+          op: OP.JUMP, target: mergeBlock.id,
+        }, loc);
+        addEdge(thenExitBlock, mergeBlock);
+      }
+      // Lower alternate in elseBlock, starting from the entry scope.
+      restoreScope(ctx.scope, entryScope);
+      ctx.currentBlock = elseBlock;
+      const elseReg = lowerExpression(ctx, node.alternate);
+      const elseExitBlock = ctx.currentBlock;
+      const elseScope = snapshotScope(ctx.scope);
+      if (!elseExitBlock.terminator) {
+        emit(ctx.module, elseExitBlock, {
+          op: OP.JUMP, target: mergeBlock.id,
+        }, loc);
+        addEdge(elseExitBlock, mergeBlock);
+      }
+      // Merge: emit phis for any names that differ between the
+      // two branches, AND a phi for the result register itself.
+      ctx.currentBlock = mergeBlock;
+      restoreScope(ctx.scope, entryScope);
+      emitScopePhis(ctx, mergeBlock, [
+        { block: thenExitBlock, scope: thenScope },
+        { block: elseExitBlock, scope: elseScope },
+      ], loc);
+      // Result phi.
+      const resultReg = newRegister(ctx.module);
+      emit(ctx.module, mergeBlock, {
+        op: OP.PHI,
+        dest: resultReg,
+        incoming: [
+          { pred: thenExitBlock.id, value: thenReg },
+          { pred: elseExitBlock.id, value: elseReg },
+        ],
+      }, loc);
+      results.push(resultReg);
       return;
     }
     case 'TemplateLiteral': {

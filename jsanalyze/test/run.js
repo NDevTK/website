@@ -38,6 +38,7 @@ const testFiles = [
   'modern-js.test.js',
   'class.test.js',
   'wave8.test.js',
+  'closure.test.js',
 ];
 
 async function main() {

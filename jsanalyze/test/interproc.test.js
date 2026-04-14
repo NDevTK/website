@@ -133,24 +133,28 @@ const tests = [
     },
   },
   {
-    name: 'C1: recursion falls back to opaque with unimplemented assumption',
+    name: 'C1: recursion detected via _callStack raises unimplemented',
     fn: async () => {
-      // Without closure capture, the inner reference to `rec`
-      // can't be resolved as a Closure at all — the inner call
-      // hits the conservative opaque-call fallback. This test
-      // documents the current behaviour. (When C2 lands, the
-      // _callStack guard will catch real recursion and raise
-      // UNIMPLEMENTED.)
+      // With closure captures (Wave 8b), the inner reference to
+      // `rec` resolves precisely — it's the same function the
+      // caller is currently analysing. applyCall's _callStack
+      // guard detects the cycle and conservatively unions all
+      // argument labels into the return, raising an explicit
+      // `unimplemented: recursive call` assumption so the
+      // imprecision is auditable.
       const t = await analyze(
         'function rec(x) { return rec(x); } ' +
         'document.body.innerHTML = rec(location.hash);',
         { typeDB: TDB });
-      // Conservative path: at least one flow (the arg labels
-      // propagate through opaque call).
+      // The fallback keeps the url label so the sink still
+      // fires.
       assert(t.taintFlows.length >= 1, 'fallback flow expected');
-      // At least one opaque-call assumption from the inner ref.
-      const opaque = t.assumptions.filter(a => a.reason === 'opaque-call');
-      assert(opaque.length >= 1, 'expected opaque-call assumption');
+      // The recursion-fallback assumption lives under
+      // `unimplemented`.
+      const unimpl = t.assumptions.filter(
+        a => a.reason === 'unimplemented' &&
+             /recursive call/.test(a.details || ''));
+      assert(unimpl.length >= 1, 'expected recursive-call unimplemented assumption');
     },
   },
 ];

@@ -1057,9 +1057,31 @@ function applyAlloc(ctx, state, instr) {
 
 function applyFunc(ctx, state, instr) {
   const loc = instrLoc(ctx, instr);
-  const captureValues = (instr.captures || []).map(r => D.getReg(state, r));
+  // Closure captures: snapshot each captured outer register's
+  // CURRENT value from the state at Func-instr time. The IR
+  // builder places the Func instruction at the source-order
+  // declaration point (not at hoist time), so by the time
+  // the worklist reaches it all preceding var initializers
+  // in the enclosing function have already run — captures
+  // see the correct values.
+  //
+  // The snapshotted values are bundled with the closure so
+  // the closure can escape its defining function (e.g. via
+  // return) and still be called from a different function
+  // whose state lacks the defining function's registers.
+  const captureEntries = [];
+  if (instr.captures && instr.captures.length > 0) {
+    for (const c of instr.captures) {
+      const outerVal = D.getReg(state, c.outerReg);
+      captureEntries.push({
+        innerReg: c.innerReg,
+        outerReg: c.outerReg,           // fallback for hoisted-forward-ref
+        value: outerVal || null,
+      });
+    }
+  }
   return D.setReg(state, instr.dest,
-    D.closure(instr.functionId, captureValues, loc));
+    D.closure(instr.functionId, captureEntries, loc));
 }
 
 function applyCall(ctx, state, instr) {
@@ -1136,6 +1158,18 @@ function applyCall(ctx, state, instr) {
     calleeFn = ctx.module.functions.find(f => f.id === callee.functionId);
   } else if (callee && callee.kind === D.V.OPAQUE && instr.calleeName) {
     calleeFn = ctx.module.functions.find(f => f.name === instr.calleeName);
+  } else if ((!callee || callee.kind === D.V.BOTTOM) && instr.calleeName) {
+    // Hoisted-forward-reference case: `f(); function f(){}` —
+    // the call site runs before the Func instruction has
+    // executed in the worklist, so state.regs[callee] is
+    // undefined. Look up the function by name directly so
+    // JS's hoisted-function-visibility semantics are
+    // preserved. (Closure captures won't be populated on this
+    // path since the Func instr hasn't run yet, but hoisted
+    // functions declared in the same enclosing function can
+    // still see the enclosing var inits through the usual
+    // identifier-to-register path at body-lowering time.)
+    calleeFn = ctx.module.functions.find(f => f.name === instr.calleeName);
   }
   if (calleeFn && calleeFn.cfg) {
     if (!ctx._callStack) ctx._callStack = new Set();
@@ -1203,6 +1237,51 @@ function applyCall(ctx, state, instr) {
     // no-op).
     const effectiveArgs = expandSpreadArgs(state, argValues, instr.spreadAt, loc);
     let calleeInit = D.createStateSharingHeap(state);
+    // Closure captures: bind each captured register in the
+    // callee's init state. We prefer the caller's CURRENT
+    // state over the applyFunc-time snapshot:
+    //
+    //   * If the caller's state has a value for the capture's
+    //     outerReg, use it. This gives correct semantics when
+    //     the outer variable was reassigned between closure
+    //     creation and the current call (the closure sees the
+    //     latest value, matching JS live-environment
+    //     semantics).
+    //
+    //   * Otherwise, fall back to the applyFunc-time snapshot.
+    //     This is what ESCAPED closures need: the closure was
+    //     returned from an outer function whose state is no
+    //     longer available, so the snapshot is the only record
+    //     of the captured value.
+    //
+    // The fixup pass at IR build time ensures outerReg is
+    // the register the declaring function bound LAST for the
+    // name — so when we check caller state, we check the
+    // latest register.
+    const closureCaptures = (callee && callee.captures) || [];
+    for (const c of closureCaptures) {
+      if (!c || c.innerReg == null) continue;
+      let val = null;
+      // Prefer the live caller-state value if the register is
+      // actually bound there (not Bottom). getReg returns a
+      // Bottom value for unassigned registers; we detect that
+      // and fall back to the applyFunc-time snapshot. This
+      // handles both the "closure sees mutation" case (where
+      // the caller IS the defining function and the reg is
+      // bound to the latest value) and the "escaped closure"
+      // case (where the caller is a different function whose
+      // state doesn't have the defining function's reg at
+      // all — Bottom — so we use the snapshot captured at
+      // closure-creation time).
+      if (c.outerReg != null) {
+        const live = D.getReg(state, c.outerReg);
+        if (live && live.kind !== D.V.BOTTOM) val = live;
+      }
+      if (!val && c.value && c.value.kind !== D.V.BOTTOM) val = c.value;
+      if (val) {
+        calleeInit = D.setReg(calleeInit, c.innerReg, val);
+      }
+    }
     const restIdx = calleeFn.restParamIndex != null ? calleeFn.restParamIndex : -1;
     const normalParamCount = restIdx >= 0 ? restIdx : calleeFn.params.length;
     for (let i = 0; i < normalParamCount && i < calleeFn.params.length; i++) {
@@ -1624,6 +1703,18 @@ function applyNew(ctx, state, instr) {
     if (!ctx._callStack) ctx._callStack = new Set();
     if (ctx._callStack.has(fn.id)) continue;   // recursion fallback
     let calleeInit = D.createStateSharingHeap(newState);
+    // Closure captures: bind each captured register in the
+    // callee's state to the outer register's current value in
+    // the caller's state (which is `state` here — the outer
+    // function invoking `new`).
+    if (fn.captures && fn.captures.length > 0) {
+      for (const cap of fn.captures) {
+        const outerVal = D.getReg(state, cap.outerReg);
+        if (outerVal) {
+          calleeInit = D.setReg(calleeInit, cap.innerReg, outerVal);
+        }
+      }
+    }
     for (let i = 0; i < fn.params.length; i++) {
       const paramReg = fn.params[i];
       const argValue = argValues[i] || D.concrete(undefined, undefined, loc);
