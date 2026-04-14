@@ -2039,6 +2039,24 @@ async function applyNew(ctx, state, instr) {
   let ctorValue = D.getReg(state, instr.ctor);
   const argValues = instr.args.map(r => D.getReg(state, r));
 
+  // Wave 12b: record every `new X(...)` as a call site too.
+  // Consumers (fetch-trace, csp-derive) filter trace.calls
+  // by callee name — `new WebSocket(...)`, `new Function(...)`,
+  // etc. need to appear there alongside plain calls.
+  // Synthesize a minimal instr shape so recordCallSite
+  // produces a consistent record: the ctor's name goes into
+  // `calleeName` (matching the legacy engine's flat-callable
+  // view).
+  const newInstr = {
+    calleeName: instr.calleeName || null,
+    methodName: null,
+    thisArg: null,
+    args: instr.args,
+    spreadAt: instr.spreadAt,
+  };
+  recordCallSite(ctx, newInstr, ctorValue, null, argValues, loc);
+  recordStringLiteralArgs(ctx, newInstr, ctorValue, null, argValues, loc);
+
   // Class objects: when a class is lowered via ClassDeclaration,
   // the class name is bound to a heap-allocated object with a
   // `__ctor__` field pointing at the real constructor closure.

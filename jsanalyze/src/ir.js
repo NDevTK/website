@@ -3053,6 +3053,7 @@ function lowerExpressionIter(ctx, root) {
         const dest = newRegister(ctx.module);
         emit(ctx.module, ctx.currentBlock, {
           op: OP.NEW, dest, ctor: ctorReg, args: argRegs,
+          calleeName: task.calleeName || null,
         }, task.loc);
         results.push(dest);
         break;
@@ -3714,7 +3715,18 @@ function visitNode(ctx, node, tasks, results) {
     }
     case 'NewExpression': {
       const nArgs = node.arguments.length;
-      tasks.push({ kind: 'emit_new', nArgs, loc });
+      // Capture the ctor's identifier name when it's a bare
+      // `new X(…)` or `new a.b.X(…)` so consumers
+      // (fetch-trace, csp-derive) can filter trace.calls by
+      // ctor name without resolving the ctor register.
+      let calleeName = null;
+      if (node.callee.type === 'Identifier') {
+        calleeName = node.callee.name;
+      } else if (node.callee.type === 'MemberExpression' &&
+                 node.callee.property && node.callee.property.type === 'Identifier') {
+        calleeName = node.callee.property.name;
+      }
+      tasks.push({ kind: 'emit_new', nArgs, loc, calleeName });
       for (let i = nArgs - 1; i >= 0; i--) {
         tasks.push({ kind: 'visit', node: node.arguments[i] });
       }

@@ -45,6 +45,8 @@ const testFiles = [
   'html.test.js',
   'accept.test.js',
   'dom-convert.test.js',
+  'csp-derive.test.js',
+  'fetch-trace.test.js',
 ];
 
 async function main() {
