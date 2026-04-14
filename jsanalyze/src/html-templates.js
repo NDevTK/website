@@ -341,25 +341,20 @@ function getAst(jsSource, filename, astCache) {
 //      recursively.
 function detectBranchAccumulator(jsSource, stmts, assignIdx, varName, receiverNode) {
   // Case 3: ternary in a var decl. Walk backward for the
-  // innermost `var X = cond ? a : b` declaration.
+  // innermost `var X = cond ? a : b` declaration. Nested
+  // ternaries are handled via `branchTemplateFromExpr`
+  // which recurses through ConditionalExpression nodes.
   for (let i = assignIdx - 1; i >= 0; i--) {
     const s = stmts[i];
     if (s.type !== 'VariableDeclaration') continue;
     for (const d of s.declarations) {
       if (!d.id || d.id.type !== 'Identifier' || d.id.name !== varName) continue;
       if (!d.init || d.init.type !== 'ConditionalExpression') break;
-      const c = d.init;
-      if (c.consequent.type !== 'Literal' || typeof c.consequent.value !== 'string') break;
-      if (c.alternate.type !== 'Literal' || typeof c.alternate.value !== 'string') break;
-      return {
-        kind: 'branch',
-        receiver: { start: receiverNode.start, end: receiverNode.end },
-        testExpr: { start: c.test.start, end: c.test.end },
-        consequent: concreteTemplate(c.consequent.value),
-        alternate:  concreteTemplate(c.alternate.value),
-        rangeStart: s.start,
-        rangeEnd: stmts[assignIdx].end,
-      };
+      const tpl = branchTemplateFromExpr(d.init, receiverNode);
+      if (!tpl) break;
+      tpl.rangeStart = s.start;
+      tpl.rangeEnd = stmts[assignIdx].end;
+      return tpl;
     }
     // Stop at the first var decl of X we find (the engine
     // treats the closest one as the controlling init).
@@ -367,14 +362,14 @@ function detectBranchAccumulator(jsSource, stmts, assignIdx, varName, receiverNo
   }
 
   // Cases 1+2: an IfStatement immediately before the
-  // assignment whose both branches write to X.
+  // assignment whose branches write to X. Nested `else if`
+  // chains are handled by branchTemplateFromStmt which
+  // recurses when either branch is itself an IfStatement.
   if (assignIdx - 1 < 0) return null;
   const ifStmt = stmts[assignIdx - 1];
   if (!ifStmt || ifStmt.type !== 'IfStatement') return null;
-  if (!ifStmt.test || !ifStmt.consequent || !ifStmt.alternate) return null;
-  const conseqWrite = getSingleStringWrite(ifStmt.consequent, varName);
-  const altWrite    = getSingleStringWrite(ifStmt.alternate, varName);
-  if (!conseqWrite || !altWrite) return null;
+  const tpl = branchTemplateFromStmt(ifStmt, varName, receiverNode);
+  if (!tpl) return null;
 
   // Look one statement further back for an optional
   // `var X` or `var X = ...` declaration. If present, the
@@ -396,15 +391,79 @@ function detectBranchAccumulator(jsSource, stmts, assignIdx, varName, receiverNo
     break;
   }
 
+  tpl.rangeStart = rangeStart;
+  tpl.rangeEnd = stmts[assignIdx].end;
+  return tpl;
+}
+
+// branchTemplateFromStmt — recursively build a `branch`
+// template from an IfStatement that writes `varName`. Each
+// sub-branch is either a literal assignment (→ concrete
+// child) or another IfStatement (→ recursive branch child).
+// Returns null when the shape isn't recognisable.
+function branchTemplateFromStmt(ifStmt, varName, receiverNode) {
+  if (!ifStmt || ifStmt.type !== 'IfStatement') return null;
+  if (!ifStmt.test) return null;
+  // Both branches must be present. A naked `if (c) X = '…'`
+  // without else isn't a balanced fragment pattern.
+  if (!ifStmt.alternate) return null;
+  const conseq = branchChildFromStmt(ifStmt.consequent, varName, receiverNode);
+  const alt    = branchChildFromStmt(ifStmt.alternate,  varName, receiverNode);
+  if (!conseq || !alt) return null;
   return {
     kind: 'branch',
     receiver: { start: receiverNode.start, end: receiverNode.end },
     testExpr: { start: ifStmt.test.start, end: ifStmt.test.end },
-    consequent: concreteTemplate(conseqWrite),
-    alternate:  concreteTemplate(altWrite),
-    rangeStart,
-    rangeEnd: stmts[assignIdx].end,
+    consequent: conseq,
+    alternate: alt,
+    rangeStart: ifStmt.start,   // caller may widen to cover a preceding var decl
+    rangeEnd: ifStmt.end,
   };
+}
+
+// branchChildFromStmt — resolve one branch of an if/else
+// chain into a nested HtmlTemplate. Accepts a direct literal
+// write, a BlockStatement wrapping a single literal write,
+// or a nested IfStatement (else-if).
+function branchChildFromStmt(branchNode, varName, receiverNode) {
+  if (!branchNode) return null;
+  if (branchNode.type === 'IfStatement') {
+    return branchTemplateFromStmt(branchNode, varName, receiverNode);
+  }
+  const lit = getSingleStringWrite(branchNode, varName);
+  if (lit != null) return concreteTemplate(lit);
+  return null;
+}
+
+// branchTemplateFromExpr — recursive counterpart for
+// `var X = c1 ? '<a>' : c2 ? '<b>' : '<c>';`-style
+// ConditionalExpression chains. Each consequent / alternate
+// is either a string literal or another ConditionalExpression.
+function branchTemplateFromExpr(condExpr, receiverNode) {
+  if (!condExpr || condExpr.type !== 'ConditionalExpression') return null;
+  const c = branchChildFromExpr(condExpr.consequent, receiverNode);
+  const a = branchChildFromExpr(condExpr.alternate,  receiverNode);
+  if (!c || !a) return null;
+  return {
+    kind: 'branch',
+    receiver: { start: receiverNode.start, end: receiverNode.end },
+    testExpr: { start: condExpr.test.start, end: condExpr.test.end },
+    consequent: c,
+    alternate: a,
+    rangeStart: condExpr.start,
+    rangeEnd: condExpr.end,
+  };
+}
+
+function branchChildFromExpr(node, receiverNode) {
+  if (!node) return null;
+  if (node.type === 'ConditionalExpression') {
+    return branchTemplateFromExpr(node, receiverNode);
+  }
+  if (node.type === 'Literal' && typeof node.value === 'string') {
+    return concreteTemplate(node.value);
+  }
+  return null;
 }
 
 // detectSwitchAccumulator — recognise the shape

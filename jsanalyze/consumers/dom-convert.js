@@ -560,15 +560,37 @@ function emitChildBlock(child, parentRef, jsSource) {
 // `branch` emitter to recursively lower each if/else
 // branch. Returns null when the nested template can't be
 // emitted (opaque / unknown kind).
-function emitBranchBody(tmpl, receiver) {
+function emitBranchBody(tmpl, receiver, jsSource) {
   if (!tmpl) return null;
   if (tmpl.kind === 'concrete' && tmpl.nodes) {
     return emitDomCalls(tmpl.nodes, receiver);
   }
-  // Nested branch / loop inside a branch isn't covered by
-  // the MVP; returning null leaves the body empty and the
-  // consumer surrounds it with a `{}` placeholder in the
-  // generated source so the runtime still has two branches.
+  // Nested branch (else-if chain, nested ternary). Emit an
+  // inner if/else whose each arm recursively emits its own
+  // template. The nested emission does NOT prepend
+  // replaceChildren — only the outermost branch clears the
+  // receiver; inner arms just emit their own createElement
+  // calls inside the inherited control flow.
+  if (tmpl.kind === 'branch') {
+    const testSrc = jsSource.slice(tmpl.testExpr.start, tmpl.testExpr.end);
+    const lines = [];
+    lines.push('if (' + testSrc + ') {');
+    const conseqBody = emitBranchBody(tmpl.consequent, receiver, jsSource);
+    if (conseqBody) {
+      for (const l of conseqBody.split('\n')) lines.push('  ' + l);
+    }
+    lines.push('} else {');
+    const altBody = emitBranchBody(tmpl.alternate, receiver, jsSource);
+    if (altBody) {
+      for (const l of altBody.split('\n')) lines.push('  ' + l);
+    }
+    lines.push('}');
+    return lines.join('\n');
+  }
+  // Nested loop inside a branch isn't covered by the MVP;
+  // returning null leaves the body empty and the consumer
+  // surrounds it with a `{}` placeholder in the generated
+  // source so the runtime still has two branches.
   return null;
 }
 
@@ -670,7 +692,7 @@ function emitFromTemplate(jsSource, ih) {
       } else {
         lines.push('  default: {');
       }
-      const body = emitBranchBody(c.template, receiver);
+      const body = emitBranchBody(c.template, receiver, jsSource);
       if (body) {
         for (const l of body.split('\n')) lines.push('    ' + l);
       }
@@ -691,12 +713,12 @@ function emitFromTemplate(jsSource, ih) {
     const lines = [];
     lines.push(receiver + '.replaceChildren();');
     lines.push('if (' + testSrc + ') {');
-    const conseqBody = emitBranchBody(tmpl.consequent, receiver);
+    const conseqBody = emitBranchBody(tmpl.consequent, receiver, jsSource);
     if (conseqBody) {
       for (const l of conseqBody.split('\n')) lines.push('  ' + l);
     }
     lines.push('} else {');
-    const altBody = emitBranchBody(tmpl.alternate, receiver);
+    const altBody = emitBranchBody(tmpl.alternate, receiver, jsSource);
     if (altBody) {
       for (const l of altBody.split('\n')) lines.push('  ' + l);
     }

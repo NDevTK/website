@@ -794,6 +794,58 @@ const tests = [
         'original innerHTML removed: ' + out);
     },
   },
+  // --- Wave 12d10: nested if-else-if and nested ternary ---
+  {
+    name: 'dom-convert js: else-if chain → nested branch template',
+    fn: async () => {
+      const src = [
+        'var kind = location.hash;',
+        'var html;',
+        'if (kind === "#a") {',
+        '  html = "<p>A</p>";',
+        '} else if (kind === "#b") {',
+        '  html = "<p>B</p>";',
+        '} else {',
+        '  html = "<p>?</p>";',
+        '}',
+        'document.body.innerHTML = html;',
+      ].join('\n');
+      const out = await convertJs(src);
+      assert(/document\.body\.replaceChildren/.test(out),
+        'outer replaceChildren emitted: ' + out);
+      assert(/if \(kind === "#a"\)/.test(out),
+        'outer if preserved: ' + out);
+      assert(/if \(kind === "#b"\)/.test(out),
+        'inner if preserved: ' + out);
+      assert(/createTextNode\("A"\)/.test(out), 'A emitted: ' + out);
+      assert(/createTextNode\("B"\)/.test(out), 'B emitted: ' + out);
+      assert(/createTextNode\("\?"\)/.test(out), 'fallback emitted: ' + out);
+      assert(!/innerHTML =/.test(out),
+        'original assignment removed: ' + out);
+    },
+  },
+  {
+    name: 'dom-convert js: nested ternary → nested branch template',
+    fn: async () => {
+      const src = [
+        'var kind = location.hash;',
+        'var html = kind === "#a" ? "<p>A</p>"',
+        '         : kind === "#b" ? "<p>B</p>"',
+        '         : "<p>?</p>";',
+        'document.body.innerHTML = html;',
+      ].join('\n');
+      const out = await convertJs(src);
+      assert(/document\.body\.replaceChildren/.test(out),
+        'outer replaceChildren emitted: ' + out);
+      assert(/if \(kind === "#a"\)/.test(out),
+        'outer if from ternary: ' + out);
+      assert(/if \(kind === "#b"\)/.test(out),
+        'inner if from nested ternary: ' + out);
+      assert(/createTextNode\("A"\)/.test(out), 'A emitted: ' + out);
+      assert(/createTextNode\("B"\)/.test(out), 'B emitted: ' + out);
+    },
+  },
+
   // --- Wave 12d9: template literal RHS support ---
   {
     name: 'dom-convert js: innerHTML = `<li>${x}</li>` template literal',
