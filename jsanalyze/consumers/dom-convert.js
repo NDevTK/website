@@ -69,6 +69,17 @@
 
 const html = require('../src/html.js');
 
+// --- Runtime helper injected into rewritten JS ---------------------------
+//
+// Ported verbatim from the legacy htmldom engine. Any JS file
+// whose rewritten form references `__safeNav` gets this helper
+// prepended. It's idempotent: if the input already defines
+// `function __safeNav` we don't add a second copy.
+const NAV_SAFE_FILTER =
+  'function __safeNav(url){try{var u=new URL(url,location.href);' +
+  'if(u.protocol==="https:"||u.protocol==="http:")return url}' +
+  'catch(e){}return undefined}';
+
 // --- CSS declaration parser ---------------------------------------------
 //
 // Port of the legacy `parseStyleDecls`. Splits a style
@@ -389,6 +400,221 @@ function convertHtmlMarkup(htmlContent, pagePath, reservedIdents) {  // eslint-d
   };
 }
 
+// --- JS-side conversion -------------------------------------------------
+//
+// emitDomCalls(node, receiverExpr, depth?, varPool?)
+//
+// Recursive DOM-call emitter. Given an HtmlNode (fragment or
+// element) and a JavaScript expression referring to the
+// receiver element (e.g. `document.body`), returns a
+// multi-line string of imperative DOM calls that produce the
+// same subtree. Void elements emit a single createElement +
+// setAttribute chain; container elements push the created
+// child and recursively emit their own children against it.
+//
+// Variable allocation: each non-text child becomes a
+// locally-scoped `__n` variable so setAttribute / appendChild
+// references resolve unambiguously. `depth` threads the
+// nesting level so inner variables don't collide.
+function emitDomCalls(node, receiverExpr, depth, varCounter) {
+  if (depth == null) depth = 0;
+  if (!varCounter) varCounter = { n: 0 };
+  const lines = [];
+  for (const child of node.children) {
+    if (child.type === 'text') {
+      // Only emit non-empty text nodes. Whitespace-only text
+      // between siblings is preserved as a text node so the
+      // rendered layout matches the original.
+      if (child.value === '') continue;
+      lines.push(receiverExpr + '.appendChild(document.createTextNode(' +
+        JSON.stringify(child.value) + '));');
+      continue;
+    }
+    if (child.type === 'comment') {
+      lines.push(receiverExpr + '.appendChild(document.createComment(' +
+        JSON.stringify(child.value) + '));');
+      continue;
+    }
+    if (child.type !== 'element') continue;
+    const varName = '__n' + (varCounter.n++);
+    lines.push('var ' + varName + ' = document.createElement(' +
+      JSON.stringify(child.tag) + ');');
+    // setAttribute for every attr in source order so the
+    // emitted code preserves the original ordering.
+    for (const attr of child.attrList || []) {
+      lines.push(varName + '.setAttribute(' + JSON.stringify(attr.name) +
+        ', ' + JSON.stringify(attr.value) + ');');
+    }
+    lines.push(receiverExpr + '.appendChild(' + varName + ');');
+    if (child.children && child.children.length > 0) {
+      const inner = emitDomCalls(child, varName, depth + 1, varCounter);
+      if (inner) lines.push(inner);
+    }
+  }
+  return lines.join('\n');
+}
+
+// sliceStatement(source, loc) → string. Extracts the source
+// text for a Location record using pos / endPos.
+function sliceStatement(source, loc) {
+  if (!loc || loc.pos == null || loc.endPos == null) return '';
+  return source.slice(loc.pos, loc.endPos);
+}
+
+// convertJsFile(jsSource, trace, filename?) → string
+//
+// Applies every JS-side rewrite to `jsSource` based on what
+// the trace observed for `filename` (or the first file in the
+// trace if only one was analysed):
+//
+//   * innerHTML / outerHTML assignments whose value is a
+//     concrete string become a sequence of createElement /
+//     setAttribute / appendChild calls.
+//   * Tainted navigation — assignments to `location.href`,
+//     `location` itself, and `<iframe|frame>.src` whose RHS
+//     is tainted — get wrapped in a `__safeNav(rhs)` protocol
+//     filter, matching the legacy engine's wrapper form.
+//   * `eval(dynamic)` calls become `/* [blocked: eval with
+//     dynamic argument] */ void 0`. Constant-string eval is
+//     left alone.
+//   * `document.write(literal)` becomes
+//     `document.body.appendChild(document.createTextNode(literal))`.
+//     Non-literal document.write is currently left alone (the
+//     legacy engine has a sanitizer pass for it, out of scope
+//     for this commit).
+//
+// Rewrites are applied in REVERSE source order so earlier
+// positions are still valid while we edit later ones. A final
+// pass prepends the `__safeNav` helper if any rewrite
+// introduced a reference to it.
+function convertJsFile(jsSource, trace, filename) {
+  const replacements = [];
+
+  // Build a per-file filter. The trace may span multiple
+  // files; a rewrite is only applicable to `jsSource` if its
+  // location.file matches.
+  const matchesFile = loc => {
+    if (!loc) return false;
+    if (filename == null) return true;
+    return loc.file === filename;
+  };
+
+  // --- 1. innerHTML / outerHTML → DOM calls -----------------------------
+  for (const ih of trace.innerHtmlAssignments || []) {
+    if (!matchesFile(ih.location)) continue;
+    if (ih.kind !== 'innerHTML' && ih.kind !== 'outerHTML') continue;
+    if (!ih.parsedHtml) continue;   // non-concrete; out of scope for MVP
+    const stmtText = sliceStatement(jsSource, ih.location);
+    // Extract the receiver expression: everything before
+    // `.innerHTML` / `.outerHTML` =.
+    const m = stmtText.match(/^(.+?)\.(innerHTML|outerHTML)\s*=/);
+    if (!m) continue;
+    const receiver = m[1];
+    const body = emitDomCalls(ih.parsedHtml, receiver);
+    // Also emit a `receiver.replaceChildren();` before the
+    // DOM calls so the innerHTML semantic (clobber existing
+    // children) is preserved.
+    const replacement = receiver + '.replaceChildren();\n' + body;
+    replacements.push({
+      start: ih.location.pos,
+      end: ih.location.endPos,
+      replacement,
+    });
+  }
+
+  // --- 2. Tainted navigation → __safeNav wrap ---------------------------
+  for (const flow of trace.taintFlows || []) {
+    if (!matchesFile(flow.sink && flow.sink.location)) continue;
+    if (!flow.sink) continue;
+    const sinkKind = flow.sink.kind;
+    const sinkProp = flow.sink.prop;
+    // Navigation sinks per the default TypeDB: 'navigation'
+    // kind on Location.href / Location.assign / etc., plus
+    // `url` kind on HTMLIFrameElement.src / .srcdoc.
+    const isNav = sinkKind === 'navigation' ||
+      (sinkKind === 'url' && (sinkProp === 'src' || sinkProp === 'href'));
+    if (!isNav) continue;
+    const stmtText = sliceStatement(jsSource, flow.sink.location);
+    if (!stmtText) continue;
+    // Match `target = rhs;` or `target = rhs`.
+    const assign = stmtText.match(/^([^=]+?)\s*=\s*([\s\S]+?);?$/);
+    if (!assign) continue;
+    const target = assign[1].trim();
+    const rhs = assign[2].trim();
+    // Skip if the RHS is a string literal — string literals
+    // are safe at compile time.
+    if (/^(["']).*\1$/.test(rhs)) continue;
+    const wrapped = '(function(){var __u=__safeNav(' + rhs +
+      ');if(__u!==undefined)' + target + '=__u}())';
+    replacements.push({
+      start: flow.sink.location.pos,
+      end: flow.sink.location.endPos,
+      replacement: wrapped,
+    });
+  }
+
+  // --- 3. eval(dynamic) → blocked ---------------------------------------
+  // --- 4. document.write(literal) → createTextNode ---------------------
+  for (const c of trace.calls || []) {
+    if (!matchesFile(c.site)) continue;
+    const text = c.callee.text;
+    const isEval = text === 'eval' ||
+      (c.callee.calleeName === 'eval' && !c.callee.typeName);
+    const isDocWrite = text === 'Document.write' || text === 'document.write';
+    if (!isEval && !isDocWrite) continue;
+    const arg0 = c.args[0];
+    if (isEval) {
+      // Only block dynamic eval. If the arg is a concrete
+      // string, leave it alone (or ideally inline-walk it —
+      // out of scope for this commit).
+      if (arg0 && arg0.kind === 'concrete' && typeof arg0.value === 'string') continue;
+      replacements.push({
+        start: c.site.pos,
+        end: c.site.endPos,
+        replacement: '/* [blocked: eval with dynamic argument] */ void 0',
+      });
+      continue;
+    }
+    if (isDocWrite) {
+      // Only rewrite concrete-literal document.write — dynamic
+      // document.write is a bigger sanitization problem that
+      // needs a runtime guard, out of scope for this commit.
+      if (!arg0 || arg0.kind !== 'concrete' || typeof arg0.value !== 'string') continue;
+      replacements.push({
+        start: c.site.pos,
+        end: c.site.endPos,
+        replacement: 'document.body.appendChild(document.createTextNode(' +
+          JSON.stringify(arg0.value) + '))',
+      });
+      continue;
+    }
+  }
+
+  // --- Apply replacements in reverse order ------------------------------
+  replacements.sort((a, b) => b.start - a.start);
+  // Drop overlapping replacements (keep the earlier / outer one).
+  const pruned = [];
+  let lastStart = Infinity;
+  for (const r of replacements) {
+    if (r.end > lastStart) continue;
+    pruned.push(r);
+    lastStart = r.start;
+  }
+
+  let result = jsSource;
+  for (const r of pruned) {
+    result = result.slice(0, r.start) + r.replacement + result.slice(r.end);
+  }
+
+  // --- Prepend __safeNav helper if referenced -----------------------
+  if (result.indexOf('__safeNav') >= 0 &&
+      result.indexOf('function __safeNav') < 0) {
+    result = NAV_SAFE_FILTER + '\n' + result;
+  }
+
+  return result;
+}
+
 // --- Project-level entry point ------------------------------------------
 //
 // convertProject(files, options?) → { filename: content }
@@ -399,38 +625,65 @@ function convertHtmlMarkup(htmlContent, pagePath, reservedIdents) {  // eslint-d
 // HTML file had no inline events/styles/scripts, it's not in
 // the output.
 //
-// The JS-side conversion (innerHTML → createElement, navigation
-// wrapping, eval blocking, document.write lowering) is added
-// in the next commit.
-async function convertProject(files, options) {  // eslint-disable-line no-unused-vars
+// For each JS file (including inline scripts extracted from
+// HTML), we run the engine via `analyze()` to get a Trace and
+// then call `convertJsFile` to apply the source-range
+// rewrites. Only files that actually changed appear in the
+// output.
+async function convertProject(files, options) {
+  options = options || {};
   const output = {};
   const keys = Object.keys(files);
   const htmlPaths = keys.filter(p => /\.html?$/i.test(p)).sort();
 
-  // Track names already taken by input files so we don't
-  // overwrite them with generated handlers/scripts.
-  const usedNames = new Set(keys);
-
+  // Stage 1: HTML-side conversion. Collect extracted JS/CSS
+  // blocks so we can run the JS-side pass on them too.
+  const pendingJs = Object.create(null);   // filename → source
   for (const page of htmlPaths) {
     const result = convertHtmlMarkup(files[page], page);
     let anyChange = false;
     if (result.handlers) {
       output[result.handlers.name] = result.handlers.content;
-      usedNames.add(result.handlers.name);
       anyChange = true;
     }
     for (const s of result.extractedScripts) {
       output[s.name] = s.content;
-      usedNames.add(s.name);
+      pendingJs[s.name] = s.content;
       anyChange = true;
     }
     for (const s of result.extractedStyles) {
       output[s.name] = s.content;
-      usedNames.add(s.name);
       anyChange = true;
     }
     if (anyChange || result.html !== files[page]) {
       output[page] = result.html;
+    }
+  }
+
+  // Stage 2: JS-side conversion. Union of (original JS files
+  // from the input) and (extracted inline scripts from HTML).
+  const jsPaths = keys.filter(p => /\.m?js$/.test(p));
+  for (const p of jsPaths) pendingJs[p] = files[p];
+
+  // Run the engine once per JS file. Passing just this file
+  // gives the Trace a single-file view; a future extension
+  // could pass the whole project for cross-file scope
+  // resolution.
+  //
+  // Require lazily so the consumer file can be loaded by
+  // non-Node hosts that don't want to pull in the engine
+  // (e.g. unit tests of convertHtmlMarkup alone).
+  const { analyze } = require('../src/index.js');
+  const TDB = options.typeDB || require('../src/default-typedb.js');
+  for (const jsPath of Object.keys(pendingJs)) {
+    const src = pendingJs[jsPath];
+    const trace = await analyze({ [jsPath]: src }, {
+      typeDB: TDB,
+      precision: options.precision || 'precise',
+    });
+    const rewritten = convertJsFile(src, trace, jsPath);
+    if (rewritten !== src) {
+      output[jsPath] = rewritten;
     }
   }
 
@@ -440,5 +693,7 @@ async function convertProject(files, options) {  // eslint-disable-line no-unuse
 module.exports = {
   convertProject,
   convertHtmlMarkup,
+  convertJsFile,
   parseStyleDecls,
+  emitDomCalls,
 };

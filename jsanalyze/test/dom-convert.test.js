@@ -21,7 +21,17 @@
 'use strict';
 
 const dc = require('../consumers/dom-convert.js');
+const { analyze } = require('../src/index.js');
+const TDB = require('../src/default-typedb.js');
 const { assert, assertEqual } = require('./run.js');
+
+// Helper: run analyze() on a JS snippet and pass the trace
+// into convertJsFile. Returns the rewritten source.
+async function convertJs(src, filename) {
+  filename = filename || '<input>.js';
+  const trace = await analyze({ [filename]: src }, { typeDB: TDB });
+  return dc.convertJsFile(src, trace, filename);
+}
 
 async function expectProject(files, expectedKeys, checks) {
   const out = await dc.convertProject(files);
@@ -297,6 +307,93 @@ const tests = [
       assertEqual(decls[0].prop, 'margin');
       assertEqual(decls[0].value, '0');
       assertEqual(decls[0].important, true);
+    },
+  },
+
+  // --- JS-side: concrete innerHTML → createElement tree ---
+  {
+    name: 'dom-convert js: concrete innerHTML becomes createElement + appendChild',
+    fn: async () => {
+      const out = await convertJs(
+        'document.body.innerHTML = "<p>Hello</p>";');
+      assert(!/innerHTML/.test(out), 'innerHTML removed');
+      assert(/replaceChildren\(\)/.test(out), 'replaceChildren before DOM calls');
+      assert(/createElement\("p"\)/.test(out), 'createElement("p")');
+      assert(/createTextNode\("Hello"\)/.test(out), 'createTextNode for "Hello"');
+    },
+  },
+  {
+    name: 'dom-convert js: nested concrete innerHTML emits nested createElement',
+    fn: async () => {
+      const out = await convertJs(
+        'document.body.innerHTML = "<div class=\\"x\\"><span>hi</span></div>";');
+      assert(/createElement\("div"\)/.test(out), 'creates div');
+      assert(/setAttribute\("class", "x"\)/.test(out), 'sets class attr');
+      assert(/createElement\("span"\)/.test(out), 'creates span');
+      assert(/createTextNode\("hi"\)/.test(out), 'creates text "hi"');
+      assert(/appendChild/.test(out), 'appendChild present');
+    },
+  },
+  {
+    name: 'dom-convert js: non-concrete innerHTML is left alone',
+    fn: async () => {
+      const src = 'var x = location.hash; document.body.innerHTML = x;';
+      const out = await convertJs(src);
+      // innerHTML is still present — the MVP JS-side doesn't
+      // synthesize runtime sanitizers for tainted values.
+      assert(/innerHTML/.test(out), 'innerHTML preserved for non-concrete');
+    },
+  },
+
+  // --- JS-side: tainted navigation → __safeNav ---
+  {
+    name: 'dom-convert js: tainted location.href wrapped in __safeNav',
+    fn: async () => {
+      const out = await convertJs(
+        'var r = location.hash.slice(1); location.href = r;');
+      assert(/__safeNav/.test(out), '__safeNav helper injected');
+      assert(/function __safeNav\(url\)/.test(out), 'helper defined');
+      // The assignment should be wrapped in the IIFE form.
+      assert(/var __u=__safeNav\(r\)/.test(out),
+        'assignment wrapped: ' + out.slice(0, 200));
+    },
+  },
+  {
+    name: 'dom-convert js: string-literal location.href NOT wrapped',
+    fn: async () => {
+      const out = await convertJs('location.href = "https://x.com/";');
+      // String literals are safe at compile time — no wrapper.
+      assert(!/__safeNav/.test(out), 'no __safeNav for literal');
+    },
+  },
+
+  // --- JS-side: eval blocking ---
+  {
+    name: 'dom-convert js: eval(dynamic) → blocked placeholder',
+    fn: async () => {
+      const out = await convertJs(
+        'var data = location.hash; eval(data);');
+      assert(/\[blocked: eval with dynamic argument\]/.test(out),
+        'eval blocked: ' + out);
+      assert(!/eval\(data\)/.test(out), 'original eval removed');
+    },
+  },
+  {
+    name: 'dom-convert js: eval(constant) is NOT blocked',
+    fn: async () => {
+      const out = await convertJs('eval("var x = 1;");');
+      assert(!/\[blocked/.test(out), 'constant eval not blocked');
+    },
+  },
+
+  // --- JS-side: document.write lowering ---
+  {
+    name: 'dom-convert js: document.write(literal) → appendChild createTextNode',
+    fn: async () => {
+      const out = await convertJs('document.write("Hello");');
+      assert(/createTextNode\("Hello"\)/.test(out), 'createTextNode emitted');
+      assert(/appendChild/.test(out), 'appendChild emitted');
+      assert(!/document\.write\("Hello"\)/.test(out), 'original call removed');
     },
   },
 ];
