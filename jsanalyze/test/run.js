@@ -44,6 +44,7 @@ const testFiles = [
   'wave11.test.js',
   'html.test.js',
   'accept.test.js',
+  'dom-convert.test.js',
 ];
 
 async function main() {
