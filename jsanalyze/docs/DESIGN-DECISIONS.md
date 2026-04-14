@@ -236,6 +236,88 @@ first two are working.
 consumers are domain-specific. A new consumer is a new file,
 not a patch to the engine.
 
+#### D11.1 What belongs in the engine vs in consumers
+
+This is load-bearing for the "library vs consumer" split —
+every piece of logic has a definite home, and drift between
+the two is a design bug.
+
+**In the engine (`src/`):**
+
+Anything that computes KNOWLEDGE about the program — its
+values, its shapes, its reachability, its interprocedural
+effects. Every observation consumers might want is
+produced here and lands on the Trace.
+
+Specifically:
+  * Parsing JS source → AST → IR → CFG.
+  * Abstract interpretation over the value lattice.
+  * Taint tracking (source → sink).
+  * Interprocedural walking, path sensitivity, state
+    correlation (B4), summary caching (C3).
+  * Z3 refutation (Layer 5 of the branch cascade + post-pass).
+  * HTML literal parsing (via `src/html.js`) when the
+    analyzer sees an innerHTML / outerHTML / insertAdjacentHTML
+    sink with a non-empty string value. The parser's tree
+    AND its flat token stream are both attached to the
+    trace's innerHtmlAssignment record.
+  * **Structured HTML-template extraction** from JS
+    accumulator patterns. When an innerHTML value is built
+    by a loop (`var H = '<nav>'; for (...) { H += ...; }
+    ...; elem.innerHTML = H;`) or a branch (`if (...) H =
+    'a'; else H = 'b';`) or a nested combination, the
+    engine recognises the shape at the AST level and
+    attaches a structured `HtmlTemplate` to the
+    innerHtmlAssignment. The template covers:
+      - `kind: 'concrete'` — fully static string (parsed HTML tree)
+      - `kind: 'loop'`     — per-iteration template + loop shape
+      - `kind: 'branch'`   — alternatives from if/else / switch
+      - `kind: 'opaque'`   — the engine couldn't recognise
+                             a pattern (the consumer decides
+                             what to do: leave alone, wrap
+                             in a runtime sanitizer, or emit
+                             a TODO).
+  * Interprocedural callback walking (addEventListener,
+    setTimeout, etc.). Sinks inside callbacks appear on the
+    trace via callback walking, not via per-consumer AST
+    detection.
+  * Multi-file project analysis (`options.project`) with
+    shared top-level scope so cross-file references
+    resolve.
+
+**In consumers (`consumers/`):**
+
+Anything that EMITS output — source rewrites, reports, CSP
+directives, exploit PoCs. Consumers read the Trace and
+produce their domain-specific result. They never
+re-analyze, never run their own AST passes over the input
+source, and never reach into engine internals.
+
+Specifically:
+  * Format conversion: taintFlow records → human-readable
+    report; trace.calls → CSP directive lists.
+  * Source-range rewriting: given a trace and the original
+    source, apply replacements at the positions the
+    engine reported. This is text substitution, not
+    analysis.
+  * HTML-token-stream mutation: dom-convert reads
+    `innerHtmlAssignment.htmlTokens` / `.template` from the
+    trace and emits DOM calls. It does NOT re-parse the
+    JS source looking for loop patterns — that's what
+    `innerHtmlAssignment.template` is for.
+  * Consumer-specific filtering: fetch-trace filters
+    trace.calls by callee name; csp-derive groups
+    trace.calls + trace.stringLiterals + trace.domMutations
+    by CSP directive.
+
+**The rule.** If a consumer is parsing JavaScript or
+running an AST walker, it's in the wrong place. The engine
+parses once, and every observation a consumer needs is
+pre-computed on the Trace. Consumers that feel the need
+to re-parse are a signal that the Trace shape needs a new
+observation field, which is a patch to the engine — not a
+workaround in the consumer.
+
 ### D12. Browser integration preserves the legacy UI
 
 The target is `htmldom/index.html`. The new engine will be

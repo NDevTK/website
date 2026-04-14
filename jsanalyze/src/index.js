@@ -13,6 +13,7 @@ const D = require('./domain.js');
 const { overlayEntries } = require('./domain.js');
 const Z3 = require('./z3.js');
 const HTML = require('./html.js');
+const HtmlTemplates = require('./html-templates.js');
 const query = require('./query.js');
 
 // analyze(input, options) → Promise<Trace>
@@ -355,20 +356,37 @@ async function analyze(input, options) {
 
     // Wave 12 / Phase E: copy innerHTML-family assignments
     // recorded during the walk into the trace. These records
-    // drive the DOM-conversion consumer (and any consumer that
-    // wants to inventory unsafe HTML sink sites).
+    // drive the DOM-conversion consumer (and any consumer
+    // that wants to inventory unsafe HTML sink sites).
     //
-    // When the assigned value is a concrete string we
-    // EAGERLY parse it via the vendored HTML parser and
-    // attach the resulting fragment + flat token stream so
-    // consumers can operate on a structured view without
-    // re-parsing. `parsedHtml` is the tree (nodes with tag,
-    // attrs, children, loc); `htmlTokens` is the flat token
-    // stream that dom-convert mutates in place for source-
-    // preserving rewrites. Non-concrete values (loop-built
-    // strings, tainted opaque) have `parsedHtml = null` and
-    // the consumer has to reconstruct the HTML from the
-    // trace's calls/bindings context.
+    // Per D11.1 the engine attaches EVERY piece of structured
+    // knowledge consumers might need to each record:
+    //
+    //   * concrete / parsedHtml / htmlTokens — when the
+    //     assigned Value is a compile-time string, the
+    //     engine parses it via src/html.js (tree + flat
+    //     token stream) so consumers can operate on a
+    //     structured view without re-parsing.
+    //
+    //   * template — a structured HtmlTemplate (from
+    //     src/html-templates.js) that covers patterns the
+    //     value lattice can't fold to a concrete string.
+    //     Right now:
+    //       - { kind: 'concrete', html, nodes } — same as
+    //         the concrete case above, also surfaced here
+    //         for uniform consumer reads
+    //       - { kind: 'loop', ... } — accumulator loops
+    //         (`var H='<tag>'; for (...){H+=...} ...`)
+    //       - { kind: 'opaque', reason } — recognised site,
+    //         engine couldn't match a pattern
+    //     Consumers read `ih.template` first and fall back
+    //     to `ih.parsedHtml` only when template is null
+    //     (engine couldn't find the site).
+    //
+    // The template extractor caches its parsed AST per
+    // source file so multiple assignments in the same file
+    // share a single parse.
+    const astCache = Object.create(null);
     for (const ih of ctx.innerHtmlAssignments) {
       const v = ih.value;
       if (v && v.kind === D.V.CONCRETE && typeof v.value === 'string') {
@@ -379,6 +397,54 @@ async function analyze(input, options) {
         ih.parsedHtml = null;
         ih.htmlTokens = null;
         ih.concrete = null;
+      }
+      // Attach the structured template. Ordering:
+      //
+      //   1. Run the AST-level template extractor FIRST. It
+      //      recognises dynamic shapes (accumulator loops,
+      //      branches, etc.) that preserve runtime iteration
+      //      semantics — consumers that rewrite the source
+      //      need these to generate code that still works
+      //      when a runtime caller mutates the underlying
+      //      data (e.g. items.push from a later event).
+      //      If the value-lattice analysis has folded the
+      //      accumulator to a specific compile-time value,
+      //      we'd be tempted to call it concrete — but that
+      //      answer IGNORES the runtime mutability and would
+      //      produce an unsound rewrite.
+      //
+      //   2. Fall back to the value-lattice concrete view
+      //      only when the extractor returns null or an
+      //      `opaque` verdict. This covers the common
+      //      `elem.innerHTML = "<p>" + x + "</p>"` shape
+      //      where x is a plain concat hole and the lattice
+      //      has resolved the final value but the AST
+      //      extractor doesn't currently match concat
+      //      chains without a surrounding loop.
+      //
+      //   3. If neither step produced a template, ih.template
+      //      is null so consumers know the site exists but
+      //      isn't rewritable.
+      const srcFile = ih.location && ih.location.file;
+      let astTemplate = null;
+      if (srcFile && workingFiles[srcFile] != null) {
+        if (!astCache[srcFile]) astCache[srcFile] = Object.create(null);
+        astTemplate = HtmlTemplates.extractTemplate(
+          workingFiles[srcFile],
+          ih.location.pos,
+          srcFile,
+          astCache[srcFile]);
+      }
+      if (astTemplate && astTemplate.kind !== 'opaque') {
+        ih.template = astTemplate;
+      } else if (ih.concrete != null && ih.parsedHtml) {
+        ih.template = {
+          kind: 'concrete',
+          html: ih.concrete,
+          nodes: ih.parsedHtml,
+        };
+      } else {
+        ih.template = astTemplate;  // opaque with reason, or null
       }
       trace.innerHtmlAssignments.push(ih);
     }

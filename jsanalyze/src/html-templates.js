@@ -1,0 +1,455 @@
+// html-templates.js — structured HTML-template extraction
+// from JS accumulator patterns (Wave 12d / D11.1).
+//
+// Observation: a lot of real-world code builds HTML by
+// concatenating strings at runtime — `var H = '<nav>'; for
+// (...) { H += '<a>'+item+'</a>'; } ...; el.innerHTML = H;`
+// is the canonical shape. The value that reaches the
+// innerHTML sink is not a compile-time constant, but the
+// STRUCTURE of the HTML being built IS static: the engine
+// can recognise the accumulator pattern and record what the
+// final DOM tree will look like.
+//
+// This module is the engine's template-extraction pass. For
+// each concrete assignment site on the trace, it walks the
+// enclosing JS AST looking for one of a set of known
+// accumulator patterns and returns an `HtmlTemplate` record
+// describing what the assignment builds. Consumers read the
+// template off the trace's innerHtmlAssignment records and
+// emit code without re-parsing the source themselves.
+//
+// This is the knowledge half of D11.1. Emitting code from
+// the template is consumer work (consumers/dom-convert.js).
+//
+// HtmlTemplate shape:
+//
+//   type HtmlTemplate =
+//     | { kind: 'concrete'; html: string; nodes: HtmlNode[] }
+//         -- fully static; nodes is the parsed tree.
+//     | { kind: 'loop';
+//         receiver: { start, end };    -- the `elem.innerHTML` LHS
+//         outer: null | {               -- optional wrapper element
+//           tag: string;
+//           attrList: HtmlAttr[];       -- static attributes from the open literal
+//         };
+//         loopShape: {
+//           initSrc: string;            -- verbatim init clause
+//           testSrc: string;            -- verbatim test clause
+//           updateSrc: string;          -- verbatim update clause
+//           bodyStart: number;          -- body block start
+//           bodyEnd: number;            -- body block end
+//         };
+//         child: {                      -- per-iteration child element
+//           tag: string;
+//           attrs: HtmlAttrTemplate[];
+//           textExpr: { start, end } | null;  -- source range of the text expression
+//         };
+//         rangeStart: number;           -- source range to replace
+//         rangeEnd: number;
+//       }
+//     | { kind: 'opaque'; reason: string };
+//
+//   type HtmlAttrTemplate = {
+//     name: string;
+//     parts: Array<
+//       | { kind: 'literal'; value: string }
+//       | { kind: 'expr'; start: number; end: number }
+//     >;
+//   };
+//
+// `start` / `end` are absolute source positions into the JS
+// source. Consumers slice the source at those positions to
+// get the exact expression text to re-emit.
+//
+// Each file's AST is cached on ctx so the detector doesn't
+// re-parse the source for every innerHtmlAssignment.
+
+'use strict';
+
+const html = require('./html.js');
+
+// --- AST source resolution ---
+//
+// The template extractor uses acorn directly (not the
+// engine's parse.js) because it needs exact byte-offset
+// positions on every AST node for source-range rewrites.
+// The engine's parse.js tokenizes via acorn but builds its
+// own AST shape with slightly different position semantics;
+// the template extractor needs a raw acorn Program so
+// `node.start` / `node.end` correspond exactly to the
+// source bytes.
+let _acorn = null;
+function getAcorn() {
+  if (_acorn) return _acorn;
+  if (typeof globalThis !== 'undefined' && globalThis.acorn &&
+      typeof globalThis.acorn.parse === 'function') {
+    _acorn = globalThis.acorn;
+    return _acorn;
+  }
+  const path = require('path');
+  const vendoredPath = path.join(__dirname, '..', 'vendor', 'acorn.js');
+  _acorn = require(vendoredPath);
+  return _acorn;
+}
+function parseAst(source) {
+  const acorn = getAcorn();
+  return acorn.parse(source, {
+    ecmaVersion: 'latest',
+    locations: true,
+    sourceType: 'script',
+  });
+}
+
+// extractTemplate(jsSource, assignStmtPos, astCache?) → HtmlTemplate | null
+//
+// The main entry point. `assignStmtPos` is the absolute
+// source position of the innerHTML assignment statement
+// (matching the `location.pos` the engine records on the
+// innerHtmlAssignment record). `astCache` is an optional
+// object that caches the parsed AST for the source so
+// multiple calls on the same file don't reparse.
+//
+// Returns an HtmlTemplate describing the shape, or null
+// when the assignment isn't found in the source (e.g. the
+// consumer passed in a position that doesn't correspond to
+// a known site). An `{ kind: 'opaque', reason }` template
+// is returned for recognised-but-unmatchable shapes so the
+// consumer knows the site exists but the engine can't tell
+// what it builds.
+function extractTemplate(jsSource, assignStmtPos, filename, astCache) {
+  const ast = getAst(jsSource, filename, astCache);
+  if (!ast) return null;
+  const stmts = ast.body;
+  let assignIdx = -1;
+  for (let i = 0; i < stmts.length; i++) {
+    if (stmts[i].start <= assignStmtPos && stmts[i].end > assignStmtPos) {
+      assignIdx = i;
+      break;
+    }
+  }
+  if (assignIdx < 0) return null;
+  const assignStmt = stmts[assignIdx];
+  if (assignStmt.type !== 'ExpressionStatement') return null;
+  const expr = assignStmt.expression;
+  if (!expr || expr.type !== 'AssignmentExpression' || expr.operator !== '=') return null;
+  const lhs = expr.left;
+  const rhs = expr.right;
+  if (!lhs || lhs.type !== 'MemberExpression') return null;
+  if (lhs.computed || !lhs.property || lhs.property.type !== 'Identifier') return null;
+  if (lhs.property.name !== 'innerHTML' && lhs.property.name !== 'outerHTML') return null;
+
+  // The RHS must be a plain Identifier referencing an
+  // accumulator variable or a string concatenation / literal.
+  if (rhs && rhs.type === 'Identifier') {
+    return extractFromAccumulator(jsSource, stmts, assignIdx, rhs.name, lhs.object);
+  }
+
+  // Right-hand side is a literal string or a static concat
+  // chain. Parse it as HTML.
+  if (rhs && rhs.type === 'Literal' && typeof rhs.value === 'string') {
+    return {
+      kind: 'concrete',
+      html: rhs.value,
+      nodes: html.parse(rhs.value),
+    };
+  }
+
+  return { kind: 'opaque', reason: 'unrecognised rhs shape' };
+}
+
+function getAst(jsSource, filename, astCache) {
+  if (astCache && astCache.ast) return astCache.ast;
+  const ast = parseAst(jsSource);
+  if (astCache) astCache.ast = ast;
+  return ast;
+}
+
+// extractFromAccumulator — match
+//
+//   [A] var X = <string lit>;        (optional wrapping open tag)
+//   [B] for (...) { X += <concat>; } (optional, the pattern's heart)
+//   [C] X += <string lit>;           (optional closing tag)
+//   [D] elem.innerHTML = X;
+//
+// Returns a `loop` template when the pattern matches,
+// `opaque` when it doesn't.
+function extractFromAccumulator(jsSource, stmts, assignIdx, varName, receiverNode) {
+  let closeStmtIdx = -1;
+  let loopStmtIdx = -1;
+  let openStmtIdx = -1;
+
+  // Optional close-accum statement immediately before the
+  // assignment (shape A wrapping).
+  if (assignIdx - 1 >= 0) {
+    const prev = stmts[assignIdx - 1];
+    if (isAccumAssign(prev, varName)) {
+      const lit = literalOfAccumAssign(prev);
+      if (typeof lit === 'string' && /<\/[a-z][^>]*>/i.test(lit)) {
+        closeStmtIdx = assignIdx - 1;
+      }
+    }
+  }
+
+  // For loop must sit at assignIdx-1 (shape B no-wrap) or
+  // closeStmtIdx-1 (shape A with wrapper).
+  const afterLoopIdx = closeStmtIdx >= 0 ? closeStmtIdx : assignIdx;
+  if (afterLoopIdx - 1 >= 0) {
+    const s = stmts[afterLoopIdx - 1];
+    if (s.type === 'ForStatement' && s.body && s.body.type === 'BlockStatement') {
+      loopStmtIdx = afterLoopIdx - 1;
+    }
+  }
+  if (loopStmtIdx < 0) {
+    return { kind: 'opaque', reason: 'no for-loop before innerHTML assignment' };
+  }
+
+  // Open-accum statement (the var X = '<…>' declaration).
+  for (let i = loopStmtIdx - 1; i >= 0; i--) {
+    const s = stmts[i];
+    if (s.type === 'VariableDeclaration') {
+      for (const d of s.declarations) {
+        if (d.id && d.id.type === 'Identifier' && d.id.name === varName &&
+            d.init && d.init.type === 'Literal' && typeof d.init.value === 'string') {
+          openStmtIdx = i;
+          break;
+        }
+      }
+      if (openStmtIdx >= 0) break;
+    }
+  }
+  if (openStmtIdx < 0) {
+    return { kind: 'opaque', reason: 'no var declaration of accumulator' };
+  }
+
+  const openStmt = stmts[openStmtIdx];
+  const loopStmt = stmts[loopStmtIdx];
+  const closeStmt = closeStmtIdx >= 0 ? stmts[closeStmtIdx] : null;
+  const openInit = openStmt.declarations.find(d => d.id.name === varName).init;
+  const openLit = openInit.value;
+  const closeLit = closeStmt ? literalOfAccumAssign(closeStmt) : null;
+
+  // Resolve outer wrapper: shape A has `<tag>` + `</tag>`,
+  // shape B has empty open literal and no close.
+  let outer = null;
+  if (openLit.length > 0) {
+    const openTree = html.parse(openLit);
+    let outerElem = null;
+    for (const c of openTree.children) {
+      if (c.type === 'element') { outerElem = c; break; }
+    }
+    if (outerElem == null) {
+      return { kind: 'opaque', reason: 'open literal has no element' };
+    }
+    if (closeLit == null) {
+      return { kind: 'opaque', reason: 'wrapper open without close' };
+    }
+    const closeMatch = closeLit.match(/<\/([a-z][a-z0-9]*)/i);
+    if (!closeMatch || closeMatch[1].toLowerCase() !== outerElem.tag) {
+      return { kind: 'opaque', reason: 'wrapper tag mismatch' };
+    }
+    outer = {
+      tag: outerElem.tag,
+      attrList: outerElem.attrList || [],
+    };
+  } else {
+    if (closeLit != null && closeLit.length > 0) {
+      return { kind: 'opaque', reason: 'empty open with non-empty close' };
+    }
+  }
+
+  // Loop body must be exactly `X += <concat expression>;`.
+  const body = loopStmt.body.body;
+  if (body.length !== 1) {
+    return { kind: 'opaque', reason: 'loop body is not a single accum' };
+  }
+  const bodyStmt = body[0];
+  if (!isAccumAssign(bodyStmt, varName)) {
+    return { kind: 'opaque', reason: 'loop body is not an accum assign' };
+  }
+
+  // Flatten the concat chain and recognise the
+  // `<child attr="prefix' + E + '">' + T + '</child>` shape.
+  const frags = flattenConcat(bodyStmt.expression.right);
+  if (!frags) return { kind: 'opaque', reason: 'concat flatten failed' };
+  const parsed = parseLoopBodyFragments(frags);
+  if (!parsed) return { kind: 'opaque', reason: 'loop body shape unrecognised' };
+
+  return {
+    kind: 'loop',
+    receiver: { start: receiverNode.start, end: receiverNode.end },
+    outer,
+    loopShape: {
+      initSrc: loopStmt.init ? jsSource.slice(loopStmt.init.start, loopStmt.init.end) : '',
+      testSrc: loopStmt.test ? jsSource.slice(loopStmt.test.start, loopStmt.test.end) : '',
+      updateSrc: loopStmt.update ? jsSource.slice(loopStmt.update.start, loopStmt.update.end) : '',
+      bodyStart: loopStmt.body.start,
+      bodyEnd: loopStmt.body.end,
+    },
+    child: {
+      tag: parsed.childTag,
+      attrs: parsed.childAttrs,
+      textExpr: parsed.textExpr
+        ? { start: parsed.textExpr.start, end: parsed.textExpr.end }
+        : null,
+    },
+    rangeStart: openStmt.start,
+    rangeEnd: stmts[assignIdx].end,
+  };
+}
+
+// --- Helpers -----------------------------------------------------------
+
+function isAccumAssign(stmt, varName) {
+  if (!stmt || stmt.type !== 'ExpressionStatement') return false;
+  const e = stmt.expression;
+  if (!e || e.type !== 'AssignmentExpression') return false;
+  if (e.operator !== '+=') return false;
+  if (!e.left || e.left.type !== 'Identifier' || e.left.name !== varName) return false;
+  return true;
+}
+
+function literalOfAccumAssign(stmt) {
+  if (!isAccumAssign(stmt, stmt.expression.left.name)) return null;
+  const r = stmt.expression.right;
+  if (r && r.type === 'Literal' && typeof r.value === 'string') return r.value;
+  return null;
+}
+
+// Flatten a left-associative chain of `+` expressions into a
+// list of { kind: 'lit' | 'expr', value?, start?, end? }.
+function flattenConcat(node) {
+  const out = [];
+  function walk(n) {
+    if (n.type === 'BinaryExpression' && n.operator === '+') {
+      walk(n.left);
+      walk(n.right);
+      return;
+    }
+    if (n.type === 'Literal' && typeof n.value === 'string') {
+      out.push({ kind: 'lit', value: n.value });
+      return;
+    }
+    out.push({ kind: 'expr', start: n.start, end: n.end });
+  }
+  walk(node);
+  return out;
+}
+
+// parseLoopBodyFragments — recognise the
+// `<child attr="prefix` + E + `">` + T + `</child>` shape
+// from a flattened concat chain. Returns
+// `{ childTag, childAttrs, textExpr }` or null.
+function parseLoopBodyFragments(rawFrags) {
+  // Coalesce adjacent literal fragments so splits like
+  // `"\""` + `">"` become a single `">"` literal.
+  const frags = [];
+  for (const f of rawFrags) {
+    if (f.kind === 'lit' && frags.length > 0 && frags[frags.length - 1].kind === 'lit') {
+      frags[frags.length - 1] = {
+        kind: 'lit',
+        value: frags[frags.length - 1].value + f.value,
+      };
+    } else {
+      frags.push(f);
+    }
+  }
+  if (frags.length < 2) return null;
+  if (frags[0].kind !== 'lit') return null;
+  const openingLit = frags[0].value;
+  const childMatch = openingLit.match(/^<([a-z][a-z0-9]*)([^>]*?)(>)?$/i);
+  if (!childMatch) return null;
+  const childTag = childMatch[1].toLowerCase();
+  const attrsStr = childMatch[2];
+  const childAttrs = [];
+  let textExpr = null;
+  let state = 'attrs';
+  let i = 1;
+
+  if (childMatch[3] === '>') {
+    state = 'children';
+  } else {
+    // Parse static attrs from the opening literal's attr portion.
+    const staticAttrs = parseStaticAttrsFragment(attrsStr);
+    for (const a of staticAttrs) childAttrs.push(a);
+    const dangling = attrsStr.match(/\s([a-z][a-z0-9-]*)\s*=\s*"([^"]*)$/i);
+    if (dangling) {
+      childAttrs.push({
+        name: dangling[1].toLowerCase(),
+        parts: [{ kind: 'literal', value: dangling[2] }],
+        _pending: true,
+      });
+    }
+  }
+  while (i < frags.length) {
+    const f = frags[i];
+    if (state === 'attrs') {
+      const pendingAttr = childAttrs[childAttrs.length - 1];
+      if (f.kind === 'expr' && pendingAttr && pendingAttr._pending) {
+        pendingAttr.parts.push({ kind: 'expr', start: f.start, end: f.end });
+        i++;
+        continue;
+      }
+      if (f.kind === 'lit' && pendingAttr && pendingAttr._pending) {
+        const closeIdx = f.value.indexOf('"');
+        if (closeIdx < 0) return null;
+        if (closeIdx > 0) {
+          pendingAttr.parts.push({ kind: 'literal', value: f.value.slice(0, closeIdx) });
+        }
+        delete pendingAttr._pending;
+        const after = f.value.slice(closeIdx + 1);
+        const gtIdx = after.indexOf('>');
+        if (gtIdx < 0) return null;
+        const moreAttrs = after.slice(0, gtIdx);
+        const rest = after.slice(gtIdx + 1);
+        const staticAttrs = parseStaticAttrsFragment(moreAttrs);
+        for (const a of staticAttrs) childAttrs.push(a);
+        state = 'children';
+        if (rest.length > 0) {
+          frags[i] = { kind: 'lit', value: rest };
+          continue;
+        }
+        i++;
+        continue;
+      }
+      return null;
+    }
+    if (state === 'children') {
+      if (f.kind === 'expr' && textExpr == null) {
+        textExpr = f;
+        i++;
+        continue;
+      }
+      if (f.kind === 'lit') {
+        const closingRe = new RegExp('</' + childTag + '\\s*>', 'i');
+        if (closingRe.test(f.value)) {
+          i++;
+          if (i < frags.length) return null;
+          // Strip the _pending flag before returning.
+          for (const a of childAttrs) delete a._pending;
+          return { childTag, childAttrs, textExpr };
+        }
+        return null;
+      }
+      return null;
+    }
+    i++;
+  }
+  return null;
+}
+
+function parseStaticAttrsFragment(s) {
+  const out = [];
+  const re = /\s*([a-z][a-z0-9-]*)\s*=\s*"([^"]*)"/gi;
+  let m;
+  while ((m = re.exec(s)) !== null) {
+    out.push({
+      name: m[1].toLowerCase(),
+      parts: [{ kind: 'literal', value: m[2] }],
+    });
+  }
+  return out;
+}
+
+module.exports = {
+  extractTemplate,
+};
