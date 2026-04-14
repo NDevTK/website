@@ -455,7 +455,13 @@ const DEFAULT_TYPE_DB = {
     // --- Base types ---
     EventTarget: {
       methods: {
-        addEventListener: { args: [{}, {}] },
+        // addEventListener(event, handler, options?) — the
+        // handler (arg 1) is a callback. `callbackArgs: [1]`
+        // tells the engine to walk its body interprocedurally
+        // at the addEventListener site so any unsafe sinks
+        // inside the handler show up on the trace even if the
+        // event itself never fires.
+        addEventListener: { args: [{}, {}], callbackArgs: [1] },
         removeEventListener: { args: [{}, {}] },
         dispatchEvent: { args: [{}] },
       },
@@ -643,10 +649,17 @@ const DEFAULT_TYPE_DB = {
       methods: {
         open: { args: [{ sink: 'navigation', severity: 'medium' }] },
         postMessage: {},
-        setTimeout:  { args: [{ sink: 'code' }] },
-        setInterval: { args: [{ sink: 'code' }] },
+        // setTimeout / setInterval: arg 0 is either a string
+        // (code sink — unsafe-eval path) OR a callback
+        // function. The callback variant needs interprocedural
+        // walking so any sink inside the timer body shows up.
+        setTimeout:  { args: [{ sink: 'code' }], callbackArgs: [0] },
+        setInterval: { args: [{ sink: 'code' }], callbackArgs: [0] },
         clearTimeout:  {},
         clearInterval: {},
+        queueMicrotask: { args: [{}], callbackArgs: [0] },
+        requestAnimationFrame: { args: [{}], callbackArgs: [0] },
+        requestIdleCallback:   { args: [{}], callbackArgs: [0] },
       },
     },
 
@@ -905,10 +918,13 @@ const DEFAULT_TYPE_DB = {
       call:      { args: [{ sink: 'code', severity: 'high' }, { sink: 'code', severity: 'high' }] },
     },
     GlobalSetTimeout: {
-      call: { args: [{ sink: 'code', severity: 'high' }, {}] },
+      // Arg 0 is either a code-string (sink: 'code') or a
+      // callback function. callbackArgs: [0] tells the engine
+      // to walk the callback when it's a function value.
+      call: { args: [{ sink: 'code', severity: 'high' }, {}], callbackArgs: [0] },
     },
     GlobalSetInterval: {
-      call: { args: [{ sink: 'code', severity: 'high' }, {}] },
+      call: { args: [{ sink: 'code', severity: 'high' }, {}], callbackArgs: [0] },
     },
     GlobalFetch: {
       // `fetch(...)` returns Promise<Response>. The walker
@@ -12297,6 +12313,131 @@ function recordStringLiteralSetProp(ctx, obj, propName, val, loc) {
   });
 }
 
+// walkCallbackArgs — interprocedural walk of callback
+// arguments to registration APIs (addEventListener, setTimeout,
+// setInterval, requestAnimationFrame, queueMicrotask, etc.).
+//
+// The TypeDB's method descriptor declares `callbackArgs: [N, ...]`
+// listing argument indices that receive a function value the
+// runtime will invoke later. For each such arg we:
+//
+//   1. Resolve the descriptor (lookupMethod / roots lookup).
+//   2. For each listed index, look up the argument Value.
+//   3. If the Value is a Closure pointing at a user function,
+//      walk the function body via getAnalyseFunction() with an
+//      empty argument context (the callback's own params will
+//      be bound to Opaque values because we don't know what
+//      the runtime will pass).
+//
+// Sinks fired inside the walked body land in ctx.taintFlows /
+// ctx.calls / ctx.domMutations / ctx.innerHtmlAssignments
+// alongside flows from the outer function, so downstream
+// consumers (dom-convert, csp-derive, taint-report) pick them
+// up uniformly.
+//
+// Recursion guard: the walk shares ctx._callStack with the
+// normal applyCall path, so a callback that registers itself
+// (or transitively re-registers) still takes the
+// D.callStackContains bail-out.
+async function walkCallbackArgs(ctx, state, instr, thisValue, argValues, loc) {
+  const db = ctx.typeDB;
+  if (!db) return;
+  let desc = null;
+  if (instr.methodName && thisValue && thisValue.typeName) {
+    desc = TDB.lookupMethod(db, thisValue.typeName, instr.methodName);
+  } else if (instr.calleeName && db.roots && db.roots[instr.calleeName]) {
+    const rootType = db.roots[instr.calleeName];
+    const typeDesc = db.types[rootType];
+    desc = typeDesc && (typeDesc.call || typeDesc.construct);
+  }
+  if (!desc || !Array.isArray(desc.callbackArgs) || desc.callbackArgs.length === 0) return;
+
+  for (const idx of desc.callbackArgs) {
+    if (typeof idx !== 'number') continue;
+    const cbValue = argValues[idx];
+    if (!cbValue) continue;
+    // Resolve a Closure to its user function id.
+    let fnId = null;
+    if (cbValue.kind === D.V.CLOSURE && cbValue.functionId) {
+      fnId = cbValue.functionId;
+    }
+    // Disjunct: fan out over closure variants.
+    if (cbValue.kind === D.V.DISJUNCT && Array.isArray(cbValue.variants)) {
+      for (const v of cbValue.variants) {
+        if (v && v.kind === D.V.CLOSURE && v.functionId) {
+          await walkCallback(ctx, state, v, loc);
+        }
+      }
+      continue;
+    }
+    if (fnId == null) continue;
+    await walkCallback(ctx, state, cbValue, loc);
+  }
+}
+
+// walkCallback — walk a single closure's body as a synthetic
+// call site. Matches the applyCall walking path but with
+// empty args (the runtime will supply them later). Captures
+// are threaded from the closure's snapshot so variables the
+// callback closes over are visible inside.
+async function walkCallback(ctx, state, closureValue, loc) {
+  const calleeFn = ctx.module.functions.find(f => f.id === closureValue.functionId);
+  if (!calleeFn || !calleeFn.cfg) return;
+
+  // Recursion guard per D7 (body + args fingerprint).
+  let calleeInit = D.createStateSharingHeap(state);
+  // Thread captures.
+  const closureCaptures = closureValue.captures || [];
+  for (const c of closureCaptures) {
+    if (!c || c.innerReg == null) continue;
+    let val = null;
+    if (c.outerReg != null) {
+      const live = D.getReg(state, c.outerReg);
+      if (live && live.kind !== D.V.BOTTOM) val = live;
+    }
+    if (!val && c.value && c.value.kind !== D.V.BOTTOM) val = c.value;
+    if (val) calleeInit = D.setReg(calleeInit, c.innerReg, val);
+  }
+  // Bind each param to an Opaque value. The callback's
+  // params receive runtime data we can't predict statically
+  // (the event object for addEventListener, no args for
+  // setTimeout, etc.) — Opaque is the sound floor.
+  for (const paramReg of calleeFn.params || []) {
+    // Each param gets a fresh opaque with no type and a
+    // ui-interaction assumption (the callback fires when a
+    // user event dispatches). Consumers that need tighter
+    // handling can override via the TypeDB's arg descriptors.
+    const a = ctx.assumptions.raise(
+      REASONS.UI_INTERACTION,
+      'callback argument is supplied by the runtime — walking with an Opaque placeholder',
+      loc
+    );
+    calleeInit = D.setReg(calleeInit, paramReg,
+      D.opaque([a.id], null, loc));
+  }
+  // Seed the callback's path with the caller's current path
+  // so sinks inside inherit the caller-side reachability.
+  const callerPath = ctx.currentPath || null;
+  if (callerPath) calleeInit = D.withPath(calleeInit, callerPath);
+
+  const fp = buildArgsFingerprint(calleeFn, calleeInit, closureCaptures, null);
+  const frame = { funcId: calleeFn.id, argsFp: fp };
+  if (D.callStackContains(state, frame)) return;
+  calleeInit = D.pushCallStack(calleeInit, frame);
+
+  const savedPath = ctx.currentPath;
+  const savedBlockId = ctx.currentBlockId;
+  const savedThis = ctx._currentThisValue;
+  try {
+    const analyse = getAnalyseFunction();
+    await analyse(ctx.module, calleeFn, calleeInit, ctx);
+  } finally {
+    ctx.currentPath = savedPath;
+    ctx.currentBlockId = savedBlockId;
+    ctx._currentThisValue = savedThis;
+  }
+}
+
 // Wave 12 / Phase E: record innerHTML-family assignments so the
 // DOM-conversion consumer can iterate them post-walk. Records
 // every write to a property the TypeDB classifies as an 'html'
@@ -12696,6 +12837,25 @@ async function applyCall(ctx, state, instr) {
   // img-src / connect-src / frame-src; fetch-trace reads it
   // to find hardcoded endpoint URLs.
   recordStringLiteralArgs(ctx, instr, callee, thisValue, argValues, loc);
+
+  // Wave 12c7: interprocedural callback walking. Some APIs
+  // take a function argument that the runtime invokes later
+  // (addEventListener, setTimeout, setInterval, Promise.then,
+  // MutationObserver, etc.). Without walking the callback
+  // body, sinks inside it are invisible to the engine — the
+  // dom-convert consumer can't rewrite a `document.write`
+  // inside an `addEventListener('message', ...)` handler,
+  // and csp-derive can't see `fetch()` inside a setTimeout
+  // callback.
+  //
+  // The TypeDB declares which args are callbacks via
+  // `callbackArgs: [N, ...]`. We look up the descriptor the
+  // same way maybeEmitSinkFlowForCall does, then for each
+  // callback index resolve the arg to a Closure Value and
+  // walk its body with a synthetic initial state. Sinks fired
+  // inside land in ctx.taintFlows / ctx.calls / etc. just
+  // like any other walked function.
+  await walkCallbackArgs(ctx, state, instr, thisValue, argValues, loc);
 
   // --- Sink classification for the call site ---
   //

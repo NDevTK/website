@@ -35,7 +35,13 @@ const DEFAULT_TYPE_DB = {
     // --- Base types ---
     EventTarget: {
       methods: {
-        addEventListener: { args: [{}, {}] },
+        // addEventListener(event, handler, options?) — the
+        // handler (arg 1) is a callback. `callbackArgs: [1]`
+        // tells the engine to walk its body interprocedurally
+        // at the addEventListener site so any unsafe sinks
+        // inside the handler show up on the trace even if the
+        // event itself never fires.
+        addEventListener: { args: [{}, {}], callbackArgs: [1] },
         removeEventListener: { args: [{}, {}] },
         dispatchEvent: { args: [{}] },
       },
@@ -223,10 +229,17 @@ const DEFAULT_TYPE_DB = {
       methods: {
         open: { args: [{ sink: 'navigation', severity: 'medium' }] },
         postMessage: {},
-        setTimeout:  { args: [{ sink: 'code' }] },
-        setInterval: { args: [{ sink: 'code' }] },
+        // setTimeout / setInterval: arg 0 is either a string
+        // (code sink — unsafe-eval path) OR a callback
+        // function. The callback variant needs interprocedural
+        // walking so any sink inside the timer body shows up.
+        setTimeout:  { args: [{ sink: 'code' }], callbackArgs: [0] },
+        setInterval: { args: [{ sink: 'code' }], callbackArgs: [0] },
         clearTimeout:  {},
         clearInterval: {},
+        queueMicrotask: { args: [{}], callbackArgs: [0] },
+        requestAnimationFrame: { args: [{}], callbackArgs: [0] },
+        requestIdleCallback:   { args: [{}], callbackArgs: [0] },
       },
     },
 
@@ -485,10 +498,13 @@ const DEFAULT_TYPE_DB = {
       call:      { args: [{ sink: 'code', severity: 'high' }, { sink: 'code', severity: 'high' }] },
     },
     GlobalSetTimeout: {
-      call: { args: [{ sink: 'code', severity: 'high' }, {}] },
+      // Arg 0 is either a code-string (sink: 'code') or a
+      // callback function. callbackArgs: [0] tells the engine
+      // to walk the callback when it's a function value.
+      call: { args: [{ sink: 'code', severity: 'high' }, {}], callbackArgs: [0] },
     },
     GlobalSetInterval: {
-      call: { args: [{ sink: 'code', severity: 'high' }, {}] },
+      call: { args: [{ sink: 'code', severity: 'high' }, {}], callbackArgs: [0] },
     },
     GlobalFetch: {
       // `fetch(...)` returns Promise<Response>. The walker

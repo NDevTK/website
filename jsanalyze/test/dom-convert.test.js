@@ -453,6 +453,62 @@ const tests = [
         'tainted value flows through createTextNode: ' + out.slice(0, 300));
     },
   },
+
+  // --- Wave 12c7: callback walking through addEventListener ---
+  {
+    name: 'dom-convert js: eval inside addEventListener handler is blocked',
+    fn: async () => {
+      // The handler is never directly called — it only gets
+      // registered as a message listener. Without callback
+      // walking the engine wouldn\'t observe the eval inside
+      // it and the rewriter would leave the call alone.
+      // With callback walking the eval surfaces in trace.calls
+      // and convertJsFile replaces it with the blocked
+      // placeholder.
+      const src = [
+        'var h = function(msg) {',
+        '  var data = msg.data;',
+        '  eval(data);',
+        '};',
+        "window.addEventListener('message', h, false);",
+      ].join('\n');
+      const out = await convertJs(src);
+      assert(/\[blocked: eval with dynamic argument\]/.test(out),
+        'eval inside handler is blocked: ' + out);
+    },
+  },
+  {
+    name: 'dom-convert js: document.write(literal) inside handler is lowered',
+    fn: async () => {
+      const src = [
+        'var h = function() {',
+        '  document.write("Hello");',
+        '};',
+        "window.addEventListener('click', h, false);",
+      ].join('\n');
+      const out = await convertJs(src);
+      assert(/createTextNode\("Hello"\)/.test(out),
+        'document.write literal inside handler lowered: ' + out);
+    },
+  },
+  {
+    name: 'dom-convert js: tainted navigation inside setTimeout callback is wrapped',
+    fn: async () => {
+      // setTimeout's first arg is a callback; the body's
+      // `location.href = dirty` assignment should be wrapped
+      // in __safeNav despite living inside a deferred handler.
+      const src = [
+        'var dirty = location.hash.slice(1);',
+        'setTimeout(function() {',
+        '  location.href = dirty;',
+        '}, 100);',
+      ].join('\n');
+      const out = await convertJs(src);
+      assert(/__safeNav/.test(out), '__safeNav helper inserted: ' + out);
+      assert(/var __u=__safeNav\(dirty\)/.test(out),
+        'tainted assignment wrapped: ' + out);
+    },
+  },
 ];
 
 module.exports = { tests };
