@@ -775,6 +775,16 @@ function collectAccumAppends(node, varName, out) {
     if (node.alternate) collectAccumAppends(node.alternate, varName, out);
     return;
   }
+  // Nested loops: recurse into the loop body so inner
+  // `H += …` appends inside a nested for / while / do-while /
+  // for-in / for-of surface as accumSites. The outer loop
+  // emitter slices the source verbatim between sites, so the
+  // nested loop header and closing brace are preserved in
+  // the rewrite unchanged.
+  if (isLoopStatement(node)) {
+    collectAccumAppends(node.body, varName, out);
+    return;
+  }
   if (node.type === 'ExpressionStatement' && isAccumAssign(node, varName)) {
     const frags = flattenConcat(node.expression.right);
     const parsed = frags ? parseLoopBodyFragments(frags) : null;
@@ -791,10 +801,9 @@ function collectAccumAppends(node, varName, out) {
     });
     return;
   }
-  // Other control-flow nodes (loops, switch, try) aren't
-  // recursed into — the MVP supports one level of if/else
-  // nesting inside a loop body. A deeper pattern falls
-  // through to opaque via the empty-site check below.
+  // Other control-flow nodes (switch, try) aren't recursed
+  // into — a deeper pattern falls through to opaque via
+  // the empty-site check in extractFromAccumulator.
 }
 
 // --- Helpers -----------------------------------------------------------

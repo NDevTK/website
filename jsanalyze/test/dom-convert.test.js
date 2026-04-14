@@ -521,6 +521,35 @@ const tests = [
     },
   },
 
+  // --- Wave 12d11: nested loops ---
+  {
+    name: 'dom-convert js: nested for-in-for → table-row createElement',
+    fn: async () => {
+      const src = [
+        'var rows = [["a","b"],["c","d"]];',
+        'var html = "<table>";',
+        'for (var i = 0; i < rows.length; i++) {',
+        '  for (var j = 0; j < rows[i].length; j++) {',
+        '    html += "<td>" + rows[i][j] + "</td>";',
+        '  }',
+        '}',
+        'html += "</table>";',
+        'document.body.innerHTML = html;',
+      ].join('\n');
+      const out = await convertJs(src);
+      assert(/createElement\("table"\)/.test(out), 'table wrapper created');
+      assert(/for \(var i = 0; i < rows\.length; i\+\+\)/.test(out),
+        'outer for preserved');
+      assert(/for \(var j = 0; j < rows\[i\]\.length; j\+\+\)/.test(out),
+        'inner for preserved');
+      assert(/createElement\("td"\)/.test(out), 'td created');
+      assert(/createTextNode\(rows\[i\]\[j\]\)/.test(out),
+        'text expression from inner loop');
+      assert(!/innerHTML =/.test(out),
+        'original innerHTML removed');
+    },
+  },
+
   // --- Wave 12d7: branch nested inside a loop body ---
   {
     name: 'dom-convert js: if/else inside loop body → one child splice per branch',
