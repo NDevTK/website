@@ -257,6 +257,145 @@ const tests = [
     },
   },
 
+  // --- Tag/attribute case preservation + token serializer ---
+  {
+    name: 'html: tokens preserve original tag casing in tagRaw',
+    fn: () => {
+      const t = html.tokenize('<DIV class="x"></DIV>');
+      assertEqual(t[0].tagName, 'div');
+      assertEqual(t[0].tagRaw, 'DIV');
+      assertEqual(t[1].tagName, 'div');
+      assertEqual(t[1].tagRaw, 'DIV');
+    },
+  },
+  {
+    name: 'html: tokens preserve original attribute casing in nameRaw',
+    fn: () => {
+      const t = html.tokenize('<input DataValue="5" AUTOfocus>');
+      const a0 = t[0].attrs[0];
+      const a1 = t[0].attrs[1];
+      assertEqual(a0.name, 'datavalue');
+      assertEqual(a0.nameRaw, 'DataValue');
+      assertEqual(a1.name, 'autofocus');
+      assertEqual(a1.nameRaw, 'AUTOfocus');
+    },
+  },
+  {
+    name: 'html: tokens record attribute quoting style',
+    fn: () => {
+      const t = html.tokenize(`<a href="d" title='t' data-x=bare>`);
+      assertEqual(t[0].attrs[0].quoted, '"');
+      assertEqual(t[0].attrs[1].quoted, "'");
+      assertEqual(t[0].attrs[2].quoted, null);
+    },
+  },
+  {
+    name: 'html: serializeTokens round-trips tag with preserved casing',
+    fn: () => {
+      const t = html.tokenize('<DIV class="x"></DIV>');
+      const out = html.serializeTokens(t);
+      // Raw case preserved; attribute quote style default to ".
+      assertEqual(out, '<DIV class="x"></DIV>');
+    },
+  },
+  {
+    name: 'html: serializeTokens attribute mutation',
+    fn: () => {
+      const t = html.tokenize('<button onclick="go()">Go</button>');
+      // Remove the onclick attribute and add data-handler="0".
+      t[0].attrs = t[0].attrs.filter(a => a.name !== 'onclick');
+      t[0].attrs.push({ name: 'data-handler', nameRaw: 'data-handler', value: '0', quoted: '"' });
+      const out = html.serializeTokens(t);
+      assertEqual(out, '<button data-handler="0">Go</button>');
+    },
+  },
+  {
+    name: 'html: serializeTokens tag rename via tagRaw',
+    fn: () => {
+      const t = html.tokenize('<style>body{}</style>');
+      // Rename style → link, add href attribute (simulate extraction).
+      t[0].tagName = 'link';
+      t[0].tagRaw = 'link';
+      t[0].attrs = [
+        { name: 'rel', nameRaw: 'rel', value: 'stylesheet', quoted: '"' },
+        { name: 'href', nameRaw: 'href', value: 'out.css', quoted: '"' },
+      ];
+      // Walk forward and blank out the text + closing tag; style
+      // is a raw-text element, so the tokens include TEXT + close.
+      // We want `<link rel="stylesheet" href="out.css">` only.
+      // Keep the first token (the renamed open) and drop the rest.
+      const trimmed = [t[0]];
+      const out = html.serializeTokens(trimmed);
+      assertEqual(out, '<link rel="stylesheet" href="out.css">');
+    },
+  },
+  {
+    name: 'html: serializeTokens escapes special chars in attribute values',
+    fn: () => {
+      const t = [
+        { type: 'start', tagName: 'a', tagRaw: 'a', attrs: [
+          { name: 'title', nameRaw: 'title', value: 'a & "b" <c>', quoted: '"' },
+        ] },
+      ];
+      const out = html.serializeTokens(t);
+      assertEqual(out, '<a title="a &amp; &quot;b&quot; &lt;c>">');
+    },
+  },
+
+  // --- Raw-text element coverage ---
+  {
+    name: 'html: iframe is a raw-text element (content not parsed)',
+    fn: () => {
+      const doc = html.parse('<iframe><p>fallback &amp; text</p></iframe>');
+      const iframe = firstElement(doc);
+      assertEqual(iframe.tag, 'iframe');
+      // The inner <p> should appear as raw text, NOT as a child element.
+      assertEqual(iframe.children.length, 1);
+      assertEqual(iframe.children[0].type, 'text');
+      assert(iframe.children[0].value.indexOf('<p>') >= 0,
+        'iframe content is raw text including the inner tag');
+    },
+  },
+  {
+    name: 'html: noscript is a raw-text element',
+    fn: () => {
+      const doc = html.parse('<noscript><a href="/">x</a></noscript>');
+      const ns = firstElement(doc);
+      assertEqual(ns.tag, 'noscript');
+      assertEqual(ns.children[0].type, 'text');
+    },
+  },
+
+  // --- Wider entity coverage ---
+  {
+    name: 'html: decodeEntities handles ported legacy entities',
+    fn: () => {
+      assertEqual(html.decodeEntities('&mdash;'), '\u2014');
+      assertEqual(html.decodeEntities('&ndash;'), '\u2013');
+      assertEqual(html.decodeEntities('&ldquo;&rdquo;'), '\u201C\u201D');
+      assertEqual(html.decodeEntities('&hellip;'), '\u2026');
+      assertEqual(html.decodeEntities('&euro;'), '\u20AC');
+      assertEqual(html.decodeEntities('&laquo;&raquo;'), '\u00AB\u00BB');
+      assertEqual(html.decodeEntities('&deg;'), '\u00B0');
+      assertEqual(html.decodeEntities('&plusmn;'), '\u00B1');
+    },
+  },
+
+  // --- element tree exposes case + ordered attr list ---
+  {
+    name: 'html: parsed element has tagRaw and attrList',
+    fn: () => {
+      const doc = html.parse('<DIV ID="x" CLASS="y">hi</DIV>');
+      const div = firstElement(doc);
+      assertEqual(div.tag, 'div');
+      assertEqual(div.tagRaw, 'DIV');
+      assert(Array.isArray(div.attrList), 'attrList present');
+      assertEqual(div.attrList.length, 2);
+      assertEqual(div.attrList[0].nameRaw, 'ID');
+      assertEqual(div.attrList[1].nameRaw, 'CLASS');
+    },
+  },
+
   // --- End-to-end: innerHTML extraction pipeline ---
   {
     name: 'html e2e: innerHTML assignment recorded on trace',

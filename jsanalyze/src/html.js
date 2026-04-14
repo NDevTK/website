@@ -53,18 +53,49 @@ const VOID_ELEMENTS = new Set([
   'input', 'link', 'meta', 'param', 'source', 'track', 'wbr',
 ]);
 
-// Raw-text elements. Everything between the open tag and the
-// matching close is treated as a single text node.
+// Raw-text elements per HTML5 §13.2.5. Everything between the
+// open tag and the matching close is treated as a single text
+// node. `iframe` and `noscript` are included to match the
+// legacy engine's `tokenizeHtml`: their content is NOT parsed
+// for HTML inside (for `iframe` because the content is the
+// fallback text shown when iframes are disabled; for
+// `noscript` because its content is escaped HTML when scripts
+// are enabled and parsed HTML otherwise, and we conservatively
+// treat it as raw for round-trip safety).
 const RAW_TEXT_ELEMENTS = new Set([
-  'script', 'style', 'textarea', 'title',
+  'script', 'style', 'textarea', 'title', 'iframe', 'noscript',
 ]);
 
-// Named entity references we recognise. The parser decodes
-// these in text and attribute values. Numeric references
-// (&#NN; / &#xNN;) are handled directly.
+// Named entity references the parser decodes in text and
+// attribute values. This is the pragmatic subset ported from
+// the legacy htmldom engine — covers the ~50 entities that
+// appear in real HTML without the 2000-entry HTML5 full
+// table. Numeric references (&#NN; / &#xNN;) are handled
+// directly. Unknown named refs pass through unchanged so
+// round-tripped HTML preserves the exact byte sequence.
 const NAMED_ENTITIES = {
-  amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: '\u00A0',
-  copy: '\u00A9', reg: '\u00AE', trade: '\u2122',
+  // Core HTML entities.
+  amp: '&', lt: '<', gt: '>', quot: '"', apos: "'",
+  // Spacing.
+  nbsp: '\u00A0', ensp: '\u2002', emsp: '\u2003', thinsp: '\u2009',
+  // Punctuation.
+  mdash: '\u2014', ndash: '\u2013',
+  lsquo: '\u2018', rsquo: '\u2019', ldquo: '\u201C', rdquo: '\u201D',
+  bull: '\u2022', hellip: '\u2026',
+  // Symbols.
+  copy: '\u00A9', reg: '\u00AE', trade: '\u2122', deg: '\u00B0',
+  plusmn: '\u00B1', times: '\u00D7', divide: '\u00F7', micro: '\u00B5',
+  // Currency.
+  cent: '\u00A2', pound: '\u00A3', euro: '\u20AC', yen: '\u00A5',
+  // Quotation / direction.
+  laquo: '\u00AB', raquo: '\u00BB',
+  larr: '\u2190', rarr: '\u2192', uarr: '\u2191', darr: '\u2193',
+  // Other common refs.
+  para: '\u00B6', sect: '\u00A7',
+  iexcl: '\u00A1', iquest: '\u00BF',
+  frac12: '\u00BD', frac14: '\u00BC', frac34: '\u00BE',
+  sup1: '\u00B9', sup2: '\u00B2', sup3: '\u00B3',
+  acute: '\u00B4', cedil: '\u00B8',
 };
 
 // --- Entity decoding ----------------------------------------------------
@@ -172,11 +203,12 @@ function tokenize(src) {
         // End tag. </tagName>
         let j = i + 2;
         while (j < n && !isTagNameTerminator(src.charCodeAt(j))) j++;
-        const tagName = src.slice(i + 2, j).toLowerCase();
+        const tagRaw = src.slice(i + 2, j);
+        const tagName = tagRaw.toLowerCase();
         // Skip to >.
         while (j < n && src.charCodeAt(j) !== 62 /* > */) j++;
         const end = j < n ? j + 1 : n;
-        tokens.push({ type: TOK_END, start: i, end, tagName });
+        tokens.push({ type: TOK_END, start: i, end, tagName, tagRaw });
         i = end;
         continue;
       }
@@ -217,7 +249,8 @@ function parseStartTag(src, start) {
   let i = start + 1;
   // Read tag name.
   while (i < n && !isTagNameTerminator(src.charCodeAt(i))) i++;
-  const tagName = src.slice(start + 1, i).toLowerCase();
+  const tagRaw = src.slice(start + 1, i);
+  const tagName = tagRaw.toLowerCase();
   const attrs = [];
   // Read attributes.
   while (i < n) {
@@ -226,14 +259,14 @@ function parseStartTag(src, start) {
     if (i >= n) break;
     const c = src.charCodeAt(i);
     if (c === 62 /* > */) {
-      return { type: TOK_START, start, end: i + 1, tagName, attrs };
+      return { type: TOK_START, start, end: i + 1, tagName, tagRaw, attrs };
     }
     if (c === 47 /* / */) {
       // Possible self-close. Skip /, allow optional whitespace, expect >.
       i++;
       while (i < n && isWs(src.charCodeAt(i))) i++;
       if (i < n && src.charCodeAt(i) === 62) {
-        return { type: TOK_SELF, start, end: i + 1, tagName, attrs };
+        return { type: TOK_SELF, start, end: i + 1, tagName, tagRaw, attrs };
       }
       continue;
     }
@@ -249,8 +282,10 @@ function parseStartTag(src, start) {
       i++;
       continue;
     }
-    const name = src.slice(nameStart, i).toLowerCase();
+    const nameRaw = src.slice(nameStart, i);
+    const name = nameRaw.toLowerCase();
     let value = '';
+    let quoted = null;   // null | '"' | "'"  — preserved for round-trip serialisation
     // Skip whitespace.
     while (i < n && isWs(src.charCodeAt(i))) i++;
     if (i < n && src.charCodeAt(i) === 61 /* = */) {
@@ -259,10 +294,10 @@ function parseStartTag(src, start) {
       if (i < n) {
         const q = src.charCodeAt(i);
         if (q === 34 /* " */ || q === 39 /* ' */) {
-          const quote = src[i];
+          quoted = src[i];
           i++;
           const valStart = i;
-          while (i < n && src[i] !== quote) i++;
+          while (i < n && src[i] !== quoted) i++;
           value = decodeEntities(src.slice(valStart, i));
           if (i < n) i++;   // consume closing quote
         } else {
@@ -276,10 +311,10 @@ function parseStartTag(src, start) {
       // HTML5 when the attribute is present with no value.
       value = '';
     }
-    attrs.push({ name, value });
+    attrs.push({ name, nameRaw, value, quoted });
   }
   // Ran out of input before closing `>`. Return an incomplete tag.
-  return { type: TOK_START, start, end: n, tagName, attrs };
+  return { type: TOK_START, start, end: n, tagName, tagRaw, attrs };
 }
 
 function isWs(code) {
@@ -417,12 +452,16 @@ function parse(src) {
 }
 
 function makeElement(startTok) {
+  // Attribute map: case-insensitive key → value. Consumers
+  // that need the original casing read `attrList` below.
   const attrs = Object.create(null);
   for (const a of startTok.attrs) attrs[a.name] = a.value;
   return {
     type: 'element',
     tag: startTok.tagName,
-    attrs,
+    tagRaw: startTok.tagRaw,       // preserved original casing
+    attrs,                          // lowercase-keyed map
+    attrList: startTok.attrs.slice(),  // ordered list with nameRaw + quoted
     children: [],
     loc: { start: startTok.start, end: startTok.end },
   };
@@ -491,11 +530,102 @@ function escapeAttr(s) {
   return out;
 }
 
+// --- Token-stream serializer --------------------------------------------
+//
+// Round-trip-friendly serializer that works from a flat
+// token array (the output of `tokenize` or a mutated copy).
+// Preserves original tag/attribute casing and attribute
+// quoting so source-level edits can rewrite individual tokens
+// in place without disturbing the bytes around them.
+//
+// Consumer-mutation contract:
+//   * Modify tok.attrs in place to add/remove/change
+//     attributes.
+//   * Set tok.attrs[k].nameRaw to override the serialized
+//     attribute name casing; default is the lowercase `name`.
+//   * Set tok.attrs[k].quoted to '"' / "'" / null to pick
+//     the quote style; default is `"`.
+//   * Set tok.tagRaw to rename a tag while preserving
+//     original case; default is the lowercase `tagName`.
+//   * Set tok.replaceText on a TEXT token to substitute the
+//     rendered text without re-escaping the original.
+//
+// The serializer walks the tokens in order and builds output
+// piecewise. Tokens that carry their original source slice
+// via `start`/`end` can be re-emitted verbatim using
+// `sourceText`, but we deliberately DON'T do that here —
+// consumers that want verbatim ranges slice the source
+// themselves. This serializer always produces a normalized
+// form that's stable regardless of input whitespace.
+function serializeTokens(tokens) {
+  let out = '';
+  for (const tok of tokens) {
+    if (!tok) continue;
+    if (tok.type === TOK_TEXT) {
+      if (tok.replaceText != null) out += tok.replaceText;
+      else out += escapeText(tok.value);
+      continue;
+    }
+    if (tok.type === TOK_COMMENT) {
+      out += '<!--' + tok.value + '-->';
+      continue;
+    }
+    if (tok.type === TOK_DOCTYPE) {
+      // Preserve the original doctype markup minus the surrounding <! and >.
+      out += '<!' + tok.value + '>';
+      continue;
+    }
+    if (tok.type === TOK_CDATA) {
+      out += '<![CDATA[' + tok.value + ']]>';
+      continue;
+    }
+    if (tok.type === TOK_START || tok.type === TOK_SELF) {
+      const tagOut = tok.tagRaw || tok.tagName;
+      out += '<' + tagOut;
+      for (const a of tok.attrs) {
+        const nameOut = a.nameRaw || a.name;
+        if (a.value === '' && a.quoted == null && a.boolean) {
+          // Boolean attribute — emit bare name.
+          out += ' ' + nameOut;
+          continue;
+        }
+        const q = a.quoted || '"';
+        out += ' ' + nameOut + '=' + q + escapeAttrForQuote(a.value, q) + q;
+      }
+      if (tok.type === TOK_SELF) out += ' />';
+      else out += '>';
+      continue;
+    }
+    if (tok.type === TOK_END) {
+      out += '</' + (tok.tagRaw || tok.tagName) + '>';
+      continue;
+    }
+  }
+  return out;
+}
+
+// Escape an attribute value for the given quote char. Inside
+// a `"`-quoted value we escape `"` and `&`; inside `'` we
+// escape `'` and `&`.
+function escapeAttrForQuote(s, quote) {
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === '&') out += '&amp;';
+    else if (ch === quote) out += (quote === '"' ? '&quot;' : '&#39;');
+    else if (ch === '<') out += '&lt;';
+    else out += ch;
+  }
+  return out;
+}
+
 module.exports = {
   parse,
   serialize,
+  serializeTokens,
   tokenize,
   decodeEntities,
   VOID_ELEMENTS,
   RAW_TEXT_ELEMENTS,
+  NAMED_ENTITIES,
 };
