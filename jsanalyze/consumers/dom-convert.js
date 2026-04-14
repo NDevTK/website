@@ -467,6 +467,94 @@ function sliceStatement(source, loc) {
   return source.slice(loc.pos, loc.endPos);
 }
 
+// detectLineIndent(source, pos) — return the whitespace
+// prefix of the line containing `pos`. Used by the loop
+// emitter to align the emitted child-block with the
+// accumulator-append statement's original indentation.
+function detectLineIndent(source, pos) {
+  let lineStart = pos;
+  while (lineStart > 0 && source[lineStart - 1] !== '\n') lineStart--;
+  let end = lineStart;
+  while (end < source.length) {
+    const ch = source[end];
+    if (ch === ' ' || ch === '\t') end++;
+    else break;
+  }
+  return source.slice(lineStart, end);
+}
+
+// findOpenStmtEnd(source, openStart, loopStart) — walk
+// forward from the open-accum var declaration's start
+// position and return the position just past the `;`
+// terminator. The open-accum is always the FIRST statement
+// in the replacement range, and it ends before any
+// bookkeeping statements (which we want to re-emit
+// between `pre` and the rewritten loop).
+function findOpenStmtEnd(source, openStart, loopStart) {
+  // Scan for the first `;` after openStart that isn't
+  // inside a string literal. We use a tiny state machine
+  // because the open literal itself contains HTML with `;`
+  // characters that shouldn't count.
+  let i = openStart;
+  let state = 'code';
+  let quote = null;
+  while (i < loopStart) {
+    const ch = source[i];
+    if (state === 'code') {
+      if (ch === '"' || ch === "'" || ch === '`') {
+        quote = ch;
+        state = 'string';
+        i++;
+        continue;
+      }
+      if (ch === ';') return i + 1;
+      i++;
+      continue;
+    }
+    if (state === 'string') {
+      if (ch === '\\') { i += 2; continue; }
+      if (ch === quote) { state = 'code'; i++; continue; }
+      i++;
+      continue;
+    }
+  }
+  return loopStart;
+}
+
+// emitChildBlock(child, parentRef, jsSource) — return the
+// list of source lines that re-create one accumulator-append
+// site's child element (a `var __c = …; parent.appendChild
+// (__c); __c.appendChild(textNode);` sequence). The caller
+// joins the lines with its chosen indent and splices the
+// result into the surrounding loop-body source.
+//
+// Factored out so the loop emitter can call it once per
+// accumSite — multiple sites arise when the loop body
+// contains branching `H += …` appends (one per branch).
+function emitChildBlock(child, parentRef, jsSource) {
+  const lines = [];
+  lines.push('var __c = document.createElement(' + JSON.stringify(child.tag) + ');');
+  for (const attr of child.attrs) {
+    if (attr.parts.length === 1 && attr.parts[0].kind === 'literal') {
+      lines.push('__c.setAttribute(' + JSON.stringify(attr.name) + ', ' +
+        JSON.stringify(attr.parts[0].value) + ');');
+      continue;
+    }
+    const pieces = attr.parts.map(p => {
+      if (p.kind === 'literal') return JSON.stringify(p.value);
+      return '(' + jsSource.slice(p.start, p.end) + ')';
+    });
+    lines.push('__c.setAttribute(' + JSON.stringify(attr.name) + ', ' +
+      pieces.join(' + ') + ');');
+  }
+  lines.push(parentRef + '.appendChild(__c);');
+  if (child.textExpr) {
+    const textSrc = jsSource.slice(child.textExpr.start, child.textExpr.end);
+    lines.push('__c.appendChild(document.createTextNode(' + textSrc + '));');
+  }
+  return lines;
+}
+
 // emitBranchBody — emit DOM calls for a nested template
 // inside a caller-provided receiver expression. Used by the
 // `branch` emitter to recursively lower each if/else
@@ -521,6 +609,34 @@ function emitFromTemplate(jsSource, ih) {
     };
   }
 
+  if (tmpl.kind === 'switch') {
+    const receiver = jsSource.slice(tmpl.receiver.start, tmpl.receiver.end);
+    const discSrc = jsSource.slice(tmpl.discriminant.start, tmpl.discriminant.end);
+    const lines = [];
+    lines.push(receiver + '.replaceChildren();');
+    lines.push('switch (' + discSrc + ') {');
+    for (const c of tmpl.cases) {
+      if (c.testExpr) {
+        const testSrc = jsSource.slice(c.testExpr.start, c.testExpr.end);
+        lines.push('  case ' + testSrc + ': {');
+      } else {
+        lines.push('  default: {');
+      }
+      const body = emitBranchBody(c.template, receiver);
+      if (body) {
+        for (const l of body.split('\n')) lines.push('    ' + l);
+      }
+      lines.push('    break;');
+      lines.push('  }');
+    }
+    lines.push('}');
+    return {
+      start: tmpl.rangeStart,
+      end: tmpl.rangeEnd,
+      replacement: lines.join('\n'),
+    };
+  }
+
   if (tmpl.kind === 'branch') {
     const receiver = jsSource.slice(tmpl.receiver.start, tmpl.receiver.end);
     const testSrc = jsSource.slice(tmpl.testExpr.start, tmpl.testExpr.end);
@@ -546,46 +662,69 @@ function emitFromTemplate(jsSource, ih) {
 
   if (tmpl.kind === 'loop') {
     const receiver = jsSource.slice(tmpl.receiver.start, tmpl.receiver.end);
-    const lines = [];
-    lines.push(receiver + '.replaceChildren();');
+    const pre = [];
+    pre.push(receiver + '.replaceChildren();');
     let parentRef;
     if (tmpl.outer) {
-      lines.push('var __p = document.createElement(' + JSON.stringify(tmpl.outer.tag) + ');');
+      pre.push('var __p = document.createElement(' + JSON.stringify(tmpl.outer.tag) + ');');
       for (const a of tmpl.outer.attrList) {
-        lines.push('__p.setAttribute(' + JSON.stringify(a.name) + ', ' +
+        pre.push('__p.setAttribute(' + JSON.stringify(a.name) + ', ' +
           JSON.stringify(a.value) + ');');
       }
-      lines.push(receiver + '.appendChild(__p);');
+      pre.push(receiver + '.appendChild(__p);');
       parentRef = '__p';
     } else {
       parentRef = receiver;
     }
+
+    // Emit the per-iteration child element creation. The
+    // library's template gives us one `accumSite` per
+    // accumulator-append statement found anywhere in the
+    // loop body (including inside nested IfStatement
+    // branches). We walk the original loop-body source from
+    // `headerEnd` to `bodyEnd`, splicing each site's child
+    // block in place of its statement and re-emitting
+    // everything else verbatim. The surrounding loop header
+    // and closing brace are sliced verbatim from the source
+    // so while / do-while / for-in / for-of all work without
+    // per-type handling.
     const sh = tmpl.loopShape;
-    lines.push('for (' + sh.initSrc + '; ' + sh.testSrc + '; ' + sh.updateSrc + ') {');
-    lines.push('  var __c = document.createElement(' + JSON.stringify(tmpl.child.tag) + ');');
-    for (const attr of tmpl.child.attrs) {
-      if (attr.parts.length === 1 && attr.parts[0].kind === 'literal') {
-        lines.push('  __c.setAttribute(' + JSON.stringify(attr.name) + ', ' +
-          JSON.stringify(attr.parts[0].value) + ');');
-        continue;
-      }
-      const pieces = attr.parts.map(p => {
-        if (p.kind === 'literal') return JSON.stringify(p.value);
-        return '(' + jsSource.slice(p.start, p.end) + ')';
-      });
-      lines.push('  __c.setAttribute(' + JSON.stringify(attr.name) + ', ' +
-        pieces.join(' + ') + ');');
+    const sites = (tmpl.accumSites || []).slice().sort((a, b) => a.start - b.start);
+
+    let loopSrc = jsSource.slice(sh.loopStart, sh.headerEnd);
+    let cursor = sh.headerEnd;
+    for (const site of sites) {
+      loopSrc += jsSource.slice(cursor, site.start);
+      // Match the indentation of the accumulator-append
+      // statement at this site so the spliced-in child-
+      // block aligns with its neighbours. The first line's
+      // indent is already supplied by the verbatim slice
+      // ending at `site.start`; subsequent lines need the
+      // indent prefix.
+      const indent = detectLineIndent(jsSource, site.start);
+      const childLines = emitChildBlock(site.child, parentRef, jsSource);
+      loopSrc += childLines.join('\n' + indent);
+      cursor = site.end;
     }
-    lines.push('  ' + parentRef + '.appendChild(__c);');
-    if (tmpl.child.textExpr) {
-      const textSrc = jsSource.slice(tmpl.child.textExpr.start, tmpl.child.textExpr.end);
-      lines.push('  __c.appendChild(document.createTextNode(' + textSrc + '));');
-    }
-    lines.push('}');
+    loopSrc += jsSource.slice(cursor, sh.bodyEnd);
+    loopSrc += jsSource.slice(sh.bodyEnd, sh.loopEnd);
+
+    // Preserve bookkeeping statements that live BETWEEN
+    // the openStmt and the loopStmt (e.g. `var i = 0;`
+    // before a while-loop). They sit inside the replacement
+    // range so we re-emit them verbatim between pre and
+    // the rewritten loop.
+    //
+    // We slice from the end of openStmt to the start of
+    // the loop, stripping the open-accum's own text, to
+    // recover the original bookkeeping region.
+    const openStmtEnd = findOpenStmtEnd(jsSource, tmpl.rangeStart, sh.loopStart);
+    const bookkeeping = jsSource.slice(openStmtEnd, sh.loopStart);
+
     return {
       start: tmpl.rangeStart,
       end: tmpl.rangeEnd,
-      replacement: lines.join('\n'),
+      replacement: pre.join('\n') + '\n' + bookkeeping.trimStart() + loopSrc,
     };
   }
 

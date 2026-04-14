@@ -454,6 +454,116 @@ const tests = [
     },
   },
 
+  // --- Wave 12d5: while / do-while / for-of loop templates ---
+  {
+    name: 'dom-convert js: while-loop accumulator → createElement + while',
+    fn: async () => {
+      const src = [
+        'var items = ["a", "b", "c"];',
+        'var html = "<ul>";',
+        'var i = 0;',
+        'while (i < items.length) {',
+        '  html += "<li>" + items[i] + "</li>";',
+        '  i++;',
+        '}',
+        'html += "</ul>";',
+        'document.body.innerHTML = html;',
+      ].join('\n');
+      const out = await convertJs(src);
+      assert(/createElement\("ul"\)/.test(out), 'ul created');
+      assert(/while \(i < items\.length\)/.test(out),
+        'while header preserved');
+      assert(/i\+\+;/.test(out), 'bookkeeping i++ preserved');
+      assert(/var i = 0/.test(out), 'var i = 0 preserved above loop');
+      assert(/createElement\("li"\)/.test(out), 'li created');
+      assert(/createTextNode\(items\[i\]\)/.test(out),
+        'text content flows through createTextNode');
+    },
+  },
+  {
+    name: 'dom-convert js: do-while loop accumulator',
+    fn: async () => {
+      const src = [
+        'var items = ["a", "b"];',
+        'var html = "<ul>";',
+        'var i = 0;',
+        'do {',
+        '  html += "<li>" + items[i] + "</li>";',
+        '  i++;',
+        '} while (i < items.length);',
+        'html += "</ul>";',
+        'document.body.innerHTML = html;',
+      ].join('\n');
+      const out = await convertJs(src);
+      assert(/do \{/.test(out), 'do-while header preserved');
+      assert(/\} while \(i < items\.length\)/.test(out),
+        'do-while tail preserved');
+      assert(/createElement\("li"\)/.test(out));
+    },
+  },
+  {
+    name: 'dom-convert js: for-of loop accumulator',
+    fn: async () => {
+      const src = [
+        'var items = ["a", "b"];',
+        'var html = "";',
+        'for (var item of items) {',
+        '  html += "<li>" + item + "</li>";',
+        '}',
+        'document.body.innerHTML = html;',
+      ].join('\n');
+      const out = await convertJs(src);
+      assert(/for \(var item of items\)/.test(out),
+        'for-of header preserved');
+      assert(/createElement\("li"\)/.test(out));
+      assert(/createTextNode\(item\)/.test(out),
+        'per-item text node');
+    },
+  },
+
+  // --- Wave 12d7: branch nested inside a loop body ---
+  {
+    name: 'dom-convert js: if/else inside loop body → one child splice per branch',
+    fn: async () => {
+      // The loop body's accumulator-append is guarded by an
+      // if/else that picks one of two different child shapes
+      // per iteration. The library collects both accum-sites
+      // and the consumer splices each site's child block in
+      // place, preserving the enclosing if/else control flow.
+      const src = [
+        'var items = ["short", "longer one"];',
+        'var html = "<ul>";',
+        'for (var i = 0; i < items.length; i++) {',
+        '  if (items[i].length > 5) {',
+        '    html += "<li class=\\"long\\">" + items[i] + "</li>";',
+        '  } else {',
+        '    html += "<li>" + items[i] + "</li>";',
+        '  }',
+        '}',
+        'html += "</ul>";',
+        'document.body.innerHTML = html;',
+      ].join('\n');
+      const out = await convertJs(src);
+      assert(/createElement\("ul"\)/.test(out), 'ul wrapper created');
+      assert(/for \(var i = 0; i < items\.length; i\+\+\)/.test(out),
+        'for header preserved');
+      assert(/if \(items\[i\]\.length > 5\) \{/.test(out),
+        'if guard preserved: ' + out);
+      assert(/\} else \{/.test(out), 'else branch preserved');
+      // Two createElement("li") calls — one per branch — and
+      // only the long branch sets the class attribute.
+      const liMatches = out.match(/createElement\("li"\)/g) || [];
+      assert(liMatches.length === 2,
+        'two li createElement calls, got ' + liMatches.length + ': ' + out);
+      assert(/setAttribute\("class", "long"\)/.test(out),
+        'long-branch class attr emitted: ' + out);
+      assert(/createTextNode\(items\[i\]\)/.test(out),
+        'text expression emitted');
+      assert(!/innerHTML =/.test(out),
+        'original innerHTML assignment removed');
+    },
+  },
+
   // --- Wave 12d: if/else accumulator branch template ---
   {
     name: 'dom-convert js: if/else accumulator → branch template',
@@ -508,6 +618,32 @@ const tests = [
       assert(/if \(cond\)/.test(out), 'if/else preserved');
       assert(/createElement\("b"\)/.test(out), 'b element in consequent');
       assert(/createElement\("i"\)/.test(out), 'i element in alternate');
+    },
+  },
+
+  // --- Wave 12d6: switch accumulator template ---
+  {
+    name: 'dom-convert js: switch accumulator → switch template',
+    fn: async () => {
+      const src = [
+        'var kind = location.hash;',
+        'var html;',
+        'switch (kind) {',
+        '  case "a": html = "<p>A</p>"; break;',
+        '  case "b": html = "<p>B</p>"; break;',
+        '  default: html = "<p>?</p>";',
+        '}',
+        'document.body.innerHTML = html;',
+      ].join('\n');
+      const out = await convertJs(src);
+      assert(/switch \(kind\)/.test(out), 'switch header preserved');
+      assert(/case "a":/.test(out), 'case "a" present');
+      assert(/case "b":/.test(out), 'case "b" present');
+      assert(/default:/.test(out), 'default present');
+      assert(/createTextNode\("A"\)/.test(out), 'A branch emitted');
+      assert(/createTextNode\("B"\)/.test(out), 'B branch emitted');
+      assert(/createTextNode\("\?"\)/.test(out), 'default emitted');
+      assert(!/innerHTML =/.test(out), 'original innerHTML removed');
     },
   },
 

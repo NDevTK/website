@@ -64,6 +64,30 @@
 //         rangeStart: number;            -- full source range to replace
 //         rangeEnd: number;
 //       }
+//     | { kind: 'switch';
+//         // Switch-built HTML assignment:
+//         //
+//         //   var H;
+//         //   switch (x) {
+//         //     case 'a': H = '<a>'; break;
+//         //     case 'b': H = '<b>'; break;
+//         //     default:  H = '<c>';
+//         //   }
+//         //   elem.innerHTML = H;
+//         //
+//         // Each case branch must contain a single
+//         // `H = <string literal>;` assignment (optionally
+//         // followed by a `break`). Fall-through between
+//         // cases isn't supported yet.
+//         receiver: { start, end };
+//         discriminant: { start, end }; -- the switch value
+//         cases: Array<{
+//           testExpr: { start, end } | null;  -- null for `default`
+//           template: HtmlTemplate;
+//         }>;
+//         rangeStart: number;
+//         rangeEnd: number;
+//       }
 //     | { kind: 'opaque'; reason: string };
 //
 //   type HtmlAttrTemplate = {
@@ -267,6 +291,75 @@ function detectBranchAccumulator(jsSource, stmts, assignIdx, varName, receiverNo
   };
 }
 
+// detectSwitchAccumulator — recognise the shape
+//
+//   var H;
+//   switch (disc) {
+//     case lit1: H = '<a>'; break;
+//     case lit2: H = '<b>'; break;
+//     default:   H = '<c>';
+//   }
+//   elem.innerHTML = H;
+//
+// Each case's consequent statements must be exactly
+// `H = <string literal>;` optionally followed by `break;`.
+// Multi-statement cases, fall-through, and non-literal
+// writes fall through to null.
+function detectSwitchAccumulator(jsSource, stmts, assignIdx, varName, receiverNode) {
+  if (assignIdx - 1 < 0) return null;
+  const swStmt = stmts[assignIdx - 1];
+  if (!swStmt || swStmt.type !== 'SwitchStatement') return null;
+  if (!Array.isArray(swStmt.cases) || swStmt.cases.length === 0) return null;
+
+  const cases = [];
+  for (const c of swStmt.cases) {
+    // Each case has `test` (null for default) and `consequent`
+    // (an array of statements). We accept:
+    //   [ExpressionStatement(H = '<lit>')]
+    //   [ExpressionStatement(H = '<lit>'), BreakStatement]
+    const stmtsInCase = c.consequent || [];
+    if (stmtsInCase.length < 1 || stmtsInCase.length > 2) return null;
+    const write = getSingleStringWrite(
+      { type: 'BlockStatement', body: [stmtsInCase[0]] },
+      varName);
+    if (write == null) return null;
+    if (stmtsInCase.length === 2 && stmtsInCase[1].type !== 'BreakStatement') return null;
+    cases.push({
+      testExpr: c.test
+        ? { start: c.test.start, end: c.test.end }
+        : null,
+      template: concreteTemplate(write),
+    });
+  }
+
+  // Extend the replacement range backward through the
+  // optional `var H;` declaration that precedes the switch.
+  let rangeStart = swStmt.start;
+  for (let i = assignIdx - 2; i >= 0; i--) {
+    const s = stmts[i];
+    if (s.type !== 'VariableDeclaration') break;
+    let matches = false;
+    for (const d of s.declarations) {
+      if (d.id && d.id.type === 'Identifier' && d.id.name === varName) {
+        matches = true;
+        break;
+      }
+    }
+    if (!matches) break;
+    rangeStart = s.start;
+    break;
+  }
+
+  return {
+    kind: 'switch',
+    receiver: { start: receiverNode.start, end: receiverNode.end },
+    discriminant: { start: swStmt.discriminant.start, end: swStmt.discriminant.end },
+    cases,
+    rangeStart,
+    rangeEnd: stmts[assignIdx].end,
+  };
+}
+
 // getSingleStringWrite — look inside an IfStatement branch
 // body and return the string literal assigned to `varName`,
 // or null when the shape isn't `{ varName = <lit> }` or
@@ -337,6 +430,10 @@ function extractFromAccumulator(jsSource, stmts, assignIdx, varName, receiverNod
   const branch = detectBranchAccumulator(jsSource, stmts, assignIdx, varName, receiverNode);
   if (branch) return branch;
 
+  // Switch shape: `switch (x) { case ...: H = '...'; break; ... }`.
+  const sw = detectSwitchAccumulator(jsSource, stmts, assignIdx, varName, receiverNode);
+  if (sw) return sw;
+
   let closeStmtIdx = -1;
   let loopStmtIdx = -1;
   let openStmtIdx = -1;
@@ -353,32 +450,53 @@ function extractFromAccumulator(jsSource, stmts, assignIdx, varName, receiverNod
     }
   }
 
-  // For loop must sit at assignIdx-1 (shape B no-wrap) or
-  // closeStmtIdx-1 (shape A with wrapper).
+  // Find the nearest loop statement walking backward from
+  // `afterLoopIdx`, skipping over non-loop / non-accum
+  // statements. `var i = 0;` style bookkeeping counts as
+  // "skippable" — its presence between the var H declaration
+  // and the loop is normal for while loops.
   const afterLoopIdx = closeStmtIdx >= 0 ? closeStmtIdx : assignIdx;
-  if (afterLoopIdx - 1 >= 0) {
-    const s = stmts[afterLoopIdx - 1];
-    if (s.type === 'ForStatement' && s.body && s.body.type === 'BlockStatement') {
-      loopStmtIdx = afterLoopIdx - 1;
+  for (let i = afterLoopIdx - 1; i >= 0; i--) {
+    const s = stmts[i];
+    if (isLoopStatement(s) && s.body && s.body.type === 'BlockStatement') {
+      loopStmtIdx = i;
+      break;
     }
+    // Skippable: plain var decl that doesn't touch the accumulator.
+    if (s.type === 'VariableDeclaration') {
+      let touchesAccum = false;
+      for (const d of s.declarations) {
+        if (d.id && d.id.type === 'Identifier' && d.id.name === varName) {
+          touchesAccum = true;
+          break;
+        }
+      }
+      if (!touchesAccum) continue;   // bookkeeping var, keep looking
+    }
+    break;
   }
   if (loopStmtIdx < 0) {
-    return { kind: 'opaque', reason: 'no for-loop before innerHTML assignment' };
+    return { kind: 'opaque', reason: 'no loop before innerHTML assignment' };
   }
 
   // Open-accum statement (the var X = '<…>' declaration).
   for (let i = loopStmtIdx - 1; i >= 0; i--) {
     const s = stmts[i];
     if (s.type === 'VariableDeclaration') {
+      let matched = false;
       for (const d of s.declarations) {
         if (d.id && d.id.type === 'Identifier' && d.id.name === varName &&
             d.init && d.init.type === 'Literal' && typeof d.init.value === 'string') {
           openStmtIdx = i;
+          matched = true;
           break;
         }
       }
-      if (openStmtIdx >= 0) break;
+      if (matched) break;
+      // Non-matching var decl (e.g. `var i = 0;`) — skip.
+      continue;
     }
+    break;
   }
   if (openStmtIdx < 0) {
     return { kind: 'opaque', reason: 'no var declaration of accumulator' };
@@ -420,47 +538,107 @@ function extractFromAccumulator(jsSource, stmts, assignIdx, varName, receiverNod
     }
   }
 
-  // Loop body must be exactly `X += <concat expression>;`.
-  const body = loopStmt.body.body;
-  if (body.length !== 1) {
-    return { kind: 'opaque', reason: 'loop body is not a single accum' };
+  // Walk the loop body (including any nested blocks /
+  // if / else) and collect every accumulator-append
+  // statement. Each append's parsed child shape becomes a
+  // splice site the consumer replaces with DOM calls. This
+  // handles branches-inside-loops uniformly: every
+  // `html += '<li>' + ...` statement anywhere inside the
+  // loop body contributes one site, regardless of whether
+  // it sits in the top of the body or nested inside an
+  // IfStatement.
+  const accumSites = [];
+  collectAccumAppends(loopStmt.body, varName, accumSites);
+  if (accumSites.length === 0) {
+    return { kind: 'opaque', reason: 'no accum assign in loop body' };
   }
-  const bodyStmt = body[0];
-  if (!isAccumAssign(bodyStmt, varName)) {
-    return { kind: 'opaque', reason: 'loop body is not an accum assign' };
+  // Every site must parse into a recognisable child shape.
+  // Sites that don't parse fall the whole template over to
+  // opaque (partial rewrites would silently drop some
+  // iterations).
+  for (const site of accumSites) {
+    if (!site.child) {
+      return { kind: 'opaque', reason: 'loop body append shape unrecognised' };
+    }
   }
-
-  // Flatten the concat chain and recognise the
-  // `<child attr="prefix' + E + '">' + T + '</child>` shape.
-  const frags = flattenConcat(bodyStmt.expression.right);
-  if (!frags) return { kind: 'opaque', reason: 'concat flatten failed' };
-  const parsed = parseLoopBodyFragments(frags);
-  if (!parsed) return { kind: 'opaque', reason: 'loop body shape unrecognised' };
 
   return {
     kind: 'loop',
     receiver: { start: receiverNode.start, end: receiverNode.end },
     outer,
     loopShape: {
-      initSrc: loopStmt.init ? jsSource.slice(loopStmt.init.start, loopStmt.init.end) : '',
-      testSrc: loopStmt.test ? jsSource.slice(loopStmt.test.start, loopStmt.test.end) : '',
-      updateSrc: loopStmt.update ? jsSource.slice(loopStmt.update.start, loopStmt.update.end) : '',
-      bodyStart: loopStmt.body.start,
-      bodyEnd: loopStmt.body.end,
+      loopType: loopStmt.type,
+      headerEnd: loopStmt.body.start + 1,   // position past the `{`
+      bodyEnd:   loopStmt.body.end - 1,     // position of the closing `}`
+      loopStart: loopStmt.start,
+      loopEnd: loopStmt.end,
     },
-    child: {
-      tag: parsed.childTag,
-      attrs: parsed.childAttrs,
-      textExpr: parsed.textExpr
-        ? { start: parsed.textExpr.start, end: parsed.textExpr.end }
-        : null,
-    },
+    accumSites,
     rangeStart: openStmt.start,
     rangeEnd: stmts[assignIdx].end,
   };
 }
 
+// collectAccumAppends(bodyNode, varName, out)
+//
+// Recursive walk that finds every `varName += <concat>`
+// statement inside a body node, descending into
+// BlockStatement and IfStatement alternatives. Each append
+// is pushed onto `out` with its source range and its
+// parsed child shape (null if the concat didn't match a
+// recognisable pattern). The caller checks the null case
+// and falls the whole template over to opaque if any site
+// didn't parse.
+function collectAccumAppends(node, varName, out) {
+  if (!node) return;
+  if (node.type === 'BlockStatement') {
+    for (const s of node.body) collectAccumAppends(s, varName, out);
+    return;
+  }
+  if (node.type === 'IfStatement') {
+    collectAccumAppends(node.consequent, varName, out);
+    if (node.alternate) collectAccumAppends(node.alternate, varName, out);
+    return;
+  }
+  if (node.type === 'ExpressionStatement' && isAccumAssign(node, varName)) {
+    const frags = flattenConcat(node.expression.right);
+    const parsed = frags ? parseLoopBodyFragments(frags) : null;
+    out.push({
+      start: node.start,
+      end: node.end,
+      child: parsed ? {
+        tag: parsed.childTag,
+        attrs: parsed.childAttrs,
+        textExpr: parsed.textExpr
+          ? { start: parsed.textExpr.start, end: parsed.textExpr.end }
+          : null,
+      } : null,
+    });
+    return;
+  }
+  // Other control-flow nodes (loops, switch, try) aren't
+  // recursed into — the MVP supports one level of if/else
+  // nesting inside a loop body. A deeper pattern falls
+  // through to opaque via the empty-site check below.
+}
+
 // --- Helpers -----------------------------------------------------------
+
+// isLoopStatement — true for any JS loop node type that
+// carries a body block. Used by the accumulator detector to
+// handle for / while / do-while / for-in / for-of
+// uniformly; each type's loop header is sliced verbatim
+// from the source so the emitter doesn't need per-type
+// handling.
+function isLoopStatement(s) {
+  return s && (
+    s.type === 'ForStatement' ||
+    s.type === 'WhileStatement' ||
+    s.type === 'DoWhileStatement' ||
+    s.type === 'ForInStatement' ||
+    s.type === 'ForOfStatement'
+  );
+}
 
 function isAccumAssign(stmt, varName) {
   if (!stmt || stmt.type !== 'ExpressionStatement') return false;
@@ -529,6 +707,11 @@ function parseLoopBodyFragments(rawFrags) {
   let i = 1;
 
   if (childMatch[3] === '>') {
+    // Opening literal is complete — `attrsStr` holds all
+    // static attributes (possibly empty). Parse them in
+    // full, then drop straight into the children state.
+    const staticAttrs = parseStaticAttrsFragment(attrsStr);
+    for (const a of staticAttrs) childAttrs.push(a);
     state = 'children';
   } else {
     // Parse static attrs from the opening literal's attr portion.
