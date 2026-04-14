@@ -47,6 +47,7 @@ const testFiles = [
   'dom-convert.test.js',
   'csp-derive.test.js',
   'fetch-trace.test.js',
+  'legacy-replay.test.js',
 ];
 
 async function main() {
