@@ -149,6 +149,11 @@ async function analyze(input, options) {
       // transfer.js. The trace projection below copies these
       // into trace.taintFlows after the walk completes.
       taintFlows: [],
+      // Wave 12: innerHTML / outerHTML / insertAdjacentHTML
+      // assignments recorded during the walk. The DOM-
+      // conversion consumer (consumers/dom-convert.js) iterates
+      // these to rewrite unsafe sinks into createElement trees.
+      innerHtmlAssignments: [],
       // Flow id counter — assigned at emission time so flows
       // have stable identity within a trace.
       nextFlowId: 1,
@@ -218,6 +223,14 @@ async function analyze(input, options) {
       if (watchers && typeof watchers.onFinding === 'function') {
         watchers.onFinding(flow);
       }
+    }
+
+    // Wave 12 / Phase E: copy innerHTML-family assignments
+    // recorded during the walk into the trace. These records
+    // drive the DOM-conversion consumer (and any consumer that
+    // wants to inventory unsafe HTML sink sites).
+    for (const ih of ctx.innerHtmlAssignments) {
+      trace.innerHtmlAssignments.push(ih);
     }
   }
 

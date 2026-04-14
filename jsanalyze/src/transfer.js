@@ -806,6 +806,7 @@ function applySetProp(ctx, state, instr) {
   // but not the anchor (which has no `src`).
   for (const variant of D.disjunctVariants(obj)) {
     maybeEmitSinkFlowForWrite(ctx, variant, instr.propName, val, loc);
+    maybeRecordInnerHtmlAssignment(ctx, variant, instr.propName, val, loc);
   }
   // Heap write: fan out over object-ref variants. We don't know
   // which variant the runtime picks, so we model both being
@@ -843,6 +844,41 @@ function maybeEmitSinkFlowForWrite(ctx, obj, propName, val, loc) {
   const sinkInfo = TDB.classifySinkByTypeViaDB(ctx.typeDB, obj.typeName, propName);
   if (!sinkInfo) return;
   emitTaintFlow(ctx, sinkInfo, loc, val);
+}
+
+// Wave 12 / Phase E: record innerHTML-family assignments so the
+// DOM-conversion consumer can iterate them post-walk. Records
+// every write to a property the TypeDB classifies as an 'html'
+// sink — regardless of whether the value is tainted — because
+// the consumer rewrites even concrete assignments into
+// createElement/appendChild trees.
+//
+// Shape (InnerHtmlAssignment):
+//   {
+//     kind: 'innerHTML' | 'outerHTML' | 'insertAdjacentHTML',
+//     targetType: string,          -- receiver's typeName
+//     value: Value,                -- the value written
+//     location: Location,          -- where the assignment sits
+//     labels: string[],            -- taint labels on value
+//   }
+//
+// `kind` is the property name. Consumers that need to
+// distinguish innerHTML from outerHTML check this field.
+function maybeRecordInnerHtmlAssignment(ctx, obj, propName, val, loc) {
+  if (!ctx.innerHtmlAssignments) return;
+  if (!ctx.typeDB || !obj || !obj.typeName) return;
+  const sinkInfo = TDB.classifySinkByTypeViaDB(ctx.typeDB, obj.typeName, propName);
+  if (!sinkInfo || sinkInfo.type !== 'html') return;
+  const labels = val && val.labels
+    ? Array.from(val.labels).sort()
+    : [];
+  ctx.innerHtmlAssignments.push({
+    kind: propName,
+    targetType: obj.typeName,
+    value: val,
+    location: loc,
+    labels,
+  });
 }
 
 function applySetIndex(ctx, state, instr) {

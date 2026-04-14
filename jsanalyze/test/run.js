@@ -42,6 +42,7 @@ const testFiles = [
   'switch.test.js',
   'wave10.test.js',
   'wave11.test.js',
+  'html.test.js',
 ];
 
 async function main() {
