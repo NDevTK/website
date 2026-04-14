@@ -1104,6 +1104,24 @@ function createState() {
     regs: createEmptyOverlay(),
     heap: createEmptyOverlay(),
     pathConds: Object.freeze([]),
+    // B4 (Wave 10): pathCond is a first-class field on every
+    // state. It is the SMT formula describing the reachability
+    // condition for this variant — the conjunction of every
+    // branch outcome that had to hold for execution to arrive
+    // at this state. `null` means "unconditionally reachable"
+    // (logical top). Merging two equivalent states (same regs +
+    // heap) ORs their pathConds so the surviving variant covers
+    // both arrival paths. Splitting a state across a branch
+    // ANDs the branch formula (or its negation) into the
+    // child's pathCond.
+    //
+    // pathCond is NOT part of stateEquals — two states with
+    // identical (regs, heap) but different pathConds are the
+    // same variant and must be collapsed (with OR) to keep the
+    // fixpoint finite. It IS part of the variant's observable
+    // behaviour for sink-flow emission: emitTaintFlow reads it
+    // to populate the flow's pathFormula.
+    pathCond: null,
     assumptionIds: Object.freeze([]),
     callStack: Object.freeze([]),
     _frozen: true,
@@ -1118,6 +1136,25 @@ function withHeap(state, newHeap) {
     regs: state.regs,
     heap: newHeap,
     pathConds: state.pathConds,
+    pathCond: state.pathCond || null,
+    assumptionIds: state.assumptionIds,
+    callStack: state.callStack,
+    _frozen: true,
+  });
+}
+
+// withPathCond — return a new frozen state whose pathCond is
+// replaced. Used by the worklist when splitting a variant across
+// a branch (the two children inherit everything except the
+// pathCond, which gets the branch formula conjoined in) and when
+// merging equivalent variants (the survivor's pathCond becomes
+// the disjunction).
+function withPathCond(state, newPathCond) {
+  return Object.freeze({
+    regs: state.regs,
+    heap: state.heap,
+    pathConds: state.pathConds,
+    pathCond: newPathCond || null,
     assumptionIds: state.assumptionIds,
     callStack: state.callStack,
     _frozen: true,
@@ -1139,6 +1176,13 @@ function createStateSharingHeap(callerState) {
       ? { own: new Map(), parent: callerState.heap }
       : createEmptyOverlay(),
     pathConds: Object.freeze([]),
+    // The callee analyses under unconditional reachability from
+    // its own entry — the caller's pathCond is a constraint on
+    // the call site, not on the callee's internal control flow.
+    // B4 threads the call-site pathCond back in when a callee
+    // flow is re-emitted into the caller's flow list (handled
+    // by emitTaintFlow at the call site).
+    pathCond: null,
     assumptionIds: Object.freeze([]),
     callStack: Object.freeze([]),
     _frozen: true,
@@ -1158,6 +1202,7 @@ function setReg(state, register, value) {
     regs: newRegs,
     heap: state.heap,
     pathConds: state.pathConds,
+    pathCond: state.pathCond || null,
     assumptionIds: state.assumptionIds,
     callStack: state.callStack,
     _frozen: true,
@@ -1177,6 +1222,7 @@ function unfreezeState(state) {
     regs: { own: new Map(), parent: state.regs },
     heap: { own: new Map(), parent: state.heap },
     pathConds: state.pathConds,
+    pathCond: state.pathCond || null,
     assumptionIds: state.assumptionIds,
     callStack: state.callStack,
     _frozen: false,
@@ -1197,6 +1243,7 @@ function freezeState(state) {
     regs: state.regs,
     heap: state.heap,
     pathConds: state.pathConds,
+    pathCond: state.pathCond || null,
     assumptionIds: state.assumptionIds,
     callStack: state.callStack,
     _frozen: true,
@@ -1281,14 +1328,31 @@ function joinStates(a, b) {
   const pathConds = a.pathConds === b.pathConds
     ? a.pathConds
     : Object.freeze(a.pathConds.concat(b.pathConds));
+  // joinStates is used by the worklist when two equivalent
+  // variants merge (same regs+heap shape, different arrival
+  // paths). We OR the pathConds so the surviving variant covers
+  // both predecessors. If either side is `null` (top /
+  // unconditionally reachable) the result is `null`. A lazy
+  // require for smt.js keeps this file's load-time dependency
+  // graph simple (domain.js loads before smt.js in some tests).
+  const joinedPathCond = joinPathConds(a.pathCond, b.pathCond);
   return Object.freeze({
     regs: newRegs,
     heap: newHeap,
     pathConds,
+    pathCond: joinedPathCond,
     assumptionIds: Object.freeze(ids),
     callStack: a.callStack,
     _frozen: true,
   });
+}
+
+let _smtModule = null;
+function joinPathConds(a, b) {
+  if (a == null || b == null) return null;
+  if (a === b || a.expr === b.expr) return a;
+  if (!_smtModule) _smtModule = require('./smt.js');
+  return _smtModule.mkOr(a, b);
 }
 
 function joinObject(a, b) {
@@ -1345,7 +1409,7 @@ module.exports = {
   withFormula, valueFormula,
   refineEq, refineNeq, refineByType, refineNotByType,
   refineInstanceof, refineNotInstanceof, typeChainIncludes,
-  createState, createStateSharingHeap, withHeap, setReg, getReg, joinStates, stateLeq, stateEquals,
+  createState, createStateSharingHeap, withHeap, withPathCond, setReg, getReg, joinStates, joinPathConds, stateLeq, stateEquals,
   unfreezeState, freezeState,
   overlayGet, overlayHas, overlayEntries, overlaySize, overlayFlatten,
   inferTypeName, canonKey,

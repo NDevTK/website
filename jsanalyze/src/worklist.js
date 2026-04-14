@@ -1,13 +1,78 @@
-// worklist.js — iterative fixpoint engine
+// worklist.js — iterative fixpoint engine (Wave 10 / B4: multi-variant)
 //
 // The worklist algorithm drives a monotone fixpoint over the CFG
-// of each function. It processes basic blocks in FIFO order,
-// joining incoming edge states, applying the transfer function,
-// and queueing successors whose inState grew.
+// of each function. Each block carries a SET of variants rather
+// than a single joined state. A variant is a full State with its
+// own `pathCond`: the SMT formula describing the reachability
+// condition for this variant (the conjunction of every branch
+// outcome that had to hold for execution to reach this point).
 //
-// Strictly iterative: no recursion. Deeply nested functions and
-// large call graphs cannot blow the JavaScript call stack. The
-// call stack stored in State handles interprocedural context.
+// Multi-variant worklist (B4)
+// ---------------------------
+//
+// Before B4, every block had one in-state produced by pointwise-
+// joining the predecessor states. Pointwise join loses cross-
+// register correlation: after `if (c) { x = 1; y = "a"; } else
+// { x = 2; y = "b"; }`, the joined state has x = oneOf(1,2) and
+// y = oneOf("a","b"), and the analyzer no longer knows that
+// x=1 implies y="a". A later `if (x === 1)` refines x to 1 but
+// CAN'T refine y, so a sink on y inside the true branch fires
+// spuriously.
+//
+// B4 keeps the two branches as separate variants all the way
+// through the join. The `if (x === 1)` true branch eliminates
+// the x=2 variant via refinement; only the x=1 variant (with
+// y="a") survives into the sink. The cross-register correlation
+// is preserved because each variant is a complete state, not a
+// pointwise abstraction.
+//
+// Variants and equivalence
+// ------------------------
+//
+// Two variants are equivalent iff their (regs, heap) are equal
+// under `stateEquals`. `pathCond` and `assumptionIds` are NOT
+// part of the equivalence check — they are merged disjunctively
+// (pathCond via SMT OR, assumptionIds via set union) when
+// equivalent variants collide.
+//
+// This keeps the variant count per block bounded by the number
+// of distinct (regs, heap) shapes reachable at that block,
+// which is finite because the underlying Value lattice has
+// finite height. Back-edges from loops eventually either add a
+// new shape (monotonic growth, terminates) or hit an existing
+// one (fixpoint).
+//
+// Per-variant transfer
+// --------------------
+//
+// Transfer functions are unchanged: they still operate on a
+// single State at a time. The worklist loop processes each
+// variant independently, restoring `ctx.currentPathCond` per
+// variant so emitTaintFlow can attach the correct per-variant
+// pathFormula to any flow it emits.
+//
+// Per-variant branching
+// ---------------------
+//
+// A BRANCH terminator splits its parent variant into up to two
+// children — one for each successor — refined according to the
+// branch outcome. The true child's pathCond conjoins the branch
+// formula; the false child's conjoins its negation. Children
+// that collapse to a Bottom register (statically infeasible)
+// are not enqueued.
+//
+// Exit state
+// ----------
+//
+// The function's exit is the list of variants that reach a
+// RETURN terminator. Callers that want a single joined view
+// (e.g. top-level trace projection) use `joinExitVariants`.
+// Callers that want per-path precision (e.g. C3 summary cache)
+// iterate the variants directly.
+//
+// Strictly iterative: no recursion. Deep call graphs cannot
+// blow the JavaScript call stack. The call stack stored in
+// ctx._callStack handles interprocedural cycle detection.
 
 'use strict';
 
@@ -16,21 +81,6 @@ const D = require('./domain.js');
 const { applyInstruction } = require('./transfer.js');
 const SMT = require('./smt.js');
 
-// Analyse one function to a fixpoint. Returns:
-//   { blockStates: Map<BlockId, State>, exitState: State }
-//
-// Arguments:
-//   module:      the IR module
-//   fn:          the function to analyse
-//   initialState: the State at the entry block (params pre-bound)
-//   ctx:         the analysis context (assumption tracker, TypeDB, ...)
-//
-// Iteration order: reverse postorder from the entry. This visits
-// every block after all its forward predecessors (except on back
-// edges from loops), so the common straight-line case converges
-// in a single pass. Back-edge changes still re-enqueue successors
-// via the monotone-growth check, guaranteeing eventual fixpoint
-// termination.
 // Build (or reuse) the function's def map: register → instruction
 // that writes it. SSA gives us the invariant that every register
 // has at most one def, so this is a simple map. Cached on the
@@ -47,232 +97,384 @@ function buildDefs(fn) {
   return defs;
 }
 
+// Add `newState` to the variant list for `blockId`. Returns a
+// descriptor: { added: boolean, variantIdx: number }.
+//
+// The equivalence check is on (regs, heap, fromBlock). Two
+// variants that arrived from different predecessors keep
+// separate entries even if their post-predecessor shapes happen
+// to match, because their phis resolve against different
+// incoming edges. Once phis are resolved and the state enters
+// the block body, `fromBlock` is immaterial — we still use it
+// for subsumption just to err toward precision.
+//
+//   * If an existing variant has the same (regs, heap) shape
+//     AND the same `fromBlock`, we merge the newcomer's
+//     pathCond and assumptionIds via disjunction / union. If
+//     the merge does not change the existing variant, `added`
+//     is false and no re-processing is required.
+//   * If the newcomer is a back-edge arrival at a loop header
+//     (`wideningJoin === true`), we pointwise-join it with any
+//     existing variant that also arrived on a back edge from
+//     the same predecessor. This collapses iteration-count
+//     differences into a single widening variant so loops
+//     converge at the lattice level rather than spawning
+//     per-iteration variants.
+//   * Otherwise the newcomer is appended and `added` is true.
+function insertVariant(blockVariants, blockId, newState, wideningJoin) {
+  let list = blockVariants.get(blockId);
+  if (!list) {
+    list = [];
+    blockVariants.set(blockId, list);
+  }
+  // Back-edge widening: fold into any variant with the same
+  // _fromBlock regardless of (regs, heap) equality.
+  if (wideningJoin) {
+    for (let i = 0; i < list.length; i++) {
+      const existing = list[i];
+      if (existing._fromBlock !== newState._fromBlock) continue;
+      const joined = D.joinStates(existing, newState);
+      if (D.stateEquals(joined, existing)) {
+        // Widening is a no-op: the existing variant already
+        // subsumes the newcomer. Still merge pathCond and
+        // assumption ids in case those are the only things
+        // that grew.
+        const mergedPath = D.joinPathConds(existing.pathCond, newState.pathCond);
+        const pcChanged = (existing.pathCond ? existing.pathCond.expr : '') !==
+          (mergedPath ? mergedPath.expr : '');
+        if (!pcChanged) return { added: false, variantIdx: i };
+        list[i] = Object.freeze({
+          regs: existing.regs,
+          heap: existing.heap,
+          pathConds: existing.pathConds,
+          pathCond: mergedPath,
+          assumptionIds: existing.assumptionIds,
+          callStack: existing.callStack,
+          _fromBlock: existing._fromBlock,
+          _frozen: true,
+        });
+        return { added: true, variantIdx: i };
+      }
+      // Widening grew the variant — replace in place and
+      // re-process. Preserve _fromBlock tag.
+      list[i] = Object.freeze({
+        regs: joined.regs,
+        heap: joined.heap,
+        pathConds: joined.pathConds,
+        pathCond: joined.pathCond,
+        assumptionIds: joined.assumptionIds,
+        callStack: joined.callStack,
+        _fromBlock: existing._fromBlock,
+        _frozen: true,
+      });
+      return { added: true, variantIdx: i };
+    }
+    // First back-edge arrival at this header: append as-is.
+    list.push(newState);
+    return { added: true, variantIdx: list.length - 1 };
+  }
+  for (let i = 0; i < list.length; i++) {
+    const existing = list[i];
+    if (existing._fromBlock !== newState._fromBlock) continue;
+    if (!D.stateEquals(existing, newState)) continue;
+    const mergedPath = D.joinPathConds(existing.pathCond, newState.pathCond);
+    const existingPcKey = existing.pathCond ? existing.pathCond.expr : '';
+    const mergedPcKey = mergedPath ? mergedPath.expr : '';
+    const pcChanged = existingPcKey !== mergedPcKey;
+    const seen = new Set(existing.assumptionIds);
+    const mergedIds = existing.assumptionIds.slice();
+    let idsChanged = false;
+    for (const id of newState.assumptionIds) {
+      if (!seen.has(id)) { seen.add(id); mergedIds.push(id); idsChanged = true; }
+    }
+    if (!pcChanged && !idsChanged) {
+      return { added: false, variantIdx: i };
+    }
+    list[i] = Object.freeze({
+      regs: existing.regs,
+      heap: existing.heap,
+      pathConds: existing.pathConds,
+      pathCond: mergedPath,
+      assumptionIds: Object.freeze(mergedIds),
+      callStack: existing.callStack,
+      _fromBlock: existing._fromBlock,
+      _frozen: true,
+    });
+    return { added: true, variantIdx: i };
+  }
+  list.push(newState);
+  return { added: true, variantIdx: list.length - 1 };
+}
+
+// Tag a state with its arriving predecessor block so phi
+// resolution at the target block can pick the correct incoming
+// edge. `fromBlock` is null for the initial-state arrival at
+// the function entry.
+function withFromBlock(state, fromBlock) {
+  return Object.freeze({
+    regs: state.regs,
+    heap: state.heap,
+    pathConds: state.pathConds,
+    pathCond: state.pathCond || null,
+    assumptionIds: state.assumptionIds,
+    callStack: state.callStack,
+    _fromBlock: fromBlock,
+    _frozen: true,
+  });
+}
+
+// Join all variants in a list into a single State, pointwise.
+// Used for backward-compatible projections (blockStates / exit
+// state / reachability) where a consumer wants a single summary
+// view rather than the per-variant list. The per-variant
+// information is still available via `blockVariants`.
+function joinVariantList(list) {
+  if (!list || list.length === 0) return null;
+  let s = list[0];
+  for (let i = 1; i < list.length; i++) s = D.joinStates(s, list[i]);
+  return s;
+}
+
 function analyseFunction(module, fn, initialState, ctx) {
   const cfg = fn.cfg;
-  const blockStates = new Map();     // BlockId → in-state (joined across all predecessors)
-  const outStates = new Map();       // BlockId → out-state (after transfer)
+
+  // Per-block in-state: each block holds a list of variants
+  // merged from its predecessors. Equivalent shapes collapse;
+  // distinct shapes stay separate so cross-register correlation
+  // survives join points.
+  const blockVariants = new Map();       // BlockId → Variant[]
+  // Per-(block, variantIdx) out-state: the state produced after
+  // running the block's instructions against that variant's
+  // in-state. Used to resolve phis for successors and to collect
+  // per-variant exit states for RETURN terminators.
+  const variantOutStates = new Map();    // BlockId → Array<State>
   const defs = buildDefs(fn);
 
-  // B3: per-block path conditions. Each entry is an SMT formula
-  // representing the disjunction of the conditions under which
-  // the block is reachable (one disjunct per incoming edge).
-  // The entry block has pathCond = null which represents
-  // unconditional reachability ("true").
-  //
-  // Tracked as a side channel so it does NOT participate in the
-  // data-lattice fixpoint check — the lattice convergence is on
-  // register/heap shape only. Path conditions are derived
-  // information used by sink classification, taint flow refutation,
-  // and the future SMT layer (Phase D).
-  //
-  // Stable-when-the-lattice-is-stable: every time a block is
-  // re-enqueued because its data lattice grew, we re-derive the
-  // edge condition and OR it into the target's pathCond. Once
-  // the data lattice reaches fixpoint, no new edges get added
-  // and the path conditions also stabilise.
-  const pathConds = new Map();       // BlockId → Formula | null
+  // Legacy per-block pathCond map, used by the tests (path-cond.test.js)
+  // and by consumers that want a single-formula-per-block view.
+  // It's the disjunction of every variant's pathCond at the block
+  // — equivalent to the old "OR over edge formulas" computation.
+  const pathConds = new Map();           // BlockId → Formula | null
 
-  // Compute reverse postorder once so the worklist visits blocks
-  // in topological-forward order. blockOrder[blockId] → integer
-  // index; lower = process earlier.
+  // Reverse postorder so blocks are processed in topological-
+  // forward order on the first pass.
   const blockOrder = computeReversePostorder(cfg);
 
-  // Priority queue keyed by blockOrder. We use a sorted array
-  // with binary insertion because the CFG sizes are small
-  // relative to a full heap's overhead.
-  const pending = [];    // sorted by blockOrder ascending
-  const queued = new Set();
-
-  // OR a new edge formula into the target block's path
-  // condition. `edgePathCond` is the formula representing the
-  // condition under which control flow reaches `blockId` along
-  // the edge being processed (typically: the source block's
-  // pathCond conjoined with the edge's branch condition). A
-  // null `edgePathCond` represents unconditional reachability
-  // and collapses the target's pathCond to null too.
+  // Identify loop-header blocks and their back-edge predecessors.
+  // A predecessor `P` of block `L` is a back-edge predecessor iff
+  // blockOrder(P) >= blockOrder(L) (under the reverse-postorder
+  // numbering, forward edges point to strictly-higher-numbered
+  // successors, so an equal-or-lower-numbered predecessor is
+  // reached from a back edge).
   //
-  // Returns true iff the target's pathCond grew, so callers can
-  // decide whether downstream consumers need a refresh. (The
-  // worklist itself only re-enqueues based on the data lattice;
-  // pathConds are read-only for the fixpoint.)
-  function orPathCond(blockId, edgePathCond) {
-    if (!pathConds.has(blockId)) {
-      pathConds.set(blockId, edgePathCond);
-      return true;
+  // backPreds: Map<BlockId, Set<PredBlockId>>
+  //
+  // At loop headers we MUST widen variants that arrive via a
+  // back edge — otherwise every loop iteration produces a new
+  // variant with a slightly-different register value, and the
+  // fixpoint never terminates in reasonable time (1000-iter
+  // loops explode to 1000 variants → ~100s walks). Forward-
+  // edge variants (from the loop pre-header) are still kept
+  // distinct so cross-register correlation across the merge
+  // of pre-loop and post-loop states is preserved.
+  const backPreds = new Map();
+  for (const [bid, blk] of cfg.blocks) {
+    for (const pred of blk.preds || []) {
+      const predOrder = blockOrder.get(pred);
+      const selfOrder = blockOrder.get(bid);
+      if (predOrder == null || selfOrder == null) continue;
+      if (predOrder >= selfOrder) {
+        if (!backPreds.has(bid)) backPreds.set(bid, new Set());
+        backPreds.get(bid).add(pred);
+      }
     }
-    const existing = pathConds.get(blockId);
-    if (existing === null) return false;       // already top
-    if (edgePathCond === null) {
-      pathConds.set(blockId, null);
-      return true;
-    }
-    // Both non-null: union them via OR. Cheap dedup: if the
-    // existing expression already contains the new one verbatim
-    // (e.g. successive iterations of the same edge), don't
-    // re-OR.
-    if (existing.expr === edgePathCond.expr) return false;
-    const merged = SMT.mkOr(existing, edgePathCond);
-    if (merged && merged.expr === existing.expr) return false;
-    pathConds.set(blockId, merged);
-    return true;
   }
 
-  // enqueue(blockId, incoming, edgePathCond?)
-  //
-  // edgePathCond, when present, is the formula that must hold
-  // for control flow to reach `blockId` along this edge. The
-  // target block's accumulated pathCond is ORed with this value.
-  // Default (omitted) means "unconditional edge" — the target's
-  // pathCond becomes null (top).
-  function enqueue(blockId, incoming, edgePathCond) {
-    // Update pathConds first; this is independent of whether
-    // the data lattice grew.
-    orPathCond(blockId, edgePathCond === undefined ? null : edgePathCond);
+  // Priority queue of (blockId, variantIdx) pairs to process,
+  // keyed primarily by blockOrder (so forward blocks run before
+  // back-edge re-enqueues). We use a plain array + sorted
+  // insertion because CFG sizes are small.
+  const pending = [];
+  const queuedKeys = new Set();    // dedup: "blockId:variantIdx"
 
-    const existing = blockStates.get(blockId);
-    const joined = existing ? D.joinStates(existing, incoming) : incoming;
-    if (existing && D.stateEquals(existing, joined)) return;
-    blockStates.set(blockId, joined);
-    if (queued.has(blockId)) return;
-    queued.add(blockId);
-    // Insert into `pending` keeping it sorted by blockOrder.
-    const order = blockOrder.get(blockId);
+  function makeKey(blockId, variantIdx) {
+    return blockId + ':' + variantIdx;
+  }
+
+  function enqueueVariant(blockId, variantIdx) {
+    const key = makeKey(blockId, variantIdx);
+    if (queuedKeys.has(key)) return;
+    queuedKeys.add(key);
+    const order = blockOrder.get(blockId) || 0;
     let lo = 0, hi = pending.length;
     while (lo < hi) {
       const mid = (lo + hi) >> 1;
-      if (blockOrder.get(pending[mid]) <= order) lo = mid + 1;
+      const midOrder = blockOrder.get(pending[mid].blockId) || 0;
+      if (midOrder <= order) lo = mid + 1;
       else hi = mid;
     }
-    pending.splice(lo, 0, blockId);
-  }
-  function dequeue() {
-    const b = pending.shift();
-    queued.delete(b);
-    return b;
+    pending.splice(lo, 0, { blockId, variantIdx });
   }
 
-  // Entry block is unconditionally reachable.
-  enqueue(cfg.entry, initialState, null);
+  // Add a state to a block's variant list, re-enqueue if it's a
+  // new or grown variant, and update the legacy pathConds map
+  // from the merged block disjunction. `fromBlock` identifies
+  // the predecessor block whose terminator is enqueueing this
+  // edge — we eagerly resolve the target's phis *here* at
+  // enqueue time, using the specific predecessor's state, so
+  // each variant at `blockId` carries its own correlated phi
+  // outputs rather than pulling from a pooled predecessor
+  // out-state list. This is what preserves cross-register
+  // correlation through nested join points: two variants
+  // arriving from the same predecessor-by-name but with
+  // different (kind, data) shapes produce distinct successor
+  // variants rather than collapsing through a join.
+  //
+  // Back-edge widening: if the edge is a back edge (fromBlock
+  // is a back-edge predecessor of blockId), the new variant
+  // gets pointwise-joined with any existing variant that also
+  // arrived via a back edge. This ensures loop iterations
+  // converge to a single widening variant rather than producing
+  // a fresh variant per iteration count. Forward edges from the
+  // loop pre-header stay distinct.
+  function enqueue(blockId, state, fromBlock) {
+    const target = cfg.blocks.get(blockId);
+    let baked = state;
+    if (target && fromBlock != null) {
+      baked = bakePhis(target, state, fromBlock);
+    }
+    const stamped = withFromBlock(baked, fromBlock);
+    const isBackEdge = fromBlock != null && backPreds.has(blockId) &&
+      backPreds.get(blockId).has(fromBlock);
+    const { added, variantIdx } = insertVariant(blockVariants, blockId, stamped, isBackEdge);
+    // Update legacy pathConds projection: disjunction over all
+    // variants at this block.
+    const list = blockVariants.get(blockId);
+    let disj = null;
+    let anyNull = false;
+    for (const v of list) {
+      if (v.pathCond == null) { anyNull = true; break; }
+      disj = disj ? D.joinPathConds(disj, v.pathCond) : v.pathCond;
+    }
+    pathConds.set(blockId, anyNull ? null : disj);
 
-  // No iteration cap. The lattice is monotone with finite height
-  // — each register draws from a Value lattice whose height is
-  // bounded by the number of distinct concrete values observed
-  // in the program — so ascending chains terminate. An iteration
-  // cap would mask a bug in the lattice ops by cutting off the
-  // fixpoint early, producing silently unsound results. If the
-  // fixpoint doesn't terminate, that is a bug the user must see
-  // by having the analysis hang rather than silently give up.
+    if (added) enqueueVariant(blockId, variantIdx);
+  }
+
+  // Entry block is unconditionally reachable. The initial state's
+  // pathCond is forced to null (top) so entry-block flows have
+  // no reachability constraint.
+  const entryState = D.withPathCond(initialState, null);
+  enqueue(cfg.entry, entryState, null);
+
+  // No iteration cap. The value lattice has finite height and
+  // the per-block variant set is bounded by the distinct
+  // (regs, heap) shapes reachable at that block, so the
+  // fixpoint terminates without an artificial limit.
   while (pending.length > 0) {
-    const blockId = dequeue();
+    const { blockId, variantIdx } = pending.shift();
+    queuedKeys.delete(makeKey(blockId, variantIdx));
+
     const block = cfg.blocks.get(blockId);
     if (!block) continue;
-    const inState = blockStates.get(blockId);
-    let state = resolvePhis(block, inState, blockStates, outStates);
+    const variants = blockVariants.get(blockId);
+    if (!variants || variantIdx >= variants.length) continue;
+    const inState = variants[variantIdx];
 
-    // Expose the current block's path condition to the transfer
-    // functions so sink emission can attach it to the resulting
-    // taint flow record. This is a side channel — transfer.js
-    // is not allowed to mutate it; it's read-only context.
-    const currentPathCond = pathConds.has(blockId) ? pathConds.get(blockId) : null;
+    // Phis were resolved eagerly at enqueue time (bakePhis).
+    // For variants arriving via the initial-state entry where
+    // fromBlock is null, there are no phis to resolve (the
+    // function entry block has no predecessors in the CFG
+    // sense, so its IR never contains phi instructions).
+    let state = inState;
+
+    // Expose the variant's path condition to the transfer
+    // functions so sink emission attaches the correct
+    // per-variant pathFormula. ctx.currentPathCond is a
+    // read-only side channel; transfer functions must not
+    // mutate it.
+    const currentPathCond = state.pathCond;
     const prevPathCond = ctx.currentPathCond;
     ctx.currentPathCond = currentPathCond;
     ctx.currentBlockId = blockId;
 
-    // Intra-block fast path: unfreeze the state so register writes
-    // mutate the Map in place instead of cloning on every instr.
-    // This turns the per-block transfer cost from O(instrs × regs)
-    // into O(instrs). We re-freeze before the state leaves the
-    // block so joins at merge points still see an immutable value.
+    // Intra-block fast path: unfreeze, write in place, refreeze.
+    // PHI instructions are already resolved by bakePhis at enqueue
+    // time, so we skip them in the block body. Skipping is
+    // important for correctness as well as performance: running
+    // applyInstruction on a PHI would re-join across all
+    // predecessors and clobber the per-variant values we just
+    // baked in.
     state = D.unfreezeState(state);
     for (const instr of block.instructions) {
+      if (instr.op === OP.PHI) continue;
       state = applyInstruction(ctx, state, instr);
     }
     state = D.freezeState(state);
 
     ctx.currentPathCond = prevPathCond;
 
-    outStates.set(blockId, state);
+    // Stash the per-variant out-state for phi resolution in
+    // successors and for exit collection.
+    let outList = variantOutStates.get(blockId);
+    if (!outList) { outList = []; variantOutStates.set(blockId, outList); }
+    outList[variantIdx] = state;
 
-    // Handle the terminator: queue successors with their appropriate
-    // incoming state. Each enqueue also propagates a per-edge
-    // path-condition formula derived from this block's accumulated
-    // pathCond and (for branches) the branch test.
+    // Handle the terminator: queue each successor with a
+    // refined / re-conditioned variant. The variant's pathCond
+    // is preserved across a JUMP and conjoined with the branch
+    // outcome across a BRANCH.
     const term = block.terminator;
     if (!term) continue;
 
-    // The path condition under which control flow reaches this
-    // block. null = unconditionally reachable.
-    const blockPathCond = pathConds.has(blockId) ? pathConds.get(blockId) : null;
+    const varPathCond = state.pathCond;
 
     switch (term.op) {
       case OP.JUMP: {
-        // Unconditional edge: target inherits this block's pathCond.
-        enqueue(term.target, state, blockPathCond);
+        // Unconditional edge: target inherits this variant's pathCond.
+        enqueue(term.target, state, blockId);
         break;
       }
       case OP.BRANCH: {
         const cond = D.getReg(state, term.cond);
         const truthy = D.truthiness(cond);
-        // Layer 1-2 reachability: concrete truth value decides both
-        // successors unambiguously. The "taken" successor inherits
-        // the block's pathCond unchanged; the other side is dead.
         if (truthy === true) {
-          enqueue(term.trueTarget, state, blockPathCond);
+          enqueue(term.trueTarget, state, blockId);
         } else if (truthy === false) {
-          enqueue(term.falseTarget, state, blockPathCond);
+          enqueue(term.falseTarget, state, blockId);
         } else {
-          // Unknown: both successors are reachable. Build the
-          // edge formula from the cond value's symbolic formula
-          // (B2 ensures most condition values carry one) and
-          // conjoin it with the source block's pathCond.
-          //
-          // True edge:  blockPathCond ∧ cond
-          // False edge: blockPathCond ∧ ¬cond
-          //
-          // If cond has no formula, we fall back to passing the
-          // source pathCond unchanged on both sides — which is
-          // sound (we just lose precision on this branch).
+          // Unknown truth: split this variant into its two
+          // children. Each child gets the refined register map
+          // and the branch formula conjoined into its pathCond.
           const condForm = (cond && cond.formula) ? cond.formula : null;
-          let trueEdge, falseEdge;
+          let trueEdge = varPathCond, falseEdge = varPathCond;
           if (condForm) {
-            trueEdge = blockPathCond
-              ? SMT.mkAnd(blockPathCond, condForm)
+            trueEdge = varPathCond
+              ? SMT.mkAnd(varPathCond, condForm)
               : condForm;
             const negCond = SMT.mkNot(condForm);
-            falseEdge = blockPathCond
-              ? SMT.mkAnd(blockPathCond, negCond)
+            falseEdge = varPathCond
+              ? SMT.mkAnd(varPathCond, negCond)
               : negCond;
-          } else {
-            trueEdge = blockPathCond;
-            falseEdge = blockPathCond;
           }
 
-          // B5 + Wave 1: refine the operand registers on each
-          // successor. Look up the def of `term.cond` to see if
-          // it's a refinable comparison (=== / !== / == / !=),
-          // an `instanceof`, or a `typeof x === "..."` pattern.
-          // If yes, narrow the operand (or the inner typeof
-          // operand) so a contradictory branch becomes Bottom
-          // and the dead successor is dropped from the worklist.
+          // Value-level branch refinement (B5 + Wave 1).
           const trueState = refineForBranch(state, term.cond, defs, true, ctx.typeDB);
           const falseState = refineForBranch(state, term.cond, defs, false, ctx.typeDB);
-
-          // After refinement, check whether a successor's state
-          // contains a Bottom register that the branch test
-          // depends on — that successor is dead. (We only mark
-          // a successor dead when refinement collapsed the
-          // refined register itself to Bottom, not other regs.)
           const trueDead = refinementContradicts(state, trueState);
           const falseDead = refinementContradicts(state, falseState);
 
-          if (!trueDead) enqueue(term.trueTarget, trueState, trueEdge);
-          if (!falseDead) enqueue(term.falseTarget, falseState, falseEdge);
+          if (!trueDead) {
+            enqueue(term.trueTarget, D.withPathCond(trueState, trueEdge), blockId);
+          }
+          if (!falseDead) {
+            enqueue(term.falseTarget, D.withPathCond(falseState, falseEdge), blockId);
+          }
         }
         break;
       }
       case OP.RETURN: {
-        // Nothing to do — the function's exit state is the join of
-        // all Return-terminator blocks. We collect them below.
+        // Nothing more to do — exit state is collected below.
         break;
       }
       case OP.THROW: {
@@ -281,11 +483,12 @@ function analyseFunction(module, fn, initialState, ctx) {
         break;
       }
       case OP.SWITCH: {
-        // Switch-case path conditions are not yet refined per
-        // case (B3 only handles binary branches). Each successor
-        // inherits the source pathCond unchanged.
-        for (const c of term.cases) enqueue(c.target, state, blockPathCond);
-        if (term.default) enqueue(term.default, state, blockPathCond);
+        // Each case successor inherits the variant's pathCond
+        // unchanged. Per-case refinement of the discriminant is
+        // handled at IR lowering time via explicit equality
+        // tests (Wave 9 switch lowering).
+        for (const c of term.cases) enqueue(c.target, state, blockId);
+        if (term.default) enqueue(term.default, state, blockId);
         break;
       }
       case OP.UNREACHABLE: break;
@@ -294,20 +497,51 @@ function analyseFunction(module, fn, initialState, ctx) {
     }
   }
 
-  // Collect the exit state: join the out-states of every block
-  // that ends in Return. If the function has no explicit return
-  // (void function), the exit is whatever block falls through.
-  let exitState = null;
+  // Backward-compatible blockStates view: pointwise join of each
+  // block's variants. Consumers that want per-variant precision
+  // can read `blockVariants` directly.
+  const blockStates = new Map();
+  const outStates = new Map();
+  for (const [blockId, list] of blockVariants) {
+    const joined = joinVariantList(list);
+    if (joined) blockStates.set(blockId, joined);
+  }
+  for (const [blockId, list] of variantOutStates) {
+    const joined = joinVariantList(list.filter(Boolean));
+    if (joined) outStates.set(blockId, joined);
+  }
+
+  // Exit state: collect every variant that reached a RETURN
+  // terminator. For backward compatibility we also expose a
+  // joined `exitState` for consumers that want a single view.
+  const exitVariants = [];
   for (const [blockId, block] of cfg.blocks) {
     const t = block.terminator;
     if (t && t.op === OP.RETURN) {
-      const s = outStates.get(blockId);
-      if (s) exitState = exitState ? D.joinStates(exitState, s) : s;
+      const list = variantOutStates.get(blockId);
+      if (list) for (const s of list) if (s) exitVariants.push(s);
     }
   }
-  if (!exitState) exitState = outStates.get(cfg.exit) || initialState;
+  // If the function has no explicit Return-terminated block
+  // (void function), fall back to the exit block's variants.
+  if (exitVariants.length === 0) {
+    const list = variantOutStates.get(cfg.exit);
+    if (list) for (const s of list) if (s) exitVariants.push(s);
+  }
+  let exitState = null;
+  for (const s of exitVariants) {
+    exitState = exitState ? D.joinStates(exitState, s) : s;
+  }
+  if (!exitState) exitState = initialState;
 
-  return { blockStates, outStates, exitState, pathConds };
+  return {
+    blockStates,
+    outStates,
+    exitState,
+    exitVariants,
+    blockVariants,
+    pathConds,
+  };
 }
 
 // B5: refine the state across a branch edge. If `condReg` is
@@ -336,13 +570,6 @@ function refineForBranch(state, condReg, defs, taken, db) {
   const op = def.operator;
 
   // --- instanceof refinement ---
-  //
-  // `x instanceof Ctor` — the BinOp's left is the value, right
-  // is the constructor reference. On the true successor x is
-  // narrowed via refineInstanceof; on the false successor via
-  // refineNotInstanceof. The constructor name is recovered by
-  // walking back to the def of the right operand (typically a
-  // GetGlobal whose `name` is the ctor identifier).
   if (op === 'instanceof') {
     const ctorName = resolveCtorName(state, defs, def.right);
     if (!ctorName) return state;
@@ -363,7 +590,6 @@ function refineForBranch(state, condReg, defs, taken, db) {
 
   const lv = D.getReg(state, def.left);
   const rv = D.getReg(state, def.right);
-  // Find the literal side and the variable side.
   let varReg = null;
   let lit = undefined;
   if (lv && lv.kind === D.V.CONCRETE && isPrimitive(lv.value)) {
@@ -380,11 +606,6 @@ function refineForBranch(state, condReg, defs, taken, db) {
   if (!varValue) return state;
 
   // --- typeof refinement ---
-  //
-  // If the variable side's def is a UnOp(typeof, x), and the
-  // literal is a string, this is `typeof x === "string"`. Refine
-  // x by type instead of by equality on the typeof result — the
-  // underlying register is x, not the result of typeof.
   const varDef = defs.get(varReg);
   if (varDef && varDef.op === OP.UN_OP && varDef.operator === 'typeof' &&
       typeof lit === 'string') {
@@ -416,13 +637,6 @@ function refineForBranch(state, condReg, defs, taken, db) {
   return D.setReg(state, varReg, refined);
 }
 
-// Resolve the constructor name on the right-hand side of an
-// `instanceof` expression. The right side is typically a
-// reference to a global constructor like `HTMLAnchorElement`,
-// which the IR lowers as a GetGlobal whose `name` is the
-// identifier. We look through the def chain to recover the name.
-// A single level of GetProp (`window.HTMLAnchorElement`) is also
-// resolved.
 function resolveCtorName(state, defs, ctorReg) {
   const ctorDef = defs.get(ctorReg);
   if (!ctorDef) return null;
@@ -431,9 +645,6 @@ function resolveCtorName(state, defs, ctorReg) {
   return null;
 }
 
-// True iff a primitive lattice value is a non-object — these are
-// the only operands B5 refines across (x === "admin", x === 1,
-// x === null, x === undefined, x === true).
 function isPrimitive(v) {
   if (v === null || v === undefined) return true;
   const t = typeof v;
@@ -441,9 +652,8 @@ function isPrimitive(v) {
 }
 
 // True iff `refined` contains a register that's been narrowed
-// to Bottom relative to `original`. We compare the entire reg
-// table for any new Bottom — a single bottom is enough to mark
-// the successor as unreachable.
+// to Bottom relative to `original`. A single bottom is enough
+// to mark the successor as unreachable.
 function refinementContradicts(original, refined) {
   if (original === refined) return false;
   for (const [reg, value] of D.overlayEntries(refined.regs)) {
@@ -455,16 +665,10 @@ function refinementContradicts(original, refined) {
   return false;
 }
 
-// Compute reverse postorder of CFG blocks starting from the
-// entry. Returns a Map<BlockId, integer> where smaller integers
-// come earlier in the order. Implementation: iterative DFS with
-// explicit stack, recording blocks in postorder, then reversing.
 function computeReversePostorder(cfg) {
   const order = new Map();
   const postorder = [];
   const visited = new Set();
-  // Explicit DFS stack: entries are {blockId, childIndex}.
-  // childIndex tracks how many successors we've pushed so far.
   const stack = [{ blockId: cfg.entry, childIndex: 0 }];
   visited.add(cfg.entry);
   while (stack.length > 0) {
@@ -482,12 +686,9 @@ function computeReversePostorder(cfg) {
     postorder.push(top.blockId);
     stack.pop();
   }
-  // Reverse postorder: the last-finished block gets index 0.
   for (let i = 0; i < postorder.length; i++) {
     order.set(postorder[postorder.length - 1 - i], i);
   }
-  // Any block not reached by the DFS (dead code) gets a high
-  // index so it's processed last if it ever enters the queue.
   let nextUnreached = postorder.length;
   for (const [blockId] of cfg.blocks) {
     if (!order.has(blockId)) order.set(blockId, nextUnreached++);
@@ -495,19 +696,114 @@ function computeReversePostorder(cfg) {
   return order;
 }
 
-// Resolve any Phi instructions at the start of `block` by picking
-// the appropriate source register from each predecessor's out-state
-// and joining them.
-function resolvePhis(block, inState, blockStates, outStates) {
+// bakePhis — eagerly resolve the target block's phis using the
+// predecessor variant's state, writing the phi dest registers
+// into the outgoing state. Called at terminator time so each
+// enqueued successor variant carries its own correlated phi
+// values. After baking, `resolvePhis` at the target block is
+// effectively a no-op (it sees the dest regs already bound).
+//
+// The phi's `incoming` list is keyed by predecessor block id;
+// we pick the entry whose `pred` matches `fromBlock` and read
+// the source register from `predState` (the outgoing state of
+// the predecessor, NOT from any pooled variantOutStates list).
+// This is exactly the semantics of SSA phi resolution at the
+// predecessor side of the edge, and it preserves cross-register
+// correlation because every variant carries its own register
+// map into the target block.
+//
+// If no incoming matches the predecessor (shouldn't happen for
+// a well-formed CFG, but we stay total just in case), the phi
+// dest is left unchanged — the target's existing value (if any)
+// is preserved.
+function bakePhis(targetBlock, predState, fromBlock) {
+  let state = predState;
+  for (const instr of targetBlock.instructions) {
+    if (instr.op !== OP.PHI) break;
+    let selected = null;
+    for (const { pred, value } of instr.incoming) {
+      if (pred !== fromBlock) continue;
+      const v = D.getReg(predState, value);
+      selected = selected == null ? v : D.join(selected, v);
+    }
+    if (selected != null) {
+      state = D.setReg(state, instr.dest, selected);
+    }
+  }
+  return state;
+}
+
+// Resolve any Phi instructions at the start of `block` by
+// picking the appropriate source register from the predecessor
+// the incoming variant arrived from.
+//
+// Multi-variant semantics: each variant carries `_fromBlock`
+// identifying the predecessor whose terminator enqueued it.
+// The phi picks the value written in THAT predecessor's
+// out-state — NOT the pointwise join across all predecessors
+// — so cross-register correlation through the join point is
+// preserved. After `if (c) { x=1; y="a"; } else { x=2; y="b"; }`,
+// a variant arriving from the true-branch predecessor resolves
+// its phis to { x=1, y="a" }, and a variant from the false-
+// branch predecessor resolves to { x=2, y="b" } — two distinct
+// variants at the join block. A later `if (x === 1)` can then
+// refine away one of them entirely, eliminating spurious sink
+// flows that would fire under the pointwise-joined y = oneOf.
+//
+// Per-predecessor precision: when multiple variants from the
+// SAME predecessor contributed, we pointwise-join only those
+// (they represent distinct paths ALREADY separated by earlier
+// splits, and joining them here corresponds to the single
+// source-level write at the predecessor's terminator).
+//
+// Fallback: if `_fromBlock` is null or unknown (initial entry
+// state, or a variant whose origin got lost through an
+// intermediate collapse), join across every predecessor's
+// out-states. This stays sound — it's the old pointwise join.
+function resolvePhis(block, inState, variantOutStates) {
+  const from = inState._fromBlock;
   let state = inState;
   for (const instr of block.instructions) {
-    if (instr.op !== OP.PHI) break;   // phis are always at the top
+    if (instr.op !== OP.PHI) break;
     let merged = D.bottom();
-    for (const { pred, value } of instr.incoming) {
-      const predOut = outStates.get(pred);
-      if (!predOut) continue;          // pred not yet walked — fine, monotone join will pick it up on a later iteration
-      const v = D.getReg(predOut, value);
-      merged = D.join(merged, v);
+    if (from != null) {
+      // Find the incoming whose pred matches the variant's
+      // arrival block.
+      let matched = false;
+      for (const { pred, value } of instr.incoming) {
+        if (pred !== from) continue;
+        matched = true;
+        const predList = variantOutStates.get(pred);
+        if (!predList) continue;
+        for (const predOut of predList) {
+          if (!predOut) continue;
+          const v = D.getReg(predOut, value);
+          merged = D.join(merged, v);
+        }
+      }
+      if (!matched) {
+        // No incoming matched our _fromBlock — fall back to
+        // the pointwise join so the phi still has a value.
+        for (const { pred, value } of instr.incoming) {
+          const predList = variantOutStates.get(pred);
+          if (!predList) continue;
+          for (const predOut of predList) {
+            if (!predOut) continue;
+            const v = D.getReg(predOut, value);
+            merged = D.join(merged, v);
+          }
+        }
+      }
+    } else {
+      for (const { pred, value } of instr.incoming) {
+        const predList = variantOutStates.get(pred);
+        if (!predList) continue;
+        for (const predOut of predList) {
+          if (!predOut) continue;
+          const v = D.getReg(predOut, value);
+          merged = D.join(merged, v);
+        }
+      }
     }
     state = D.setReg(state, instr.dest, merged);
   }
