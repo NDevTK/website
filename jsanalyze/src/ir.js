@@ -585,6 +585,7 @@ function lowerStatement(ctx, node) {
     case 'ContinueStatement':  return lowerContinue(ctx, node, loc);
     case 'TryStatement':       return beginTry(ctx, node, loc);
     case 'ThrowStatement':     return lowerThrow(ctx, node, loc);
+    case 'WithStatement':      return lowerWith(ctx, node, loc);
     case 'EmptyStatement':      return;
     case 'UnimplementedStatement': {
       const dest = newRegister(ctx.module);
@@ -1783,6 +1784,27 @@ function finishTryFinallyStep(ctx, task) {
     addEdge(finallyExitBlock, task.mergeBlock);
   }
   ctx.currentBlock = task.mergeBlock;
+}
+
+// `with (obj) body` — legacy dynamic scope extension. We
+// evaluate `obj` for its side effects and raise an
+// UNIMPLEMENTED assumption flagging the precision gap
+// (identifier → property lookups through the with-object are
+// not modeled). The body is lowered as a regular statement.
+// Taint flows through explicit statements in the body; only
+// implicit dynamic lookups are imprecise.
+function lowerWith(ctx, node, loc) {
+  if (node.object) lowerExpression(ctx, node.object);
+  ctx.assumptions.raise(
+    REASONS.UNIMPLEMENTED,
+    'with statement — dynamic scope extension not modeled; identifier-as-property lookups through the with object fall back to the enclosing scope',
+    loc
+  );
+  // Lower the body inline. It's already a single Statement
+  // (typically a BlockStatement).
+  if (node.body) {
+    ctx._work.push({ kind: 'lower_stmt', node: node.body });
+  }
 }
 
 function lowerThrow(ctx, node, loc) {

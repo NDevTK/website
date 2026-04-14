@@ -1768,6 +1768,9 @@ function parseStatement(lexer) {
       case 'finish_try_finally':
         finishTryFinally(task, outputs);
         break;
+      case 'finish_with':
+        finishWith(task, outputs);
+        break;
       case 'block_body':
         blockBodyStep(lexer, task, tasks, outputs);
         break;
@@ -1974,6 +1977,27 @@ function beginStatement(lexer, tasks, outputs) {
     outputs.push(mkClassDeclaration(id, superClass, body, t));
     return;
   }
+  // --- with statement ---
+  //
+  // `with (obj) body;` dynamically adds obj's properties to
+  // the scope chain for resolutions inside body. It's legacy
+  // JS (forbidden in strict mode) but still parseable. We
+  // lower it by evaluating obj for its side effects, raising
+  // an UNIMPLEMENTED assumption to flag the precision gap
+  // (identifier → property lookups via the dynamic scope are
+  // not modeled), and then processing the body as if the
+  // `with` wasn't there. This is sound for taint flowing
+  // through the body's explicit statements, only imprecise
+  // for implicit property reads through the with object.
+  if (label === 'with') {
+    lexer.advance();
+    expect(lexer, '(');
+    const obj = parseExpression(lexer);
+    expect(lexer, ')');
+    tasks.push({ kind: 'finish_with', startTok: t, obj });
+    tasks.push({ kind: 'parse_stmt' });
+    return;
+  }
   // --- try / catch / finally ---
   if (label === 'try') {
     lexer.advance();
@@ -2031,7 +2055,7 @@ function beginStatement(lexer, tasks, outputs) {
 // until the corresponding transfer function is written.
 const UNHANDLED_STATEMENT_KEYWORDS = new Set([
   'switch',
-  'with', 'import', 'export',
+  'import', 'export',
 ]);
 
 function isUnhandledStatementKeyword(label) {
@@ -2411,6 +2435,24 @@ function finishTryCatch(lexer, task, tasks, outputs) {
 function finishTryFinally(task, outputs) {
   const finalizer = outputs.pop();
   outputs.push(mkTryStatement(task.block, task.handler, finalizer, task.startTok));
+}
+
+function finishWith(task, outputs) {
+  const body = outputs.pop();
+  outputs.push(mkWithStatement(task.obj, body, task.startTok));
+}
+
+function mkWithStatement(object, body, startTok) {
+  return {
+    type: 'WithStatement',
+    object,
+    body,
+    loc: startTok && startTok.loc && body && body.loc
+      ? { start: startTok.loc.start, end: body.loc.end }
+      : null,
+    start: startTok ? startTok.start : 0,
+    end:   body ? body.end : 0,
+  };
 }
 
 // parseVarDeclarationsInFor — like parseVarDeclarations but does

@@ -185,12 +185,12 @@ const tests = [
   {
     name: 'analyse: unimplemented statement raises soundness assumption',
     fn: () => {
-      // `with` is still unimplemented (and likely to stay).
-      // Loops became supported in Wave 3, try/catch in Wave 4.
-      const r = analyse('with (obj) { x = 1; }');
+      // `switch` is still unimplemented (Wave 9 territory).
+      // Loops / try/catch / with all lowered in earlier waves.
+      const r = analyse('switch (x) { case 1: y = 1; break; }');
       const snap = r.ctx.assumptions.snapshot();
       const hasUnimpl = snap.some(a => a.reason === 'unimplemented');
-      assert(hasUnimpl, 'expected unimplemented assumption for with-statement');
+      assert(hasUnimpl, 'expected unimplemented assumption for switch');
       const unimpl = snap.find(a => a.reason === 'unimplemented');
       assertEqual(unimpl.severity, 'soundness');
     },
