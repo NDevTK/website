@@ -629,6 +629,27 @@ function emitFromTemplate(jsSource, ih) {
     };
   }
 
+  if (tmpl.kind === 'append') {
+    // `el.innerHTML += <rhs>` — append, not replace. Emits
+    // createElement / appendChild calls targeted at the
+    // receiver; no replaceChildren, so existing children
+    // stay in place.
+    const receiver = jsSource.slice(tmpl.receiver.start, tmpl.receiver.end);
+    let body;
+    if (tmpl.nodes) {
+      body = emitDomCalls(tmpl.nodes, receiver);
+    } else if (tmpl.child) {
+      body = emitChildBlock(tmpl.child, receiver, jsSource).join('\n');
+    } else {
+      return null;
+    }
+    return {
+      start: tmpl.rangeStart,
+      end: tmpl.rangeEnd,
+      replacement: body,
+    };
+  }
+
   if (tmpl.kind === 'switch') {
     const receiver = jsSource.slice(tmpl.receiver.start, tmpl.receiver.end);
     const discSrc = jsSource.slice(tmpl.discriminant.start, tmpl.discriminant.end);

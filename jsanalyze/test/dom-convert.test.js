@@ -795,6 +795,45 @@ const tests = [
     },
   },
   {
+    name: 'dom-convert js: innerHTML += concat → appendChild per item',
+    fn: async () => {
+      const src = [
+        'var item = "hello";',
+        'var el = document.getElementById("list");',
+        'el.innerHTML += "<li>" + item + "</li>";',
+      ].join('\n');
+      const out = await convertJs(src);
+      assert(/createElement\("li"\)/.test(out),
+        'li created: ' + out);
+      assert(/el\.appendChild/.test(out),
+        'appendChild on receiver: ' + out);
+      assert(!/replaceChildren/.test(out),
+        '+= must not emit replaceChildren: ' + out);
+      assert(!/innerHTML \+=/.test(out),
+        'original += removed: ' + out);
+      assert(/createTextNode\(item\)/.test(out),
+        'text expression preserved: ' + out);
+    },
+  },
+  {
+    name: 'dom-convert js: innerHTML += literal → createElement appendChild',
+    fn: async () => {
+      const src = [
+        'var el = document.getElementById("list");',
+        'el.innerHTML += "<li>hi</li>";',
+      ].join('\n');
+      const out = await convertJs(src);
+      assert(/createElement\("li"\)/.test(out),
+        'li created: ' + out);
+      assert(/el\.appendChild/.test(out),
+        'appendChild on receiver: ' + out);
+      assert(!/replaceChildren/.test(out),
+        'literal += must not emit replaceChildren: ' + out);
+      assert(!/innerHTML \+=/.test(out),
+        'original += removed: ' + out);
+    },
+  },
+  {
     name: 'dom-convert js: outerHTML = literal → parentNode.replaceChild',
     fn: async () => {
       const src = [

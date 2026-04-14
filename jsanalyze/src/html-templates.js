@@ -172,12 +172,23 @@ function extractTemplate(jsSource, assignStmtPos, filename, astCache) {
   const assignStmt = stmts[assignIdx];
   if (assignStmt.type !== 'ExpressionStatement') return null;
   const expr = assignStmt.expression;
-  if (!expr || expr.type !== 'AssignmentExpression' || expr.operator !== '=') return null;
+  if (!expr || expr.type !== 'AssignmentExpression') return null;
+  if (expr.operator !== '=' && expr.operator !== '+=') return null;
   const lhs = expr.left;
   const rhs = expr.right;
   if (!lhs || lhs.type !== 'MemberExpression') return null;
   if (lhs.computed || !lhs.property || lhs.property.type !== 'Identifier') return null;
   if (lhs.property.name !== 'innerHTML' && lhs.property.name !== 'outerHTML') return null;
+
+  // `el.innerHTML += <rhs>` — append-shaped assignment. The
+  // semantic difference from `=` is that there is no
+  // replaceChildren(); the new nodes are appended to the
+  // receiver. The template extractor produces an `append`
+  // template describing the new nodes, and the consumer
+  // emits appendChild calls directly on the receiver.
+  if (expr.operator === '+=') {
+    return extractAppend(jsSource, stmts, assignStmt, assignIdx, lhs.object, rhs);
+  }
 
   // The RHS must be a plain Identifier referencing an
   // accumulator variable or a string concatenation / literal.
@@ -196,6 +207,63 @@ function extractTemplate(jsSource, assignStmtPos, filename, astCache) {
   }
 
   return { kind: 'opaque', reason: 'unrecognised rhs shape' };
+}
+
+// extractAppend — build an `append` template for `el.innerHTML
+// += <rhs>`. Two RHS shapes are accepted:
+//
+//   1. Literal string — parse via html.parse; the template
+//      carries the parsed node list and the consumer emits
+//      createElement / appendChild calls without a preceding
+//      replaceChildren.
+//
+//   2. Concat chain (BinaryExpression of `+`) — flatten
+//      via flattenConcat and match the single-child shape
+//      from parseLoopBodyFragments. The template carries
+//      the parsed child descriptor so the consumer emits
+//      one appendChild per iteration.
+//
+// Anything else falls to opaque so the consumer leaves the
+// site alone.
+//
+// HtmlTemplate shape for append:
+//   { kind: 'append';
+//     receiver: { start, end };
+//     nodes: HtmlNode[] | null;         -- literal rhs
+//     child: ChildShape | null;          -- concat rhs
+//     rangeStart, rangeEnd }
+function extractAppend(jsSource, stmts, assignStmt, assignIdx, receiverNode, rhs) {
+  if (rhs && rhs.type === 'Literal' && typeof rhs.value === 'string') {
+    return {
+      kind: 'append',
+      receiver: { start: receiverNode.start, end: receiverNode.end },
+      nodes: html.parse(rhs.value),
+      child: null,
+      rangeStart: assignStmt.start,
+      rangeEnd: assignStmt.end,
+    };
+  }
+  const frags = flattenConcat(rhs);
+  if (frags) {
+    const parsed = parseLoopBodyFragments(frags);
+    if (parsed) {
+      return {
+        kind: 'append',
+        receiver: { start: receiverNode.start, end: receiverNode.end },
+        nodes: null,
+        child: {
+          tag: parsed.childTag,
+          attrs: parsed.childAttrs,
+          textExpr: parsed.textExpr
+            ? { start: parsed.textExpr.start, end: parsed.textExpr.end }
+            : null,
+        },
+        rangeStart: assignStmt.start,
+        rangeEnd: assignStmt.end,
+      };
+    }
+  }
+  return { kind: 'opaque', reason: 'append rhs not recognised' };
 }
 
 function getAst(jsSource, filename, astCache) {
