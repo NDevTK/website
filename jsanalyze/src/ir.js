@@ -1731,11 +1731,6 @@ function lowerVarDecl(ctx, node, loc) {
     : BIND.VAR;
 
   for (const decl of node.declarations) {
-    if (decl.id.type !== 'Identifier') {
-      // Destructuring — not yet implemented.
-      lowerUnimplementedStmt(ctx, decl, loc);
-      continue;
-    }
     let reg;
     if (decl.init) {
       reg = lowerExpression(ctx, decl.init);
@@ -1745,14 +1740,133 @@ function lowerVarDecl(ctx, node, loc) {
         op: OP.CONST, dest: reg, value: undefined,
       }, loc);
     }
-    // var / function  → hoisted into the nearest function frame.
-    // let / const     → block-scoped in the innermost frame.
-    if (bindingKind === BIND.VAR) {
-      defineHoisted(ctx.scope, decl.id.name, reg, BIND.VAR);
-    } else {
-      defineLexical(ctx.scope, decl.id.name, reg, bindingKind);
-    }
+    // Destructure the binding target. For plain identifiers
+    // this just defines the name; for ObjectPattern / ArrayPattern
+    // / AssignmentPattern we recursively emit property reads
+    // and defaults.
+    bindDestructuringTarget(ctx, decl.id, reg, bindingKind, loc);
   }
+}
+
+// bindDestructuringTarget — recursively bind a destructuring
+// pattern against a source register. Handles:
+//   Identifier         — plain binding
+//   ObjectPattern      — emit GetProp per property, recurse
+//   ArrayPattern       — emit GetIndex per element, recurse
+//   AssignmentPattern  — default value: `if (src === undefined) src = default`
+//   RestElement        — opaque binding (remaining fields/elements)
+//
+// `srcReg` is the register holding the source value. `kind` is
+// the BIND.* kind (var/let/const/param) so the leaf Identifier
+// bindings end up in the correct scope frame.
+function bindDestructuringTarget(ctx, target, srcReg, kind, loc) {
+  if (!target) return;
+  if (target.type === 'Identifier') {
+    if (kind === BIND.VAR || kind === BIND.PARAM) {
+      defineHoisted(ctx.scope, target.name, srcReg, kind);
+    } else {
+      defineLexical(ctx.scope, target.name, srcReg, kind);
+    }
+    return;
+  }
+  if (target.type === 'AssignmentPattern') {
+    // `target = default`: if srcReg is undefined, use the default.
+    // We produce a new register holding either the src or the
+    // default, then recurse on target.left.
+    //
+    // Emitted shape (conservative, non-branching):
+    //   defaultReg = <default expression>
+    //   resolvedReg = UnOp('??', srcReg, defaultReg)  // if exists
+    //   — but we don't have `??` as a BinOp, so we use the
+    //   transfer-level approximation: just bind to the source
+    //   register AND also lower the default expression so any
+    //   side effects are captured. The lattice-level precision
+    //   loss is tracked via an UNIMPLEMENTED assumption marking
+    //   the default as a fallback value.
+    const defReg = lowerExpression(ctx, target.right);
+    // Emit an opaque "default resolution" marker so consumers
+    // see the imprecision. The resulting register merges src
+    // and def via a Phi-like Disjunct at the Value level, which
+    // we approximate as a new Opaque that inherits labels from
+    // both.
+    const mergedReg = newRegister(ctx.module);
+    emit(ctx.module, ctx.currentBlock, {
+      op: OP.BIN_OP,
+      dest: mergedReg,
+      operator: '??',   // nullish coalescing — transfer falls through to OneOf/join
+      left: srcReg,
+      right: defReg,
+    }, loc);
+    bindDestructuringTarget(ctx, target.left, mergedReg, kind, loc);
+    return;
+  }
+  if (target.type === 'ObjectPattern') {
+    for (const prop of target.properties) {
+      if (prop.type === 'RestElement') {
+        // Rest element in an object pattern: the remaining
+        // properties get collected into a fresh object whose
+        // shape we can't precisely compute. Bind as an opaque.
+        const restReg = newRegister(ctx.module);
+        emit(ctx.module, ctx.currentBlock, {
+          op: OP.OPAQUE,
+          dest: restReg,
+          reason: REASONS.UNIMPLEMENTED,
+          details: 'object rest element — remaining properties not precisely tracked',
+          affects: null,
+        }, loc);
+        bindDestructuringTarget(ctx, prop.argument, restReg, kind, loc);
+        continue;
+      }
+      if (prop.type !== 'Property') continue;
+      const keyName = prop.key.type === 'Identifier' ? prop.key.name
+        : prop.key.type === 'Literal' ? String(prop.key.value) : null;
+      if (keyName == null) continue;  // computed keys: skip
+      const elemReg = newRegister(ctx.module);
+      emit(ctx.module, ctx.currentBlock, {
+        op: OP.GET_PROP, dest: elemReg, object: srcReg, propName: keyName,
+      }, loc);
+      bindDestructuringTarget(ctx, prop.value, elemReg, kind, loc);
+    }
+    return;
+  }
+  if (target.type === 'ArrayPattern') {
+    for (let i = 0; i < target.elements.length; i++) {
+      const elem = target.elements[i];
+      if (elem == null) continue;  // hole
+      if (elem.type === 'RestElement') {
+        const restReg = newRegister(ctx.module);
+        emit(ctx.module, ctx.currentBlock, {
+          op: OP.OPAQUE,
+          dest: restReg,
+          reason: REASONS.UNIMPLEMENTED,
+          details: 'array rest element — remaining elements not precisely tracked',
+          affects: null,
+        }, loc);
+        bindDestructuringTarget(ctx, elem.argument, restReg, kind, loc);
+        break;
+      }
+      // Emit a Const(i) for the index and a GET_INDEX.
+      const idxReg = newRegister(ctx.module);
+      emit(ctx.module, ctx.currentBlock, {
+        op: OP.CONST, dest: idxReg, value: i,
+      }, loc);
+      const elemReg = newRegister(ctx.module);
+      emit(ctx.module, ctx.currentBlock, {
+        op: OP.GET_INDEX, dest: elemReg, object: srcReg, key: idxReg,
+      }, loc);
+      bindDestructuringTarget(ctx, elem, elemReg, kind, loc);
+    }
+    return;
+  }
+  // Unknown target shape — record as unimplemented.
+  const r = newRegister(ctx.module);
+  emit(ctx.module, ctx.currentBlock, {
+    op: OP.OPAQUE,
+    dest: r,
+    reason: REASONS.UNIMPLEMENTED,
+    details: 'destructuring target shape not yet modeled: ' + target.type,
+    affects: null,
+  }, loc);
 }
 
 function lowerReturn(ctx, node, loc) {
@@ -1789,6 +1903,10 @@ function lowerFunctionDecl(ctx, node, loc) {
     p.type === 'Identifier' ? p.name : null
   );
   const fn = createFunction(ctx.module, node.id && node.id.name, params);
+  // Attach the full param AST nodes so enterFunctionStep can do
+  // destructuring / default / rest binding, not just simple
+  // identifier params.
+  fn.paramNodes = node.params.slice();
   fn.isAsync = !!node.async;
   fn.isGenerator = !!node.generator;
   fn.location = loc;
@@ -1860,17 +1978,44 @@ function enterFunctionStep(ctx, task) {
   ctx.blocks = fn.cfg.blocks;
   ctx.currentBlock = fn.cfg.blocks.get(fn.cfg.entry);
   ctx.catchStack = [];
-  // Bind params in the new scope AS 'param' bindings. The
-  // param register list on `fn.params` is appended here so it's
-  // populated by the time any caller starts walking the body.
+  // Bind params in the new scope. For each formal parameter:
+  //   1. Allocate a fresh `paramReg` — this is the register the
+  //      caller binds to when applyCall passes an argument.
+  //   2. If the parameter is a plain Identifier, bind its name
+  //      directly to paramReg.
+  //   3. Otherwise (ObjectPattern / ArrayPattern / AssignmentPattern
+  //      / RestElement) recursively destructure paramReg into
+  //      the leaf identifier names via bindDestructuringTarget.
+  //
   // Params live in the function frame (kind='function') so
   // later `var` declarations with the same name rebind them
   // rather than shadow.
-  for (const name of fn.paramNames) {
-    if (!name) continue;
-    const reg = newRegister(ctx.module);
-    fn.params.push(reg);
-    defineHoisted(ctx.scope, name, reg, BIND.PARAM);
+  const paramNodes = fn.paramNodes || [];
+  for (let i = 0; i < paramNodes.length; i++) {
+    const p = paramNodes[i];
+    const paramReg = newRegister(ctx.module);
+    fn.params.push(paramReg);
+    if (!p) continue;
+    if (p.type === 'Identifier') {
+      defineHoisted(ctx.scope, p.name, paramReg, BIND.PARAM);
+      continue;
+    }
+    if (p.type === 'RestElement') {
+      // Rest param: bind the argument to an opaque that
+      // represents the "remaining args" array. Precise modeling
+      // would require arity-aware call site handling.
+      const restReg = newRegister(ctx.module);
+      emit(ctx.module, ctx.currentBlock, {
+        op: OP.OPAQUE, dest: restReg,
+        reason: REASONS.UNIMPLEMENTED,
+        details: 'rest parameter — remaining arguments as opaque array',
+        affects: null,
+      }, fn.location);
+      bindDestructuringTarget(ctx, p.argument, restReg, BIND.PARAM, fn.location);
+      continue;
+    }
+    // Default / destructuring param: recursively bind.
+    bindDestructuringTarget(ctx, p, paramReg, BIND.PARAM, fn.location);
   }
 }
 
@@ -2049,6 +2194,49 @@ function lowerExpressionIter(ctx, root) {
         const dest = newRegister(ctx.module);
         emit(ctx.module, ctx.currentBlock, {
           op: OP.NEW, dest, ctor: ctorReg, args: argRegs,
+        }, task.loc);
+        results.push(dest);
+        break;
+      }
+      case 'emit_array_alloc': {
+        // Pop nElements regs (pushed in source order). Build a
+        // fields map keyed by integer string ("0", "1", ...)
+        // and emit an ALLOC instruction.
+        const elemRegs = [];
+        for (let i = 0; i < task.nElements; i++) elemRegs.unshift(results.pop());
+        const fields = new Map();
+        for (let i = 0; i < elemRegs.length; i++) {
+          fields.set(String(i), elemRegs[i]);
+        }
+        // Length field makes `.length` reads correct for
+        // concrete-sized arrays.
+        const lengthReg = newRegister(ctx.module);
+        emit(ctx.module, ctx.currentBlock, {
+          op: OP.CONST, dest: lengthReg, value: elemRegs.length,
+        }, task.loc);
+        fields.set('length', lengthReg);
+        const dest = newRegister(ctx.module);
+        emit(ctx.module, ctx.currentBlock, {
+          op: OP.ALLOC, dest, kind: 'Array', fields,
+        }, task.loc);
+        results.push(dest);
+        break;
+      }
+      case 'emit_object_alloc': {
+        // Pop nProperties regs (pushed in source order). Build a
+        // fields map keyed by the Property keys (collected at
+        // visit time). Keys whose lookup is null (computed, spread)
+        // are omitted.
+        const nProps = task.keys.length;
+        const valRegs = [];
+        for (let i = 0; i < nProps; i++) valRegs.unshift(results.pop());
+        const fields = new Map();
+        for (let i = 0; i < nProps; i++) {
+          if (task.keys[i] != null) fields.set(task.keys[i], valRegs[i]);
+        }
+        const dest = newRegister(ctx.module);
+        emit(ctx.module, ctx.currentBlock, {
+          op: OP.ALLOC, dest, kind: 'Object', fields,
         }, task.loc);
         results.push(dest);
         break;
@@ -2323,6 +2511,18 @@ function visitNode(ctx, node, tasks, results) {
     }
     case 'CallExpression': {
       const nArgs = node.arguments.length;
+      // Spread in arguments: `f(...args)`. We don't know the
+      // expanded arity so we can't bind the callee's param
+      // registers. Fall back to an opaque call result. Taint
+      // is conservatively propagated by the caller's general
+      // "arg labels flow to return" rule in applyCall.
+      for (const arg of node.arguments) {
+        if (arg && arg.type === 'SpreadElement') {
+          const dest = lowerUnimplementedExpr(ctx, node, loc);
+          results.push(dest);
+          return;
+        }
+      }
       const hasMemberCallee = node.callee.type === 'MemberExpression';
       if (hasMemberCallee) {
         // obj.method(args) — need to produce:
@@ -2411,6 +2611,63 @@ function visitNode(ctx, node, tasks, results) {
       };
       const dest = lowerFunctionDecl(ctx, syntheticDecl, loc);
       results.push(dest);
+      return;
+    }
+    case 'ArrayExpression': {
+      // Lower `[a, b, c]` to an ALLOC with integer-keyed fields.
+      // Holes (undefined element) and SpreadElement lose
+      // precision: a spread makes subsequent indices opaque
+      // because we don't know the spread source's length.
+      //
+      // We visit each non-spread element and pass a list of
+      // (index, reg) pairs to emit_array_alloc via the results
+      // stack: push all element regs first (in reverse), then
+      // emit_array_alloc pops them and builds the fields map.
+      const elements = node.elements || [];
+      // Figure out whether any spread is present. If so we mark
+      // the whole array as opaque to be sound.
+      let hasSpread = false;
+      for (const e of elements) {
+        if (e && e.type === 'SpreadElement') { hasSpread = true; break; }
+      }
+      if (hasSpread) {
+        const dest = lowerUnimplementedExpr(ctx, node, loc);
+        results.push(dest);
+        return;
+      }
+      // Filter out holes for now — a hole reads undefined.
+      const nonHole = elements.filter(e => e != null);
+      tasks.push({ kind: 'emit_array_alloc', nElements: nonHole.length, loc });
+      for (let i = nonHole.length - 1; i >= 0; i--) {
+        tasks.push({ kind: 'visit', node: nonHole[i] });
+      }
+      return;
+    }
+    case 'ObjectExpression': {
+      // Lower `{a: 1, b: 2, ...c}` to an ALLOC with the key=>reg
+      // map. Spread and computed keys lose precision (fall back
+      // to opaque).
+      const properties = node.properties || [];
+      let unsupported = false;
+      for (const p of properties) {
+        if (p.type === 'SpreadElement') { unsupported = true; break; }
+        if (p.computed) { unsupported = true; break; }
+        if (p.kind !== 'init') { unsupported = true; break; }  // getters / setters
+      }
+      if (unsupported) {
+        const dest = lowerUnimplementedExpr(ctx, node, loc);
+        results.push(dest);
+        return;
+      }
+      const keys = properties.map(p => {
+        if (p.key.type === 'Identifier') return p.key.name;
+        if (p.key.type === 'Literal') return String(p.key.value);
+        return null;
+      });
+      tasks.push({ kind: 'emit_object_alloc', keys, loc });
+      for (let i = properties.length - 1; i >= 0; i--) {
+        tasks.push({ kind: 'visit', node: properties[i].value });
+      }
       return;
     }
     default: {

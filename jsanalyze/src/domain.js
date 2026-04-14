@@ -1110,6 +1110,27 @@ function createState() {
   });
 }
 
+// createStateSharingHeap — used by inter-procedural call
+// lowering (applyCall). Produces a fresh state whose `regs`
+// are empty but whose `heap` overlays the caller's, so the
+// callee can dereference any ObjectRef / heap cell the caller
+// passed as an argument. This is sound for call-site-
+// context-insensitive analysis; a more precise treatment
+// (Phase C3) would clone-and-reconcile the heap per call
+// context.
+function createStateSharingHeap(callerState) {
+  return Object.freeze({
+    regs: createEmptyOverlay(),
+    heap: callerState && callerState.heap
+      ? { own: new Map(), parent: callerState.heap }
+      : createEmptyOverlay(),
+    pathConds: Object.freeze([]),
+    assumptionIds: Object.freeze([]),
+    callStack: Object.freeze([]),
+    _frozen: true,
+  });
+}
+
 function setReg(state, register, value) {
   if (!register) return state;
   if (!state._frozen) {
@@ -1310,7 +1331,7 @@ module.exports = {
   withFormula, valueFormula,
   refineEq, refineNeq, refineByType, refineNotByType,
   refineInstanceof, refineNotInstanceof, typeChainIncludes,
-  createState, setReg, getReg, joinStates, stateLeq, stateEquals,
+  createState, createStateSharingHeap, setReg, getReg, joinStates, stateLeq, stateEquals,
   unfreezeState, freezeState,
   overlayGet, overlayHas, overlayEntries, overlaySize, overlayFlatten,
   inferTypeName, canonKey,

@@ -583,11 +583,18 @@ function parseOperand(lexer) {
     }
     if (label === '(') {
       // Function call — parse comma-separated arguments.
+      // Supports spread `f(a, ...b, c)`.
       lexer.advance();
       const args = [];
       if (lexer.peek().type.label !== ')') {
         while (true) {
-          args.push(parseExpression(lexer));
+          if (lexer.peek().type.label === '...') {
+            const spreadTok = lexer.advance();
+            const inner = parseExpression(lexer);
+            args.push(mkSpreadElement(inner, spreadTok));
+          } else {
+            args.push(parseExpression(lexer));
+          }
           const n = lexer.peek();
           if (n.type.label === ',') { lexer.advance(); continue; }
           break;
@@ -635,6 +642,103 @@ function parseOperand(lexer) {
 // parseArrowBody — `=>` has already been consumed. Parses the
 // arrow body (block or expression) and returns an
 // ArrowFunctionExpression node with the provided params.
+// parseObjectExpression — `{ key: value, shorthand, [computed]: v,
+// ...spread, method() { }, get foo() { }, set foo(v) { } }`.
+//
+// Runs on the `{` token. Minimal implementation:
+//   * `name` alone → shorthand property (key=value=Identifier)
+//   * `name : expr` → plain property
+//   * `"str" : expr` / `num : expr` → plain property with literal key
+//   * `[expr] : value` → computed key property
+//   * `...spread`
+//   * `name (params) { body }` → method shorthand (lowered as
+//     function expression assigned to the key)
+//   * `get name () { }` / `set name (v) { }` → accessor (unimplemented;
+//     emits an opaque property value)
+function parseObjectExpression(lexer) {
+  const startTok = lexer.advance();  // `{`
+  const properties = [];
+  while (lexer.peek() && lexer.peek().type.label !== '}') {
+    const t = lexer.peek();
+    // Spread: `...expr`
+    if (t.type.label === '...') {
+      const spreadTok = lexer.advance();
+      const inner = parseExpression(lexer);
+      properties.push(mkSpreadElement(inner, spreadTok));
+      if (lexer.peek() && lexer.peek().type.label === ',') lexer.advance();
+      continue;
+    }
+    // Computed key: `[expr] : value`
+    if (t.type.label === '[') {
+      lexer.advance();
+      const keyExpr = parseExpression(lexer);
+      expect(lexer, ']');
+      expect(lexer, ':');
+      const value = parseExpression(lexer);
+      properties.push(mkProperty(keyExpr, value, 'init', false, true, false, t));
+      if (lexer.peek() && lexer.peek().type.label === ',') lexer.advance();
+      continue;
+    }
+    // String / number literal key.
+    if (t.type.label === 'string' || t.type.label === 'num') {
+      lexer.advance();
+      const key = mkLiteral(t.value, JSON.stringify(t.value), t);
+      expect(lexer, ':');
+      const value = parseExpression(lexer);
+      properties.push(mkProperty(key, value, 'init', false, false, false, t));
+      if (lexer.peek() && lexer.peek().type.label === ',') lexer.advance();
+      continue;
+    }
+    // Name key.
+    if (t.type.label === 'name') {
+      lexer.advance();
+      // `name: value`
+      if (lexer.peek() && lexer.peek().type.label === ':') {
+        lexer.advance();
+        const value = parseExpression(lexer);
+        properties.push(mkProperty(
+          mkIdentifier(t.value, t), value, 'init', false, false, false, t));
+      } else if (lexer.peek() && lexer.peek().type.label === '(') {
+        // Method shorthand: `name(params) { body }`. Desugar to a
+        // property holding an anonymous FunctionExpression.
+        lexer.advance();
+        const params = parseParamList(lexer);
+        expect(lexer, ')');
+        const body = parseStatement(lexer);
+        const fnExpr = mkFunctionExpression(null, params, body, false, false, t);
+        properties.push(mkProperty(
+          mkIdentifier(t.value, t), fnExpr, 'init', false, false, true, t));
+      } else {
+        // Shorthand: `{ name }` → key and value are both the name.
+        const ident = mkIdentifier(t.value, t);
+        properties.push(mkProperty(ident, ident, 'init', true, false, false, t));
+      }
+      if (lexer.peek() && lexer.peek().type.label === ',') lexer.advance();
+      continue;
+    }
+    throw parseError(lexer, 'unexpected token in object literal: `' + t.type.label + '`');
+  }
+  const endTok = lexer.peek();
+  expect(lexer, '}');
+  return mkObjectExpression(properties, startTok, endTok);
+}
+
+function mkFunctionExpression(id, params, body, isAsync, isGenerator, tok) {
+  return {
+    type: 'FunctionExpression',
+    id,
+    params,
+    body,
+    async: !!isAsync,
+    generator: !!isGenerator,
+    loc: tok && tok.loc && body && body.loc
+      ? { start: tok.loc.start, end: body.loc.end }
+      : null,
+    start: tok ? tok.start : 0,
+    end:   body ? body.end : 0,
+  };
+}
+
 function parseArrowBody(lexer, params, startTok) {
   const t = lexer.peek();
   if (t && t.type.label === '{') {
@@ -677,6 +781,127 @@ function exprToArrowParams(expr) {
     return out;
   }
   throw new Error('arrow parameter list must be identifiers (got ' + expr.type + ')');
+}
+
+function mkSpreadElement(argument, tok) {
+  return {
+    type: 'SpreadElement',
+    argument,
+    loc: tok && tok.loc && argument && argument.loc
+      ? { start: tok.loc.start, end: argument.loc.end }
+      : null,
+    start: tok ? tok.start : 0,
+    end:   argument ? argument.end : 0,
+  };
+}
+
+function mkArrayExpression(elements, startTok, endTok) {
+  return {
+    type: 'ArrayExpression',
+    elements,
+    loc: startTok && startTok.loc && endTok && endTok.loc
+      ? { start: startTok.loc.start, end: endTok.loc.end }
+      : null,
+    start: startTok ? startTok.start : 0,
+    end:   endTok ? endTok.end : 0,
+  };
+}
+
+function mkObjectExpression(properties, startTok, endTok) {
+  return {
+    type: 'ObjectExpression',
+    properties,
+    loc: startTok && startTok.loc && endTok && endTok.loc
+      ? { start: startTok.loc.start, end: endTok.loc.end }
+      : null,
+    start: startTok ? startTok.start : 0,
+    end:   endTok ? endTok.end : 0,
+  };
+}
+
+function mkProperty(key, value, kind, shorthand, computed, method, tok) {
+  return {
+    type: 'Property',
+    key,
+    value,
+    kind: kind || 'init',
+    shorthand: !!shorthand,
+    computed: !!computed,
+    method: !!method,
+    loc: tok && tok.loc && value && value.loc
+      ? { start: tok.loc.start, end: value.loc.end }
+      : null,
+    start: tok ? tok.start : 0,
+    end:   value ? value.end : 0,
+  };
+}
+
+function mkObjectPattern(properties, startTok) {
+  const last = properties[properties.length - 1];
+  return {
+    type: 'ObjectPattern',
+    properties,
+    loc: startTok && startTok.loc
+      ? { start: startTok.loc.start,
+          end: (last && last.loc ? last.loc.end : startTok.loc.end) }
+      : null,
+    start: startTok ? startTok.start : 0,
+    end:   last ? last.end : (startTok ? startTok.end : 0),
+  };
+}
+
+function mkObjectPatternProperty(key, value, shorthand, tok) {
+  return {
+    type: 'Property',
+    key,
+    value,
+    kind: 'init',
+    shorthand,
+    computed: false,
+    method: false,
+    loc: tok && tok.loc ? { start: tok.loc.start, end: (value.loc || tok.loc).end } : null,
+    start: tok ? tok.start : 0,
+    end:   value ? value.end : 0,
+  };
+}
+
+function mkArrayPattern(elements, startTok) {
+  const last = elements[elements.length - 1];
+  return {
+    type: 'ArrayPattern',
+    elements,
+    loc: startTok && startTok.loc
+      ? { start: startTok.loc.start,
+          end: (last && last.loc ? last.loc.end : startTok.loc.end) }
+      : null,
+    start: startTok ? startTok.start : 0,
+    end:   last ? last.end : (startTok ? startTok.end : 0),
+  };
+}
+
+function mkRestElement(argument, tok) {
+  return {
+    type: 'RestElement',
+    argument,
+    loc: tok && tok.loc && argument && argument.loc
+      ? { start: tok.loc.start, end: argument.loc.end }
+      : null,
+    start: tok ? tok.start : 0,
+    end:   argument ? argument.end : 0,
+  };
+}
+
+function mkAssignmentPattern(left, right) {
+  return {
+    type: 'AssignmentPattern',
+    left,
+    right,
+    loc: left && left.loc && right && right.loc
+      ? { start: left.loc.start, end: right.loc.end }
+      : null,
+    start: left ? left.start : 0,
+    end:   right ? right.end : 0,
+  };
 }
 
 function mkSequenceExpression(expressions) {
@@ -809,6 +1034,36 @@ function parsePrimary(lexer) {
     // SequenceExpression (the comma operator).
     if (items.length === 1) return items[0];
     return mkSequenceExpression(items);
+  }
+  // Array literal: `[a, b, ...rest]`. Elements may include
+  // spread elements and holes (produced by two adjacent commas).
+  if (label === '[') {
+    lexer.advance();
+    const elements = [];
+    while (lexer.peek() && lexer.peek().type.label !== ']') {
+      if (lexer.peek().type.label === ',') {
+        elements.push(null);  // hole
+        lexer.advance();
+        continue;
+      }
+      if (lexer.peek().type.label === '...') {
+        const spreadTok = lexer.advance();
+        const inner = parseExpression(lexer);
+        elements.push(mkSpreadElement(inner, spreadTok));
+      } else {
+        elements.push(parseExpression(lexer));
+      }
+      if (lexer.peek() && lexer.peek().type.label === ',') {
+        lexer.advance();
+      }
+    }
+    const endTok = lexer.peek();
+    expect(lexer, ']');
+    return mkArrayExpression(elements, t, endTok);
+  }
+  // Object literal: `{ a: 1, b, ...rest, [k]: v }`.
+  if (label === '{') {
+    return parseObjectExpression(lexer);
   }
   // Unknown primary. Emit an UnimplementedExpression marker so
   // the IR builder can raise an explicit `unimplemented`
@@ -1464,19 +1719,14 @@ function skipToNextStatementBoundary(lexer) {
 function parseVarDeclarations(lexer, kind, startTok, outputs) {
   const decls = [];
   while (true) {
-    const nameTok = lexer.peek();
-    if (!nameTok || nameTok.type.label !== 'name') {
-      throw parseError(lexer, 'expected variable name after `' + kind + '`');
-    }
-    lexer.advance();
-    const id = mkIdentifier(nameTok.value, nameTok);
+    const target = parseBindingTarget(lexer);
     let init = null;
     const next = lexer.peek();
     if (next && (next.type.label === '=' || next.value === '=')) {
       lexer.advance();
       init = parseExpression(lexer);
     }
-    decls.push(mkVariableDeclarator(id, init));
+    decls.push(mkVariableDeclarator(target, init));
     if (lexer.peek() && lexer.peek().type.label === ',') {
       lexer.advance();
       continue;
@@ -1491,12 +1741,23 @@ function parseParamList(lexer) {
   const params = [];
   if (lexer.peek() && lexer.peek().type.label === ')') return params;
   while (true) {
-    const t = lexer.peek();
-    if (!t || t.type.label !== 'name') {
-      throw parseError(lexer, 'expected parameter name');
+    // `...rest`
+    if (lexer.peek() && lexer.peek().type.label === '...') {
+      const restTok = lexer.advance();
+      const target = parseBindingTarget(lexer);
+      params.push(mkRestElement(target, restTok));
+      // Rest must be the last param.
+      break;
     }
-    lexer.advance();
-    params.push(mkIdentifier(t.value, t));
+    const target = parseBindingTarget(lexer);
+    // Default value: `x = 1`
+    if (lexer.peek() && (lexer.peek().type.label === '=' || lexer.peek().value === '=')) {
+      lexer.advance();
+      const def = parseExpression(lexer);
+      params.push(mkAssignmentPattern(target, def));
+    } else {
+      params.push(target);
+    }
     if (lexer.peek() && lexer.peek().type.label === ',') {
       lexer.advance();
       continue;
@@ -1504,6 +1765,116 @@ function parseParamList(lexer) {
     break;
   }
   return params;
+}
+
+// parseBindingTarget — parses an identifier, object pattern, or
+// array pattern. Returns an ESTree node (Identifier,
+// ObjectPattern, or ArrayPattern).
+//
+// Grammar:
+//   BindingTarget:
+//     Identifier
+//     ObjectPattern:
+//       { BindingProperty* }
+//       BindingProperty: name
+//                      | name : BindingTarget
+//                      | name = default       (shorthand + default)
+//                      | ... BindingTarget    (rest element)
+//     ArrayPattern:
+//       [ BindingElement* ]
+//       BindingElement: BindingTarget
+//                     | BindingTarget = default
+//                     | ... BindingTarget
+//                     | (empty — hole)
+function parseBindingTarget(lexer) {
+  const t = lexer.peek();
+  if (!t) throw parseError(lexer, 'expected binding target');
+  if (t.type.label === 'name') {
+    lexer.advance();
+    return mkIdentifier(t.value, t);
+  }
+  if (t.type.label === '{') {
+    return parseObjectPattern(lexer);
+  }
+  if (t.type.label === '[') {
+    return parseArrayPattern(lexer);
+  }
+  throw parseError(lexer, 'expected binding target, got `' + t.type.label + '`');
+}
+
+function parseObjectPattern(lexer) {
+  const startTok = lexer.advance();  // `{`
+  const properties = [];
+  while (lexer.peek() && lexer.peek().type.label !== '}') {
+    // Rest: `...rest`
+    if (lexer.peek().type.label === '...') {
+      const restTok = lexer.advance();
+      const target = parseBindingTarget(lexer);
+      properties.push(mkRestElement(target, restTok));
+      // Rest must be last in an ObjectPattern, but we don't
+      // strictly enforce it — parser is lenient.
+      if (lexer.peek() && lexer.peek().type.label === ',') lexer.advance();
+      continue;
+    }
+    // Property: key [: value] [= default]
+    const keyTok = lexer.peek();
+    if (keyTok.type.label !== 'name') {
+      throw parseError(lexer, 'expected property name in destructuring pattern');
+    }
+    lexer.advance();
+    const key = mkIdentifier(keyTok.value, keyTok);
+    let value;
+    let shorthand;
+    if (lexer.peek() && lexer.peek().type.label === ':') {
+      lexer.advance();
+      value = parseBindingTarget(lexer);
+      shorthand = false;
+    } else {
+      value = mkIdentifier(keyTok.value, keyTok);
+      shorthand = true;
+    }
+    // Default value: `key = default` (in shorthand only legal)
+    if (lexer.peek() && lexer.peek().type.label === '=' && shorthand) {
+      lexer.advance();
+      const def = parseExpression(lexer);
+      value = mkAssignmentPattern(value, def);
+    }
+    properties.push(mkObjectPatternProperty(key, value, shorthand, keyTok));
+    if (lexer.peek() && lexer.peek().type.label === ',') lexer.advance();
+  }
+  expect(lexer, '}');
+  return mkObjectPattern(properties, startTok);
+}
+
+function parseArrayPattern(lexer) {
+  const startTok = lexer.advance();  // `[`
+  const elements = [];
+  while (lexer.peek() && lexer.peek().type.label !== ']') {
+    // Hole: `[,`
+    if (lexer.peek().type.label === ',') {
+      elements.push(null);
+      lexer.advance();
+      continue;
+    }
+    // Rest: `...rest`
+    if (lexer.peek().type.label === '...') {
+      const restTok = lexer.advance();
+      const target = parseBindingTarget(lexer);
+      elements.push(mkRestElement(target, restTok));
+      break;
+    }
+    let elem = parseBindingTarget(lexer);
+    // Default value
+    if (lexer.peek() && lexer.peek().type.label === '=') {
+      lexer.advance();
+      const def = parseExpression(lexer);
+      elem = mkAssignmentPattern(elem, def);
+    }
+    elements.push(elem);
+    if (lexer.peek() && lexer.peek().type.label === ',') lexer.advance();
+  }
+  expect(lexer, ']');
+  return mkArrayPattern(elements, startTok);
 }
 
 // block_body re-runs itself after each inner statement until `}`.
@@ -1696,19 +2067,14 @@ function finishTryFinally(task, outputs) {
 function parseVarDeclarationsInFor(lexer, kind, kindTok, outputs) {
   const decls = [];
   while (true) {
-    const nameTok = lexer.peek();
-    if (!nameTok || nameTok.type.label !== 'name') {
-      throw parseError(lexer, 'expected identifier after ' + kind);
-    }
-    const id = mkIdentifier(nameTok.value, nameTok);
-    lexer.advance();
+    const target = parseBindingTarget(lexer);
     let init = null;
     const next = lexer.peek();
     if (next && next.type.label === '=') {
       lexer.advance();
       init = parseExpression(lexer);
     }
-    decls.push(mkVariableDeclarator(id, init, nameTok));
+    decls.push(mkVariableDeclarator(target, init));
     if (lexer.peek() && lexer.peek().type.label === ',') {
       lexer.advance();
       continue;

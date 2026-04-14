@@ -34,6 +34,7 @@ const testFiles = [
   'loop.test.js',
   'try.test.js',
   'arrow.test.js',
+  'destructure.test.js',
 ];
 
 async function main() {

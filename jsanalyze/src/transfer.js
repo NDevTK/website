@@ -1029,13 +1029,25 @@ function applyCall(ctx, state, instr) {
         D.opaque(recChain, null, loc, recLabels));
     }
     // Build the callee's initial state. Bind each param
-    // register to the corresponding caller-side argValue.
+    // register to the corresponding caller-side argValue. We
+    // also share the caller's heap so any ObjectRef passed as
+    // an argument can be dereferenced by the callee's transfer
+    // functions — without this, `function f({a}) { ... }` can't
+    // read the destructured field because the ObjectRef's
+    // heap cell lives in the caller's state.
+    //
+    // Sharing the heap overlay is sound: the callee may mutate
+    // cells the caller can see, which is the JS semantics.
+    // Precise points-to analysis (Phase C3) would clone the
+    // heap into a fresh overlay and reconcile writes back to
+    // the caller.
+    //
     // Captures: the Closure value's `captures` array stores
     // the values captured at definition time; they need to
     // be bound to the function's capture registers (Phase C2
     // — for now closures capture nothing, so this is a
     // no-op).
-    let calleeInit = D.createState();
+    let calleeInit = D.createStateSharingHeap(state);
     for (let i = 0; i < calleeFn.params.length; i++) {
       const paramReg = calleeFn.params[i];
       const argValue = argValues[i] || D.concrete(undefined, undefined, loc);
