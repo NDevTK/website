@@ -396,6 +396,91 @@ const tests = [
     },
   },
 
+  // --- Implicit close rules ---
+  {
+    name: 'html: <p><p> produces siblings, not nested',
+    fn: () => {
+      const doc = html.parse('<p>one<p>two');
+      // Two <p> children of the fragment, each with its own
+      // text content. The second <p> implicitly closes the first.
+      const ps = doc.children.filter(c => c.type === 'element' && c.tag === 'p');
+      assertEqual(ps.length, 2);
+      assertEqual(ps[0].children[0].value, 'one');
+      assertEqual(ps[1].children[0].value, 'two');
+    },
+  },
+  {
+    name: 'html: <p><div> closes the paragraph',
+    fn: () => {
+      const doc = html.parse('<p>text<div>inside</div>');
+      // The <p> is closed when <div> appears (block-level).
+      const elements = doc.children.filter(c => c.type === 'element');
+      assertEqual(elements.length, 2);
+      assertEqual(elements[0].tag, 'p');
+      assertEqual(elements[1].tag, 'div');
+      assertEqual(elements[1].children[0].value, 'inside');
+    },
+  },
+  {
+    name: 'html: <li><li> produces siblings under <ul>',
+    fn: () => {
+      const doc = html.parse('<ul><li>one<li>two<li>three</ul>');
+      const ul = firstElement(doc);
+      const lis = ul.children.filter(c => c.type === 'element' && c.tag === 'li');
+      assertEqual(lis.length, 3);
+      assertEqual(lis[0].children[0].value, 'one');
+      assertEqual(lis[1].children[0].value, 'two');
+      assertEqual(lis[2].children[0].value, 'three');
+    },
+  },
+  {
+    name: 'html: <tr><td><td> auto-closes the first td',
+    fn: () => {
+      const doc = html.parse('<table><tr><td>a<td>b</tr></table>');
+      // Walk down: table → tr → [td, td]
+      const table = firstElement(doc);
+      const tr = table.children.find(c => c.type === 'element' && c.tag === 'tr');
+      const tds = tr.children.filter(c => c.type === 'element' && c.tag === 'td');
+      assertEqual(tds.length, 2);
+      assertEqual(tds[0].children[0].value, 'a');
+      assertEqual(tds[1].children[0].value, 'b');
+    },
+  },
+  {
+    name: 'html: <tr><td>a</td><tr><td>b</td> produces two rows',
+    fn: () => {
+      const doc = html.parse('<table><tr><td>a<tr><td>b</table>');
+      const table = firstElement(doc);
+      const trs = table.children.filter(c => c.type === 'element' && c.tag === 'tr');
+      assertEqual(trs.length, 2);
+      assertEqual(trs[0].children[0].children[0].value, 'a');
+      assertEqual(trs[1].children[0].children[0].value, 'b');
+    },
+  },
+  {
+    name: 'html: <dt><dd> auto-closes the dt',
+    fn: () => {
+      const doc = html.parse('<dl><dt>term<dd>definition</dl>');
+      const dl = firstElement(doc);
+      const dt = dl.children.find(c => c.type === 'element' && c.tag === 'dt');
+      const dd = dl.children.find(c => c.type === 'element' && c.tag === 'dd');
+      assert(dt);
+      assert(dd);
+      assertEqual(dt.children[0].value, 'term');
+      assertEqual(dd.children[0].value, 'definition');
+    },
+  },
+  {
+    name: 'html: <option><option> in <select> produces siblings',
+    fn: () => {
+      const doc = html.parse('<select><option>a<option>b</select>');
+      const select = firstElement(doc);
+      const options = select.children.filter(c => c.type === 'element' && c.tag === 'option');
+      assertEqual(options.length, 2);
+    },
+  },
+
+
   // --- End-to-end: innerHTML extraction pipeline ---
   {
     name: 'html e2e: innerHTML assignment recorded on trace',
@@ -412,42 +497,53 @@ const tests = [
     },
   },
   {
-    name: 'html e2e: concrete innerHTML parses into a tree',
+    name: 'html e2e: concrete innerHTML attaches parsed tree + tokens',
     fn: async () => {
       const t = await analyze(
         'document.body.innerHTML = "<div class=\\"box\\">hi <b>bold</b></div>";',
         { typeDB: TDB });
       const assigns = query.innerHtmlAssignments(t);
       assertEqual(assigns.length, 1);
-      const tree = html.parse(assigns[0].value.value);
-      assertEqual(tree.type, 'fragment');
-      const div = tree.children[0];
+      const a = assigns[0];
+      // Wave 12c1b: trace projection attaches parsedHtml +
+      // htmlTokens + concrete for concrete-string assignments.
+      assertEqual(a.concrete, '<div class="box">hi <b>bold</b></div>');
+      assert(a.parsedHtml, 'parsedHtml attached');
+      assertEqual(a.parsedHtml.type, 'fragment');
+      const div = a.parsedHtml.children[0];
       assertEqual(div.type, 'element');
       assertEqual(div.tag, 'div');
       assertEqual(div.attrs.class, 'box');
-      // <div>hi <b>bold</b></div> → text("hi ") + <b>bold</b>
       assertEqual(div.children.length, 2);
       assertEqual(div.children[0].type, 'text');
       assertEqual(div.children[0].value, 'hi ');
       assertEqual(div.children[1].type, 'element');
       assertEqual(div.children[1].tag, 'b');
+      assert(Array.isArray(a.htmlTokens), 'htmlTokens attached');
+      assert(a.htmlTokens.length > 0);
     },
   },
   {
-    name: 'html e2e: tainted innerHTML carries labels on the assignment record',
+    name: 'html e2e: tainted innerHTML carries labels + null parsedHtml',
     fn: async () => {
       const t = await analyze(
         'document.body.innerHTML = location.hash;',
         { typeDB: TDB });
       const assigns = query.innerHtmlAssignments(t);
       assertEqual(assigns.length, 1);
+      const a = assigns[0];
       // The assigned value is an opaque tainted string — the
       // consumer sees it's not concrete and falls back to a
       // runtime-guarded rewrite.
-      assert(assigns[0].value.kind !== 'concrete',
+      assert(a.value.kind !== 'concrete',
         'tainted value is not concrete');
-      assert(assigns[0].labels.indexOf('url') >= 0,
+      assert(a.labels.indexOf('url') >= 0,
         'url label is surfaced on the assignment record');
+      // Non-concrete values get null parsedHtml so consumers
+      // know to fall back to runtime-guarded rewrites.
+      assertEqual(a.parsedHtml, null);
+      assertEqual(a.htmlTokens, null);
+      assertEqual(a.concrete, null);
     },
   },
   {

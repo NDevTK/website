@@ -12,6 +12,7 @@ const { AssumptionTracker, REASONS, SEVERITIES } = require('./assumptions.js');
 const D = require('./domain.js');
 const { overlayEntries } = require('./domain.js');
 const Z3 = require('./z3.js');
+const HTML = require('./html.js');
 const query = require('./query.js');
 
 // analyze(input, options) → Promise<Trace>
@@ -272,7 +273,29 @@ async function analyze(input, options) {
     // recorded during the walk into the trace. These records
     // drive the DOM-conversion consumer (and any consumer that
     // wants to inventory unsafe HTML sink sites).
+    //
+    // When the assigned value is a concrete string we
+    // EAGERLY parse it via the vendored HTML parser and
+    // attach the resulting fragment + flat token stream so
+    // consumers can operate on a structured view without
+    // re-parsing. `parsedHtml` is the tree (nodes with tag,
+    // attrs, children, loc); `htmlTokens` is the flat token
+    // stream that dom-convert mutates in place for source-
+    // preserving rewrites. Non-concrete values (loop-built
+    // strings, tainted opaque) have `parsedHtml = null` and
+    // the consumer has to reconstruct the HTML from the
+    // trace's calls/bindings context.
     for (const ih of ctx.innerHtmlAssignments) {
+      const v = ih.value;
+      if (v && v.kind === D.V.CONCRETE && typeof v.value === 'string') {
+        ih.parsedHtml = HTML.parse(v.value);
+        ih.htmlTokens = HTML.tokenize(v.value);
+        ih.concrete = v.value;
+      } else {
+        ih.parsedHtml = null;
+        ih.htmlTokens = null;
+        ih.concrete = null;
+      }
       trace.innerHtmlAssignments.push(ih);
     }
     for (const c of ctx.calls) trace.calls.push(c);

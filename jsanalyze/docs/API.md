@@ -221,6 +221,54 @@ type StringPattern = {
   exactLength?: number;
 };
 
+// Wave 12 — innerHTML / outerHTML / insertAdjacentHTML
+// assignment observation. Every write to a property the
+// TypeDB classifies as an 'html' sink is recorded here,
+// regardless of whether the value is tainted.
+//
+// When the assigned value is a concrete string, the trace
+// EAGERLY parses it via the vendored HTML parser
+// (src/html.js) and attaches:
+//   * `concrete`     — the raw string source
+//   * `parsedHtml`   — the parsed HTML fragment tree
+//   * `htmlTokens`   — the flat token stream for source-
+//                      preserving rewrites (dom-convert
+//                      mutates these in place and calls
+//                      html.serializeTokens to re-emit)
+//
+// Non-concrete values (loop-built strings, tainted opaque,
+// OneOf unions) get `parsedHtml = null` / `htmlTokens = null`
+// / `concrete = null`. Consumers detect this and fall back
+// to runtime-guarded rewrites (wrapping the tainted value in
+// a `__safeNav`-style filter).
+type InnerHtmlAssignment = {
+  kind: 'innerHTML' | 'outerHTML' | 'insertAdjacentHTML';
+  targetType: string;                // receiver's TypeDB typeName
+  value: Value;                      // the assigned Value
+  location: Location;
+  labels: string[];                  // taint labels on value
+  concrete: string | null;           // raw string when concrete
+  parsedHtml: HtmlNode | null;       // parsed fragment when concrete
+  htmlTokens: HtmlToken[] | null;    // flat token stream when concrete
+};
+
+type HtmlNode =
+  | { type: 'fragment'; children: HtmlNode[]; loc: { start, end } }
+  | { type: 'element'; tag: string; tagRaw: string;
+      attrs: Record<string, string>;
+      attrList: HtmlAttr[];          // ordered, with original casing
+      children: HtmlNode[]; loc }
+  | { type: 'text'; value: string; loc }
+  | { type: 'comment'; value: string; loc }
+  | { type: 'doctype'; value: string; loc };
+
+type HtmlAttr = {
+  name: string;                      // lowercase
+  nameRaw: string;                   // original casing
+  value: string;                     // entity-decoded
+  quoted: '"' | "'" | null;          // original quoting style
+};
+
 // Wave 12b — DOM mutation observation. Every method call
 // whose receiver has a DOM-chain typeName, and every property
 // write on a DOM-chain receiver (except innerHTML/outerHTML/

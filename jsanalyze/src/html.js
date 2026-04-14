@@ -66,6 +66,51 @@ const RAW_TEXT_ELEMENTS = new Set([
   'script', 'style', 'textarea', 'title', 'iframe', 'noscript',
 ]);
 
+// Block-level elements whose appearance implicitly closes an
+// open `<p>`. Matches the HTML5 "optional tags" rules in
+// §13.1.2: a `<p>` element is implicitly closed when a block-
+// level start tag appears inside it. Without these rules
+// real-world markup like `<p>one<p>two<div>three` would nest
+// instead of forming three siblings.
+const P_CLOSE_ON_OPEN = new Set([
+  'address', 'article', 'aside', 'blockquote', 'details', 'div',
+  'dl', 'fieldset', 'figcaption', 'figure', 'footer', 'form',
+  'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'header', 'hgroup', 'hr',
+  'main', 'menu', 'nav', 'ol', 'p', 'pre', 'section', 'table', 'ul',
+]);
+
+// shouldAutoClose(openTag, newTag) — true iff `openTag` on
+// the top of the parser stack should be implicitly closed
+// when `newTag` is about to be opened. Covers:
+//
+//   * <p> before a block-level start (see P_CLOSE_ON_OPEN)
+//   * <li> before another <li>
+//   * <dt>/<dd> before another <dt> or <dd>
+//   * <tr> before another <tr>
+//   * <td>/<th> before another <td>/<th>/<tr>
+//   * <option> before another <option> or <optgroup>
+//   * <optgroup> before another <optgroup>
+//   * <thead>/<tbody>/<tfoot> before another of themselves
+//
+// These are the pragmatic subset that produces correct trees
+// for real-world tag soup without implementing the full HTML5
+// insertion modes (foster parenting, adoption agency, etc.).
+function shouldAutoClose(openTag, newTag) {
+  if (openTag === 'p' && P_CLOSE_ON_OPEN.has(newTag)) return true;
+  if (openTag === 'li' && newTag === 'li') return true;
+  if ((openTag === 'dt' || openTag === 'dd') &&
+      (newTag === 'dt' || newTag === 'dd')) return true;
+  if (openTag === 'tr' && newTag === 'tr') return true;
+  if ((openTag === 'td' || openTag === 'th') &&
+      (newTag === 'td' || newTag === 'th' || newTag === 'tr')) return true;
+  if (openTag === 'option' &&
+      (newTag === 'option' || newTag === 'optgroup')) return true;
+  if (openTag === 'optgroup' && newTag === 'optgroup') return true;
+  if ((openTag === 'thead' || openTag === 'tbody' || openTag === 'tfoot') &&
+      (newTag === 'thead' || newTag === 'tbody' || newTag === 'tfoot')) return true;
+  return false;
+}
+
 // Named entity references the parser decodes in text and
 // attribute values. This is the pragmatic subset ported from
 // the legacy htmldom engine — covers the ~50 entities that
@@ -365,8 +410,25 @@ function parse(src) {
       }
       case TOK_START: {
         const elem = makeElement(tok);
+        // Implicit close: if the current top of stack is an
+        // element whose content is auto-terminated by the
+        // incoming tag, pop it before pushing the new one. Run
+        // in a loop so chained closes work
+        // (e.g. `<td>a<td>b` pops the first `<td>`, and
+        // `<tr><td>a<tr>` pops both td and tr).
+        while (stack.length > 1) {
+          const topEl = stack[stack.length - 1];
+          if (topEl.type === 'element' && shouldAutoClose(topEl.tag, tok.tagName)) {
+            topEl.loc.end = tok.start;
+            stack.pop();
+            continue;
+          }
+          break;
+        }
+        // `top` may have changed — re-read it.
+        const parent = stack[stack.length - 1];
         if (VOID_ELEMENTS.has(tok.tagName)) {
-          top.children.push(elem);
+          parent.children.push(elem);
           i++;
           break;
         }
@@ -396,7 +458,7 @@ function parse(src) {
               });
             }
             elem.loc.end = tokens[j].end;
-            top.children.push(elem);
+            parent.children.push(elem);
             i = j + 1;
           } else {
             // No matching close; raw text runs to end of input.
@@ -409,13 +471,13 @@ function parse(src) {
               });
             }
             elem.loc.end = src.length;
-            top.children.push(elem);
+            parent.children.push(elem);
             i = tokens.length;
           }
           break;
         }
         // Normal element: push onto the stack.
-        top.children.push(elem);
+        parent.children.push(elem);
         stack.push(elem);
         i++;
         break;
