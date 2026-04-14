@@ -150,13 +150,13 @@ function sourceLabelToReason(label) {
 //     trust floor for each finding.
 //
 // B3: when a flow fires, the worklist exposes the current
-// block's accumulated path condition via `ctx.currentPathCond`.
-// We attach BOTH the block-level pathCond AND the value's own
-// formula (built up by computeBinOp / source reads) so a Phase D
-// consumer has the full SMT context needed to refute the flow:
+// block's accumulated path via `ctx.currentPath`. We attach
+// BOTH the block-level path AND the value's own formula (built
+// up by computeBinOp / source reads) so the Z3 refutation layer
+// has the full SMT context needed to refute the flow:
 //
 //   refutable iff
-//     (pathCond ∧ valueFormula ∧ <sink-shape-predicate>) is unsat
+//     (path ∧ valueFormula ∧ <sink-shape-predicate>) is unsat
 //
 // The `pathConditions` array is the legacy shape (a list of
 // human-readable strings) and is left empty for now. The
@@ -208,7 +208,7 @@ function emitTaintFlow(ctx, sinkInfo, sinkLoc, value) {
     },
     severity: sinkInfo.severity,
     pathConditions: [],            // legacy human-readable list — unused in B3
-    pathFormula: ctx.currentPathCond || null,  // SMT formula for the block's reachability
+    pathFormula: ctx.currentPath || null,  // SMT formula for the block's reachability
     valueFormula: (value.formula) || null,     // SMT formula for the value at the sink
     assumptionIds: value.assumptionIds ? value.assumptionIds.slice() : [],
   };
@@ -232,9 +232,21 @@ function instrLoc(ctx, instr) {
 
 // --- Apply a single non-terminator instruction --------------------------
 //
-// Returns the updated State. `ctx` carries the module, assumption
-// tracker, and heap-allocation counter.
-function applyInstruction(ctx, state, instr) {
+// Returns `Promise<State>`. The function is `async` because
+// CALL and NEW walk user functions via `analyseFunction`, which
+// is itself async to support Z3 as Layer 5 of the branch
+// cascade (D6). Synchronous ops still return a State directly
+// from their own helper; the `async` wrapper at this boundary
+// auto-wraps those returns in a resolved Promise.
+//
+// Callers MUST await. Tests that construct a state manually and
+// apply one or more instructions do so via:
+//
+//   state = await applyInstruction(ctx, state, instr);
+//
+// `ctx` carries the module, assumption tracker, and heap-
+// allocation counter.
+async function applyInstruction(ctx, state, instr) {
   switch (instr.op) {
     case OP.CONST: return applyConst(ctx, state, instr);
     case OP.BIN_OP: return applyBinOp(ctx, state, instr);
@@ -249,8 +261,8 @@ function applyInstruction(ctx, state, instr) {
     case OP.SET_GLOBAL: return applySetGlobal(ctx, state, instr);
     case OP.ALLOC: return applyAlloc(ctx, state, instr);
     case OP.FUNC: return applyFunc(ctx, state, instr);
-    case OP.CALL: return applyCall(ctx, state, instr);
-    case OP.NEW: return applyNew(ctx, state, instr);
+    case OP.CALL: return await applyCall(ctx, state, instr);
+    case OP.NEW: return await applyNew(ctx, state, instr);
     case OP.CAST: return applyCast(ctx, state, instr);
     case OP.PHI: return state;  // phi is resolved at block-entry join time
     case OP.OPAQUE: return applyOpaqueInstr(ctx, state, instr);
@@ -879,7 +891,8 @@ function writeHeapField(state, objId, field, value) {
   return Object.freeze({
     regs: state.regs,
     heap: newHeap,
-    pathConds: state.pathConds,
+    path: state.path || null,
+    effects: state.effects,
     assumptionIds: state.assumptionIds,
     callStack: state.callStack,
     _frozen: true,
@@ -1047,7 +1060,8 @@ function applyAlloc(ctx, state, instr) {
   const newState = Object.freeze({
     regs: state.regs,
     heap: newHeap,
-    pathConds: state.pathConds,
+    path: state.path || null,
+    effects: state.effects,
     assumptionIds: state.assumptionIds,
     callStack: state.callStack,
     _frozen: true,
@@ -1084,24 +1098,24 @@ function applyFunc(ctx, state, instr) {
     D.closure(instr.functionId, captureEntries, loc));
 }
 
-// Compute a cache key for a function call's input state.
-// Returns a string (the key) or null if the state contains a
-// value that cannot be fingerprinted cleanly — in which case
-// the call is walked without caching.
+// buildArgsFingerprint — stable string summary of a callee's
+// input state, per D7. Two calls that hash to the same
+// fingerprint share a summary. Components:
 //
-// The key is a concatenation of value fingerprints and a
-// heap-overlay identity tag:
+//   * Each parameter's value fingerprint (in param order).
+//   * Each closure-captured value's fingerprint (in capture
+//     order). A call into the same body with different
+//     captures is a different context and gets its own entry.
+//   * `this` fingerprint.
+//   * A stable heap-identity tag: D.callStackContains handles
+//     recursion, but the cache still needs to know when the
+//     heap differs — two calls with the same args but
+//     different heap shapes can produce different exit
+//     states, so they can't share a summary.
 //
-//   "<fnId>|p=<argFp>|c=<captureFp>|t=<thisFp>|h=<heapId>"
-//
-// Heap identity is a process-unique integer assigned to the
-// caller's heap overlay object via a WeakMap. Two calls with
-// the same overlay REFERENCE share contents (overlays are
-// immutable after freeze); a different reference may or may
-// not have equal contents, so we conservatively miss.
-function buildSummaryCacheKey(calleeFn, calleeInit, closureCaptures, thisValue, callerHeap, callerPathCond) {
-  const parts = [calleeFn.id];
-  // Parameter fingerprints, in param order.
+// Returns a deterministic string.
+function buildArgsFingerprint(calleeFn, calleeInit, closureCaptures, thisValue) {
+  const parts = [];
   if (calleeFn.params) {
     parts.push('p=');
     for (const paramReg of calleeFn.params) {
@@ -1123,19 +1137,11 @@ function buildSummaryCacheKey(calleeFn, calleeInit, closureCaptures, thisValue, 
     parts.push('|t=');
     parts.push(D.valueFingerprint(thisValue));
   }
+  // Heap identity: reuse the caller's heap-overlay identity
+  // tag so a function that doesn't touch the heap shares a
+  // single cache entry across repeated calls.
   parts.push('|h=');
-  parts.push(heapIdentityTag(callerHeap));
-  // Caller pathCond is part of the state correlation: two
-  // calls with the same args but different caller-side
-  // reachability conditions produce different interprocedural
-  // pathFormulas on any flows they emit, so they must not
-  // share a cache entry. Using the formula's string expression
-  // is a conservative but precise key: syntactically identical
-  // formulas share entries, syntactically different ones
-  // don't. A null caller pathCond (top / unconditional) gets
-  // a fixed sentinel.
-  parts.push('|pc=');
-  parts.push(callerPathCond ? callerPathCond.expr : 'top');
+  parts.push(heapIdentityTag(calleeInit.heap));
   return parts.join('');
 }
 
@@ -1177,7 +1183,7 @@ function isEmptyOverlayOver(candidate, base) {
   return o === base;
 }
 
-function applyCall(ctx, state, instr) {
+async function applyCall(ctx, state, instr) {
   const loc = instrLoc(ctx, instr);
   const callee = D.getReg(state, instr.callee);
   const argValues = instr.args.map(r => D.getReg(state, r));
@@ -1217,12 +1223,13 @@ function applyCall(ctx, state, instr) {
   // caller's argument values bound to its params. The callee's
   // exit state's return value becomes this call's result.
   //
-  // Cycle detection: we maintain ctx._callStack as a Set of
-  // function ids currently being analyzed. Re-entering a
-  // function on its own stack = recursion, which we don't
-  // model precisely yet — fall through to the conservative
-  // fallback with an explicit `unimplemented: recursion`
-  // assumption so consumers can see the precision floor.
+  // Cycle detection: per D7, the callee's initial state
+  // carries a `callStack` list of `(funcId, argsFp)` frames.
+  // `D.callStackContains(state, frame)` checks whether this
+  // exact (body, args) pair is already on the chain — if so
+  // we fall through to the recursion fallback below. Different
+  // arg fingerprints for the same body proceed (state-level
+  // check, not a ctx-level Set).
   //
   // Sinks fired inside the callee already get appended to
   // ctx.taintFlows because the callee shares ctx with the
@@ -1265,38 +1272,11 @@ function applyCall(ctx, state, instr) {
     calleeFn = ctx.module.functions.find(f => f.name === instr.calleeName);
   }
   if (calleeFn && calleeFn.cfg) {
-    if (!ctx._callStack) ctx._callStack = new Set();
-    if (ctx._callStack.has(calleeFn.id)) {
-      // Recursion. Raise an explicit assumption so the
-      // imprecision is auditable, and conservatively union the
-      // argument labels into the return value — a recursive
-      // function might return any of its arguments through any
-      // depth of the recursion, so we have to assume it can.
-      const a = ctx.assumptions.raise(
-        REASONS.UNIMPLEMENTED,
-        'recursive call to `' + (calleeFn.name || calleeFn.id) +
-          '` not yet modeled — return value conservatively inherits all argument labels',
-        loc
-      );
-      let recLabels = D.EMPTY_LABELS;
-      const recChain = [a.id];
-      for (const arg of argValues) {
-        if (arg && arg.labels && arg.labels.size > 0) {
-          if (recLabels.size === 0) {
-            recLabels = arg.labels;
-          } else if (recLabels !== arg.labels) {
-            const merged = new Set(recLabels);
-            for (const l of arg.labels) merged.add(l);
-            recLabels = Object.freeze(merged);
-          }
-        }
-        if (arg && arg.assumptionIds) {
-          for (const id of arg.assumptionIds) recChain.push(id);
-        }
-      }
-      return D.setReg(state, instr.dest,
-        D.opaque(recChain, null, loc, recLabels));
-    }
+    // Note: D7 recursion guard is a state-level check using
+    // `D.callStackContains(state, frame)` — it runs AFTER the
+    // args fingerprint is computed below, so a call with the
+    // same (body, argsFp) already on the callStack returns
+    // opaque while different argsFps for the same body proceed.
     // Build the callee's initial state. Bind each param
     // register to the corresponding caller-side argValue. We
     // also share the caller's heap so any ObjectRef passed as
@@ -1331,18 +1311,18 @@ function applyCall(ctx, state, instr) {
     const effectiveArgs = expandSpreadArgs(state, argValues, instr.spreadAt, loc);
     let calleeInit = D.createStateSharingHeap(state);
     // Interprocedural path-sensitivity (Phase D / Wave 11):
-    // seed the callee's initial pathCond with the caller's
-    // current pathCond. As the callee branches, every split
+    // seed the callee's initial `path` with the caller's
+    // current `path`. As the callee branches, every split
     // refines this by conjoining the local branch formula, so
     // any sink fired anywhere inside the callee carries the
     // FULL path from the outermost function entry down to the
     // sink — including all caller-side branches. Without this
-    // seeding, the callee analyses under an empty pathCond
-    // and the Z3 refutation layer cannot use caller-side
+    // seeding, the callee analyses under an empty `path` and
+    // the Z3 refutation layer cannot use caller-side
     // constraints to prove infeasibility.
-    const callerPathCond = ctx.currentPathCond || null;
-    if (callerPathCond) {
-      calleeInit = D.withPathCond(calleeInit, callerPathCond);
+    const callerPath = ctx.currentPath || null;
+    if (callerPath) {
+      calleeInit = D.withPath(calleeInit, callerPath);
     }
     // Closure captures: bind each captured register in the
     // callee's init state. We prefer the caller's CURRENT
@@ -1405,81 +1385,88 @@ function applyCall(ctx, state, instr) {
       calleeInit = D.setReg(calleeInit, restParamReg, restObj.ref);
     }
 
-    // --- C3: state-correlated function summary cache ---
+    // --- D7: k-CFA summary cache + (body, args) recursion guard ---
     //
-    // Before walking the callee, we compute a fingerprint of
-    // the callee's input state (params + captures + this +
-    // heap identity) and check the function's per-instance
-    // cache. On a hit we reuse the cached exit state and
-    // return value without re-analysing the body — a pure
-    // performance win for functions called repeatedly with
-    // the same inputs, but also a PRECISION win under B4:
-    // each caller variant passes its own fingerprint, so a
-    // function called from two distinct variants gets two
-    // distinct cached summaries rather than a single joined
-    // view that merges both paths.
+    // Recursion detection: per D7, a call with the same body
+    // AND same arg fingerprint already on the callStack returns
+    // opaque. Different arg fingerprints for the same body
+    // proceed — they represent distinct call contexts. The
+    // callStack is threaded through every state (not a ctx-
+    // level side channel), so the check is local to the
+    // caller's variant and two variants with different
+    // callStacks decide independently.
+    const argsFingerprint = buildArgsFingerprint(calleeFn, calleeInit, closureCaptures, thisValue);
+    const recursionFrame = { funcId: calleeFn.id, argsFp: argsFingerprint };
+    if (D.callStackContains(state, recursionFrame)) {
+      // Recursion fallback. Raise an unimplemented assumption
+      // so the precision floor is auditable and conservatively
+      // union the argument labels into the return value.
+      const a = ctx.assumptions.raise(
+        REASONS.UNIMPLEMENTED,
+        'recursive call to `' + (calleeFn.name || calleeFn.id) +
+          '` with the same argument fingerprint already on the call stack — return value conservatively inherits all argument labels',
+        loc
+      );
+      let recLabels = D.EMPTY_LABELS;
+      const recChain = [a.id];
+      for (const arg of argValues) {
+        if (arg && arg.labels && arg.labels.size > 0) {
+          if (recLabels.size === 0) {
+            recLabels = arg.labels;
+          } else if (recLabels !== arg.labels) {
+            const merged = new Set(recLabels);
+            for (const l of arg.labels) merged.add(l);
+            recLabels = Object.freeze(merged);
+          }
+        }
+        if (arg && arg.assumptionIds) {
+          for (const id of arg.assumptionIds) recChain.push(id);
+        }
+      }
+      return D.setReg(state, instr.dest,
+        D.opaque(recChain, null, loc, recLabels));
+    }
+
+    // --- C3 (D7): state-correlated function summary cache ---
     //
-    // Fingerprint components:
+    // Key shape per D7: `(body range, argument fingerprint,
+    // this fingerprint)`. Two calls with the same (body, argsFp,
+    // thisFp) share a summary regardless of where they're
+    // called from; the entry value is { exitState }. The
+    // callerPath seeding is NOT part of the key — the callee
+    // analyses the same way structurally regardless of caller
+    // context, and per-caller pathFormula propagation is
+    // handled by the worklist's Layer 5 cascade running during
+    // this walk, not by re-walking per caller.
     //
-    //   * calleeFn.id — function identity
-    //   * valueFingerprint of each effective argument
-    //   * valueFingerprint of each capture (live-preferred, same
-    //     rule applyCall uses to bind them above)
-    //   * valueFingerprint of `this`
-    //   * identity of the caller's heap overlay: two cache
-    //     entries with the same heap overlay REFERENCE observe
-    //     identical heap contents. A different reference may or
-    //     may not have different contents — we conservatively
-    //     treat it as a miss. Heap writes inside the callee
-    //     allocate new overlays, so back-to-back calls with the
-    //     same heap-but-different-writes correctly miss.
-    //
-    // Cache stored on calleeFn (not on ctx) so it survives
-    // across multiple analyze() calls in the same process;
-    // each analysis run starts with a cleared cache when the
-    // IR is rebuilt (fn._summaryCache is undefined on fresh
-    // functions).
-    //
-    // Correctness: the cache value is { exitState, returnValue,
-    // flowsAtWalk }. `flowsAtWalk` is the list of taint-flow
-    // records that the first walk emitted into ctx.taintFlows;
-    // on a cache hit we DO NOT re-emit them (they're already
-    // present from the first walk, keyed by sink location +
-    // labels in ctx._emittedFlowKeys). Subsequent callers with
-    // distinct path conditions won't produce per-caller
-    // pathFormulas on the callee's flows — that's a known
-    // precision floor for cache hits; callers that need the
-    // precise per-caller formula can disable the cache by
-    // bumping calleeFn._summaryCacheBypass.
+    // Cache lives on calleeFn (body-local) so repeated calls
+    // across analyze() invocations on the same module share
+    // summaries without ctx-level bookkeeping.
     if (!calleeFn._summaryCache) calleeFn._summaryCache = new Map();
-    const cacheKey = buildSummaryCacheKey(calleeFn, calleeInit, closureCaptures, thisValue, state.heap, callerPathCond);
-    let calleeResult = cacheKey != null ? calleeFn._summaryCache.get(cacheKey) : null;
+    const cacheKey = 'b=' + calleeFn.id + '|a=' + argsFingerprint;
+    let calleeResult = calleeFn._summaryCache.get(cacheKey) || null;
     let cacheHit = !!calleeResult;
 
+    // Push the current frame onto the callee's callStack so
+    // nested recursive calls see it.
+    calleeInit = D.pushCallStack(calleeInit, recursionFrame);
+
     // Save and restore worklist-level ctx fields so the
-    // callee's analysis runs in its own scope without
-    // leaking into the caller's. The fields the caller's
-    // worklist may have set:
-    //   currentPathCond, currentBlockId, _currentThisValue
-    const savedPathCond = ctx.currentPathCond;
+    // callee's analysis runs in its own scope.
+    const savedPath = ctx.currentPath;
     const savedBlockId = ctx.currentBlockId;
     const savedThis = ctx._currentThisValue;
     if (!cacheHit) {
-      ctx._callStack.add(calleeFn.id);
-      // For method calls, bind `this` to the receiver. For free-
-      // function calls thisValue is null and we keep the saved
-      // value (which may itself be null at the top level).
       if (thisValue) ctx._currentThisValue = thisValue;
       try {
         const analyse = getAnalyseFunction();
-        calleeResult = analyse(ctx.module, calleeFn, calleeInit, ctx);
+        calleeResult = await analyse(ctx.module, calleeFn, calleeInit, ctx);
       } finally {
-        ctx._callStack.delete(calleeFn.id);
-        ctx.currentPathCond = savedPathCond;
+        ctx.currentPath = savedPath;
         ctx.currentBlockId = savedBlockId;
         ctx._currentThisValue = savedThis;
       }
-      if (cacheKey != null && calleeResult && calleeResult.exitState) {
+      if (calleeResult && calleeResult.exitState) {
         calleeFn._summaryCache.set(cacheKey, {
           exitState: calleeResult.exitState,
         });
@@ -1785,7 +1772,7 @@ function maybeEmitSinkFlowForCall(ctx, instr, thisValue, argValues, loc) {
   }
 }
 
-function applyNew(ctx, state, instr) {
+async function applyNew(ctx, state, instr) {
   const loc = instrLoc(ctx, instr);
   let ctorValue = D.getReg(state, instr.ctor);
   const argValues = instr.args.map(r => D.getReg(state, r));
@@ -1873,8 +1860,11 @@ function applyNew(ctx, state, instr) {
   // all args to every ctor. Overrides: a child ctor's SetProp
   // on the same field replaces the parent's value.
   for (const fn of chainFns) {
-    if (!ctx._callStack) ctx._callStack = new Set();
-    if (ctx._callStack.has(fn.id)) continue;   // recursion fallback
+    // D7 recursion guard at the state-level: skip ctor walks
+    // already on this state's callStack with the same argsFp.
+    const ctorArgsFp = buildArgsFingerprint(fn, newState, fn.captures || [], thisRef);
+    const ctorFrame = { funcId: fn.id, argsFp: ctorArgsFp };
+    if (D.callStackContains(newState, ctorFrame)) continue;
     let calleeInit = D.createStateSharingHeap(newState);
     // Closure captures: bind each captured register in the
     // callee's state to the outer register's current value in
@@ -1893,18 +1883,25 @@ function applyNew(ctx, state, instr) {
       const argValue = argValues[i] || D.concrete(undefined, undefined, loc);
       calleeInit = D.setReg(calleeInit, paramReg, argValue);
     }
-    const savedPathCond = ctx.currentPathCond;
+    // Seed the ctor's initial path from the caller's current
+    // path so interprocedural refutations apply inside
+    // constructors too.
+    const ctorCallerPath = ctx.currentPath || null;
+    if (ctorCallerPath) calleeInit = D.withPath(calleeInit, ctorCallerPath);
+    // Push this ctor's frame onto the callStack so any nested
+    // `new` or user call inside the body can see the chain.
+    calleeInit = D.pushCallStack(calleeInit, ctorFrame);
+
+    const savedPath = ctx.currentPath;
     const savedBlockId = ctx.currentBlockId;
     const savedThis = ctx._currentThisValue;
-    ctx._callStack.add(fn.id);
     ctx._currentThisValue = thisRef;
     let calleeResult;
     try {
       const analyse = getAnalyseFunction();
-      calleeResult = analyse(ctx.module, fn, calleeInit, ctx);
+      calleeResult = await analyse(ctx.module, fn, calleeInit, ctx);
     } finally {
-      ctx._callStack.delete(fn.id);
-      ctx.currentPathCond = savedPathCond;
+      ctx.currentPath = savedPath;
       ctx.currentBlockId = savedBlockId;
       ctx._currentThisValue = savedThis;
     }
@@ -2007,7 +2004,8 @@ function writeHeapCell(state, objId, cell) {
   return Object.freeze({
     regs: state.regs,
     heap: newHeap,
-    pathConds: state.pathConds,
+    path: state.path || null,
+    effects: state.effects,
     assumptionIds: state.assumptionIds,
     callStack: state.callStack,
     _frozen: true,
@@ -2032,7 +2030,8 @@ function initHeapCell(state, objId, typeName) {
   return Object.freeze({
     regs: state.regs,
     heap: newHeap,
-    pathConds: state.pathConds,
+    path: state.path || null,
+    effects: state.effects,
     assumptionIds: state.assumptionIds,
     callStack: state.callStack,
     _frozen: true,

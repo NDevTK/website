@@ -3,7 +3,7 @@
 // The worklist algorithm drives a monotone fixpoint over the CFG
 // of each function. Each block carries a SET of variants rather
 // than a single joined state. A variant is a full State with its
-// own `pathCond`: the SMT formula describing the reachability
+// own `path`: the SMT formula describing the reachability
 // condition for this variant (the conjunction of every branch
 // outcome that had to hold for execution to reach this point).
 //
@@ -30,9 +30,9 @@
 // ------------------------
 //
 // Two variants are equivalent iff their (regs, heap) are equal
-// under `stateEquals`. `pathCond` and `assumptionIds` are NOT
-// part of the equivalence check — they are merged disjunctively
-// (pathCond via SMT OR, assumptionIds via set union) when
+// under `stateEquals`. `path` and `assumptionIds` are NOT part
+// of the equivalence check — they are merged disjunctively
+// (path via SMT OR, assumptionIds via set union) when
 // equivalent variants collide.
 //
 // This keeps the variant count per block bounded by the number
@@ -47,7 +47,7 @@
 //
 // Transfer functions are unchanged: they still operate on a
 // single State at a time. The worklist loop processes each
-// variant independently, restoring `ctx.currentPathCond` per
+// variant independently, restoring `ctx.currentPath` per
 // variant so emitTaintFlow can attach the correct per-variant
 // pathFormula to any flow it emits.
 //
@@ -56,10 +56,40 @@
 //
 // A BRANCH terminator splits its parent variant into up to two
 // children — one for each successor — refined according to the
-// branch outcome. The true child's pathCond conjoins the branch
+// branch outcome. The true child's path conjoins the branch
 // formula; the false child's conjoins its negation. Children
 // that collapse to a Bottom register (statically infeasible)
 // are not enqueued.
+//
+// Branch reachability cascade (D6 — 5-layer)
+// ------------------------------------------
+//
+// Every branch check runs through the 5-layer cascade from
+// DESIGN-DECISIONS.md §D6:
+//
+//   1. structural          — JUMP / UNREACHABLE terminators,
+//                            both successors inherit the variant
+//                            (O(1)).
+//   2. constant fold       — truthiness() on a Concrete/OneOf
+//                            cond value returns true/false/null
+//                            (O(1)).
+//   3. value-set refutation — refineEq/refineNeq on the branch
+//                            operand when one side is a literal;
+//                            contradictions collapse to Bottom
+//                            (O(value-set size)).
+//   4. path-sensitive propagation — the conjunction of earlier
+//                            refinements is what actually sits
+//                            in each successor's `path` and in
+//                            its register values (O(refined vars)).
+//   5. SMT (Z3)            — if layers 1-4 leave both successors
+//                            reachable, ask Z3 whether
+//                            (path ∧ cond) is SAT and
+//                            (path ∧ ¬cond) is SAT. Edges whose
+//                            SAT check returns `unsat` are
+//                            statically infeasible and dropped.
+//
+// The cascade is short-circuited at the earliest layer that can
+// decide. Layer 5 is only called when layers 1-4 return unknown.
 //
 // Exit state
 // ----------
@@ -72,7 +102,8 @@
 //
 // Strictly iterative: no recursion. Deep call graphs cannot
 // blow the JavaScript call stack. The call stack stored in
-// ctx._callStack handles interprocedural cycle detection.
+// Each state's `callStack` frame list handles interprocedural
+// cycle detection per D7 (see domain.callStackContains).
 
 'use strict';
 
@@ -110,7 +141,7 @@ function buildDefs(fn) {
 //
 //   * If an existing variant has the same (regs, heap) shape
 //     AND the same `fromBlock`, we merge the newcomer's
-//     pathCond and assumptionIds via disjunction / union. If
+//     `path` and assumptionIds via disjunction / union. If
 //     the merge does not change the existing variant, `added`
 //     is false and no re-processing is required.
 //   * If the newcomer is a back-edge arrival at a loop header
@@ -136,18 +167,18 @@ function insertVariant(blockVariants, blockId, newState, wideningJoin) {
       const joined = D.joinStates(existing, newState);
       if (D.stateEquals(joined, existing)) {
         // Widening is a no-op: the existing variant already
-        // subsumes the newcomer. Still merge pathCond and
+        // subsumes the newcomer. Still merge path and
         // assumption ids in case those are the only things
         // that grew.
-        const mergedPath = D.joinPathConds(existing.pathCond, newState.pathCond);
-        const pcChanged = (existing.pathCond ? existing.pathCond.expr : '') !==
+        const mergedPath = D.joinPaths(existing.path, newState.path);
+        const pcChanged = (existing.path ? existing.path.expr : '') !==
           (mergedPath ? mergedPath.expr : '');
         if (!pcChanged) return { added: false, variantIdx: i };
         list[i] = Object.freeze({
           regs: existing.regs,
           heap: existing.heap,
-          pathConds: existing.pathConds,
-          pathCond: mergedPath,
+          path: mergedPath,
+          effects: existing.effects,
           assumptionIds: existing.assumptionIds,
           callStack: existing.callStack,
           _fromBlock: existing._fromBlock,
@@ -160,8 +191,8 @@ function insertVariant(blockVariants, blockId, newState, wideningJoin) {
       list[i] = Object.freeze({
         regs: joined.regs,
         heap: joined.heap,
-        pathConds: joined.pathConds,
-        pathCond: joined.pathCond,
+        path: joined.path,
+        effects: joined.effects,
         assumptionIds: joined.assumptionIds,
         callStack: joined.callStack,
         _fromBlock: existing._fromBlock,
@@ -177,8 +208,8 @@ function insertVariant(blockVariants, blockId, newState, wideningJoin) {
     const existing = list[i];
     if (existing._fromBlock !== newState._fromBlock) continue;
     if (!D.stateEquals(existing, newState)) continue;
-    const mergedPath = D.joinPathConds(existing.pathCond, newState.pathCond);
-    const existingPcKey = existing.pathCond ? existing.pathCond.expr : '';
+    const mergedPath = D.joinPaths(existing.path, newState.path);
+    const existingPcKey = existing.path ? existing.path.expr : '';
     const mergedPcKey = mergedPath ? mergedPath.expr : '';
     const pcChanged = existingPcKey !== mergedPcKey;
     const seen = new Set(existing.assumptionIds);
@@ -193,8 +224,8 @@ function insertVariant(blockVariants, blockId, newState, wideningJoin) {
     list[i] = Object.freeze({
       regs: existing.regs,
       heap: existing.heap,
-      pathConds: existing.pathConds,
-      pathCond: mergedPath,
+      path: mergedPath,
+      effects: existing.effects,
       assumptionIds: Object.freeze(mergedIds),
       callStack: existing.callStack,
       _fromBlock: existing._fromBlock,
@@ -214,8 +245,8 @@ function withFromBlock(state, fromBlock) {
   return Object.freeze({
     regs: state.regs,
     heap: state.heap,
-    pathConds: state.pathConds,
-    pathCond: state.pathCond || null,
+    path: state.path || null,
+    effects: state.effects,
     assumptionIds: state.assumptionIds,
     callStack: state.callStack,
     _fromBlock: fromBlock,
@@ -235,7 +266,7 @@ function joinVariantList(list) {
   return s;
 }
 
-function analyseFunction(module, fn, initialState, ctx) {
+async function analyseFunction(module, fn, initialState, ctx) {
   const cfg = fn.cfg;
 
   // Per-block in-state: each block holds a list of variants
@@ -250,9 +281,9 @@ function analyseFunction(module, fn, initialState, ctx) {
   const variantOutStates = new Map();    // BlockId → Array<State>
   const defs = buildDefs(fn);
 
-  // Legacy per-block pathCond map, used by the tests (path-cond.test.js)
+  // Legacy per-block path map, used by the tests (path-cond.test.js)
   // and by consumers that want a single-formula-per-block view.
-  // It's the disjunction of every variant's pathCond at the block
+  // It's the disjunction of every variant's `path` at the block
   // — equivalent to the old "OR over edge formulas" computation.
   const pathConds = new Map();           // BlockId → Formula | null
 
@@ -316,19 +347,16 @@ function analyseFunction(module, fn, initialState, ctx) {
     pending.splice(lo, 0, { blockId, variantIdx });
   }
 
-  // Add a state to a block's variant list, re-enqueue if it's a
-  // new or grown variant, and update the legacy pathConds map
-  // from the merged block disjunction. `fromBlock` identifies
-  // the predecessor block whose terminator is enqueueing this
-  // edge — we eagerly resolve the target's phis *here* at
-  // enqueue time, using the specific predecessor's state, so
-  // each variant at `blockId` carries its own correlated phi
-  // outputs rather than pulling from a pooled predecessor
-  // out-state list. This is what preserves cross-register
-  // correlation through nested join points: two variants
-  // arriving from the same predecessor-by-name but with
-  // different (kind, data) shapes produce distinct successor
-  // variants rather than collapsing through a join.
+  // Add a state to a block's variant list, re-enqueue if it's
+  // a new or grown variant, and update the legacy pathConds
+  // map from the merged block disjunction. `fromBlock`
+  // identifies the predecessor block whose terminator is
+  // enqueueing this edge — we eagerly resolve the target's
+  // phis *here* at enqueue time, using the specific
+  // predecessor's state, so each variant at `blockId` carries
+  // its own correlated phi outputs rather than pulling from a
+  // pooled predecessor out-state list. This is what preserves
+  // cross-register correlation through nested join points.
   //
   // Back-edge widening: if the edge is a back edge (fromBlock
   // is a back-edge predecessor of blockId), the new variant
@@ -353,21 +381,21 @@ function analyseFunction(module, fn, initialState, ctx) {
     let disj = null;
     let anyNull = false;
     for (const v of list) {
-      if (v.pathCond == null) { anyNull = true; break; }
-      disj = disj ? D.joinPathConds(disj, v.pathCond) : v.pathCond;
+      if (v.path == null) { anyNull = true; break; }
+      disj = disj ? D.joinPaths(disj, v.path) : v.path;
     }
     pathConds.set(blockId, anyNull ? null : disj);
 
     if (added) enqueueVariant(blockId, variantIdx);
   }
 
-  // Entry block is reachable under whatever pathCond the
-  // caller passed in — null for the top-level (outermost)
-  // function, a non-trivial formula for a callee walked from
+  // Entry block is reachable under whatever `path` the caller
+  // passed in — null for the top-level (outermost) function, a
+  // non-trivial formula for a callee walked from
   // transfer.applyCall (the caller seeds the callee's initial
-  // pathCond with its own current pathCond so any flow fired
-  // inside the callee inherits the full interprocedural path
-  // condition). We preserve `initialState.pathCond` instead of
+  // `path` with its own current path so any flow fired inside
+  // the callee inherits the full interprocedural path
+  // condition). We preserve `initialState.path` instead of
   // forcing it to null.
   enqueue(cfg.entry, initialState, null);
 
@@ -392,31 +420,36 @@ function analyseFunction(module, fn, initialState, ctx) {
     // sense, so its IR never contains phi instructions).
     let state = inState;
 
-    // Expose the variant's path condition to the transfer
-    // functions so sink emission attaches the correct
-    // per-variant pathFormula. ctx.currentPathCond is a
-    // read-only side channel; transfer functions must not
-    // mutate it.
-    const currentPathCond = state.pathCond;
-    const prevPathCond = ctx.currentPathCond;
-    ctx.currentPathCond = currentPathCond;
+    // Expose the variant's path to the transfer functions so
+    // sink emission attaches the correct per-variant pathFormula.
+    // `ctx.currentPath` is a read-only side channel; transfer
+    // functions must not mutate it.
+    const currentPath = state.path;
+    const prevPath = ctx.currentPath;
+    ctx.currentPath = currentPath;
     ctx.currentBlockId = blockId;
 
     // Intra-block fast path: unfreeze, write in place, refreeze.
-    // PHI instructions are already resolved by bakePhis at enqueue
-    // time, so we skip them in the block body. Skipping is
-    // important for correctness as well as performance: running
+    // PHI instructions are already resolved by bakePhis at
+    // enqueue time, so we skip them in the block body. Running
     // applyInstruction on a PHI would re-join across all
-    // predecessors and clobber the per-variant values we just
-    // baked in.
+    // predecessors and clobber the per-variant values that
+    // bakePhis just installed.
+    //
+    // applyInstruction is async — CALL / NEW walk user
+    // functions via this same analyseFunction, which is async
+    // for Z3 Layer 5. Every op returns Promise<State>; the
+    // `await` here is the cost of proper async discipline
+    // (one resolved-promise microtask per sync op), not an
+    // optimisation knob to hack around.
     state = D.unfreezeState(state);
     for (const instr of block.instructions) {
       if (instr.op === OP.PHI) continue;
-      state = applyInstruction(ctx, state, instr);
+      state = await applyInstruction(ctx, state, instr);
     }
     state = D.freezeState(state);
 
-    ctx.currentPathCond = prevPathCond;
+    ctx.currentPath = prevPath;
 
     // Stash the per-variant out-state for phi resolution in
     // successors and for exit collection.
@@ -425,55 +458,87 @@ function analyseFunction(module, fn, initialState, ctx) {
     outList[variantIdx] = state;
 
     // Handle the terminator: queue each successor with a
-    // refined / re-conditioned variant. The variant's pathCond
-    // is preserved across a JUMP and conjoined with the branch
+    // refined / re-conditioned variant. The variant's `path` is
+    // preserved across a JUMP and conjoined with the branch
     // outcome across a BRANCH.
     const term = block.terminator;
     if (!term) continue;
 
-    const varPathCond = state.pathCond;
+    const varPath = state.path;
 
     switch (term.op) {
       case OP.JUMP: {
-        // Unconditional edge: target inherits this variant's pathCond.
+        // Layer 1 (structural): unconditional edge, target
+        // inherits this variant's `path`.
         enqueue(term.target, state, blockId);
         break;
       }
       case OP.BRANCH: {
+        // D6: 5-layer reachability cascade. Every check goes
+        // through all 5 layers in order, stopping at the first
+        // layer that can decide.
         const cond = D.getReg(state, term.cond);
+        // Layer 2 (constant fold): concrete truthiness decides
+        // the branch unambiguously.
         const truthy = D.truthiness(cond);
         if (truthy === true) {
           enqueue(term.trueTarget, state, blockId);
-        } else if (truthy === false) {
+          break;
+        }
+        if (truthy === false) {
           enqueue(term.falseTarget, state, blockId);
-        } else {
-          // Unknown truth: split this variant into its two
-          // children. Each child gets the refined register map
-          // and the branch formula conjoined into its pathCond.
-          const condForm = (cond && cond.formula) ? cond.formula : null;
-          let trueEdge = varPathCond, falseEdge = varPathCond;
-          if (condForm) {
-            trueEdge = varPathCond
-              ? SMT.mkAnd(varPathCond, condForm)
-              : condForm;
-            const negCond = SMT.mkNot(condForm);
-            falseEdge = varPathCond
-              ? SMT.mkAnd(varPathCond, negCond)
-              : negCond;
-          }
+          break;
+        }
 
-          // Value-level branch refinement (B5 + Wave 1).
-          const trueState = refineForBranch(state, term.cond, defs, true, ctx.typeDB);
-          const falseState = refineForBranch(state, term.cond, defs, false, ctx.typeDB);
-          const trueDead = refinementContradicts(state, trueState);
-          const falseDead = refinementContradicts(state, falseState);
+        // Build the per-edge `path` formula: varPath ∧ cond for
+        // the true edge, varPath ∧ ¬cond for the false edge.
+        const condForm = (cond && cond.formula) ? cond.formula : null;
+        let trueEdge = varPath, falseEdge = varPath;
+        if (condForm) {
+          trueEdge = varPath ? SMT.mkAnd(varPath, condForm) : condForm;
+          const negCond = SMT.mkNot(condForm);
+          falseEdge = varPath ? SMT.mkAnd(varPath, negCond) : negCond;
+        }
 
-          if (!trueDead) {
-            enqueue(term.trueTarget, D.withPathCond(trueState, trueEdge), blockId);
+        // Layers 3 + 4 (value-set refutation + path-sensitive
+        // propagation): refineEq/refineNeq on the branch
+        // operand when one side is a literal. Collapses
+        // contradictory sides to Bottom.
+        const trueState = refineForBranch(state, term.cond, defs, true, ctx.typeDB);
+        const falseState = refineForBranch(state, term.cond, defs, false, ctx.typeDB);
+        let trueDead = refinementContradicts(state, trueState);
+        let falseDead = refinementContradicts(state, falseState);
+
+        // Layer 5 (SMT): if both sides are still reachable
+        // after value-level refinement, ask Z3 whether each
+        // edge's `path` is satisfiable. UNSAT edges are dead.
+        //
+        // Skipped entirely when precision === 'fast'. Skipped
+        // also when both sides already have a non-symbolic
+        // formula (the cond has no SMT representation, so Z3
+        // can't help).
+        if (!trueDead && !falseDead &&
+            ctx.precision !== 'fast' &&
+            condForm &&
+            ctx.solverCheckPathSat) {
+          // Check trueEdge first: we need both to be checked
+          // independently because different refinements can
+          // land on different sides.
+          if (SMT.hasSym(trueEdge) && !trueEdge.incompatible) {
+            const verdict = await ctx.solverCheckPathSat(trueEdge);
+            if (verdict === 'unsat') trueDead = true;
           }
-          if (!falseDead) {
-            enqueue(term.falseTarget, D.withPathCond(falseState, falseEdge), blockId);
+          if (SMT.hasSym(falseEdge) && !falseEdge.incompatible) {
+            const verdict = await ctx.solverCheckPathSat(falseEdge);
+            if (verdict === 'unsat') falseDead = true;
           }
+        }
+
+        if (!trueDead) {
+          enqueue(term.trueTarget, D.withPath(trueState, trueEdge), blockId);
+        }
+        if (!falseDead) {
+          enqueue(term.falseTarget, D.withPath(falseState, falseEdge), blockId);
         }
         break;
       }
@@ -487,9 +552,9 @@ function analyseFunction(module, fn, initialState, ctx) {
         break;
       }
       case OP.SWITCH: {
-        // Each case successor inherits the variant's pathCond
-        // unchanged. Per-case refinement of the discriminant is
-        // handled at IR lowering time via explicit equality
+        // Each case successor inherits the variant's `path`
+        // unchanged. Per-case refinement of the discriminant
+        // is handled at IR lowering time via explicit equality
         // tests (Wave 9 switch lowering).
         for (const c of term.cases) enqueue(c.target, state, blockId);
         if (term.default) enqueue(term.default, state, blockId);

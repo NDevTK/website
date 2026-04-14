@@ -34,30 +34,45 @@ type AnalyzeOptions = {
   // Precision level. Higher = slower but fewer `precision`
   // assumptions. Defaults to 'precise'.
   //
-  //   'fast'   — skip Layer 5 (SMT) entirely; all undecided
-  //              branches become `unsolvable-math` assumptions.
-  //   'precise' — use cascaded layers 1–5 with Z3 as the last
-  //              resort.
-  //   'exact'  — use cascaded layers 1–5 and never cache-reuse
-  //              across distinct argument fingerprints (full
-  //              context sensitivity, slowest).
+  //   'fast'   — skip Layer 5 (Z3) entirely. The branch
+  //              reachability cascade stops at Layer 4 (path-
+  //              sensitive propagation), and the post-pass
+  //              refutation is also skipped. Undecided branches
+  //              become `unsolvable-math` assumptions.
+  //   'precise' — use cascaded layers 1–5 with Z3 at the branch
+  //              decision cascade AND run the post-pass
+  //              refutation over any surviving flows. Default.
+  //   'exact'  — same as 'precise' but also clears every
+  //              function's C3 summary cache before the walk,
+  //              so each call site walks the callee from scratch
+  //              (full context sensitivity, slowest).
   precision?: 'fast' | 'precise' | 'exact';
 
   // Soft cap per SMT call in milliseconds. Exceeded calls
   // return 'unknown' and raise an `unsolvable-math` assumption.
-  // Default: 5000.
+  // Default: 5000. Plumbed through to z3.checkPathSat on every
+  // Layer 5 invocation and to the post-pass refutation.
   smtTimeoutMs?: number;
 
   // Enable taint tracking. When false, the analyser skips
   // source/sink classification but still produces the call
-  // graph, string literals, and value sets. Default: false.
+  // graph, string literals, and value sets. Default: true.
   taint?: boolean;
 
   // Streaming watchers. Invoked during the walk rather than
   // after. Use for long-running analyses where incremental
   // feedback matters.
+  //
+  //   onCall       — fired for every user-function call walked
+  //                  interprocedurally. The callback receives
+  //                  (callee, argValues, thisValue, state, loc,
+  //                  instr). May return an override { value,
+  //                  state } to short-circuit the walk.
+  //   onFinding    — fired with each TaintFlow as it is emitted.
+  //   onAssumption — fired with each Assumption as it is raised.
   watchers?: {
-    onCall?: (info: CallInfo) => void;
+    onCall?: (callee, argValues, thisValue, state, loc, instr) =>
+      void | { value: Value, state?: State };
     onFinding?: (flow: TaintFlow) => void;
     onAssumption?: (a: Assumption) => void;
   };
@@ -79,8 +94,19 @@ type Trace = {
   calls: CallInfo[];
 
   // Taint flows from sources to sinks, with accumulated path
-  // conditions.
+  // conditions. Flows whose path condition Z3 proved UNSAT at
+  // branch-decision time (Layer 5) are never emitted and do
+  // not appear here. Flows refuted by the post-pass are moved
+  // to `refutedFlows`.
   taintFlows: TaintFlow[];
+
+  // Flows that the Z3 post-pass refutation moved out of
+  // `taintFlows`. Present only when the post-pass found at
+  // least one refutable flow (under precision: 'fast' this
+  // field is never populated). Consumers that want to audit
+  // which flows were dropped inspect this list; consumers
+  // that only want surviving flows ignore it.
+  refutedFlows?: TaintFlow[];
 
   // Assignments to innerHTML / outerHTML / document.write.
   innerHtmlAssignments: InnerHtmlAssignment[];

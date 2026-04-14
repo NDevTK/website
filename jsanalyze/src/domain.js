@@ -1140,26 +1140,36 @@ function createState() {
   return Object.freeze({
     regs: createEmptyOverlay(),
     heap: createEmptyOverlay(),
-    pathConds: Object.freeze([]),
-    // B4 (Wave 10): pathCond is a first-class field on every
-    // state. It is the SMT formula describing the reachability
-    // condition for this variant — the conjunction of every
-    // branch outcome that had to hold for execution to arrive
-    // at this state. `null` means "unconditionally reachable"
-    // (logical top). Merging two equivalent states (same regs +
-    // heap) ORs their pathConds so the surviving variant covers
-    // both arrival paths. Splitting a state across a branch
-    // ANDs the branch formula (or its negation) into the
-    // child's pathCond.
-    //
-    // pathCond is NOT part of stateEquals — two states with
-    // identical (regs, heap) but different pathConds are the
-    // same variant and must be collapsed (with OR) to keep the
-    // fixpoint finite. It IS part of the variant's observable
-    // behaviour for sink-flow emission: emitTaintFlow reads it
-    // to populate the flow's pathFormula.
-    pathCond: null,
+    // State.path — the SMT formula describing the reachability
+    // condition for this variant (ABSTRACT-DOMAIN.md §State).
+    // `null` means unconditionally reachable (logical top).
+    // Merging two equivalent variants (same regs + heap) ORs
+    // their paths via `joinPaths` so the surviving variant
+    // covers both arrival paths. Splitting across a branch
+    // ANDs the branch formula (or its negation) into each
+    // child's path. `path` is NOT part of stateEquals — two
+    // states with identical (regs, heap) are equivalent
+    // variants regardless of path, and must be collapsed with
+    // OR to keep the fixpoint finite.
+    path: null,
+    // State.effects — ordered list of externally-observable
+    // writes made along this path (heap writes, console calls,
+    // network requests, etc.). Populated by transfer functions
+    // that emit side-effect events and consumed by downstream
+    // rewriters like the DOM-conversion consumer. Empty at
+    // the function entry.
+    effects: Object.freeze([]),
+    // State.assumptionIds — the set of assumption ids this
+    // path has accumulated. Merged by set-union on joins.
     assumptionIds: Object.freeze([]),
+    // State.callStack — the call chain for recursion
+    // detection, per D7. Each entry is a frame record:
+    //   { funcId: <fnId>, argsFp: <arg fingerprint> }
+    // Equality of two frames requires BOTH the funcId AND
+    // argsFp to match — different arg fingerprints are
+    // different contexts even for the same function, so
+    // non-infinite recursion proceeds until the callStack
+    // actually cycles.
     callStack: Object.freeze([]),
     _frozen: true,
   });
@@ -1172,59 +1182,85 @@ function withHeap(state, newHeap) {
   return Object.freeze({
     regs: state.regs,
     heap: newHeap,
-    pathConds: state.pathConds,
-    pathCond: state.pathCond || null,
+    path: state.path || null,
+    effects: state.effects || EMPTY_EFFECTS,
     assumptionIds: state.assumptionIds,
     callStack: state.callStack,
     _frozen: true,
   });
 }
 
-// withPathCond — return a new frozen state whose pathCond is
-// replaced. Used by the worklist when splitting a variant across
-// a branch (the two children inherit everything except the
-// pathCond, which gets the branch formula conjoined in) and when
-// merging equivalent variants (the survivor's pathCond becomes
+// withPath — return a new frozen state whose `path` is
+// replaced. Used by the worklist when splitting a variant
+// across a branch (each child inherits everything except the
+// path, which gets the branch formula conjoined in) and when
+// merging equivalent variants (the survivor's path becomes
 // the disjunction).
-function withPathCond(state, newPathCond) {
+function withPath(state, newPath) {
   return Object.freeze({
     regs: state.regs,
     heap: state.heap,
-    pathConds: state.pathConds,
-    pathCond: newPathCond || null,
+    path: newPath || null,
+    effects: state.effects || EMPTY_EFFECTS,
     assumptionIds: state.assumptionIds,
     callStack: state.callStack,
     _frozen: true,
   });
+}
+
+// pushCallStack — return a new frozen state whose callStack
+// gains `frame` on top. Used by transfer.applyCall before it
+// invokes analyseFunction on the callee, so the callee's
+// state records the call chain for D7 recursion detection.
+// Frame shape: { funcId, argsFp }.
+function pushCallStack(state, frame) {
+  const next = state.callStack.concat([Object.freeze(frame)]);
+  return Object.freeze({
+    regs: state.regs,
+    heap: state.heap,
+    path: state.path || null,
+    effects: state.effects || EMPTY_EFFECTS,
+    assumptionIds: state.assumptionIds,
+    callStack: Object.freeze(next),
+    _frozen: true,
+  });
+}
+
+// callStackContains — true iff any frame on the stack has
+// the same (funcId, argsFp) as `frame`. This is the D7
+// recursion guard: a call with the same body AND same arg
+// fingerprint already on the stack would loop forever and
+// returns opaque; different args for the same body proceed.
+function callStackContains(state, frame) {
+  if (!state.callStack || state.callStack.length === 0) return false;
+  for (const f of state.callStack) {
+    if (f.funcId === frame.funcId && f.argsFp === frame.argsFp) return true;
+  }
+  return false;
 }
 
 // createStateSharingHeap — used by inter-procedural call
 // lowering (applyCall). Produces a fresh state whose `regs`
 // are empty but whose `heap` overlays the caller's, so the
 // callee can dereference any ObjectRef / heap cell the caller
-// passed as an argument. This is sound for call-site-
-// context-insensitive analysis; a more precise treatment
-// (Phase C3) would clone-and-reconcile the heap per call
-// context.
+// passed as an argument. The callee's path starts as whatever
+// the caller passed in (seeded with the caller's current
+// path to preserve interprocedural path-sensitivity).
 function createStateSharingHeap(callerState) {
   return Object.freeze({
     regs: createEmptyOverlay(),
     heap: callerState && callerState.heap
       ? { own: new Map(), parent: callerState.heap }
       : createEmptyOverlay(),
-    pathConds: Object.freeze([]),
-    // The callee analyses under unconditional reachability from
-    // its own entry — the caller's pathCond is a constraint on
-    // the call site, not on the callee's internal control flow.
-    // B4 threads the call-site pathCond back in when a callee
-    // flow is re-emitted into the caller's flow list (handled
-    // by emitTaintFlow at the call site).
-    pathCond: null,
+    path: null,
+    effects: Object.freeze([]),
     assumptionIds: Object.freeze([]),
-    callStack: Object.freeze([]),
+    callStack: (callerState && callerState.callStack) || Object.freeze([]),
     _frozen: true,
   });
 }
+
+const EMPTY_EFFECTS = Object.freeze([]);
 
 function setReg(state, register, value) {
   if (!register) return state;
@@ -1238,8 +1274,8 @@ function setReg(state, register, value) {
   return Object.freeze({
     regs: newRegs,
     heap: state.heap,
-    pathConds: state.pathConds,
-    pathCond: state.pathCond || null,
+    path: state.path || null,
+    effects: state.effects || EMPTY_EFFECTS,
     assumptionIds: state.assumptionIds,
     callStack: state.callStack,
     _frozen: true,
@@ -1258,8 +1294,8 @@ function unfreezeState(state) {
   return {
     regs: { own: new Map(), parent: state.regs },
     heap: { own: new Map(), parent: state.heap },
-    pathConds: state.pathConds,
-    pathCond: state.pathCond || null,
+    path: state.path || null,
+    effects: state.effects || EMPTY_EFFECTS,
     assumptionIds: state.assumptionIds,
     callStack: state.callStack,
     _frozen: false,
@@ -1279,8 +1315,8 @@ function freezeState(state) {
   return Object.freeze({
     regs: state.regs,
     heap: state.heap,
-    pathConds: state.pathConds,
-    pathCond: state.pathCond || null,
+    path: state.path || null,
+    effects: state.effects || EMPTY_EFFECTS,
     assumptionIds: state.assumptionIds,
     callStack: state.callStack,
     _frozen: true,
@@ -1362,22 +1398,27 @@ function joinStates(a, b) {
   const seen = new Set(a.assumptionIds);
   const ids = a.assumptionIds.slice();
   for (const i of b.assumptionIds) if (!seen.has(i)) { seen.add(i); ids.push(i); }
-  const pathConds = a.pathConds === b.pathConds
-    ? a.pathConds
-    : Object.freeze(a.pathConds.concat(b.pathConds));
+  // Merge effects as ordered concatenation of deduped events.
+  // Effects represent writes that happened on each path; the
+  // joined state covers both paths so it accumulates every
+  // write from either side. Duplicate events (identity-equal
+  // objects) are dropped.
+  const effSeen = new Set(a.effects);
+  const effMerged = a.effects.slice();
+  for (const e of b.effects) if (!effSeen.has(e)) { effSeen.add(e); effMerged.push(e); }
   // joinStates is used by the worklist when two equivalent
   // variants merge (same regs+heap shape, different arrival
-  // paths). We OR the pathConds so the surviving variant covers
+  // paths). We OR the paths so the surviving variant covers
   // both predecessors. If either side is `null` (top /
   // unconditionally reachable) the result is `null`. A lazy
   // require for smt.js keeps this file's load-time dependency
-  // graph simple (domain.js loads before smt.js in some tests).
-  const joinedPathCond = joinPathConds(a.pathCond, b.pathCond);
+  // graph simple.
+  const joinedPath = joinPaths(a.path, b.path);
   return Object.freeze({
     regs: newRegs,
     heap: newHeap,
-    pathConds,
-    pathCond: joinedPathCond,
+    path: joinedPath,
+    effects: Object.freeze(effMerged),
     assumptionIds: Object.freeze(ids),
     callStack: a.callStack,
     _frozen: true,
@@ -1385,7 +1426,7 @@ function joinStates(a, b) {
 }
 
 let _smtModule = null;
-function joinPathConds(a, b) {
+function joinPaths(a, b) {
   if (a == null || b == null) return null;
   if (a === b || a.expr === b.expr) return a;
   if (!_smtModule) _smtModule = require('./smt.js');
@@ -1446,7 +1487,8 @@ module.exports = {
   withFormula, valueFormula,
   refineEq, refineNeq, refineByType, refineNotByType,
   refineInstanceof, refineNotInstanceof, typeChainIncludes,
-  createState, createStateSharingHeap, withHeap, withPathCond, setReg, getReg, joinStates, joinPathConds, stateLeq, stateEquals,
+  createState, createStateSharingHeap, withHeap, withPath, pushCallStack, callStackContains,
+  setReg, getReg, joinStates, joinPaths, stateLeq, stateEquals,
   unfreezeState, freezeState,
   overlayGet, overlayHas, overlayEntries, overlaySize, overlayFlatten,
   inferTypeName, canonKey, valueFingerprint,

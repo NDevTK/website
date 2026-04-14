@@ -307,39 +307,85 @@ If Layer 5 returned unknown, the branch is treated as reachable
 with the assumption attached. Findings on this branch are still
 sound; they may over-report.
 
-## Worklist algorithm
+## Worklist algorithm (multi-variant / B4)
+
+Each block carries a SET of variants rather than a single
+joined state. A variant is a full State (including its own
+`path`, `effects`, `assumptionIds`, `callStack`). Equivalent
+variants — same `(regs, heap)` — merge disjunctively,
+unioning their `effects`, OR-ing their `path`, unioning their
+`assumptionIds`. Distinct variants stay separate so cross-
+register correlation survives merges: after
+
+    if (c) { x = 1; y = "a"; } else { x = 2; y = "b"; }
+
+the join block holds two variants, `{x=1, y="a"}` and
+`{x=2, y="b"}`, rather than the pointwise join `{x=oneOf{1,2},
+y=oneOf{"a","b"}}`. A later `if (x === 1)` refines x to 1 on
+variant 1 and to ⊥ on variant 2 — the dead variant drops out,
+and any sink on `y` inside the true branch sees only `y="a"`.
 
 ```
 function analyse(module, initialState):
-  blockStates = Map()
-  worklist = new Queue()
-  worklist.push((module.top.cfg.entry, initialState))
+  blockVariants = Map<BlockId, Variant[]>   -- per-block variant list
+  pending = PriorityQueue of (blockId, variantIdx)
+                              -- keyed by reverse-postorder
 
-  while worklist not empty:
-    (block, inState) = worklist.dequeue()
-    oldState = blockStates[block] or ⊥
-    joinedIn = oldState ⊔ inState
-    if joinedIn == oldState: continue     -- no new information
-    blockStates[block] = joinedIn
-    outState = transfer(block, joinedIn)
+  enqueue(cfg.entry, initialState, fromBlock=null)
+
+  while pending not empty:
+    (block, variantIdx) = pending.dequeue()
+    variant = blockVariants[block][variantIdx]
+    outState = transfer(block, variant)
+    blockVariants[block][variantIdx].out = outState
+
     for (succ, succState) in reachableSuccessors(block, outState):
-      worklist.push((succ, succState))
+      -- reachableSuccessors runs the 5-layer cascade; Z3 is
+      -- Layer 5, called only when layers 1-4 return unknown
+      enqueue(succ, succState, fromBlock=block)
 
-  return blockStates
+  return blockVariants
 ```
+
+Variant merging at a block obeys two rules:
+
+1. **Structural subsumption**: when a variant arrives with the
+   same `(regs, heap)` and same `fromBlock` as an existing
+   variant, merge the two — OR their paths, union their
+   assumptionIds and effects. If neither grew, no re-processing
+   is needed.
+
+2. **Loop-header widening**: when a variant arrives via a
+   back-edge (the fromBlock has a higher reverse-postorder
+   index than the target, indicating a loop header), pointwise-
+   join it with any existing back-edge variant for the same
+   fromBlock. This collapses per-iteration variants into a
+   single widened variant so loops converge at the value
+   lattice level rather than spawning a fresh variant per
+   iteration count. Forward-edge variants stay distinct.
+
+Phi instructions are **eagerly resolved at enqueue time**: when
+a variant arrives at a target block, its `fromBlock` identifies
+which incoming of each phi to read, and the phi's dest register
+is written into the target variant's regs as a side effect of
+enqueueing. Each variant at the target then carries its own
+correlated phi outputs rather than pulling from a pooled
+predecessor out-state.
 
 Termination: the state lattice has finite ascending chains
 because each block's register set is fixed (finite SSA names)
 and each register's value is drawn from a lattice whose height
 is bounded by the number of distinct concrete values actually
-observed in the program. The worklist only processes a block
-when its inState joined with existing is strictly larger —
-otherwise it skips. Strict growth on a finite lattice terminates.
+observed in the program. Variant counts per block are bounded
+by distinct `(regs, heap)` shapes reachable at that block,
+also finite. The worklist only enqueues a variant when the
+inserted variant is new or strictly grew; strict growth on a
+finite lattice terminates.
 
-Iteration order: block-label priority, with back edges processed
-last to give forward propagation a chance before loop re-visits.
-The exact order does not affect the final result (monotone
-lattice) but affects convergence speed.
+Iteration order: reverse postorder, so forward edges process
+before back-edge re-enqueues. The exact order does not affect
+the final result (monotone lattice) but affects convergence
+speed.
 
 ## Context sensitivity
 

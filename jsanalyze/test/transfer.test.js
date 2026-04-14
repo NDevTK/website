@@ -74,41 +74,41 @@ const tests = [
   },
   {
     name: 'applyInstruction: Const',
-    fn: () => {
+    fn: async () => {
       const c = ctx();
       const s0 = D.createState();
       const instr = { op: OP.CONST, dest: '%r1', value: 42, _id: 1 };
-      const s1 = applyInstruction(c, s0, instr);
+      const s1 = await applyInstruction(c, s0, instr);
       assertEqual(D.getReg(s1, '%r1').value, 42);
     },
   },
   {
     name: 'applyInstruction: BinOp folds',
-    fn: () => {
+    fn: async () => {
       const c = ctx();
       let s = D.createState();
-      s = applyInstruction(c, s, { op: OP.CONST, dest: '%r1', value: 10, _id: 1 });
-      s = applyInstruction(c, s, { op: OP.CONST, dest: '%r2', value: 20, _id: 2 });
-      s = applyInstruction(c, s, { op: OP.BIN_OP, dest: '%r3', operator: '+', left: '%r1', right: '%r2', _id: 3 });
+      s = await applyInstruction(c, s, { op: OP.CONST, dest: '%r1', value: 10, _id: 1 });
+      s = await applyInstruction(c, s, { op: OP.CONST, dest: '%r2', value: 20, _id: 2 });
+      s = await applyInstruction(c, s, { op: OP.BIN_OP, dest: '%r3', operator: '+', left: '%r1', right: '%r2', _id: 3 });
       assertEqual(D.getReg(s, '%r3').value, 30);
     },
   },
   {
     name: 'applyInstruction: UnOp typeof',
-    fn: () => {
+    fn: async () => {
       const c = ctx();
       let s = D.createState();
-      s = applyInstruction(c, s, { op: OP.CONST, dest: '%r1', value: 'hi', _id: 1 });
-      s = applyInstruction(c, s, { op: OP.UN_OP, dest: '%r2', operator: 'typeof', operand: '%r1', _id: 2 });
+      s = await applyInstruction(c, s, { op: OP.CONST, dest: '%r1', value: 'hi', _id: 1 });
+      s = await applyInstruction(c, s, { op: OP.UN_OP, dest: '%r2', operator: 'typeof', operand: '%r1', _id: 2 });
       assertEqual(D.getReg(s, '%r2').value, 'string');
     },
   },
   {
     name: 'applyInstruction: GetGlobal raises opaque-call assumption',
-    fn: () => {
+    fn: async () => {
       const c = ctx();
       const s0 = D.createState();
-      const s1 = applyInstruction(c, s0, {
+      const s1 = await applyInstruction(c, s0, {
         op: OP.GET_GLOBAL, dest: '%r1', name: 'someGlobal', _id: 1,
       });
       assertEqual(D.getReg(s1, '%r1').kind, 'opaque');
@@ -119,10 +119,10 @@ const tests = [
   },
   {
     name: 'applyInstruction: Opaque instr raises assumption with given reason',
-    fn: () => {
+    fn: async () => {
       const c = ctx();
       const s0 = D.createState();
-      const s1 = applyInstruction(c, s0, {
+      const s1 = await applyInstruction(c, s0, {
         op: OP.OPAQUE, dest: '%r1',
         reason: 'unimplemented',
         details: 'test opaque',

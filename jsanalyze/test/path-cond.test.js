@@ -28,7 +28,7 @@ const { assert, assertEqual } = require('./run.js');
 // Helper to run the worklist directly on a snippet. Returns
 // { module, result } where result.pathConds is the per-block
 // path-condition map.
-function walk(code) {
+async function walk(code) {
   const module = buildModule(code, '<input>.js');
   const ctx = {
     module,
@@ -38,7 +38,7 @@ function walk(code) {
     taintFlows: [],
     nextFlowId: 1,
   };
-  const result = analyseFunction(module, module.top, D.createState(), ctx);
+  const result = await analyseFunction(module, module.top, D.createState(), ctx);
   return { module, ctx, result };
 }
 
@@ -63,8 +63,8 @@ function pathCondAtPos(walked, posSubstr) {
 const tests = [
   {
     name: 'B3: entry block is unconditionally reachable (pathCond = null/top)',
-    fn: () => {
-      const w = walk('var x = 1;');
+    fn: async () => {
+      const w = await walk('var x = 1;');
       // Entry block should have pathCond = null (top).
       const entry = w.module.top.cfg.entry;
       const pc = w.result.pathConds.get(entry);
@@ -73,8 +73,8 @@ const tests = [
   },
   {
     name: 'B3: linear (no branch) program → all blocks have null pathCond',
-    fn: () => {
-      const w = walk('var x = location.hash; var y = x + "a";');
+    fn: async () => {
+      const w = await walk('var x = location.hash; var y = x + "a";');
       for (const [bid, pc] of w.result.pathConds) {
         assertEqual(pc, null, 'block ' + bid + ' should have top pathCond');
       }
@@ -82,8 +82,8 @@ const tests = [
   },
   {
     name: 'B3: simple if-else produces conjoined branch conditions',
-    fn: () => {
-      const w = walk('var x = location.hash; if (x === "admin") { var y = 1; } else { var z = 2; }');
+    fn: async () => {
+      const w = await walk('var x = location.hash; if (x === "admin") { var y = 1; } else { var z = 2; }');
       // Find blocks with non-null pathConds. There should be a
       // true branch with `(= |Location.hash_N| "admin")` and a
       // false branch with `(not (= ...))`.
@@ -101,8 +101,8 @@ const tests = [
   },
   {
     name: 'B3: nested if produces conjunctions',
-    fn: () => {
-      const w = walk(
+    fn: async () => {
+      const w = await walk(
         'var x = location.hash; var y = location.search; ' +
         'if (x === "admin") { if (y === "secret") { var z = x; } }');
       // Look for an `(and (= ... "admin") (= ... "secret"))` formula.
@@ -122,8 +122,8 @@ const tests = [
   },
   {
     name: 'B3: post-if join produces disjunctive merge',
-    fn: () => {
-      const w = walk(
+    fn: async () => {
+      const w = await walk(
         'var x = location.hash; if (x === "admin") { var a = 1; } else { var b = 2; } var c = 3;');
       // The block containing `var c = 3` is a join successor and
       // should have pathCond = (or (= ...) (not (= ...))). That's
@@ -143,9 +143,9 @@ const tests = [
   },
   {
     name: 'B3: concrete-true if collapses to single successor (no pathCond growth)',
-    fn: () => {
+    fn: async () => {
       // `if (true)` — the false branch should never be enqueued.
-      const w = walk('var x = location.hash; if (true) { var y = x; } var z = 0;');
+      const w = await walk('var x = location.hash; if (true) { var y = x; } var z = 0;');
       // No block should have a pathCond mentioning `true` — the
       // truthiness check short-circuits before formula construction.
       for (const [bid, pc] of w.result.pathConds) {

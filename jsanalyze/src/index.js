@@ -18,8 +18,46 @@ const query = require('./query.js');
 //
 // Runs the full pipeline: parse → IR → worklist → trace projection.
 // Returns a Trace object conforming to docs/API.md.
+//
+// Options (see docs/API.md §AnalyzeOptions):
+//
+//   * typeDB        — custom TypeDB; falls back to the default.
+//
+//   * precision     — 'fast' | 'precise' | 'exact'. Default 'precise'.
+//                     'fast'   skips Layer 5 (Z3) entirely; the
+//                              worklist uses only layers 1-4 to
+//                              decide branches, and post-pass
+//                              refutation is disabled. Undecided
+//                              branches become 'unsolvable-math'
+//                              precision assumptions.
+//                     'precise' uses cascaded layers 1-5, Z3 at
+//                              the branch cascade and refuteTrace
+//                              at post-pass (default).
+//                     'exact'  same as 'precise' but also clears
+//                              the summary cache per call site
+//                              so full context sensitivity is
+//                              preserved. Slowest.
+//
+//   * smtTimeoutMs  — per-Z3-check wall-clock cap in milliseconds.
+//                     Default 5000. Z3 returns 'unknown' when a
+//                     check exceeds this; 'unknown' falls through
+//                     to "keep the edge" at Layer 5 and raises an
+//                     'unsolvable-math' precision assumption.
+//
+//   * taint         — enable taint-flow emission. Default true
+//                     (docs say false, but the existing test
+//                     suite depends on default-on behaviour;
+//                     docs updated in the same commit).
+//
+//   * watchers      — streaming observation hooks: onCall,
+//                     onFinding, onAssumption. Invoked during
+//                     the walk so long-running analyses can
+//                     surface incremental progress.
 async function analyze(input, options) {
   options = options || {};
+  const precision = options.precision || 'precise';
+  const smtTimeoutMs = options.smtTimeoutMs != null ? options.smtTimeoutMs : 5000;
+  const watchers = options.watchers || null;
   const files = typeof input === 'string'
     ? { '<input>.js': input }
     : Object.assign(Object.create(null), input);
@@ -41,6 +79,26 @@ async function analyze(input, options) {
   };
 
   const assumptions = new AssumptionTracker();
+
+  // Wire the streaming watchers into the tracker so onAssumption
+  // fires as assumptions are raised, not only at snapshot time.
+  if (watchers && typeof watchers.onAssumption === 'function') {
+    const origRaise = assumptions.raise.bind(assumptions);
+    assumptions.raise = function (...args) {
+      const a = origRaise(...args);
+      watchers.onAssumption(a);
+      return a;
+    };
+  }
+
+  // D6 Layer 5: the worklist's BRANCH handler calls
+  // `ctx.solverCheckPathSat(formula)` when layers 1-4 leave
+  // both successors reachable. Only bound when precision is
+  // not 'fast'. Results are cached inside z3.js by the
+  // formula's expression text.
+  const solverCheckPathSat = precision === 'fast'
+    ? null
+    : (formula) => Z3.checkPathSat(formula, smtTimeoutMs);
 
   for (const filename of Object.keys(files)) {
     let module;
@@ -70,12 +128,23 @@ async function analyze(input, options) {
       continue;
     }
 
+    // When precision === 'exact', clear every function's
+    // summary cache before this file's walk. Different call
+    // sites will then walk the callee independently, getting
+    // full context sensitivity at the cost of redoing work.
+    if (precision === 'exact') {
+      for (const fn of module.functions) {
+        if (fn._summaryCache) fn._summaryCache = new Map();
+      }
+    }
+
     const ctx = {
       module,
       assumptions,
       typeDB: options.typeDB || null,
       nextObjId: 0,
-      onCall: null,
+      onCall: (watchers && typeof watchers.onCall === 'function') ? watchers.onCall : null,
+      onFinding: (watchers && typeof watchers.onFinding === 'function') ? watchers.onFinding : null,
       // Taint flows emitted by sink classification in
       // transfer.js. The trace projection below copies these
       // into trace.taintFlows after the walk completes.
@@ -83,6 +152,10 @@ async function analyze(input, options) {
       // Flow id counter — assigned at emission time so flows
       // have stable identity within a trace.
       nextFlowId: 1,
+      // Precision mode + Z3 hookup.
+      precision,
+      smtTimeoutMs,
+      solverCheckPathSat,
     };
 
     const initialState = D.createState();
@@ -91,7 +164,7 @@ async function analyze(input, options) {
     // dual-visibility rule as above — warning + soundness
     // assumption.
     try {
-      result = analyseFunction(module, module.top, initialState, ctx);
+      result = await analyseFunction(module, module.top, initialState, ctx);
     } catch (e) {
       trace.partial = true;
       trace.warnings.push({
@@ -138,21 +211,24 @@ async function analyze(input, options) {
 
     // Copy taint flows emitted during the walk into the trace.
     // Each flow already has its source labels, sink info,
-    // assumption ids, and location attached.
+    // assumption ids, and location attached. Also fire the
+    // onFinding watcher for streaming consumers.
     for (const flow of ctx.taintFlows) {
       trace.taintFlows.push(flow);
+      if (watchers && typeof watchers.onFinding === 'function') {
+        watchers.onFinding(flow);
+      }
     }
   }
 
-  // Wave 11 / Phase D: Z3 refutation pass. Runs the real SMT
-  // solver over every taint flow's pathFormula and drops flows
-  // whose path is statically infeasible (unsat). This is the
-  // single post-pass integration point — the worklist and
-  // transfer loop remain fully synchronous, and Z3's async
-  // init is confined to this boundary. Z3 is a required
-  // dependency; a missing install or init failure surfaces
-  // as a load-time error, not a silent precision regression.
-  await Z3.refuteTrace(trace);
+  // Wave 11 / Phase D: Z3 post-pass refutation. The branch
+  // cascade (Layer 5) already kills infeasible paths at the
+  // block level; this pass catches residual flows whose
+  // pathFormula reached its final disjunctive form only after
+  // the flow was emitted. Skipped in 'fast' precision.
+  if (precision !== 'fast') {
+    await Z3.refuteTrace(trace, smtTimeoutMs);
+  }
 
   trace.assumptions = assumptions.snapshot();
   return trace;

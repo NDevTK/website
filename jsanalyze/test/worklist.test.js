@@ -7,7 +7,7 @@ const D = require('../src/domain.js');
 const { overlayEntries } = require('../src/domain.js');
 const { assert, assertEqual } = require('./run.js');
 
-function analyse(source) {
+async function analyse(source) {
   const module = buildModule(source, 'test.js');
   const ctx = {
     module,
@@ -17,7 +17,7 @@ function analyse(source) {
     onCall: null,
   };
   const initial = D.createState();
-  const result = analyseFunction(module, module.top, initial, ctx);
+  const result = await analyseFunction(module, module.top, initial, ctx);
   return { module, ctx, result };
 }
 
@@ -47,8 +47,8 @@ function lastRegWithValue(module, state, predicate) {
 const tests = [
   {
     name: 'analyse: var x = 42 → register holds concrete 42',
-    fn: () => {
-      const r = analyse('var x = 42;');
+    fn: async () => {
+      const r = await analyse('var x = 42;');
       const v = lastRegWithValue(r.module, r.result.exitState,
         v => v.kind === 'concrete' && v.value === 42);
       assert(v, 'expected a register holding 42');
@@ -56,8 +56,8 @@ const tests = [
   },
   {
     name: 'analyse: var z = 1 + 2 → register holds concrete 3',
-    fn: () => {
-      const r = analyse('var z = 1 + 2;');
+    fn: async () => {
+      const r = await analyse('var z = 1 + 2;');
       const v = lastRegWithValue(r.module, r.result.exitState,
         v => v.kind === 'concrete' && v.value === 3);
       assert(v, 'expected a register holding 3');
@@ -65,8 +65,8 @@ const tests = [
   },
   {
     name: 'analyse: var z = "a" + "b" → register holds "ab"',
-    fn: () => {
-      const r = analyse('var z = "a" + "b";');
+    fn: async () => {
+      const r = await analyse('var z = "a" + "b";');
       const v = lastRegWithValue(r.module, r.result.exitState,
         v => v.kind === 'concrete' && v.value === 'ab');
       assert(v, 'expected "ab"');
@@ -74,8 +74,8 @@ const tests = [
   },
   {
     name: 'analyse: var x = 1; var y = x + 1 → y holds 2',
-    fn: () => {
-      const r = analyse('var x = 1; var y = x + 1;');
+    fn: async () => {
+      const r = await analyse('var x = 1; var y = x + 1;');
       const v = lastRegWithValue(r.module, r.result.exitState,
         v => v.kind === 'concrete' && v.value === 2);
       assert(v, 'expected 2');
@@ -83,8 +83,8 @@ const tests = [
   },
   {
     name: 'analyse: if/else with phi joins to oneOf',
-    fn: () => {
-      const r = analyse('var x; if (cond) x = 1; else x = 2;');
+    fn: async () => {
+      const r = await analyse('var x; if (cond) x = 1; else x = 2;');
       // The merged x should be oneOf {1, 2}.
       let found = false;
       for (const [, v] of overlayEntries(r.result.exitState.regs)) {
@@ -98,8 +98,8 @@ const tests = [
   },
   {
     name: 'analyse: concrete-true branch prunes else',
-    fn: () => {
-      const r = analyse('var x; if (true) x = 1; else x = 2;');
+    fn: async () => {
+      const r = await analyse('var x; if (true) x = 1; else x = 2;');
       // Only the true branch runs, so x should be concrete(1), not oneOf.
       const v = lastRegWithValue(r.module, r.result.exitState,
         v => v.kind === 'concrete' && v.value === 1);
@@ -114,8 +114,8 @@ const tests = [
   },
   {
     name: 'analyse: concrete-false branch prunes then',
-    fn: () => {
-      const r = analyse('var x; if (false) x = 1; else x = 2;');
+    fn: async () => {
+      const r = await analyse('var x; if (false) x = 1; else x = 2;');
       const v = lastRegWithValue(r.module, r.result.exitState,
         v => v.kind === 'concrete' && v.value === 2);
       assert(v, 'expected x to be concrete(2)');
@@ -123,7 +123,7 @@ const tests = [
   },
   {
     name: 'analyse: terminates on deeply nested expressions',
-    fn: () => {
+    fn: async () => {
       // 1000-term chain. acorn itself uses recursive descent, so
       // the upper bound on expression nesting is acorn's stack
       // limit (~1000 on Node's default stack). The IR builder
@@ -131,13 +131,13 @@ const tests = [
       let src = 'var x = 1';
       for (let i = 0; i < 500; i++) src += ' + ' + i;
       src += ';';
-      const r = analyse(src);
+      const r = await analyse(src);
       assert(r.result.exitState, 'produced exit state for 500-level expression');
     },
   },
   {
     name: 'analyse: terminates on 5000-deep nested function declarations',
-    fn: () => {
+    fn: async () => {
       // Stress test for the iterative function lowering. The
       // legacy code recursed via `lowerFunctionDecl → drainWork
       // → lower_stmt → lowerFunctionDecl` and overflowed at
@@ -147,36 +147,36 @@ const tests = [
       let src = '';
       for (let i = 0; i < 5000; i++) src += 'function f' + i + '(){';
       for (let i = 0; i < 5000; i++) src += '}';
-      const r = analyse(src);
+      const r = await analyse(src);
       assert(r.result.exitState, 'produced exit state for 5000-deep nested fns');
     },
   },
   {
     name: 'analyse: terminates on 5000 sequential statements',
-    fn: () => {
+    fn: async () => {
       // Flat-but-long program: this is the workload where the
       // iterative worklist and IR builder actually matter. acorn
       // handles sequential statements trivially; the engine must
       // walk all 5000 without blowing the JS stack.
       let src = '';
       for (let i = 0; i < 5000; i++) src += 'var x' + i + ' = ' + i + ';';
-      const r = analyse(src);
+      const r = await analyse(src);
       assert(r.result.exitState, 'produced exit state for 5000 sequential decls');
     },
   },
   {
     name: 'analyse: terminates on deeply nested if/else',
-    fn: () => {
+    fn: async () => {
       let src = 'var x = 0;';
       for (let i = 0; i < 50; i++) src += 'if (x) { x = x + 1; } else { x = x - 1; }';
-      const r = analyse(src);
+      const r = await analyse(src);
       assert(r.result.exitState, 'produced exit state for 50-deep if chain');
     },
   },
   {
     name: 'analyse: unresolved global raises opaque-call assumption',
-    fn: () => {
-      const r = analyse('var x = someUnknown;');
+    fn: async () => {
+      const r = await analyse('var x = someUnknown;');
       const snap = r.ctx.assumptions.snapshot();
       const hasOpaque = snap.some(a => a.reason === 'opaque-call');
       assert(hasOpaque, 'expected opaque-call assumption for someUnknown');
@@ -184,10 +184,10 @@ const tests = [
   },
   {
     name: 'analyse: unimplemented statement raises soundness assumption',
-    fn: () => {
+    fn: async () => {
       // `import` is still unimplemented. Loops / try/catch /
       // with / switch all lowered in earlier waves.
-      const r = analyse('import x from "m";');
+      const r = await analyse('import x from "m";');
       const snap = r.ctx.assumptions.snapshot();
       const hasUnimpl = snap.some(a => a.reason === 'unimplemented');
       assert(hasUnimpl, 'expected unimplemented assumption for import');

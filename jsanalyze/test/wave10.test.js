@@ -35,7 +35,7 @@ const { assert, assertEqual } = require('./run.js');
 // Walk a program through analyseFunction and return the module
 // plus ctx so tests can inspect per-function state (e.g. the
 // C3 summary cache).
-function walk(src) {
+async function walk(src) {
   const module = buildModule(src, 'test.js');
   const ctx = {
     module,
@@ -45,7 +45,7 @@ function walk(src) {
     taintFlows: [],
     nextFlowId: 1,
   };
-  analyseFunction(module, module.top, D.createState(), ctx);
+  await analyseFunction(module, module.top, D.createState(), ctx);
   return { module, ctx };
 }
 
@@ -194,11 +194,11 @@ const tests = [
   // --- C3: state-correlated function summary cache ---
   {
     name: 'Wave10 C3: identical calls collapse to one cache entry',
-    fn: () => {
+    fn: async () => {
       // `id("a")` called three times with identical args — the
       // second and third calls hit the cache and don't walk
       // the body a second time.
-      const { module } = walk(
+      const { module } = await walk(
         'function id(x) { return x + "x"; } ' +
         'var a = id("a"); var b = id("a"); var c = id("a");');
       const fn = module.functions.find(f => f.name === 'id');
@@ -209,8 +209,8 @@ const tests = [
   },
   {
     name: 'Wave10 C3: distinct arg shapes produce distinct cache entries',
-    fn: () => {
-      const { module } = walk(
+    fn: async () => {
+      const { module } = await walk(
         'function wrap(x) { return "p:" + x; } ' +
         'var a = wrap("clean1"); var b = wrap("clean2"); var c = wrap("clean1");');
       const fn = module.functions.find(f => f.name === 'wrap');
@@ -239,13 +239,13 @@ const tests = [
   },
   {
     name: 'Wave10 C3: state-correlated split across B4 variants',
-    fn: () => {
+    fn: async () => {
       // Under B4 the caller splits into two variants (one per
       // if/else branch). Each variant calls `wrap` with a
       // different arg shape. C3 caches per-variant input, so
       // `wrap` gets two distinct summaries — one per caller
       // variant — and the cross-register correlation survives.
-      const { module } = walk(
+      const { module } = await walk(
         'function wrap(x) { return "p:" + x; }' +
         'var y;' +
         'if (location.hash === "a") { y = wrap("clean"); }' +
@@ -272,10 +272,10 @@ const tests = [
   },
   {
     name: 'Wave10 C3: 100 identical calls walk the body only once',
-    fn: () => {
+    fn: async () => {
       let src = 'function id(x) { return x + "!"; } ';
       for (let i = 0; i < 100; i++) src += 'var r' + i + ' = id("a");';
-      const { module } = walk(src);
+      const { module } = await walk(src);
       const fn = module.functions.find(f => f.name === 'id');
       // One cache entry for 100 calls means 99 cache hits.
       assertEqual(fn._summaryCache.size, 1);

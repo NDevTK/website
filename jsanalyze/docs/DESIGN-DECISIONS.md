@@ -94,17 +94,29 @@ truth.
 
 ### D5. SMT integration uses Z3 via the vendored `z3-solver` WASM
 
-Z3 is vendored under `jsanalyze/vendor/z3-solver/` (symlinked
-or copied from `htmldom/vendor/z3-solver/` during initial
-port). The SMT layer imports Z3 through a single `initZ3()`
-function that works in both Node (`require('z3-solver')`) and
-the browser (via the existing `globalThis.__htmldomZ3Init`
-hook from `htmldom/jsanalyze-z3-browser.js`).
+Z3 is vendored under `jsanalyze/vendor/z3-solver/` as a symlink
+to `htmldom/vendor/z3-solver/`. The SMT layer imports Z3
+through a single `_initZ3()` function in `src/z3.js` that
+works in both Node (requires the vendored `node.js` entry via
+an absolute path rooted at `__dirname`) and the browser (via
+the existing `globalThis.__htmldomZ3Init` hook from
+`htmldom/jsanalyze-z3-browser.js`). Z3 is REQUIRED — there is
+no fallback; if the solver can't load, analysis fails loudly.
+
+The Node path deliberately uses the vendored `node.js` entry
+directly (`vendor/z3-solver/node.js`) rather than
+`require('z3-solver')`, so the engine's behaviour is
+independent of whatever happens to sit in `node_modules` at
+the consumer's level. The vendor symlink is the sole source
+of truth for the Z3 binary.
 
 **Rationale.** One vendor copy, shared between the legacy
 engine and the new one. Z3 is heavy (33 MB WASM); we don't
 want two copies. The browser bootstrap already works; reuse
-it.
+it. Requiring it (no optional fallback) means the "proper
+interprocedural, path-sensitive, state-correlated" contract
+holds in every deployment — consumers never silently downgrade
+to a weaker analysis because their install is incomplete.
 
 ### D6. Reachability is a 5-layer cascade with no layer skipped
 
@@ -280,6 +292,51 @@ deletes tests for the removed feature.
 **Rationale.** Test churn hides regressions. A feature that
 replaces a stub must pass the stub's tests (unchanged) and
 add new ones for its new capabilities.
+
+### D19. Worklist is multi-variant (trace partitioning)
+
+Each block in `worklist.analyseFunction` carries a SET of
+variants rather than a single joined state. A variant is a
+full State (regs + heap + path + effects + assumptionIds +
+callStack). Equivalent variants — same `(regs, heap)` — merge
+disjunctively (OR their paths, union their assumptionIds and
+effects). Distinct variants stay separate through joins so
+**cross-register correlation survives merges**.
+
+Without this, a pointwise join at
+```
+  if (c) { x = 1; y = "a"; } else { x = 2; y = "b"; }
+```
+loses the `x=1 ⇔ y="a"` correlation: `x` becomes `oneOf{1,2}`,
+`y` becomes `oneOf{"a","b"}`, and a later `if (x === 1)` refines
+`x` but can't refine `y`. A sink on `y` inside the true branch
+then fires with a joined-in `"b"` the true path can never
+actually see. Multi-variant keeps `{x=1, y="a"}` and
+`{x=2, y="b"}` as separate variants; `if (x === 1)` eliminates
+the second variant entirely and the false positive disappears.
+
+Loop handling: back-edge arrivals at a loop header pointwise-
+join with any existing back-edge variant for the same
+predecessor. Forward edges stay distinct. This collapses per-
+iteration variants at loop heads (otherwise a 1000-iter
+counter loop spawns 1000 variants) while preserving
+pre-loop/post-loop correlation.
+
+Phi resolution: phis are eagerly resolved at enqueue time,
+using the specific predecessor variant's state. This is what
+makes cross-register correlation survive nested join points —
+a variant arriving from predecessor B carries the correlated
+values of predecessor B, not a pool over all predecessors.
+
+**Rationale.** Wave 10 / B4. Trace partitioning is the
+standard technique for recovering cross-register correlation
+in a forward dataflow analysis. The alternative — staying with
+pointwise joins and doing per-path reasoning purely at the SMT
+layer — makes every sink emission a Z3 call, which is orders
+of magnitude slower and depends on Z3 understanding every
+abstract value kind (it doesn't). Trace partitioning handles
+the correlation at the lattice level and reserves Z3 for the
+residual cases where only symbolic reasoning helps.
 
 ### D17. Documentation stays in sync with code
 
