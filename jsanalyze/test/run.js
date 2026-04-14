@@ -39,6 +39,7 @@ const testFiles = [
   'class.test.js',
   'wave8.test.js',
   'closure.test.js',
+  'switch.test.js',
 ];
 
 async function main() {

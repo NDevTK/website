@@ -185,12 +185,12 @@ const tests = [
   {
     name: 'analyse: unimplemented statement raises soundness assumption',
     fn: () => {
-      // `switch` is still unimplemented (Wave 9 territory).
-      // Loops / try/catch / with all lowered in earlier waves.
-      const r = analyse('switch (x) { case 1: y = 1; break; }');
+      // `import` is still unimplemented. Loops / try/catch /
+      // with / switch all lowered in earlier waves.
+      const r = analyse('import x from "m";');
       const snap = r.ctx.assumptions.snapshot();
       const hasUnimpl = snap.some(a => a.reason === 'unimplemented');
-      assert(hasUnimpl, 'expected unimplemented assumption for switch');
+      assert(hasUnimpl, 'expected unimplemented assumption for import');
       const unimpl = snap.find(a => a.reason === 'unimplemented');
       assertEqual(unimpl.severity, 'soundness');
     },

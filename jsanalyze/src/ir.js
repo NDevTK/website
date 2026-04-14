@@ -422,6 +422,8 @@ function stepStmtTask(ctx, task) {
     case 'finish_try_body':    return finishTryBodyStep(ctx, task);
     case 'finish_try_catch':   return finishTryCatchStep(ctx, task);
     case 'finish_try_finally': return finishTryFinallyStep(ctx, task);
+    case 'finish_switch':      return finishSwitchStep(ctx, task);
+    case 'finish_switch_case': return finishSwitchCaseStep(ctx, task);
     default:
       throw new Error('ir: unknown statement task ' + task.kind);
   }
@@ -644,6 +646,7 @@ function lowerStatement(ctx, node) {
     case 'TryStatement':       return beginTry(ctx, node, loc);
     case 'ThrowStatement':     return lowerThrow(ctx, node, loc);
     case 'WithStatement':      return lowerWith(ctx, node, loc);
+    case 'SwitchStatement':    return beginSwitch(ctx, node, loc);
     case 'EmptyStatement':      return;
     case 'UnimplementedStatement': {
       const dest = newRegister(ctx.module);
@@ -1911,6 +1914,199 @@ function finishTryFinallyStep(ctx, task) {
 // not modeled). The body is lowered as a regular statement.
 // Taint flows through explicit statements in the body; only
 // implicit dynamic lookups are imprecise.
+// --- switch statement lowering ----------------------------------------
+//
+// `switch (disc) { case v1: body1; case v2: body2; default: bodyD;
+//  case v3: body3; }` lowers to:
+//
+//     predBlock: evaluate disc
+//     test1:     if (disc === v1) goto body1 else goto test2
+//     test2:     if (disc === v2) goto body2 else goto testD
+//     testD:                goto bodyD              (default)
+//     (test3 is effectively unreachable if bodyD falls through,
+//      but we still emit it for cases BEFORE default in source
+//      order — their tests come first in the chain.)
+//
+//     body1 → body2 → bodyD → body3 → exitBlock
+//     (each body block falls through to the NEXT body block
+//      unless terminated by break/return.)
+//
+// `break` inside a case jumps to exitBlock via the loop-style
+// _loopStack mechanism — switch is a break target too.
+//
+// Default handling: all cases are tested in source order.
+// If no case matches, control jumps to the default body (or
+// to exitBlock if no default exists). The default's position
+// in the source determines where it sits in the fall-through
+// chain, but NOT where it sits in the test chain: the test
+// for default is implicitly "all cases failed".
+function beginSwitch(ctx, node, loc) {
+  const discReg = lowerExpression(ctx, node.discriminant);
+  const predBlock = ctx.currentBlock;
+
+  // Allocate one body block per case (including default).
+  const bodyBlocks = node.cases.map(() => {
+    const b = createBlock(ctx.module);
+    ctx.blocks.set(b.id, b);
+    return b;
+  });
+  const exitBlock = createBlock(ctx.module);
+  ctx.blocks.set(exitBlock.id, exitBlock);
+
+  // Allocate test blocks for each non-default case, chained
+  // together. The last test block falls through to the
+  // default (or exitBlock if no default).
+  let defaultIndex = -1;
+  for (let i = 0; i < node.cases.length; i++) {
+    if (node.cases[i].test == null) { defaultIndex = i; break; }
+  }
+
+  // Collect the indices of non-default cases in source order.
+  // The test chain only tests these — the default is reached
+  // when ALL tests fail.
+  const testIndices = [];
+  for (let i = 0; i < node.cases.length; i++) {
+    if (node.cases[i].test != null) testIndices.push(i);
+  }
+  const finalFallback = defaultIndex >= 0
+    ? bodyBlocks[defaultIndex]
+    : exitBlock;
+
+  // If the switch has no cases at all, jump directly to exit.
+  if (node.cases.length === 0) {
+    emit(ctx.module, predBlock, {
+      op: OP.JUMP, target: exitBlock.id,
+    }, loc);
+    addEdge(predBlock, exitBlock);
+    ctx.currentBlock = exitBlock;
+    return;
+  }
+
+  // If all cases are default (only default, no case), jump
+  // directly to its body.
+  if (testIndices.length === 0) {
+    emit(ctx.module, predBlock, {
+      op: OP.JUMP, target: finalFallback.id,
+    }, loc);
+    addEdge(predBlock, finalFallback);
+  } else {
+    // Emit tests in source order. First test lives in
+    // predBlock; each test on miss jumps to the next test
+    // block, or to finalFallback for the last miss.
+    let curTestBlock = predBlock;
+    for (let k = 0; k < testIndices.length; k++) {
+      const i = testIndices[k];
+      const caseNode = node.cases[i];
+      ctx.currentBlock = curTestBlock;
+      const caseValReg = lowerExpression(ctx, caseNode.test);
+      const eqReg = newRegister(ctx.module);
+      emit(ctx.module, ctx.currentBlock, {
+        op: OP.BIN_OP,
+        dest: eqReg,
+        operator: '===',
+        left: discReg,
+        right: caseValReg,
+      }, loc);
+      const nextTestBlock = (k + 1 < testIndices.length)
+        ? (() => {
+            const b = createBlock(ctx.module);
+            ctx.blocks.set(b.id, b);
+            return b;
+          })()
+        : finalFallback;
+      emit(ctx.module, ctx.currentBlock, {
+        op: OP.BRANCH,
+        cond: eqReg,
+        trueTarget: bodyBlocks[i].id,
+        falseTarget: nextTestBlock.id,
+      }, loc);
+      addEdge(ctx.currentBlock, bodyBlocks[i]);
+      addEdge(ctx.currentBlock, nextTestBlock);
+      curTestBlock = nextTestBlock;
+    }
+  }
+
+  // Push a "loop" context onto the loop stack so `break`
+  // inside any case body jumps to exitBlock. `continue` is
+  // not valid inside a switch (outside of an enclosing loop),
+  // so we leave continueTarget unset.
+  if (!ctx._loopStack) ctx._loopStack = [];
+  ctx._loopStack.push({
+    headerBlock: predBlock,
+    bodyBlock: null,
+    exitBlock,
+    continueTarget: null,
+    phis: [],
+    breakSources: [],
+  });
+
+  // Schedule the case bodies. For each case in source order:
+  //   1. Switch to its body block.
+  //   2. Lower its consequent statements.
+  //   3. After the last consequent, fall through to the NEXT
+  //      case body (if any), or to exitBlock.
+  //
+  // We do this via a `finish_switch` task that runs after the
+  // last case body is lowered.
+  ctx._work.push({
+    kind: 'finish_switch',
+    loc,
+    exitBlock,
+    bodyBlocks,
+    cases: node.cases,
+  });
+  // Queue body statements in REVERSE case order so LIFO
+  // processes them in source order.
+  for (let i = node.cases.length - 1; i >= 0; i--) {
+    const caseNode = node.cases[i];
+    const nextBody = (i + 1 < node.cases.length)
+      ? bodyBlocks[i + 1]
+      : exitBlock;
+    ctx._work.push({
+      kind: 'finish_switch_case',
+      caseIdx: i,
+      bodyBlock: bodyBlocks[i],
+      nextBody,
+      exitBlock,
+      loc,
+    });
+    for (let j = caseNode.consequent.length - 1; j >= 0; j--) {
+      ctx._work.push({ kind: 'after_stmt' });
+      ctx._work.push({ kind: 'lower_stmt', node: caseNode.consequent[j] });
+    }
+    // Before running the body statements, switch the current
+    // block to this case's body block.
+    ctx._work.push({
+      kind: 'set_block',
+      block: bodyBlocks[i],
+    });
+  }
+}
+
+// finish_switch_case task — after a case body's statements
+// have been lowered, wire its fall-through: if the body's
+// current block isn't terminated, jump to the next body block
+// (or exit).
+function finishSwitchCaseStep(ctx, task) {
+  const curBlock = ctx.currentBlock;
+  if (curBlock && !curBlock.terminator) {
+    emit(ctx.module, curBlock, {
+      op: OP.JUMP, target: task.nextBody.id,
+    }, task.loc);
+    addEdge(curBlock, task.nextBody);
+  }
+}
+
+// finish_switch task — after all case bodies are lowered,
+// pop the loop-stack entry for `break` and switch the current
+// block to the exit block.
+function finishSwitchStep(ctx, task) {
+  if (ctx._loopStack && ctx._loopStack.length > 0) {
+    ctx._loopStack.pop();
+  }
+  ctx.currentBlock = task.exitBlock;
+}
+
 function lowerWith(ctx, node, loc) {
   if (node.object) lowerExpression(ctx, node.object);
   ctx.assumptions.raise(

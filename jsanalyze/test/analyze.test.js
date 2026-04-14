@@ -29,13 +29,11 @@ const tests = [
     },
   },
   {
-    name: 'analyze: unimplemented switch raises soundness assumption',
+    name: 'analyze: unimplemented import raises soundness assumption',
     fn: async () => {
-      // `switch` is still unimplemented (Wave 9). For-loops
-      // became supported in Wave 3, try/catch in Wave 4, with
-      // in Wave 7. We use a `switch` statement as the canonical
-      // still-unimplemented marker.
-      const t = await analyze('switch (x) { case 1: y = 1; break; }');
+      // `import` is still unimplemented (Wave 12 territory).
+      // All earlier constructs lower in dedicated waves.
+      const t = await analyze('import x from "m";');
       const unimpl = query.assumptions(t, { reason: ['unimplemented'], severity: 'soundness' });
       assert(unimpl.length >= 1, 'expected unimplemented soundness assumption');
     },
@@ -68,9 +66,9 @@ const tests = [
   {
     name: 'query.assumptions: filter by reason',
     fn: async () => {
-      // `switch` is still unimplemented (Wave 9 territory).
-      // `someGlobal` is the canonical opaque-call probe.
-      const t = await analyze('var x = someGlobal; switch (y) { case 1: z = 1; break; }');
+      // `import` is still unimplemented. `someGlobal` is the
+      // canonical opaque-call probe.
+      const t = await analyze('var x = someGlobal; import y from "m";');
       const opaque = query.assumptions(t, { reason: ['opaque-call'] });
       const unimpl = query.assumptions(t, { reason: ['unimplemented'] });
       assert(opaque.length >= 1);

@@ -87,11 +87,12 @@ const tests = [
   {
     name: 'buildModule: unimplemented node becomes Opaque',
     fn: () => {
-      // `switch` is still unimplemented (Wave 9). Earlier
-      // waves implement for / while / try/catch / with.
-      const m = buildModule('switch (x) { case 1: y = 1; break; }', 'a.js');
+      // `import` / `export` are the canonical still-unimplemented
+      // marker statements. Earlier waves implement for / while /
+      // try/catch / with / switch.
+      const m = buildModule('import x from "m";', 'a.js');
       const ops = opsOf(m);
-      assert(ops.includes(OP.OPAQUE), 'has Opaque for unimplemented switch');
+      assert(ops.includes(OP.OPAQUE), 'has Opaque for unimplemented import');
     },
   },
   {

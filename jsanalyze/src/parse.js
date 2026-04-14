@@ -2035,6 +2035,29 @@ function beginStatement(lexer, tasks, outputs) {
     outputs.push(mkClassDeclaration(id, superClass, body, t));
     return;
   }
+  // --- switch statement ---
+  //
+  // `switch (disc) { case v: stmts; case v2: stmts; default:
+  // stmts; }` parses into a SwitchStatement node with a list
+  // of SwitchCase entries. Each case's consequent is a
+  // flat array of statements (fall-through is explicit in the
+  // IR: a case without a terminating `break` falls into the
+  // next case body).
+  if (label === 'switch') {
+    lexer.advance();
+    expect(lexer, '(');
+    const disc = parseExpression(lexer);
+    expect(lexer, ')');
+    expect(lexer, '{');
+    const cases = [];
+    while (lexer.peek() && lexer.peek().type.label !== '}') {
+      const c = parseSwitchCase(lexer);
+      if (c) cases.push(c);
+    }
+    expect(lexer, '}');
+    outputs.push(mkSwitchStatement(disc, cases, t));
+    return;
+  }
   // --- with statement ---
   //
   // `with (obj) body;` dynamically adds obj's properties to
@@ -2112,7 +2135,6 @@ function beginStatement(lexer, tasks, outputs) {
 // implemented yet. Each becomes an UnimplementedStatement marker
 // until the corresponding transfer function is written.
 const UNHANDLED_STATEMENT_KEYWORDS = new Set([
-  'switch',
   'import', 'export',
 ]);
 
@@ -2496,6 +2518,67 @@ function finishTryFinally(task, outputs) {
 function finishWith(task, outputs) {
   const body = outputs.pop();
   outputs.push(mkWithStatement(task.obj, body, task.startTok));
+}
+
+// parseSwitchCase — `case expr: stmts*` or `default: stmts*`.
+// The consequent is a sequence of statements until the next
+// `case`, `default`, or the closing `}`. Fall-through is
+// preserved: a case without a terminating `break` flows into
+// the next case at IR build time.
+function parseSwitchCase(lexer) {
+  const startTok = lexer.peek();
+  if (!startTok) return null;
+  let test = null;
+  if (startTok.type.label === 'case') {
+    lexer.advance();
+    test = parseExpression(lexer);
+  } else if (startTok.type.label === 'default') {
+    lexer.advance();
+  } else {
+    // Stray token — skip it so we don't loop forever.
+    lexer.advance();
+    return null;
+  }
+  expect(lexer, ':');
+  // Parse statements until the next case/default/}.
+  const consequent = [];
+  while (lexer.peek() && lexer.peek().type.label !== 'case' &&
+         lexer.peek().type.label !== 'default' &&
+         lexer.peek().type.label !== '}') {
+    // parseStatement here is the main statement parser, which
+    // returns an AST node on `outputs` but we need to run it
+    // as a standalone. parseStatement drives its own task
+    // loop and returns the single top-of-output.
+    const stmt = parseStatement(lexer);
+    if (stmt) consequent.push(stmt);
+  }
+  return mkSwitchCase(test, consequent, startTok);
+}
+
+function mkSwitchStatement(disc, cases, startTok) {
+  return {
+    type: 'SwitchStatement',
+    discriminant: disc,
+    cases,
+    loc: startTok && startTok.loc
+      ? { start: startTok.loc.start, end: startTok.loc.end }
+      : null,
+    start: startTok ? startTok.start : 0,
+    end:   startTok ? startTok.end : 0,
+  };
+}
+
+function mkSwitchCase(test, consequent, startTok) {
+  return {
+    type: 'SwitchCase',
+    test,
+    consequent,
+    loc: startTok && startTok.loc
+      ? { start: startTok.loc.start, end: startTok.loc.end }
+      : null,
+    start: startTok ? startTok.start : 0,
+    end:   startTok ? startTok.end : 0,
+  };
 }
 
 function mkWithStatement(object, body, startTok) {
