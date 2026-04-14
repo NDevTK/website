@@ -13,14 +13,33 @@
 
 let _acorn = null;
 
-// Resolve acorn: prefer the vendored copy shipped under
-// jsanalyze/vendor/, fall back to a node_modules install. We
-// check for the file's existence explicitly rather than catching
-// a require error — the boundary between "vendored" and
-// "installed" is an environment property, not data-dependent
-// recovery.
+// Resolve acorn. Three environments are supported:
+//
+//   1. Browser (jsanalyze/browser-bundle.js): acorn is
+//      expected to be pre-loaded via a `<script>` tag so
+//      `globalThis.acorn` is populated. The vendored
+//      `jsanalyze/vendor/acorn.js` is a UMD build whose
+//      browser branch assigns `global.acorn = {}`, so a
+//      bare `<script src="jsanalyze/vendor/acorn.js">`
+//      satisfies this contract.
+//
+//   2. Node with the vendored copy. The vendored path is
+//      resolved via fs.existsSync — the boundary between
+//      "vendored" and "installed" is an environment property,
+//      not a data-dependent recovery, so we check for the
+//      file's existence explicitly rather than catching a
+//      require error.
+//
+//   3. Node with `acorn` installed under node_modules. Fall
+//      back to a bare `require('acorn')`.
 function getAcorn() {
   if (_acorn) return _acorn;
+  // Browser path: pre-loaded as a global.
+  if (typeof globalThis !== 'undefined' && globalThis.acorn &&
+      typeof globalThis.acorn.tokenizer === 'function') {
+    _acorn = globalThis.acorn;
+    return _acorn;
+  }
   const path = require('path');
   const fs = require('fs');
   const vendoredPath = path.join(__dirname, '..', 'vendor', 'acorn.js');

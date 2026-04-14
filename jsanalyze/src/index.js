@@ -98,6 +98,60 @@ async function analyze(input, options) {
     partial: false,
   };
 
+  // Extract inline <script> content from HTML files so the
+  // walker sees the JS. For each .html key in `files` we
+  // parse the HTML via src/html.js, walk the token stream,
+  // pull every inline <script>'s text into a synthetic
+  // `<page>.inline.N.js` file, and replace the HTML entry
+  // with the extracted JS sources. Non-HTML files pass through
+  // unchanged.
+  //
+  // Consumers (dom-convert, taint-report, csp-derive,
+  // fetch-trace) that take raw project files expect HTML
+  // inputs to be analyzed as if the <script> blocks were
+  // standalone JS — this is the same auto-extraction the
+  // legacy engine did inline inside its walker, lifted here
+  // to the public entry so every consumer benefits.
+  const extracted = Object.create(null);
+  for (const filename of Object.keys(files)) {
+    if (!/\.html?$/i.test(filename)) {
+      extracted[filename] = files[filename];
+      continue;
+    }
+    const toks = HTML.tokenize(files[filename]);
+    let idx = 0;
+    const base = filename.replace(/\.html?$/i, '');
+    for (let i = 0; i < toks.length; i++) {
+      const t = toks[i];
+      if (t.type !== 'start' || t.tagName !== 'script') continue;
+      const hasSrc = t.attrs && t.attrs.some(a => a.name === 'src');
+      if (hasSrc) continue;
+      // Scan for the matching </script> and collect inner TEXT.
+      let body = '';
+      let j = i + 1;
+      for (; j < toks.length; j++) {
+        if (toks[j].type === 'end' && toks[j].tagName === 'script') break;
+        if (toks[j].type === 'text') body += toks[j].value;
+      }
+      body = body.trim();
+      if (body) {
+        const synth = base + '.inline.' + idx + '.js';
+        idx++;
+        extracted[synth] = body;
+      }
+      i = j;
+    }
+  }
+
+  // Replace the working set with the extracted map so the
+  // walker loop sees only JS entries (HTML files have been
+  // replaced by their inline JS; HTML files with no inline
+  // scripts simply disappear from the set).
+  for (const k of Object.keys(files)) {
+    if (/\.html?$/i.test(k)) delete extracted[k];
+  }
+  const workingFiles = extracted;
+
   const assumptions = new AssumptionTracker();
 
   // Wire the streaming watchers into the tracker so onAssumption
@@ -120,7 +174,7 @@ async function analyze(input, options) {
     ? null
     : (formula) => Z3.checkPathSat(formula, smtTimeoutMs);
 
-  for (const filename of Object.keys(files)) {
+  for (const filename of Object.keys(workingFiles)) {
     let module;
     // Boundary: parse/IR errors. We catch here — and ONLY here —
     // so one bad file doesn't tank the whole multi-file analysis.
@@ -130,7 +184,7 @@ async function analyze(input, options) {
     // human-readable entry in `trace.warnings`. The underlying
     // exception's message is recorded on both.
     try {
-      module = buildModule(files[filename], filename);
+      module = buildModule(workingFiles[filename], filename);
     } catch (e) {
       trace.partial = true;
       trace.warnings.push({
