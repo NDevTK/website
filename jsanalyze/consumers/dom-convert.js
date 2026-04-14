@@ -467,6 +467,23 @@ function sliceStatement(source, loc) {
   return source.slice(loc.pos, loc.endPos);
 }
 
+// emitBranchBody — emit DOM calls for a nested template
+// inside a caller-provided receiver expression. Used by the
+// `branch` emitter to recursively lower each if/else
+// branch. Returns null when the nested template can't be
+// emitted (opaque / unknown kind).
+function emitBranchBody(tmpl, receiver) {
+  if (!tmpl) return null;
+  if (tmpl.kind === 'concrete' && tmpl.nodes) {
+    return emitDomCalls(tmpl.nodes, receiver);
+  }
+  // Nested branch / loop inside a branch isn't covered by
+  // the MVP; returning null leaves the body empty and the
+  // consumer surrounds it with a `{}` placeholder in the
+  // generated source so the runtime still has two branches.
+  return null;
+}
+
 // --- Emit code from a structured HtmlTemplate ---------------------------
 //
 // The engine's src/html-templates.js attaches a template to
@@ -501,6 +518,29 @@ function emitFromTemplate(jsSource, ih) {
       start: ih.location.pos,
       end: ih.location.endPos,
       replacement: receiver + '.replaceChildren();\n' + body,
+    };
+  }
+
+  if (tmpl.kind === 'branch') {
+    const receiver = jsSource.slice(tmpl.receiver.start, tmpl.receiver.end);
+    const testSrc = jsSource.slice(tmpl.testExpr.start, tmpl.testExpr.end);
+    const lines = [];
+    lines.push(receiver + '.replaceChildren();');
+    lines.push('if (' + testSrc + ') {');
+    const conseqBody = emitBranchBody(tmpl.consequent, receiver);
+    if (conseqBody) {
+      for (const l of conseqBody.split('\n')) lines.push('  ' + l);
+    }
+    lines.push('} else {');
+    const altBody = emitBranchBody(tmpl.alternate, receiver);
+    if (altBody) {
+      for (const l of altBody.split('\n')) lines.push('  ' + l);
+    }
+    lines.push('}');
+    return {
+      start: tmpl.rangeStart,
+      end: tmpl.rangeEnd,
+      replacement: lines.join('\n'),
     };
   }
 

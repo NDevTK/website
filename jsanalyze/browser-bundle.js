@@ -2848,6 +2848,23 @@ module.exports = {
 //         rangeStart: number;           -- source range to replace
 //         rangeEnd: number;
 //       }
+//     | { kind: 'branch';
+//         // Conditional HTML assignment:
+//         //
+//         //   var H; if (cond) H = '<a>'; else H = '<b>'; elem.innerHTML = H;
+//         //   var H = cond ? '<a>' : '<b>'; elem.innerHTML = H;
+//         //
+//         // emitFromTemplate emits `receiver.replaceChildren()`
+//         // followed by `if (cond) { consequent } else
+//         // { alternate }` where each branch recursively
+//         // emits its own HtmlTemplate.
+//         receiver: { start, end };
+//         testExpr: { start, end };     -- source range of the if test
+//         consequent: HtmlTemplate;      -- recursive template for the if branch
+//         alternate: HtmlTemplate;       -- recursive template for the else branch
+//         rangeStart: number;            -- full source range to replace
+//         rangeEnd: number;
+//       }
 //     | { kind: 'opaque'; reason: string };
 //
 //   type HtmlAttrTemplate = {
@@ -2965,16 +2982,162 @@ function getAst(jsSource, filename, astCache) {
   return ast;
 }
 
-// extractFromAccumulator — match
+// detectBranchAccumulator — recognise the if/else or
+// conditional-expression shapes that write `varName`. Returns
+// a `branch` template or null.
 //
-//   [A] var X = <string lit>;        (optional wrapping open tag)
-//   [B] for (...) { X += <concat>; } (optional, the pattern's heart)
-//   [C] X += <string lit>;           (optional closing tag)
-//   [D] elem.innerHTML = X;
+// Supported:
 //
-// Returns a `loop` template when the pattern matches,
-// `opaque` when it doesn't.
+//   1. `if (cond) { X = <lit>; } else { X = <lit>; }` where
+//      both branches have exactly one assignment to X and
+//      each literal is parseable HTML.
+//
+//   2. `if (cond) X = <lit>; else X = <lit>;` (no braces).
+//
+//   3. `var X = cond ? <lit> : <lit>;` (ternary in a var
+//      declaration).
+//
+//   4. Nested: each consequent / alternate template may
+//      itself be a `branch` or `concrete` template, built
+//      recursively.
+function detectBranchAccumulator(jsSource, stmts, assignIdx, varName, receiverNode) {
+  // Case 3: ternary in a var decl. Walk backward for the
+  // innermost `var X = cond ? a : b` declaration.
+  for (let i = assignIdx - 1; i >= 0; i--) {
+    const s = stmts[i];
+    if (s.type !== 'VariableDeclaration') continue;
+    for (const d of s.declarations) {
+      if (!d.id || d.id.type !== 'Identifier' || d.id.name !== varName) continue;
+      if (!d.init || d.init.type !== 'ConditionalExpression') break;
+      const c = d.init;
+      if (c.consequent.type !== 'Literal' || typeof c.consequent.value !== 'string') break;
+      if (c.alternate.type !== 'Literal' || typeof c.alternate.value !== 'string') break;
+      return {
+        kind: 'branch',
+        receiver: { start: receiverNode.start, end: receiverNode.end },
+        testExpr: { start: c.test.start, end: c.test.end },
+        consequent: concreteTemplate(c.consequent.value),
+        alternate:  concreteTemplate(c.alternate.value),
+        rangeStart: s.start,
+        rangeEnd: stmts[assignIdx].end,
+      };
+    }
+    // Stop at the first var decl of X we find (the engine
+    // treats the closest one as the controlling init).
+    break;
+  }
+
+  // Cases 1+2: an IfStatement immediately before the
+  // assignment whose both branches write to X.
+  if (assignIdx - 1 < 0) return null;
+  const ifStmt = stmts[assignIdx - 1];
+  if (!ifStmt || ifStmt.type !== 'IfStatement') return null;
+  if (!ifStmt.test || !ifStmt.consequent || !ifStmt.alternate) return null;
+  const conseqWrite = getSingleStringWrite(ifStmt.consequent, varName);
+  const altWrite    = getSingleStringWrite(ifStmt.alternate, varName);
+  if (!conseqWrite || !altWrite) return null;
+
+  // Look one statement further back for an optional
+  // `var X` or `var X = ...` declaration. If present, the
+  // replacement range starts at that declaration; otherwise
+  // at the IfStatement.
+  let rangeStart = ifStmt.start;
+  for (let i = assignIdx - 2; i >= 0; i--) {
+    const s = stmts[i];
+    if (s.type !== 'VariableDeclaration') break;
+    let matches = false;
+    for (const d of s.declarations) {
+      if (d.id && d.id.type === 'Identifier' && d.id.name === varName) {
+        matches = true;
+        break;
+      }
+    }
+    if (!matches) break;
+    rangeStart = s.start;
+    break;
+  }
+
+  return {
+    kind: 'branch',
+    receiver: { start: receiverNode.start, end: receiverNode.end },
+    testExpr: { start: ifStmt.test.start, end: ifStmt.test.end },
+    consequent: concreteTemplate(conseqWrite),
+    alternate:  concreteTemplate(altWrite),
+    rangeStart,
+    rangeEnd: stmts[assignIdx].end,
+  };
+}
+
+// getSingleStringWrite — look inside an IfStatement branch
+// body and return the string literal assigned to `varName`,
+// or null when the shape isn't `{ varName = <lit> }` or
+// `varName = <lit>`.
+function getSingleStringWrite(branchNode, varName) {
+  if (!branchNode) return null;
+  let stmt = branchNode;
+  if (branchNode.type === 'BlockStatement') {
+    if (branchNode.body.length !== 1) return null;
+    stmt = branchNode.body[0];
+  }
+  if (!stmt || stmt.type !== 'ExpressionStatement') return null;
+  const e = stmt.expression;
+  if (!e || e.type !== 'AssignmentExpression' || e.operator !== '=') return null;
+  if (!e.left || e.left.type !== 'Identifier' || e.left.name !== varName) return null;
+  if (!e.right || e.right.type !== 'Literal' || typeof e.right.value !== 'string') return null;
+  return e.right.value;
+}
+
+// concreteTemplate — build a `{kind: 'concrete'}` template
+// for a literal HTML string. The consumer's emitFromTemplate
+// walks the parsed tree to emit DOM calls.
+function concreteTemplate(htmlString) {
+  return {
+    kind: 'concrete',
+    html: htmlString,
+    nodes: html.parse(htmlString),
+  };
+}
+
+// extractFromAccumulator — match one of several
+// accumulator shapes preceding an innerHTML assignment.
+// Ordered by specificity:
+//
+//   Branch A: if/else accumulator
+//
+//     var X;          // or `var X = <something>` — overwritten
+//     if (cond) X = '<a>'; else X = '<b>';
+//     elem.innerHTML = X;
+//
+//     or the single-statement form:
+//
+//     var X = cond ? '<a>' : '<b>';
+//     elem.innerHTML = X;
+//
+//     Produces a `{kind: 'branch'}` template.
+//
+//   Shape A (loop wrapping):
+//
+//     var X = '<tag>';
+//     for (...) { X += <concat>; }
+//     X += '</tag>';
+//     elem.innerHTML = X;
+//
+//   Shape B (loop no wrap):
+//
+//     var X = '';
+//     for (...) { X += <concat>; }
+//     elem.innerHTML = X;
+//
+// Returns the first matching template, or `opaque` when
+// nothing matches.
 function extractFromAccumulator(jsSource, stmts, assignIdx, varName, receiverNode) {
+  // Try the branch shape first: immediately before the
+  // assignment, we have either an IfStatement whose both
+  // branches write to `varName`, or a VariableDeclaration
+  // with a ConditionalExpression init.
+  const branch = detectBranchAccumulator(jsSource, stmts, assignIdx, varName, receiverNode);
+  if (branch) return branch;
+
   let closeStmtIdx = -1;
   let loopStmtIdx = -1;
   let openStmtIdx = -1;
@@ -17252,6 +17415,23 @@ function sliceStatement(source, loc) {
   return source.slice(loc.pos, loc.endPos);
 }
 
+// emitBranchBody — emit DOM calls for a nested template
+// inside a caller-provided receiver expression. Used by the
+// `branch` emitter to recursively lower each if/else
+// branch. Returns null when the nested template can't be
+// emitted (opaque / unknown kind).
+function emitBranchBody(tmpl, receiver) {
+  if (!tmpl) return null;
+  if (tmpl.kind === 'concrete' && tmpl.nodes) {
+    return emitDomCalls(tmpl.nodes, receiver);
+  }
+  // Nested branch / loop inside a branch isn't covered by
+  // the MVP; returning null leaves the body empty and the
+  // consumer surrounds it with a `{}` placeholder in the
+  // generated source so the runtime still has two branches.
+  return null;
+}
+
 // --- Emit code from a structured HtmlTemplate ---------------------------
 //
 // The engine's src/html-templates.js attaches a template to
@@ -17286,6 +17466,29 @@ function emitFromTemplate(jsSource, ih) {
       start: ih.location.pos,
       end: ih.location.endPos,
       replacement: receiver + '.replaceChildren();\n' + body,
+    };
+  }
+
+  if (tmpl.kind === 'branch') {
+    const receiver = jsSource.slice(tmpl.receiver.start, tmpl.receiver.end);
+    const testSrc = jsSource.slice(tmpl.testExpr.start, tmpl.testExpr.end);
+    const lines = [];
+    lines.push(receiver + '.replaceChildren();');
+    lines.push('if (' + testSrc + ') {');
+    const conseqBody = emitBranchBody(tmpl.consequent, receiver);
+    if (conseqBody) {
+      for (const l of conseqBody.split('\n')) lines.push('  ' + l);
+    }
+    lines.push('} else {');
+    const altBody = emitBranchBody(tmpl.alternate, receiver);
+    if (altBody) {
+      for (const l of altBody.split('\n')) lines.push('  ' + l);
+    }
+    lines.push('}');
+    return {
+      start: tmpl.rangeStart,
+      end: tmpl.rangeEnd,
+      replacement: lines.join('\n'),
     };
   }
 

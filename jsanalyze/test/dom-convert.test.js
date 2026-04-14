@@ -454,6 +454,63 @@ const tests = [
     },
   },
 
+  // --- Wave 12d: if/else accumulator branch template ---
+  {
+    name: 'dom-convert js: if/else accumulator → branch template',
+    fn: async () => {
+      const src = [
+        'var cond = location.hash === "admin";',
+        'var html;',
+        'if (cond) {',
+        '  html = "<p>Welcome, admin</p>";',
+        '} else {',
+        '  html = "<p>Welcome, guest</p>";',
+        '}',
+        'document.body.innerHTML = html;',
+      ].join('\n');
+      const out = await convertJs(src);
+      assert(/document\.body\.replaceChildren/.test(out),
+        'replaceChildren emitted');
+      assert(/if \(cond\) \{/.test(out), 'if branch preserved');
+      assert(/\} else \{/.test(out), 'else branch preserved');
+      assert(/createTextNode\("Welcome, admin"\)/.test(out),
+        'admin branch emits admin text');
+      assert(/createTextNode\("Welcome, guest"\)/.test(out),
+        'guest branch emits guest text');
+      assert(!/innerHTML =/.test(out), 'original innerHTML assignment removed');
+    },
+  },
+  {
+    name: 'dom-convert js: ternary in var decl → branch template',
+    fn: async () => {
+      const src = [
+        'var cond = location.hash === "admin";',
+        'var html = cond ? "<p>admin</p>" : "<p>guest</p>";',
+        'document.body.innerHTML = html;',
+      ].join('\n');
+      const out = await convertJs(src);
+      assert(/if \(cond\)/.test(out), 'ternary lowered to if/else');
+      assert(/createTextNode\("admin"\)/.test(out), 'admin emitted');
+      assert(/createTextNode\("guest"\)/.test(out), 'guest emitted');
+    },
+  },
+  {
+    name: 'dom-convert js: if/else without block braces → branch template',
+    fn: async () => {
+      const src = [
+        'var cond = 1;',
+        'var html;',
+        'if (cond) html = "<b>yes</b>";',
+        'else html = "<i>no</i>";',
+        'document.body.innerHTML = html;',
+      ].join('\n');
+      const out = await convertJs(src);
+      assert(/if \(cond\)/.test(out), 'if/else preserved');
+      assert(/createElement\("b"\)/.test(out), 'b element in consequent');
+      assert(/createElement\("i"\)/.test(out), 'i element in alternate');
+    },
+  },
+
   // --- Wave 12c7: callback walking through addEventListener ---
   {
     name: 'dom-convert js: eval inside addEventListener handler is blocked',
