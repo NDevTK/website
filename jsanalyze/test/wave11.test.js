@@ -153,20 +153,33 @@ const tests = [
     },
   },
   {
-    name: 'Wave11: options.precision="fast" disables Z3 (Layer 5 off)',
+    name: 'Wave11: accept smt-skipped disables Z3 (Layer 5 off)',
     fn: async () => {
-      // Under 'fast' precision the branch cascade stops at
-      // layer 4 and the post-pass refutation is skipped.
-      // Contradictory paths that Z3 would refute stay in the
-      // flow list because the engine never consults Z3.
-      // This exercises the options.precision plumbing end-to-end.
+      // When the consumer accepts `smt-skipped`, the branch
+      // cascade stops at Layer 4 and the post-pass refutation
+      // is skipped. Contradictory paths that Z3 would refute
+      // stay in the flow list because the engine never
+      // consults Z3. This exercises the single-axis accept
+      // system end-to-end.
       const t = await analyze(
         'var h = location.hash;' +
         'var s = location.search;' +
         'if (h === s) { if (h === "x") { if (s === "y") { document.body.innerHTML = h; } } }',
-        { typeDB: TDB, precision: 'fast' });
+        {
+          typeDB: TDB,
+          accept: [
+            // Every default-accepted reason PLUS smt-skipped.
+            'network', 'attacker-input', 'persistent-state', 'dom-state',
+            'ui-interaction', 'environmental', 'runtime-time', 'pseudorandom',
+            'cryptographic-random', 'unsolvable-math',
+            'opaque-call', 'external-module', 'code-from-data',
+            'unimplemented', 'heap-escape',
+            'loop-widening', 'summary-reused',
+            'smt-skipped',
+          ],
+        });
       assertEqual(t.taintFlows.length, 1,
-        "precision: 'fast' skips Z3 — the contradictory flow is kept");
+        'accepting smt-skipped turns Z3 off — contradictory flow kept');
     },
   },
   {

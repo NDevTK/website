@@ -240,6 +240,18 @@ const REASONS = Object.freeze({
   // sensitivity (every call site walks the body, at the cost
   // of O(calls × body) analysis time).
   SUMMARY_REUSED: 'summary-reused',
+
+  // SMT skipped: the engine chose not to invoke Z3 on a
+  // branch decision or a post-pass refutation. This is the
+  // consumer's escape hatch from Z3 overhead when speed
+  // matters more than refuting infeasible flows. Unlike
+  // LOOP_WIDENING and SUMMARY_REUSED (which are accepted by
+  // default because skipping them is the preconditioned
+  // cost of a finite analysis), SMT_SKIPPED is NOT accepted
+  // by default — the precision path is the default, and
+  // consumers opt in to skipping Z3 by explicitly adding
+  // this reason to `options.accept`.
+  SMT_SKIPPED: 'smt-skipped',
 });
 
 const VALID_REASONS = new Set(Object.values(REASONS));
@@ -304,7 +316,46 @@ const DEFAULT_SEVERITY = Object.freeze({
   // is ⊒ the per-caller-context exit state).
   'loop-widening':        SEVERITIES.PRECISION,
   'summary-reused':       SEVERITIES.PRECISION,
+  'smt-skipped':          SEVERITIES.PRECISION,
 });
+
+// Default accept set for consumers that don't pass an
+// explicit `options.accept`. Every reason code except
+// SMT_SKIPPED is accepted by default:
+//
+//   * Theoretical-floor reasons (network, attacker-input,
+//     etc.) — the engine can't avoid them, so consumers
+//     tolerate them unless they specifically need a
+//     stricter analysis.
+//
+//   * Engineering gaps (unimplemented, heap-escape) and
+//     environmental reasons — same rationale.
+//
+//   * Performance shortcuts LOOP_WIDENING and
+//     SUMMARY_REUSED — both are the cost of a finite,
+//     scalable analysis. Rejecting them forces the engine
+//     into exhaustive mode, which a consumer that wants
+//     maximum precision can opt into. Accepted by default.
+//
+//   * SMT_SKIPPED is NOT in the default set. By default
+//     the engine runs Z3 (precision path). Consumers that
+//     want fast analysis add 'smt-skipped' to their
+//     accept list, which turns Z3 off at the branch
+//     cascade AND the post-pass.
+//
+// This replaces the old `options.precision: 'fast' |
+// 'precise' | 'exact'` knob which was a parallel axis
+// duplicating what the accept system already expressed.
+// One source of truth: the accept set.
+const DEFAULT_ACCEPT = Object.freeze(new Set([
+  'network', 'attacker-input', 'persistent-state', 'dom-state',
+  'ui-interaction', 'environmental', 'runtime-time', 'pseudorandom',
+  'cryptographic-random', 'unsolvable-math',
+  'opaque-call', 'external-module', 'code-from-data',
+  'unimplemented', 'heap-escape',
+  'loop-widening', 'summary-reused',
+  // 'smt-skipped' deliberately excluded — opt-in.
+]));
 
 // AssumptionTracker is the mutable ledger the analyser writes
 // to during the walk. It assigns stable ids and builds chain
@@ -412,6 +463,7 @@ module.exports = {
   REASONS,
   SEVERITIES,
   DEFAULT_SEVERITY,
+  DEFAULT_ACCEPT,
   AssumptionTracker,
 };
 
@@ -3955,7 +4007,7 @@ module.exports = {
 
 const { buildModule, buildProjectModule } = require('./ir.js');
 const { analyseFunction } = require('./worklist.js');
-const { AssumptionTracker, REASONS, SEVERITIES } = require('./assumptions.js');
+const { AssumptionTracker, REASONS, SEVERITIES, DEFAULT_ACCEPT } = require('./assumptions.js');
 const D = require('./domain.js');
 const { overlayEntries } = require('./domain.js');
 const Z3 = require('./z3.js');
@@ -3972,28 +4024,46 @@ const query = require('./query.js');
 //
 //   * typeDB        — custom TypeDB; falls back to the default.
 //
-//   * precision     — 'fast' | 'precise' | 'exact'. Default 'precise'.
+//   * smtTimeoutMs  — per-Z3-check wall-clock cap in
+//                     milliseconds. Default 5000. Plumbed
+//                     through to z3.checkPathSat on every
+//                     Layer 5 invocation and to the post-pass
+//                     refutation. A soft cap; Z3 returns
+//                     `unknown` on timeout, which raises an
+//                     `unsolvable-math` assumption and leaves
+//                     the branch / flow in place.
 //
-//   * smtTimeoutMs  — per-Z3-check wall-clock cap in milliseconds.
-//                     Default 5000.
+//   * accept        — PRESCRIPTIVE Set<AssumptionReason>.
+//                     The single axis for all precision /
+//                     performance / soundness trade-offs.
+//                     When omitted, defaults to
+//                     assumptions.DEFAULT_ACCEPT which
+//                     accepts every reason EXCEPT the opt-in
+//                     performance shortcut 'smt-skipped'.
 //
-//   * accept        — Array<AssumptionReason>. The set of
-//                     assumption reason codes the consumer is
-//                     willing to tolerate. Any assumption raised
-//                     with a reason NOT in this set is copied into
-//                     `trace.rejectedAssumptions` and marks
-//                     `trace.partial = true` — the consumer knows
-//                     its result is untrustworthy for paths that
-//                     depend on the rejected assumptions, and can
-//                     rerun with stricter `precision` / a larger
-//                     `smtTimeoutMs` / a richer TypeDB to suppress
-//                     them. Performance shortcuts (loop-widening,
-//                     summary-reused) are assumption reasons like
-//                     any other, so consumers that reject them
-//                     force the engine into higher-precision
-//                     modes.
-//                     Default: every defined reason code is
-//                     accepted (no rejection).
+//                     Rejecting a reason is prescriptive: the
+//                     engine does NOT take the shortcut that
+//                     would raise that reason. For example:
+//                       * reject 'loop-widening'  → engine
+//                         walks loops per-iteration (may not
+//                         terminate on big loops).
+//                       * reject 'summary-reused' → every
+//                         call walks the callee body fresh
+//                         (full context sensitivity).
+//                       * reject 'smt-skipped'    → engine
+//                         runs Z3 at every branch and in the
+//                         post-pass refutation. This is the
+//                         DEFAULT.
+//                       * accept 'smt-skipped'    → engine
+//                         skips Z3 entirely (fast mode).
+//
+//                     Rejections of theoretical-floor
+//                     reasons (network, attacker-input, etc.)
+//                     are advisory — the engine can't conjure
+//                     bytes it doesn't have; the rejection
+//                     lands in `trace.rejectedAssumptions`
+//                     with `partial = true` so the consumer
+//                     knows its result is untrustworthy.
 //
 //   * taint         — enable taint-flow emission. Default true.
 //
@@ -4001,26 +4071,18 @@ const query = require('./query.js');
 //                     onFinding, onAssumption.
 async function analyze(input, options) {
   options = options || {};
-  const precision = options.precision || 'precise';
   const smtTimeoutMs = options.smtTimeoutMs != null ? options.smtTimeoutMs : 5000;
   const watchers = options.watchers || null;
-  // `accept` is a Set<string> — the assumption reason codes
-  // the consumer tolerates. If omitted, every reason is
-  // implicitly accepted. The set is PRESCRIPTIVE: rejecting a
-  // reason forces the engine to NOT take that shortcut,
-  // instead of merely reporting it. For performance-shortcut
-  // reasons (loop-widening, summary-reused) this means the
-  // engine walks exhaustively at the consumer's request; for
-  // theoretical-floor reasons (network, attacker-input, etc.)
-  // rejection is advisory — the engine can't conjure bytes it
-  // doesn't have, so the rejection lands in
-  // `trace.rejectedAssumptions` with `partial = true` as a
-  // signal to the consumer that the analysis isn't trustworthy
-  // for those paths.
-  const acceptAll = options.accept == null;
-  const accept = acceptAll
-    ? null
-    : new Set(Array.isArray(options.accept) ? options.accept : []);
+  // Single axis for precision / performance / soundness
+  // trade-offs: `accept`. When the consumer doesn't pass
+  // one, we use the default set which accepts every reason
+  // except 'smt-skipped' (Z3 runs by default).
+  const accept = options.accept != null
+    ? new Set(Array.isArray(options.accept) ? options.accept : [])
+    : DEFAULT_ACCEPT;
+  // Derived shortcut gates — read directly from `accept` so
+  // the same Set controls every engine decision uniformly.
+  const smtSkipped = accept.has(REASONS.SMT_SKIPPED);
   const files = typeof input === 'string'
     ? { '<input>.js': input }
     : Object.assign(Object.create(null), input);
@@ -4115,10 +4177,11 @@ async function analyze(input, options) {
 
   // D6 Layer 5: the worklist's BRANCH handler calls
   // `ctx.solverCheckPathSat(formula)` when layers 1-4 leave
-  // both successors reachable. Only bound when precision is
-  // not 'fast'. Results are cached inside z3.js by the
-  // formula's expression text.
-  const solverCheckPathSat = precision === 'fast'
+  // both successors reachable. Bound only when the consumer
+  // has NOT accepted 'smt-skipped' (i.e. the default
+  // precise-mode path). Results are cached inside z3.js by
+  // the formula's expression text.
+  const solverCheckPathSat = smtSkipped
     ? null
     : (formula) => Z3.checkPathSat(formula, smtTimeoutMs);
 
@@ -4180,11 +4243,17 @@ async function analyze(input, options) {
       continue;
     }
 
-    // When precision === 'exact', clear every function's
+    // When the consumer has rejected 'summary-reused' (no
+    // longer the permissive default), clear every function's
     // summary cache before this file's walk. Different call
     // sites will then walk the callee independently, getting
     // full context sensitivity at the cost of redoing work.
-    if (precision === 'exact') {
+    // The per-call gate inside transfer.applyCall also
+    // checks ctx.accept.has('summary-reused'); clearing here
+    // is a belt-and-suspenders step so stale cache entries
+    // from a prior permissive analyse() don't accidentally
+    // get reused.
+    if (!accept.has(REASONS.SUMMARY_REUSED)) {
       for (const fn of module.functions) {
         if (fn._summaryCache) fn._summaryCache = new Map();
       }
@@ -4227,15 +4296,17 @@ async function analyze(input, options) {
       // Flow id counter — assigned at emission time so flows
       // have stable identity within a trace.
       nextFlowId: 1,
-      // Precision mode + Z3 hookup.
-      precision,
+      // Z3 hookup. When the consumer has accepted
+      // 'smt-skipped', solverCheckPathSat is null and the
+      // worklist's branch cascade stops at Layer 4.
       smtTimeoutMs,
       solverCheckPathSat,
-      // Accept set (null = all accepted). The worklist and
-      // transfer functions consult this to decide whether to
-      // take performance shortcuts like loop widening and
-      // summary-cache reuse. Rejected shortcuts force the
-      // engine into the exhaustive equivalent.
+      // Accept set. The worklist and transfer functions
+      // consult this to decide whether to take performance
+      // shortcuts (loop widening, summary-cache reuse) and
+      // whether to call Z3 at all. Every engine decision
+      // reads from the same set so there's no parallel
+      // precision axis.
       accept,
     };
 
@@ -4426,20 +4497,31 @@ async function analyze(input, options) {
   // cascade (Layer 5) already kills infeasible paths at the
   // block level; this pass catches residual flows whose
   // pathFormula reached its final disjunctive form only after
-  // the flow was emitted. Skipped in 'fast' precision.
-  if (precision !== 'fast') {
+  // the flow was emitted. Skipped when the consumer has
+  // accepted 'smt-skipped'. Every SMT skip raises a
+  // SMT_SKIPPED assumption so the consumer can audit where
+  // the engine would have refuted if precision mattered.
+  if (!smtSkipped) {
     await Z3.refuteTrace(trace, smtTimeoutMs);
+  } else {
+    assumptions.raise(
+      REASONS.SMT_SKIPPED,
+      'Z3 post-pass refutation skipped because consumer accepted smt-skipped',
+      { file: '<solver>', line: 0, col: 0, pos: 0 }
+    );
   }
 
   trace.assumptions = assumptions.snapshot();
 
-  // Assumption rejection pass. If the consumer passed an
-  // explicit `accept` set, any assumption with a reason not in
-  // the set is rejected — copied into `rejectedAssumptions`
-  // and setting `partial = true`. Consumers that did NOT pass
-  // `accept` get every assumption as-tolerated (the default
-  // permissive mode).
-  if (!acceptAll) {
+  // Assumption rejection pass. The accept set is
+  // prescriptive — every assumption with a reason NOT in the
+  // set is flagged as rejected and sets `partial = true` on
+  // the trace. Because the default accept set (when the
+  // consumer doesn't pass one) already covers every reason
+  // code, default analyse() calls never produce rejections.
+  // Consumers that pass a narrower explicit set get
+  // fine-grained strict-mode reporting.
+  {
     for (const a of trace.assumptions) {
       if (!accept.has(a.reason)) {
         trace.rejectedAssumptions.push(a);
@@ -15699,12 +15781,13 @@ async function analyseFunction(module, fn, initialState, ctx) {
         // after value-level refinement, ask Z3 whether each
         // edge's `path` is satisfiable. UNSAT edges are dead.
         //
-        // Skipped entirely when precision === 'fast'. Skipped
-        // also when both sides already have a non-symbolic
-        // formula (the cond has no SMT representation, so Z3
-        // can't help).
+        // Skipped entirely when the consumer has accepted
+        // 'smt-skipped' (ctx.solverCheckPathSat is null in
+        // that case — the index.js wiring only binds it
+        // when smt-skipped is NOT in the accept set).
+        // Skipped also when the cond value has no symbolic
+        // formula (no SMT representation, so Z3 can't help).
         if (!trueDead && !falseDead &&
-            ctx.precision !== 'fast' &&
             condForm &&
             ctx.solverCheckPathSat) {
           // Check trueEdge first: we need both to be checked
@@ -16470,7 +16553,7 @@ async function derive(input, options) {
   options = options || {};
   const trace = await analyze(input, {
     typeDB: options.typeDB || TDB,
-    precision: options.precision || 'precise',
+    
     accept: options.accept,
     watchers: options.watchers,
   });
@@ -17543,7 +17626,7 @@ async function convertProject(files, options) {
   for (const project of projects) {
     const trace = await analyze(project.files, {
       typeDB: TDB,
-      precision: options.precision || 'precise',
+      
       project: project.order,
     });
     for (const jsPath of project.order) {
@@ -17658,7 +17741,7 @@ async function trace(input, options) {
   options = options || {};
   const t = await analyze(input, {
     typeDB: options.typeDB || TDB,
-    precision: options.precision || 'precise',
+    
     accept: options.accept,
     watchers: options.watchers,
   });
@@ -17841,7 +17924,7 @@ async function analyzeReport(input, options) {
   options = options || {};
   const trace = await analyze(input, {
     typeDB: options.typeDB || TDB,
-    precision: options.precision || 'precise',
+    
     accept: options.accept,
     watchers: options.watchers,
   });

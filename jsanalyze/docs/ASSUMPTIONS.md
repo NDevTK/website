@@ -626,12 +626,40 @@ also fires on the cached replay.
 **Rejection effect.** The engine does NOT consult the cache
 and does NOT populate it. Every call site walks the callee
 body fresh, giving full context sensitivity at O(calls × body)
-cost. This is equivalent to `precision: 'exact'` scoped to the
-summary cache.
+cost. Accepted in the DEFAULT accept set — consumers that
+want exact mode must reject this reason explicitly.
 
 **How to narrow.** Keep function arities small so argument
 fingerprints are selective; or accept the reuse and audit the
 raised sites.
+
+### `smt-skipped`
+
+**When raised.** The engine chose not to invoke Z3 on a
+branch decision or a post-pass refutation because the
+consumer's accept set contained `'smt-skipped'`. This is
+the consumer's single opt-in switch for "fast mode" —
+skipping Z3 trades refutation precision for analysis speed.
+
+**Severity.** `precision`. The engine's lower-layer
+reachability cascade (truthiness, refineEq, value-set
+refutation, path-sensitive propagation) still runs, so
+most cheap wins are preserved. Only the SMT path is
+dropped.
+
+**Rejection effect.** This is the only performance shortcut
+in Class 4 that is REJECTED by default. The engine runs Z3
+unless the consumer explicitly accepts `'smt-skipped'`.
+Consumers that want fast mode add `'smt-skipped'` to their
+accept set; consumers that want the default precision
+behaviour do nothing.
+
+**How to narrow.** Don't accept the shortcut — the engine
+will run Z3 at every branch decision where layers 1-4 are
+inconclusive, and in the post-pass refutation over
+surviving taint flows. Use `options.smtTimeoutMs` if Z3 is
+taking too long on pathological formulas; that caps
+individual checks without disabling the whole SMT path.
 
 ---
 

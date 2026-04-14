@@ -178,6 +178,18 @@ const REASONS = Object.freeze({
   // sensitivity (every call site walks the body, at the cost
   // of O(calls × body) analysis time).
   SUMMARY_REUSED: 'summary-reused',
+
+  // SMT skipped: the engine chose not to invoke Z3 on a
+  // branch decision or a post-pass refutation. This is the
+  // consumer's escape hatch from Z3 overhead when speed
+  // matters more than refuting infeasible flows. Unlike
+  // LOOP_WIDENING and SUMMARY_REUSED (which are accepted by
+  // default because skipping them is the preconditioned
+  // cost of a finite analysis), SMT_SKIPPED is NOT accepted
+  // by default — the precision path is the default, and
+  // consumers opt in to skipping Z3 by explicitly adding
+  // this reason to `options.accept`.
+  SMT_SKIPPED: 'smt-skipped',
 });
 
 const VALID_REASONS = new Set(Object.values(REASONS));
@@ -242,7 +254,46 @@ const DEFAULT_SEVERITY = Object.freeze({
   // is ⊒ the per-caller-context exit state).
   'loop-widening':        SEVERITIES.PRECISION,
   'summary-reused':       SEVERITIES.PRECISION,
+  'smt-skipped':          SEVERITIES.PRECISION,
 });
+
+// Default accept set for consumers that don't pass an
+// explicit `options.accept`. Every reason code except
+// SMT_SKIPPED is accepted by default:
+//
+//   * Theoretical-floor reasons (network, attacker-input,
+//     etc.) — the engine can't avoid them, so consumers
+//     tolerate them unless they specifically need a
+//     stricter analysis.
+//
+//   * Engineering gaps (unimplemented, heap-escape) and
+//     environmental reasons — same rationale.
+//
+//   * Performance shortcuts LOOP_WIDENING and
+//     SUMMARY_REUSED — both are the cost of a finite,
+//     scalable analysis. Rejecting them forces the engine
+//     into exhaustive mode, which a consumer that wants
+//     maximum precision can opt into. Accepted by default.
+//
+//   * SMT_SKIPPED is NOT in the default set. By default
+//     the engine runs Z3 (precision path). Consumers that
+//     want fast analysis add 'smt-skipped' to their
+//     accept list, which turns Z3 off at the branch
+//     cascade AND the post-pass.
+//
+// This replaces the old `options.precision: 'fast' |
+// 'precise' | 'exact'` knob which was a parallel axis
+// duplicating what the accept system already expressed.
+// One source of truth: the accept set.
+const DEFAULT_ACCEPT = Object.freeze(new Set([
+  'network', 'attacker-input', 'persistent-state', 'dom-state',
+  'ui-interaction', 'environmental', 'runtime-time', 'pseudorandom',
+  'cryptographic-random', 'unsolvable-math',
+  'opaque-call', 'external-module', 'code-from-data',
+  'unimplemented', 'heap-escape',
+  'loop-widening', 'summary-reused',
+  // 'smt-skipped' deliberately excluded — opt-in.
+]));
 
 // AssumptionTracker is the mutable ledger the analyser writes
 // to during the walk. It assigns stable ids and builds chain
@@ -350,5 +401,6 @@ module.exports = {
   REASONS,
   SEVERITIES,
   DEFAULT_SEVERITY,
+  DEFAULT_ACCEPT,
   AssumptionTracker,
 };

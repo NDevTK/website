@@ -28,7 +28,7 @@ async function analyzeReport(input, options) {
   options = options || {};
   const trace = await analyze(input, {
     typeDB: options.typeDB || TDB,
-    precision: options.precision || 'precise',
+    
     accept: options.accept,
     watchers: options.watchers,
   });

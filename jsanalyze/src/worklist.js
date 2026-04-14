@@ -538,12 +538,13 @@ async function analyseFunction(module, fn, initialState, ctx) {
         // after value-level refinement, ask Z3 whether each
         // edge's `path` is satisfiable. UNSAT edges are dead.
         //
-        // Skipped entirely when precision === 'fast'. Skipped
-        // also when both sides already have a non-symbolic
-        // formula (the cond has no SMT representation, so Z3
-        // can't help).
+        // Skipped entirely when the consumer has accepted
+        // 'smt-skipped' (ctx.solverCheckPathSat is null in
+        // that case — the index.js wiring only binds it
+        // when smt-skipped is NOT in the accept set).
+        // Skipped also when the cond value has no symbolic
+        // formula (no SMT representation, so Z3 can't help).
         if (!trueDead && !falseDead &&
-            ctx.precision !== 'fast' &&
             condForm &&
             ctx.solverCheckPathSat) {
           // Check trueEdge first: we need both to be checked

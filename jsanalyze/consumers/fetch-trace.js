@@ -86,7 +86,7 @@ async function trace(input, options) {
   options = options || {};
   const t = await analyze(input, {
     typeDB: options.typeDB || TDB,
-    precision: options.precision || 'precise',
+    
     accept: options.accept,
     watchers: options.watchers,
   });

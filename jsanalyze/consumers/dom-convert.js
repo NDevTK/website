@@ -841,7 +841,7 @@ async function convertProject(files, options) {
   for (const project of projects) {
     const trace = await analyze(project.files, {
       typeDB: TDB,
-      precision: options.precision || 'precise',
+      
       project: project.order,
     });
     for (const jsPath of project.order) {

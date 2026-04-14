@@ -31,23 +31,6 @@ type AnalyzeOptions = {
   // Custom TypeDB. Overrides the default. See `docs/TYPEDB.md`.
   typeDB?: TypeDB;
 
-  // Precision level. Higher = slower but fewer `precision`
-  // assumptions. Defaults to 'precise'.
-  //
-  //   'fast'   — skip Layer 5 (Z3) entirely. The branch
-  //              reachability cascade stops at Layer 4 (path-
-  //              sensitive propagation), and the post-pass
-  //              refutation is also skipped. Undecided branches
-  //              become `unsolvable-math` assumptions.
-  //   'precise' — use cascaded layers 1–5 with Z3 at the branch
-  //              decision cascade AND run the post-pass
-  //              refutation over any surviving flows. Default.
-  //   'exact'  — same as 'precise' but also clears every
-  //              function's C3 summary cache before the walk,
-  //              so each call site walks the callee from scratch
-  //              (full context sensitivity, slowest).
-  precision?: 'fast' | 'precise' | 'exact';
-
   // Soft cap per SMT call in milliseconds. Exceeded calls
   // return 'unknown' and raise an `unsolvable-math` assumption.
   // Default: 5000. Plumbed through to z3.checkPathSat on every
@@ -55,39 +38,53 @@ type AnalyzeOptions = {
   smtTimeoutMs?: number;
 
   // PRESCRIPTIVE assumption-acceptance set. Declares which
-  // assumption reason codes the consumer tolerates. Missing
-  // reasons are REJECTED — the engine is forbidden from
-  // taking any shortcut that would raise a rejected reason,
-  // AND any assumption that gets raised with a rejected
-  // reason is copied into `trace.rejectedAssumptions` with
-  // `trace.partial = true`.
+  // assumption reason codes the consumer tolerates.
+  // `accept` is the SINGLE axis for every precision /
+  // performance / soundness trade-off — there's no parallel
+  // `precision: 'fast' | 'precise' | 'exact'` option.
   //
-  // Two classes of effect:
+  // Omitting the option gives the default accept set, which
+  // includes every reason code EXCEPT `'smt-skipped'`:
+  // that default corresponds to what legacy engines called
+  // "precise mode" — engine runs Z3, takes loop-widening
+  // and summary-reuse shortcuts, and accepts every
+  // theoretical-floor reason.
   //
-  //   * Performance-shortcut reasons (`loop-widening`,
-  //     `summary-reused`) — rejection PREVENTS the engine
-  //     from taking the shortcut. Loops walk per-iteration,
-  //     function calls walk fresh on every call site.
+  // Passing an explicit `accept: [...]` gives fine-grained
+  // strict mode. Any assumption raised with a reason NOT in
+  // the set is copied into `trace.rejectedAssumptions` and
+  // sets `trace.partial = true`. Rejection is prescriptive
+  // for performance shortcuts (the engine does NOT take
+  // them) and advisory for theoretical-floor reasons (the
+  // engine can't conjure bytes it doesn't have).
   //
-  //   * Theoretical-floor / environmental / engineering-gap
-  //     reasons (`network`, `attacker-input`, `opaque-call`,
-  //     `unimplemented`, …) — rejection is advisory. The
-  //     engine can't conjure bytes it doesn't have; the
-  //     assumption still rises, but lands in
-  //     `rejectedAssumptions` so the consumer knows its
-  //     result is untrustworthy for the affected paths.
+  // Common recipes:
   //
-  // Default: undefined = every defined reason is accepted
-  // (no rejection, maximum permissiveness).
+  //   * Fast mode: add 'smt-skipped' to the accept set so
+  //     the engine skips Z3 at branch decisions and the
+  //     post-pass refutation. Consumer gets faster analysis
+  //     at the cost of keeping infeasible taint flows.
   //
-  // Example: a DOM-conversion consumer that can't tolerate
-  // opaque-call laundering because it rewrites the string:
-  //   accept: ['network', 'attacker-input', 'persistent-state',
-  //            'unsolvable-math', 'loop-widening',
-  //            'summary-reused']
-  //   // rejects opaque-call, external-module, code-from-data,
-  //   // unimplemented, heap-escape — partial=true if any of
-  //   // those fire, and the consumer knows to skip that file.
+  //   * Exact mode: remove 'summary-reused' from the accept
+  //     set so every call site walks the callee body
+  //     fresh. O(calls × body) cost; full context
+  //     sensitivity.
+  //
+  //   * Strict mode: remove 'opaque-call' /
+  //     'external-module' / 'unimplemented' / 'heap-escape'
+  //     so the engine flags every imprecise spot as a
+  //     rejected assumption on the trace.
+  //
+  // Class 4 (performance shortcuts) default membership:
+  //
+  //     loop-widening         IN  (engine widens by default)
+  //     summary-reused        IN  (engine caches by default)
+  //     smt-skipped           OUT (engine runs Z3 by default)
+  //
+  // Defaults favor precision over speed. Consumers that
+  // want speed opt in to 'smt-skipped'; consumers that want
+  // maximum precision opt out of 'loop-widening' /
+  // 'summary-reused'.
   accept?: AssumptionReason[];
 
   // Enable taint tracking. When false, the analyser skips
@@ -138,10 +135,11 @@ type Trace = {
 
   // Flows that the Z3 post-pass refutation moved out of
   // `taintFlows`. Present only when the post-pass found at
-  // least one refutable flow (under precision: 'fast' this
-  // field is never populated). Consumers that want to audit
-  // which flows were dropped inspect this list; consumers
-  // that only want surviving flows ignore it.
+  // least one refutable flow (when the consumer has
+  // accepted 'smt-skipped' Z3 never runs and this field is
+  // never populated). Consumers that want to audit which
+  // flows were dropped inspect this list; consumers that
+  // only want surviving flows ignore it.
   refutedFlows?: TaintFlow[];
 
   // Assumptions that were raised during the walk AND whose

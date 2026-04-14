@@ -143,9 +143,13 @@ when layers 1-4 return unknown.
 **Rationale.** SMT calls dominate analysis wall time on
 realistic inputs. Cheap layers must run first. The cascade
 ordering is fixed in code, not configurable — if a consumer
-wants to skip SMT, they set `precision: 'fast'` which
-short-circuits layer 5 to "unknown → over-approximate as
-reachable" with an `unsolvable-math` assumption.
+wants to skip SMT, they add `'smt-skipped'` to
+`options.accept` which gates the Layer 5 invocation and
+the post-pass refutation on the accept set — the SAME axis
+that controls `loop-widening` / `summary-reused`. There is
+no parallel `options.precision` knob: a single
+`options.accept` set is the source of truth for every
+precision / performance / soundness trade-off.
 
 ### D7. Interprocedural analysis uses k-CFA context sensitivity via summary cache
 
