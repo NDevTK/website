@@ -807,6 +807,8 @@ function applySetProp(ctx, state, instr) {
   for (const variant of D.disjunctVariants(obj)) {
     maybeEmitSinkFlowForWrite(ctx, variant, instr.propName, val, loc);
     maybeRecordInnerHtmlAssignment(ctx, variant, instr.propName, val, loc);
+    recordDomMutationForWrite(ctx, variant, instr.propName, val, loc);
+    recordStringLiteralSetProp(ctx, variant, instr.propName, val, loc);
   }
   // Heap write: fan out over object-ref variants. We don't know
   // which variant the runtime picks, so we model both being
@@ -844,6 +846,192 @@ function maybeEmitSinkFlowForWrite(ctx, obj, propName, val, loc) {
   const sinkInfo = TDB.classifySinkByTypeViaDB(ctx.typeDB, obj.typeName, propName);
   if (!sinkInfo) return;
   emitTaintFlow(ctx, sinkInfo, loc, val);
+}
+
+// --- Wave 12b: trace-enrichment recorders -------------------------------
+//
+// Every observation the consumers need flows into a
+// dedicated trace field. Consumers read these arrays via the
+// query.* functions. Records are generic and consumer-
+// agnostic: a single record can serve multiple consumers.
+
+// recordCallSite — push one CallInfo record per call instr.
+// Shape (matches docs/API.md §CallInfo):
+//
+//   {
+//     callee: { text, typeName, methodName, calleeName },
+//     args: Value[],
+//     thisArg: Value | null,
+//     site: Location,
+//     reachability: 'reachable' | 'unknown',
+//     pathFormula: Formula | null,
+//   }
+//
+// `callee.text` is a best-effort display string built from
+// the IR's calleeName / methodName hints. `callee.typeName`
+// is set when the receiver has a TypeDB type, so consumers
+// can filter by receiver type without re-classifying.
+function recordCallSite(ctx, instr, callee, thisValue, argValues, loc) {
+  if (!ctx.calls) return;
+  const text = instr.methodName
+    ? (thisValue && thisValue.typeName
+        ? thisValue.typeName + '.' + instr.methodName
+        : instr.methodName)
+    : (instr.calleeName || '<anonymous>');
+  ctx.calls.push({
+    callee: {
+      text,
+      typeName: (thisValue && thisValue.typeName) || null,
+      methodName: instr.methodName || null,
+      calleeName: instr.calleeName || null,
+      // Expose the callee's Value so consumers can inspect its
+      // labels/assumptionIds without a second lookup.
+      value: callee || null,
+    },
+    args: argValues.slice(),
+    thisArg: thisValue || null,
+    site: loc,
+    reachability: 'reachable',    // if we're in transfer, the instr is reachable
+    pathFormula: ctx.currentPath || null,
+  });
+}
+
+// recordDomMutation — push one DomMutation record for every
+// call that mutates a DOM-typed receiver. The TypeDB's type
+// chain is the authority: if `thisValue.typeName` is in the
+// Element / Node / HTMLCollection / NodeList / CSSStyleDeclaration
+// / DOMTokenList / NamedNodeMap chain, the call is a DOM
+// mutation observation and goes into trace.domMutations.
+//
+// Shape (DomMutation):
+//
+//   {
+//     kind: string,           -- method name (e.g. 'setAttribute')
+//     category: 'method',
+//     targetType: string,     -- receiver's typeName
+//     target: Value,          -- receiver value
+//     args: Value[],          -- arguments
+//     site: Location,
+//     pathFormula: Formula | null,
+//   }
+//
+// SetProp observations (property assignments like `el.innerHTML = s`)
+// use the parallel `recordDomMutationForWrite` helper called
+// from applySetProp.
+function recordDomMutation(ctx, instr, thisValue, argValues, loc) {
+  if (!ctx.domMutations) return;
+  if (!thisValue || !thisValue.typeName) return;
+  if (!instr.methodName) return;
+  if (!isDomMutationType(ctx, thisValue.typeName)) return;
+  ctx.domMutations.push({
+    kind: instr.methodName,
+    category: 'method',
+    targetType: thisValue.typeName,
+    target: thisValue,
+    args: argValues.slice(),
+    site: loc,
+    pathFormula: ctx.currentPath || null,
+  });
+}
+
+// recordDomMutationForWrite — SetProp analogue of
+// recordDomMutation. Fired from applySetProp. Skips properties
+// already covered by the innerHtmlAssignments channel
+// (innerHTML, outerHTML, insertAdjacentHTML) so consumers
+// don't have to dedupe.
+function recordDomMutationForWrite(ctx, obj, propName, val, loc) {
+  if (!ctx.domMutations) return;
+  if (!obj || !obj.typeName) return;
+  if (!isDomMutationType(ctx, obj.typeName)) return;
+  if (propName === 'innerHTML' || propName === 'outerHTML') return;
+  ctx.domMutations.push({
+    kind: propName,
+    category: 'property-set',
+    targetType: obj.typeName,
+    target: obj,
+    args: [val],
+    site: loc,
+    pathFormula: ctx.currentPath || null,
+  });
+}
+
+// True iff the given TypeDB type name is in the DOM chain.
+// We walk the TypeDB's `extends` links from the given type up
+// to the root; any ancestor in the set below qualifies. The
+// check is cached per-type on the TypeDB object to avoid
+// walking the chain every time.
+const DOM_ROOT_TYPES = new Set([
+  'Element', 'Node', 'HTMLElement',
+  'CSSStyleDeclaration', 'DOMTokenList', 'NamedNodeMap',
+  'HTMLCollection', 'NodeList',
+  'EventTarget',       // addEventListener / removeEventListener
+]);
+
+function isDomMutationType(ctx, typeName) {
+  if (!typeName) return false;
+  if (!ctx.typeDB || !ctx.typeDB.types) return false;
+  if (!ctx._domTypeCache) ctx._domTypeCache = new Map();
+  const cached = ctx._domTypeCache.get(typeName);
+  if (cached !== undefined) return cached;
+  let t = typeName;
+  while (t) {
+    if (DOM_ROOT_TYPES.has(t)) {
+      ctx._domTypeCache.set(typeName, true);
+      return true;
+    }
+    const desc = ctx.typeDB.types[t];
+    if (!desc) break;
+    t = desc.extends || null;
+  }
+  ctx._domTypeCache.set(typeName, false);
+  return false;
+}
+
+// recordStringLiteralArgs — push a LiteralObservation for
+// every concrete-string argument of a recorded call. The
+// context is built from the callee description so consumers
+// can filter to a specific API (e.g. "every concrete string
+// passed as the first arg of fetch").
+//
+// Shape (LiteralObservation):
+//
+//   {
+//     value: string,
+//     context: string,          -- e.g. 'fetch/0', 'Element.setAttribute/1'
+//     site: Location,
+//     sinkKind: string | null,  -- from sink classification, if any
+//   }
+function recordStringLiteralArgs(ctx, instr, callee, thisValue, argValues, loc) {
+  if (!ctx.stringLiterals) return;
+  const base = instr.methodName
+    ? (thisValue && thisValue.typeName
+        ? thisValue.typeName + '.' + instr.methodName
+        : instr.methodName)
+    : (instr.calleeName || '<anonymous>');
+  for (let i = 0; i < argValues.length; i++) {
+    const a = argValues[i];
+    if (!a || a.kind !== D.V.CONCRETE || typeof a.value !== 'string') continue;
+    ctx.stringLiterals.push({
+      value: a.value,
+      context: base + '/' + i,
+      site: loc,
+      sinkKind: null,
+    });
+  }
+}
+
+// recordStringLiteralSetProp — SetProp analogue: if `val` is
+// a concrete string, record it with context `<type>.<prop>`.
+function recordStringLiteralSetProp(ctx, obj, propName, val, loc) {
+  if (!ctx.stringLiterals) return;
+  if (!val || val.kind !== D.V.CONCRETE || typeof val.value !== 'string') return;
+  const typeName = obj && obj.typeName ? obj.typeName : '<anonymous>';
+  ctx.stringLiterals.push({
+    value: val.value,
+    context: typeName + '.' + propName,
+    site: loc,
+    sinkKind: null,
+  });
 }
 
 // Wave 12 / Phase E: record innerHTML-family assignments so the
@@ -1225,6 +1413,27 @@ async function applyCall(ctx, state, instr) {
   const argValues = instr.args.map(r => D.getReg(state, r));
   const thisValue = instr.thisArg ? D.getReg(state, instr.thisArg) : null;
 
+  // Wave 12b: record every call site on the trace. Consumers
+  // (fetch-trace, csp-derive, dom-convert) filter this array
+  // via query.calls to find what they care about. The record
+  // shape is generic, not consumer-specific.
+  recordCallSite(ctx, instr, callee, thisValue, argValues, loc, state);
+  // DOM mutation recording: if the call is a method on a
+  // DOM-typed receiver, treat it as a DOM mutation observation.
+  // This covers setAttribute / appendChild / replaceChildren /
+  // insertBefore / removeChild / style.setProperty /
+  // classList.add / addEventListener / etc. — every consumer
+  // that wants to rewrite or inventory DOM calls reads from
+  // trace.domMutations.
+  recordDomMutation(ctx, instr, thisValue, argValues, loc);
+  // String-literal argument recording: if any argument is a
+  // concrete string, record it on trace.stringLiterals with
+  // the call's context (callee name + arg index). CSP-derive
+  // reads this to find concrete origins for script-src /
+  // img-src / connect-src / frame-src; fetch-trace reads it
+  // to find hardcoded endpoint URLs.
+  recordStringLiteralArgs(ctx, instr, callee, thisValue, argValues, loc);
+
   // --- Sink classification for the call site ---
   //
   // When the receiver is a Disjunct (e.g. `(anchor|iframe).method()`),
@@ -1478,10 +1687,27 @@ async function applyCall(ctx, state, instr) {
     // Cache lives on calleeFn (body-local) so repeated calls
     // across analyze() invocations on the same module share
     // summaries without ctx-level bookkeeping.
+    // Summary cache: the `accept` set decides whether we use
+    // it. A consumer that rejects `summary-reused` gets full
+    // context sensitivity — every call walks the callee body
+    // fresh regardless of argument fingerprint. Otherwise the
+    // cache is consulted; a hit raises SUMMARY_REUSED so the
+    // consumer can audit where shortcuts fired.
+    const cacheAllowed = ctx.accept == null ||
+      ctx.accept.has(REASONS.SUMMARY_REUSED);
     if (!calleeFn._summaryCache) calleeFn._summaryCache = new Map();
     const cacheKey = 'b=' + calleeFn.id + '|a=' + argsFingerprint;
-    let calleeResult = calleeFn._summaryCache.get(cacheKey) || null;
+    let calleeResult = cacheAllowed
+      ? (calleeFn._summaryCache.get(cacheKey) || null)
+      : null;
     let cacheHit = !!calleeResult;
+    if (cacheHit) {
+      ctx.assumptions.raise(
+        REASONS.SUMMARY_REUSED,
+        'call to `' + (calleeFn.name || calleeFn.id) + '` replayed from summary cache instead of walking fresh',
+        loc
+      );
+    }
 
     // Push the current frame onto the callee's callStack so
     // nested recursive calls see it.
@@ -1502,7 +1728,7 @@ async function applyCall(ctx, state, instr) {
         ctx.currentBlockId = savedBlockId;
         ctx._currentThisValue = savedThis;
       }
-      if (calleeResult && calleeResult.exitState) {
+      if (cacheAllowed && calleeResult && calleeResult.exitState) {
         calleeFn._summaryCache.set(cacheKey, {
           exitState: calleeResult.exitState,
         });

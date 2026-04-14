@@ -576,6 +576,65 @@ for the points-to / effect-summary pass.
 
 ---
 
+## Class 4 — Performance shortcuts
+
+These reason codes are unique: they mark places where the
+engine took a precision-for-time tradeoff that the consumer
+can explicitly opt out of. Unlike classes 1-3, rejecting a
+performance-shortcut reason via `options.accept` PREVENTS the
+engine from taking the shortcut in the first place — the
+engine walks exhaustively instead.
+
+### `loop-widening`
+
+**When raised.** A loop header's back-edge variants were
+pointwise-joined into a single widened variant instead of
+kept as distinct per-iteration variants. This keeps loop
+analysis finite (a 1000-iter counter loop would otherwise
+spawn 1000 variants and take ~100s); with widening it
+converges in milliseconds.
+
+**Severity.** `precision`. The widened variant is an
+OVER-approximation of every iteration's actual state, so
+findings derived from it are conservative upper bounds — may
+over-report, never miss.
+
+**Rejection effect.** The engine does NOT apply the widening.
+Back-edge variants stay distinct, loops converge only at the
+value-lattice level, analysis time grows linearly in loop
+iteration count. The consumer is responsible for accepting
+the slowdown (and the risk that unbounded loops may not
+terminate).
+
+**How to narrow.** Use smaller loop bounds in test fixtures;
+prefer recursive formulations the summary cache can handle;
+or accept the widening and audit the raised sites.
+
+### `summary-reused`
+
+**When raised.** A user-function call hit the D7 k-CFA
+summary cache and the engine replayed the cached exit state
+instead of walking the body fresh. The key is
+`(body, argsFingerprint, thisFingerprint)`; repeated calls
+with the same fingerprint share a summary.
+
+**Severity.** `precision`. The cached exit state is ⊒ the
+per-caller exit state in the lattice order, so reusing it is
+sound — any finding that would have fired on a fresh walk
+also fires on the cached replay.
+
+**Rejection effect.** The engine does NOT consult the cache
+and does NOT populate it. Every call site walks the callee
+body fresh, giving full context sensitivity at O(calls × body)
+cost. This is equivalent to `precision: 'exact'` scoped to the
+summary cache.
+
+**How to narrow.** Keep function arities small so argument
+fingerprints are selective; or accept the reuse and audit the
+raised sites.
+
+---
+
 ## Severity handling
 
 Consumers choose how strictly to interpret each severity class.

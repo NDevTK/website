@@ -111,6 +111,7 @@ const { OP } = require('./ir.js');
 const D = require('./domain.js');
 const { applyInstruction } = require('./transfer.js');
 const SMT = require('./smt.js');
+const { REASONS } = require('./assumptions.js');
 
 // Build (or reuse) the function's def map: register → instruction
 // that writes it. SSA gives us the invariant that every register
@@ -374,7 +375,31 @@ async function analyseFunction(module, fn, initialState, ctx) {
     const stamped = withFromBlock(baked, fromBlock);
     const isBackEdge = fromBlock != null && backPreds.has(blockId) &&
       backPreds.get(blockId).has(fromBlock);
-    const { added, variantIdx } = insertVariant(blockVariants, blockId, stamped, isBackEdge);
+    // Back-edge widening is a performance shortcut per D19.
+    // The `accept` set decides whether the engine is allowed
+    // to take it: if the consumer has opted out of
+    // `loop-widening`, we skip the widening and insert the
+    // back-edge variant as a normal distinct variant. Loops
+    // then converge only at the value-lattice level (and can
+    // take O(iterations) variants to reach fixpoint on
+    // bounded loops) — the consumer explicitly accepted that
+    // cost by rejecting the widening assumption.
+    const widenAllowed = ctx.accept == null ||
+      ctx.accept.has(REASONS.LOOP_WIDENING);
+    if (isBackEdge && widenAllowed && ctx.assumptions) {
+      const headerLoc = cfg.blocks.get(blockId) &&
+        cfg.blocks.get(blockId).instructions[0] &&
+        module.sourceMap.get(cfg.blocks.get(blockId).instructions[0]._id);
+      ctx.assumptions.raise(
+        REASONS.LOOP_WIDENING,
+        'loop header at block ' + blockId + ' widened back-edge variants into one (widening is finite but may over-approximate per-iteration state)',
+        headerLoc || { file: module.name || '<input>', line: 0, col: 0, pos: 0 }
+      );
+    }
+    const { added, variantIdx } = insertVariant(
+      blockVariants, blockId, stamped,
+      isBackEdge && widenAllowed
+    );
     // Update legacy pathConds projection: disjunction over all
     // variants at this block.
     const list = blockVariants.get(blockId);

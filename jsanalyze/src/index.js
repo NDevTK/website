@@ -24,40 +24,54 @@ const query = require('./query.js');
 //   * typeDB        — custom TypeDB; falls back to the default.
 //
 //   * precision     — 'fast' | 'precise' | 'exact'. Default 'precise'.
-//                     'fast'   skips Layer 5 (Z3) entirely; the
-//                              worklist uses only layers 1-4 to
-//                              decide branches, and post-pass
-//                              refutation is disabled. Undecided
-//                              branches become 'unsolvable-math'
-//                              precision assumptions.
-//                     'precise' uses cascaded layers 1-5, Z3 at
-//                              the branch cascade and refuteTrace
-//                              at post-pass (default).
-//                     'exact'  same as 'precise' but also clears
-//                              the summary cache per call site
-//                              so full context sensitivity is
-//                              preserved. Slowest.
 //
 //   * smtTimeoutMs  — per-Z3-check wall-clock cap in milliseconds.
-//                     Default 5000. Z3 returns 'unknown' when a
-//                     check exceeds this; 'unknown' falls through
-//                     to "keep the edge" at Layer 5 and raises an
-//                     'unsolvable-math' precision assumption.
+//                     Default 5000.
 //
-//   * taint         — enable taint-flow emission. Default true
-//                     (docs say false, but the existing test
-//                     suite depends on default-on behaviour;
-//                     docs updated in the same commit).
+//   * accept        — Array<AssumptionReason>. The set of
+//                     assumption reason codes the consumer is
+//                     willing to tolerate. Any assumption raised
+//                     with a reason NOT in this set is copied into
+//                     `trace.rejectedAssumptions` and marks
+//                     `trace.partial = true` — the consumer knows
+//                     its result is untrustworthy for paths that
+//                     depend on the rejected assumptions, and can
+//                     rerun with stricter `precision` / a larger
+//                     `smtTimeoutMs` / a richer TypeDB to suppress
+//                     them. Performance shortcuts (loop-widening,
+//                     summary-reused) are assumption reasons like
+//                     any other, so consumers that reject them
+//                     force the engine into higher-precision
+//                     modes.
+//                     Default: every defined reason code is
+//                     accepted (no rejection).
+//
+//   * taint         — enable taint-flow emission. Default true.
 //
 //   * watchers      — streaming observation hooks: onCall,
-//                     onFinding, onAssumption. Invoked during
-//                     the walk so long-running analyses can
-//                     surface incremental progress.
+//                     onFinding, onAssumption.
 async function analyze(input, options) {
   options = options || {};
   const precision = options.precision || 'precise';
   const smtTimeoutMs = options.smtTimeoutMs != null ? options.smtTimeoutMs : 5000;
   const watchers = options.watchers || null;
+  // `accept` is a Set<string> — the assumption reason codes
+  // the consumer tolerates. If omitted, every reason is
+  // implicitly accepted. The set is PRESCRIPTIVE: rejecting a
+  // reason forces the engine to NOT take that shortcut,
+  // instead of merely reporting it. For performance-shortcut
+  // reasons (loop-widening, summary-reused) this means the
+  // engine walks exhaustively at the consumer's request; for
+  // theoretical-floor reasons (network, attacker-input, etc.)
+  // rejection is advisory — the engine can't conjure bytes it
+  // doesn't have, so the rejection lands in
+  // `trace.rejectedAssumptions` with `partial = true` as a
+  // signal to the consumer that the analysis isn't trustworthy
+  // for those paths.
+  const acceptAll = options.accept == null;
+  const accept = acceptAll
+    ? null
+    : new Set(Array.isArray(options.accept) ? options.accept : []);
   const files = typeof input === 'string'
     ? { '<input>.js': input }
     : Object.assign(Object.create(null), input);
@@ -69,11 +83,16 @@ async function analyze(input, options) {
     taintFlows: [],
     innerHtmlAssignments: [],
     stringLiterals: [],
+    domMutations: [],
     mayBe: Object.create(null),
     bindings: Object.create(null),
     callGraph: { nodes: [], edges: [] },
     reachability: new Map(),
     assumptions: [],
+    // Assumptions the consumer explicitly rejected via
+    // options.accept. Empty unless the consumer opted in to
+    // strict-mode rejection. Presence sets partial = true.
+    rejectedAssumptions: [],
     warnings: [],
     partial: false,
   };
@@ -154,6 +173,24 @@ async function analyze(input, options) {
       // conversion consumer (consumers/dom-convert.js) iterates
       // these to rewrite unsafe sinks into createElement trees.
       innerHtmlAssignments: [],
+      // Wave 12b: generic call-site recording. Populated by
+      // applyCall for every CALL instruction. fetch-trace and
+      // csp-derive are the primary consumers; dom-convert reads
+      // it for addEventListener / appendChild / setAttribute
+      // call resolution.
+      calls: [],
+      // Wave 12b: concrete string-literal arguments passed to
+      // any call, plus concrete string property writes. csp-
+      // derive reads this to find script-src / img-src / etc.
+      // allow-list origins; fetch-trace reads it to find
+      // hardcoded endpoint URLs.
+      stringLiterals: [],
+      // Wave 12b: DOM mutations (method calls + property writes)
+      // on DOM-typed receivers. dom-convert's primary input
+      // alongside innerHtmlAssignments; csp-derive checks it
+      // for createElement('script') patterns; any consumer
+      // that rewrites DOM code reads from here.
+      domMutations: [],
       // Flow id counter — assigned at emission time so flows
       // have stable identity within a trace.
       nextFlowId: 1,
@@ -161,6 +198,12 @@ async function analyze(input, options) {
       precision,
       smtTimeoutMs,
       solverCheckPathSat,
+      // Accept set (null = all accepted). The worklist and
+      // transfer functions consult this to decide whether to
+      // take performance shortcuts like loop widening and
+      // summary-cache reuse. Rejected shortcuts force the
+      // engine into the exhaustive equivalent.
+      accept,
     };
 
     const initialState = D.createState();
@@ -232,6 +275,31 @@ async function analyze(input, options) {
     for (const ih of ctx.innerHtmlAssignments) {
       trace.innerHtmlAssignments.push(ih);
     }
+    for (const c of ctx.calls) trace.calls.push(c);
+    for (const s of ctx.stringLiterals) trace.stringLiterals.push(s);
+    for (const d of ctx.domMutations) trace.domMutations.push(d);
+
+    // Projection: trace.callGraph is derived from ctx.calls.
+    // Nodes are unique callee identities (by calleeName +
+    // typeName), edges connect caller-file to callee-target.
+    // The call graph is intentionally coarse — consumers that
+    // need finer-grained edges read trace.calls directly.
+    for (const c of ctx.calls) {
+      const calleeId = (c.callee.typeName ? c.callee.typeName + '.' : '') +
+        (c.callee.methodName || c.callee.calleeName || '<anonymous>');
+      if (!trace.callGraph.nodes.some(n => n.id === calleeId)) {
+        trace.callGraph.nodes.push({ id: calleeId, kind: 'callee' });
+      }
+      const callerId = filename;
+      if (!trace.callGraph.nodes.some(n => n.id === callerId)) {
+        trace.callGraph.nodes.push({ id: callerId, kind: 'file' });
+      }
+      trace.callGraph.edges.push({
+        from: callerId,
+        to: calleeId,
+        site: c.site,
+      });
+    }
   }
 
   // Wave 11 / Phase D: Z3 post-pass refutation. The branch
@@ -244,6 +312,24 @@ async function analyze(input, options) {
   }
 
   trace.assumptions = assumptions.snapshot();
+
+  // Assumption rejection pass. If the consumer passed an
+  // explicit `accept` set, any assumption with a reason not in
+  // the set is rejected — copied into `rejectedAssumptions`
+  // and setting `partial = true`. Consumers that did NOT pass
+  // `accept` get every assumption as-tolerated (the default
+  // permissive mode).
+  if (!acceptAll) {
+    for (const a of trace.assumptions) {
+      if (!accept.has(a.reason)) {
+        trace.rejectedAssumptions.push(a);
+      }
+    }
+    if (trace.rejectedAssumptions.length > 0) {
+      trace.partial = true;
+    }
+  }
+
   return trace;
 }
 
@@ -257,9 +343,25 @@ function projectValue(v) {
   return v;
 }
 
+// resetCache() — hard-reset the per-process Z3 solver cache.
+// Hosts that reuse a single jsanalyze import across many
+// analyses (browser UI, analysis server, long-running worker)
+// call this when they want to guarantee no stale SAT results
+// from a previous analyse() leak into the next. The shared
+// Solver is released so its declaration table is rebuilt from
+// scratch on the next use. Safe to call at any time.
+//
+// Not needed for normal CLI / single-analysis workflows — the
+// cache is LRU-bounded, so it will stabilise at a constant
+// memory footprint without manual intervention.
+function resetCache() {
+  Z3.resetCache();
+}
+
 module.exports = {
   analyze,
   query,
+  resetCache,
   // Re-exports for consumers that want direct access to the
   // assumption system (e.g. tests).
   AssumptionTracker,

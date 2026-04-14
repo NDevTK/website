@@ -144,6 +144,40 @@ const REASONS = Object.freeze({
   // fields can no longer be tracked. Points-to analysis and
   // effect-tracking function summaries would eliminate this.
   HEAP_ESCAPE: 'heap-escape',
+
+  // --- Performance shortcuts: the engine took a precision-
+  //     for-time tradeoff the consumer may or may not tolerate ---
+  //
+  // These reason codes exist so a consumer can declare via
+  // `options.accept` whether the engine is allowed to take the
+  // shortcut at all. A consumer that rejects a performance
+  // reason gets `trace.partial = true` and a
+  // `rejectedAssumptions` entry pointing at the site where the
+  // engine took the shortcut — and should then reanalyse with
+  // a stricter `precision` / `smtTimeoutMs` to suppress it.
+  //
+  // The engine's default behaviour is to TAKE the shortcut
+  // (shortcuts are what make large bundles analyzable) and to
+  // raise the assumption so the decision is auditable. A strict
+  // consumer can verify soundness by rejecting every
+  // performance reason and rerunning.
+
+  // Back-edge widening: at a loop header, a variant arriving on
+  // a back edge was pointwise-joined with an existing back-edge
+  // variant instead of kept as a separate per-iteration
+  // variant. This keeps loop analysis finite but loses per-
+  // iteration precision on registers that change inside the
+  // body. Rejection forces an exact loop walk.
+  LOOP_WIDENING: 'loop-widening',
+
+  // Summary cache reuse: a user-function call hit the D7 k-CFA
+  // summary cache and the engine replayed the cached exit
+  // state instead of walking the body fresh. Repeated calls
+  // with the same (body, args, this) fingerprint share a
+  // summary; a consumer that rejects this gets full context
+  // sensitivity (every call site walks the body, at the cost
+  // of O(calls × body) analysis time).
+  SUMMARY_REUSED: 'summary-reused',
 });
 
 const VALID_REASONS = new Set(Object.values(REASONS));
@@ -200,6 +234,14 @@ const DEFAULT_SEVERITY = Object.freeze({
   'code-from-data':       SEVERITIES.SOUNDNESS,
   'unimplemented':        SEVERITIES.SOUNDNESS,
   'heap-escape':          SEVERITIES.SOUNDNESS,
+  // Performance shortcuts: precision by default. A widened
+  // loop produces a value that's an OVER-approximation of every
+  // iteration's real value, so the resulting findings are
+  // conservative upper bounds — may over-report, never miss.
+  // Same reasoning for summary reuse (the cached exit state
+  // is ⊒ the per-caller-context exit state).
+  'loop-widening':        SEVERITIES.PRECISION,
+  'summary-reused':       SEVERITIES.PRECISION,
 });
 
 // AssumptionTracker is the mutable ledger the analyser writes

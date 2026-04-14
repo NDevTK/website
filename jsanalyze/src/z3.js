@@ -100,9 +100,65 @@ function _initZ3() {
 // a declaration tracker, and a satisfiability memoisation map
 // keyed by the formula's (sorted) script text. push/pop
 // isolates individual checks.
+//
+// Multi-use: the solver state is module-level (intentional — Z3
+// init is 33 MB of WASM and costs seconds; we amortise it
+// across every `analyze()` call in the process). The SAT cache
+// is LRU-bounded so long-running hosts (browser UIs, analysis
+// servers) don't leak memory over hours of analysis.
+// `_declaredSorts` is small (bounded by the number of distinct
+// source syms in the program being analysed; each analyse()
+// call resets the solver if a sort conflict appears so
+// declarations are refreshed). `resetCache()` is exposed for
+// hosts that want a hard reset — e.g. a browser UI loading a
+// new file where the previous file's cached SAT results are
+// stale.
 let _sharedSolver = null;
 const _declaredSorts = new Map();   // symName → 'Int' | 'String' | 'Bool'
-const _satCache = new Map();        // scriptText → 'sat'|'unsat'|'unknown'
+
+// SAT-result LRU. We use a plain Map and rely on JavaScript
+// Map's insertion-order iteration to implement LRU-on-touch:
+// every read deletes + reinserts the entry so its iteration
+// position moves to the newest slot; evictions pop the oldest
+// entry when the size exceeds SAT_CACHE_LIMIT. The limit is a
+// property of the *solver cache implementation*, not an
+// analysis knob — it bounds memory growth and nothing else.
+// Cache hits preserve the same verdict they'd return
+// uncached; evictions just trigger a re-solve.
+const SAT_CACHE_LIMIT = 10000;
+const _satCache = new Map();        // scriptText → verdict
+
+function _satCacheGet(key) {
+  if (!_satCache.has(key)) return undefined;
+  const v = _satCache.get(key);
+  // Touch: move to most-recent by delete + reinsert.
+  _satCache.delete(key);
+  _satCache.set(key, v);
+  return v;
+}
+
+function _satCachePut(key, verdict) {
+  _satCache.set(key, verdict);
+  if (_satCache.size > SAT_CACHE_LIMIT) {
+    // Evict the oldest entry. Map iterator yields in insertion
+    // order; the first key is the LRU victim.
+    const oldest = _satCache.keys().next().value;
+    if (oldest !== undefined) _satCache.delete(oldest);
+  }
+}
+
+// resetCache() — hard reset of the per-process solver cache.
+// Hosts that reuse a single jsanalyze import across many
+// analyses (browser UI, analysis server) call this when they
+// want to guarantee no stale SAT results from a previous
+// analyse() leak into the next. The shared Solver is also
+// released so its declaration table is rebuilt from scratch
+// on the next `_initZ3()` use. Safe to call at any time.
+function resetCache() {
+  _satCache.clear();
+  _declaredSorts.clear();
+  _sharedSolver = null;
+}
 
 // Emit declare-const lines for every sort in `formula.sorts`
 // that isn't already installed on the shared solver, AND
@@ -168,7 +224,8 @@ async function checkPathSat(formula, timeoutMs) {
     : SMT._internals.toBool(formula);
   const assertText = '(assert ' + asserted + ')\n';
   const cacheKey = assertText;
-  if (_satCache.has(cacheKey)) return _satCache.get(cacheKey);
+  const hit = _satCacheGet(cacheKey);
+  if (hit !== undefined) return hit;
 
   const z3 = await _initZ3();
   if (!_sharedSolver) _sharedSolver = new z3.Solver();
@@ -204,7 +261,7 @@ async function checkPathSat(formula, timeoutMs) {
   if (result === 'unsat') verdict = 'unsat';
   else if (result === 'sat') verdict = 'sat';
   else verdict = 'unknown';
-  _satCache.set(cacheKey, verdict);
+  _satCachePut(cacheKey, verdict);
   return verdict;
 }
 
@@ -243,4 +300,5 @@ module.exports = {
   _initZ3,
   checkPathSat,
   refuteTrace,
+  resetCache,
 };

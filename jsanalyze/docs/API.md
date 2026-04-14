@@ -54,6 +54,42 @@ type AnalyzeOptions = {
   // Layer 5 invocation and to the post-pass refutation.
   smtTimeoutMs?: number;
 
+  // PRESCRIPTIVE assumption-acceptance set. Declares which
+  // assumption reason codes the consumer tolerates. Missing
+  // reasons are REJECTED — the engine is forbidden from
+  // taking any shortcut that would raise a rejected reason,
+  // AND any assumption that gets raised with a rejected
+  // reason is copied into `trace.rejectedAssumptions` with
+  // `trace.partial = true`.
+  //
+  // Two classes of effect:
+  //
+  //   * Performance-shortcut reasons (`loop-widening`,
+  //     `summary-reused`) — rejection PREVENTS the engine
+  //     from taking the shortcut. Loops walk per-iteration,
+  //     function calls walk fresh on every call site.
+  //
+  //   * Theoretical-floor / environmental / engineering-gap
+  //     reasons (`network`, `attacker-input`, `opaque-call`,
+  //     `unimplemented`, …) — rejection is advisory. The
+  //     engine can't conjure bytes it doesn't have; the
+  //     assumption still rises, but lands in
+  //     `rejectedAssumptions` so the consumer knows its
+  //     result is untrustworthy for the affected paths.
+  //
+  // Default: undefined = every defined reason is accepted
+  // (no rejection, maximum permissiveness).
+  //
+  // Example: a DOM-conversion consumer that can't tolerate
+  // opaque-call laundering because it rewrites the string:
+  //   accept: ['network', 'attacker-input', 'persistent-state',
+  //            'unsolvable-math', 'loop-widening',
+  //            'summary-reused']
+  //   // rejects opaque-call, external-module, code-from-data,
+  //   // unimplemented, heap-escape — partial=true if any of
+  //   // those fire, and the consumer knows to skip that file.
+  accept?: AssumptionReason[];
+
   // Enable taint tracking. When false, the analyser skips
   // source/sink classification but still produces the call
   // graph, string literals, and value sets. Default: true.
@@ -107,6 +143,18 @@ type Trace = {
   // which flows were dropped inspect this list; consumers
   // that only want surviving flows ignore it.
   refutedFlows?: TaintFlow[];
+
+  // Assumptions that were raised during the walk AND whose
+  // reason code was NOT in `options.accept`. Empty when the
+  // consumer didn't pass an accept set or when every raised
+  // assumption's reason was in it. Presence sets
+  // `partial = true`.
+  rejectedAssumptions: Assumption[];
+
+  // Wave 12b: DOM mutations — method calls and property
+  // writes on DOM-typed receivers. Consumers that rewrite or
+  // inventory DOM code read from here.
+  domMutations: DomMutation[];
 
   // Assignments to innerHTML / outerHTML / document.write.
   innerHtmlAssignments: InnerHtmlAssignment[];
@@ -171,6 +219,34 @@ type StringPattern = {
   suffix?: string;
   contains?: string[];
   exactLength?: number;
+};
+
+// Wave 12b — DOM mutation observation. Every method call
+// whose receiver has a DOM-chain typeName, and every property
+// write on a DOM-chain receiver (except innerHTML/outerHTML/
+// insertAdjacentHTML, which have their own innerHtmlAssignments
+// channel), appears as one DomMutation record.
+//
+// Consumers filter by `kind` to find specific API use:
+// `'setAttribute'`, `'appendChild'`, `'addEventListener'`,
+// `'style.setProperty'`, `'classList.add'`, etc. The
+// `target` field is the receiver Value, so consumers can
+// check its `typeName` to narrow to (say) HTMLIFrameElement.
+type DomMutation = {
+  kind: string;            // method name or property name
+  category: 'method' | 'property-set';
+  targetType: string;      // receiver's TypeDB typeName
+  target: Value;           // receiver Value
+  args: Value[];           // method args or [value] for property-set
+  site: Location;
+  pathFormula: Formula | null;   // path condition at the mutation site
+};
+
+type Formula = {
+  expr: string;            // SMT-LIB v2 expression
+  isBool?: boolean;
+  incompatible?: boolean;
+  // ... see src/smt.js for the full shape
 };
 ```
 

@@ -43,6 +43,7 @@ const testFiles = [
   'wave10.test.js',
   'wave11.test.js',
   'html.test.js',
+  'accept.test.js',
 ];
 
 async function main() {
