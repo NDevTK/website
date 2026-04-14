@@ -187,7 +187,8 @@ function extractTemplate(jsSource, assignStmtPos, filename, astCache) {
   // template describing the new nodes, and the consumer
   // emits appendChild calls directly on the receiver.
   if (expr.operator === '+=') {
-    return extractAppend(jsSource, stmts, assignStmt, assignIdx, lhs.object, rhs);
+    return extractAppend(jsSource, stmts, assignStmt, assignIdx,
+      lhs.object, rhs, '+=');
   }
 
   // The RHS must be a plain Identifier referencing an
@@ -196,8 +197,9 @@ function extractTemplate(jsSource, assignStmtPos, filename, astCache) {
     return extractFromAccumulator(jsSource, stmts, assignIdx, rhs.name, lhs.object);
   }
 
-  // Right-hand side is a literal string or a static concat
-  // chain. Parse it as HTML.
+  // Right-hand side is a literal string. Parse it as HTML.
+  // Template literals with no expressions fold to their
+  // cooked string and take the same path.
   if (rhs && rhs.type === 'Literal' && typeof rhs.value === 'string') {
     return {
       kind: 'concrete',
@@ -205,39 +207,84 @@ function extractTemplate(jsSource, assignStmtPos, filename, astCache) {
       nodes: html.parse(rhs.value),
     };
   }
+  if (rhs && rhs.type === 'TemplateLiteral' &&
+      rhs.expressions.length === 0) {
+    const cooked = rhs.quasis.map(q => q.value.cooked).join('');
+    return {
+      kind: 'concrete',
+      html: cooked,
+      nodes: html.parse(cooked),
+    };
+  }
+
+  // Non-literal RHS: a concat chain (BinaryExpression of `+`)
+  // or a template literal with ${…} interpolations. Both
+  // flatten to the same fragment list via flattenConcat and
+  // are recognised by parseLoopBodyFragments. The resulting
+  // template is an `append`-shape with operator '=' so the
+  // consumer prepends a replaceChildren() call before the
+  // new nodes.
+  if (rhs && (
+      (rhs.type === 'BinaryExpression' && rhs.operator === '+') ||
+      rhs.type === 'TemplateLiteral')) {
+    const t = extractAppend(jsSource, stmts, assignStmt, assignIdx,
+      lhs.object, rhs, '=');
+    if (t && t.kind !== 'opaque') return t;
+  }
 
   return { kind: 'opaque', reason: 'unrecognised rhs shape' };
 }
 
-// extractAppend — build an `append` template for `el.innerHTML
-// += <rhs>`. Two RHS shapes are accepted:
+// extractAppend — build an `append` template for an
+// innerHTML assignment whose RHS is a string-shaped
+// expression. The `operator` argument distinguishes `=`
+// (prepend replaceChildren) from `+=` (pure append); the
+// consumer reads `tmpl.operator` and emits accordingly.
 //
-//   1. Literal string — parse via html.parse; the template
-//      carries the parsed node list and the consumer emits
-//      createElement / appendChild calls without a preceding
-//      replaceChildren.
+// Accepted RHS shapes (after flattenConcat normalises them):
 //
-//   2. Concat chain (BinaryExpression of `+`) — flatten
-//      via flattenConcat and match the single-child shape
-//      from parseLoopBodyFragments. The template carries
-//      the parsed child descriptor so the consumer emits
-//      one appendChild per iteration.
+//   1. Literal string / single-quasi TemplateLiteral —
+//      parse via html.parse; the template carries the
+//      parsed node list.
+//
+//   2. Concat chain (BinaryExpression of `+`) OR
+//      TemplateLiteral with ${…} expressions — flatten via
+//      flattenConcat and match the single-child shape from
+//      parseLoopBodyFragments. The template carries the
+//      parsed child descriptor so the consumer emits one
+//      appendChild + one textNode slot per iteration.
 //
 // Anything else falls to opaque so the consumer leaves the
 // site alone.
 //
 // HtmlTemplate shape for append:
 //   { kind: 'append';
+//     operator: '=' | '+=';
 //     receiver: { start, end };
 //     nodes: HtmlNode[] | null;         -- literal rhs
-//     child: ChildShape | null;          -- concat rhs
+//     child: ChildShape | null;          -- concat/tmpl rhs
 //     rangeStart, rangeEnd }
-function extractAppend(jsSource, stmts, assignStmt, assignIdx, receiverNode, rhs) {
+function extractAppend(jsSource, stmts, assignStmt, assignIdx,
+                       receiverNode, rhs, operator) {
   if (rhs && rhs.type === 'Literal' && typeof rhs.value === 'string') {
     return {
       kind: 'append',
+      operator,
       receiver: { start: receiverNode.start, end: receiverNode.end },
       nodes: html.parse(rhs.value),
+      child: null,
+      rangeStart: assignStmt.start,
+      rangeEnd: assignStmt.end,
+    };
+  }
+  if (rhs && rhs.type === 'TemplateLiteral' &&
+      rhs.expressions.length === 0) {
+    const cooked = rhs.quasis.map(q => q.value.cooked).join('');
+    return {
+      kind: 'append',
+      operator,
+      receiver: { start: receiverNode.start, end: receiverNode.end },
+      nodes: html.parse(cooked),
       child: null,
       rangeStart: assignStmt.start,
       rangeEnd: assignStmt.end,
@@ -249,6 +296,7 @@ function extractAppend(jsSource, stmts, assignStmt, assignIdx, receiverNode, rhs
     if (parsed) {
       return {
         kind: 'append',
+        operator,
         receiver: { start: receiverNode.start, end: receiverNode.end },
         nodes: null,
         child: {
@@ -724,8 +772,24 @@ function literalOfAccumAssign(stmt) {
   return null;
 }
 
-// Flatten a left-associative chain of `+` expressions into a
-// list of { kind: 'lit' | 'expr', value?, start?, end? }.
+// Flatten a left-associative chain of `+` expressions OR a
+// TemplateLiteral into a uniform list of
+// `{ kind: 'lit' | 'expr', value?, start?, end? }` fragments.
+//
+// Template literals are handled structurally: quasis become
+// `lit` fragments (value = the cooked string) and expressions
+// become `expr` fragments with the expression's source
+// range. This means a RHS like
+//   `<li class="${cls}">${text}</li>`
+// flattens to the same shape as
+//   '<li class="' + cls + '">' + text + '</li>'
+// and parseLoopBodyFragments matches both without knowing
+// which source form produced them.
+//
+// Nested template literals inside `${...}` expressions are
+// treated as opaque expr fragments (their inner structure
+// isn't flattened into the parent chain), which keeps the
+// depth-1 shape the rest of the extractor assumes.
 function flattenConcat(node) {
   const out = [];
   function walk(n) {
@@ -736,6 +800,22 @@ function flattenConcat(node) {
     }
     if (n.type === 'Literal' && typeof n.value === 'string') {
       out.push({ kind: 'lit', value: n.value });
+      return;
+    }
+    if (n.type === 'TemplateLiteral') {
+      // `quasis` and `expressions` interleave: quasi[0],
+      // expr[0], quasi[1], expr[1], ..., quasi[N].
+      const quasis = n.quasis || [];
+      const exprs = n.expressions || [];
+      for (let i = 0; i < quasis.length; i++) {
+        const q = quasis[i];
+        const cooked = q && q.value ? q.value.cooked : '';
+        if (cooked !== '') out.push({ kind: 'lit', value: cooked });
+        if (i < exprs.length) {
+          const e = exprs[i];
+          out.push({ kind: 'expr', start: e.start, end: e.end });
+        }
+      }
       return;
     }
     out.push({ kind: 'expr', start: n.start, end: n.end });

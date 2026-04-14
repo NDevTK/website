@@ -630,10 +630,16 @@ function emitFromTemplate(jsSource, ih) {
   }
 
   if (tmpl.kind === 'append') {
-    // `el.innerHTML += <rhs>` — append, not replace. Emits
-    // createElement / appendChild calls targeted at the
-    // receiver; no replaceChildren, so existing children
-    // stay in place.
+    // innerHTML `=` or `+=` assignment whose RHS is a
+    // string-shaped expression (literal, concat chain, or
+    // TemplateLiteral). The template carries either a
+    // parsed node list (for static content) or a single-
+    // child descriptor (for one-element RHS). The emitter
+    // prepends `receiver.replaceChildren();` when the
+    // operator is '=' so existing children are cleared
+    // before the new nodes go in; for '+=' the existing
+    // children stay in place and only the new nodes are
+    // appended.
     const receiver = jsSource.slice(tmpl.receiver.start, tmpl.receiver.end);
     let body;
     if (tmpl.nodes) {
@@ -643,10 +649,11 @@ function emitFromTemplate(jsSource, ih) {
     } else {
       return null;
     }
+    const pre = tmpl.operator === '=' ? receiver + '.replaceChildren();\n' : '';
     return {
       start: tmpl.rangeStart,
       end: tmpl.rangeEnd,
-      replacement: body,
+      replacement: pre + body,
     };
   }
 

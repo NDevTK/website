@@ -794,6 +794,61 @@ const tests = [
         'original innerHTML removed: ' + out);
     },
   },
+  // --- Wave 12d9: template literal RHS support ---
+  {
+    name: 'dom-convert js: innerHTML = `<li>${x}</li>` template literal',
+    fn: async () => {
+      const src = [
+        'var x = "hi";',
+        'var el = document.getElementById("x");',
+        'el.innerHTML = `<li>${x}</li>`;',
+      ].join('\n');
+      const out = await convertJs(src);
+      assert(/createElement\("li"\)/.test(out),
+        'li created: ' + out);
+      assert(/el\.replaceChildren\(\)/.test(out),
+        'replaceChildren emitted (= operator): ' + out);
+      assert(/createTextNode\(x\)/.test(out),
+        'expression preserved as text: ' + out);
+      assert(!/innerHTML =/.test(out),
+        'original assignment removed: ' + out);
+    },
+  },
+  {
+    name: 'dom-convert js: innerHTML += template literal with attr',
+    fn: async () => {
+      const src = [
+        'var cls = "hot";',
+        'var text = "item";',
+        'var el = document.getElementById("x");',
+        'el.innerHTML += `<li class="${cls}">${text}</li>`;',
+      ].join('\n');
+      const out = await convertJs(src);
+      assert(/createElement\("li"\)/.test(out),
+        'li created: ' + out);
+      assert(!/replaceChildren/.test(out),
+        '+= must not emit replaceChildren: ' + out);
+      assert(/setAttribute\("class",/.test(out),
+        'dynamic class attribute: ' + out);
+      assert(/createTextNode\(text\)/.test(out),
+        'text expression preserved: ' + out);
+    },
+  },
+  {
+    name: 'dom-convert js: innerHTML = static template literal (no exprs)',
+    fn: async () => {
+      const src = [
+        'var el = document.getElementById("x");',
+        'el.innerHTML = `<p>static</p>`;',
+      ].join('\n');
+      const out = await convertJs(src);
+      assert(/createElement\("p"\)/.test(out),
+        'p created: ' + out);
+      assert(/createTextNode\("static"\)/.test(out),
+        'text preserved: ' + out);
+    },
+  },
+
   {
     name: 'dom-convert js: innerHTML += concat → appendChild per item',
     fn: async () => {
