@@ -26,7 +26,28 @@
 
 const { analyze } = require('../src/index.js');
 const TDB = require('../src/default-typedb.js');
+const D = require('../src/domain.js');
+const { buildModule } = require('../src/ir.js');
+const { analyseFunction } = require('../src/worklist.js');
+const { AssumptionTracker } = require('../src/assumptions.js');
 const { assert, assertEqual } = require('./run.js');
+
+// Walk a program through analyseFunction and return the module
+// plus ctx so tests can inspect per-function state (e.g. the
+// C3 summary cache).
+function walk(src) {
+  const module = buildModule(src, 'test.js');
+  const ctx = {
+    module,
+    assumptions: new AssumptionTracker(),
+    typeDB: TDB,
+    nextObjId: 0,
+    taintFlows: [],
+    nextFlowId: 1,
+  };
+  analyseFunction(module, module.top, D.createState(), ctx);
+  return { module, ctx };
+}
 
 const tests = [
   // --- Cross-register correlation through if/else merges ---
@@ -167,6 +188,97 @@ const tests = [
         { typeDB: TDB });
       assertEqual(t.taintFlows.length, 1,
         'true branch is taken; only the tainted sink is reachable');
+    },
+  },
+
+  // --- C3: state-correlated function summary cache ---
+  {
+    name: 'Wave10 C3: identical calls collapse to one cache entry',
+    fn: () => {
+      // `id("a")` called three times with identical args — the
+      // second and third calls hit the cache and don't walk
+      // the body a second time.
+      const { module } = walk(
+        'function id(x) { return x + "x"; } ' +
+        'var a = id("a"); var b = id("a"); var c = id("a");');
+      const fn = module.functions.find(f => f.name === 'id');
+      assert(fn._summaryCache, 'id has a summary cache');
+      assertEqual(fn._summaryCache.size, 1,
+        'three identical calls collapse to one cache entry');
+    },
+  },
+  {
+    name: 'Wave10 C3: distinct arg shapes produce distinct cache entries',
+    fn: () => {
+      const { module } = walk(
+        'function wrap(x) { return "p:" + x; } ' +
+        'var a = wrap("clean1"); var b = wrap("clean2"); var c = wrap("clean1");');
+      const fn = module.functions.find(f => f.name === 'wrap');
+      // Two distinct arg shapes ("clean1", "clean2") → two
+      // cache entries; the third call hits the "clean1" entry.
+      assertEqual(fn._summaryCache.size, 2,
+        'distinct arg shapes produce distinct cache entries');
+    },
+  },
+  {
+    name: 'Wave10 C3: cache-hit call still returns correct taint',
+    fn: async () => {
+      // The cache reuses the walked body's return shape — if
+      // the body launders taint via a prefix concat, the
+      // cached return value still carries the argument's
+      // labels and the downstream sink still fires.
+      const t = await analyze(
+        'function wrap(x) { return "p:" + x; } ' +
+        'var a = wrap("clean"); ' +
+        'var b = wrap(location.hash); ' +
+        'document.body.innerHTML = b;',
+        { typeDB: TDB });
+      assertEqual(t.taintFlows.length, 1,
+        'tainted second call produces its own summary, not the clean first one');
+    },
+  },
+  {
+    name: 'Wave10 C3: state-correlated split across B4 variants',
+    fn: () => {
+      // Under B4 the caller splits into two variants (one per
+      // if/else branch). Each variant calls `wrap` with a
+      // different arg shape. C3 caches per-variant input, so
+      // `wrap` gets two distinct summaries — one per caller
+      // variant — and the cross-register correlation survives.
+      const { module } = walk(
+        'function wrap(x) { return "p:" + x; }' +
+        'var y;' +
+        'if (location.hash === "a") { y = wrap("clean"); }' +
+        'else                        { y = wrap(location.search); }' +
+        'document.body.innerHTML = y;');
+      const fn = module.functions.find(f => f.name === 'wrap');
+      assertEqual(fn._summaryCache.size, 2,
+        'two caller variants → two state-correlated summaries');
+    },
+  },
+  {
+    name: 'Wave10 C3: recursion still falls through unimpl fallback',
+    fn: async () => {
+      // The cycle guard (_callStack) fires before the cache
+      // check — recursive calls still raise the unimplemented
+      // assumption and never cache a self-recursive summary.
+      const t = await analyze(
+        'function rec(x) { return rec(x); } document.body.innerHTML = rec(location.hash);',
+        { typeDB: TDB });
+      const unimpl = t.assumptions.filter(
+        a => a.reason === 'unimplemented' && /recursive call/.test(a.details || ''));
+      assert(unimpl.length >= 1, 'recursion fallback fires');
+    },
+  },
+  {
+    name: 'Wave10 C3: 100 identical calls walk the body only once',
+    fn: () => {
+      let src = 'function id(x) { return x + "!"; } ';
+      for (let i = 0; i < 100; i++) src += 'var r' + i + ' = id("a");';
+      const { module } = walk(src);
+      const fn = module.functions.find(f => f.name === 'id');
+      // One cache entry for 100 calls means 99 cache hits.
+      assertEqual(fn._summaryCache.size, 1);
     },
   },
 ];

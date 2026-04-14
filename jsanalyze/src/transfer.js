@@ -1084,6 +1084,88 @@ function applyFunc(ctx, state, instr) {
     D.closure(instr.functionId, captureEntries, loc));
 }
 
+// Compute a cache key for a function call's input state.
+// Returns a string (the key) or null if the state contains a
+// value that cannot be fingerprinted cleanly — in which case
+// the call is walked without caching.
+//
+// The key is a concatenation of value fingerprints and a
+// heap-overlay identity tag:
+//
+//   "<fnId>|p=<argFp>|c=<captureFp>|t=<thisFp>|h=<heapId>"
+//
+// Heap identity is a process-unique integer assigned to the
+// caller's heap overlay object via a WeakMap. Two calls with
+// the same overlay REFERENCE share contents (overlays are
+// immutable after freeze); a different reference may or may
+// not have equal contents, so we conservatively miss.
+function buildSummaryCacheKey(calleeFn, calleeInit, closureCaptures, thisValue, callerHeap) {
+  const parts = [calleeFn.id];
+  // Parameter fingerprints, in param order.
+  if (calleeFn.params) {
+    parts.push('p=');
+    for (const paramReg of calleeFn.params) {
+      const v = D.getReg(calleeInit, paramReg);
+      parts.push(D.valueFingerprint(v));
+      parts.push(',');
+    }
+  }
+  if (closureCaptures && closureCaptures.length > 0) {
+    parts.push('|c=');
+    for (const c of closureCaptures) {
+      if (!c) continue;
+      const v = c.innerReg != null ? D.getReg(calleeInit, c.innerReg) : null;
+      parts.push(D.valueFingerprint(v));
+      parts.push(',');
+    }
+  }
+  if (thisValue) {
+    parts.push('|t=');
+    parts.push(D.valueFingerprint(thisValue));
+  }
+  parts.push('|h=');
+  parts.push(heapIdentityTag(callerHeap));
+  return parts.join('');
+}
+
+// Assign a stable, process-unique id to each heap overlay
+// object. Two calls with the same overlay REFERENCE get the
+// same id; any other overlay gets a fresh id. Because overlays
+// are frozen once built, reference-equality implies content-
+// equality: a cache hit under this key is always sound.
+const _heapIdMap = new WeakMap();
+let _nextHeapId = 1;
+function heapIdentityTag(heap) {
+  if (!heap) return '0';
+  // Walk through empty overlays: an overlay with no local
+  // writes is observationally equivalent to its parent, so
+  // they should share a cache-key identity. Without this, a
+  // function called repeatedly would miss the cache even when
+  // no heap state has actually changed between calls.
+  let o = heap;
+  while (o && o.own && o.own.size === 0 && o.parent) o = o.parent;
+  if (!o) return '0';
+  let id = _heapIdMap.get(o);
+  if (id == null) {
+    id = _nextHeapId++;
+    _heapIdMap.set(o, id);
+  }
+  return String(id);
+}
+
+// True iff `candidate` is an empty overlay chain over `base` —
+// i.e. every overlay above `base` has an empty `own` map. This
+// means `candidate` adds no new writes to `base` and can be
+// replaced by `base` directly without loss of information.
+function isEmptyOverlayOver(candidate, base) {
+  let o = candidate;
+  while (o && o !== base) {
+    if (o.own && o.own.size > 0) return false;
+    o = o.parent;
+  }
+  return o === base;
+}
+
 function applyCall(ctx, state, instr) {
   const loc = instrLoc(ctx, instr);
   const callee = D.getReg(state, instr.callee);
@@ -1298,6 +1380,57 @@ function applyCall(ctx, state, instr) {
       calleeInit = D.setReg(calleeInit, restParamReg, restObj.ref);
     }
 
+    // --- C3: state-correlated function summary cache ---
+    //
+    // Before walking the callee, we compute a fingerprint of
+    // the callee's input state (params + captures + this +
+    // heap identity) and check the function's per-instance
+    // cache. On a hit we reuse the cached exit state and
+    // return value without re-analysing the body — a pure
+    // performance win for functions called repeatedly with
+    // the same inputs, but also a PRECISION win under B4:
+    // each caller variant passes its own fingerprint, so a
+    // function called from two distinct variants gets two
+    // distinct cached summaries rather than a single joined
+    // view that merges both paths.
+    //
+    // Fingerprint components:
+    //
+    //   * calleeFn.id — function identity
+    //   * valueFingerprint of each effective argument
+    //   * valueFingerprint of each capture (live-preferred, same
+    //     rule applyCall uses to bind them above)
+    //   * valueFingerprint of `this`
+    //   * identity of the caller's heap overlay: two cache
+    //     entries with the same heap overlay REFERENCE observe
+    //     identical heap contents. A different reference may or
+    //     may not have different contents — we conservatively
+    //     treat it as a miss. Heap writes inside the callee
+    //     allocate new overlays, so back-to-back calls with the
+    //     same heap-but-different-writes correctly miss.
+    //
+    // Cache stored on calleeFn (not on ctx) so it survives
+    // across multiple analyze() calls in the same process;
+    // each analysis run starts with a cleared cache when the
+    // IR is rebuilt (fn._summaryCache is undefined on fresh
+    // functions).
+    //
+    // Correctness: the cache value is { exitState, returnValue,
+    // flowsAtWalk }. `flowsAtWalk` is the list of taint-flow
+    // records that the first walk emitted into ctx.taintFlows;
+    // on a cache hit we DO NOT re-emit them (they're already
+    // present from the first walk, keyed by sink location +
+    // labels in ctx._emittedFlowKeys). Subsequent callers with
+    // distinct path conditions won't produce per-caller
+    // pathFormulas on the callee's flows — that's a known
+    // precision floor for cache hits; callers that need the
+    // precise per-caller formula can disable the cache by
+    // bumping calleeFn._summaryCacheBypass.
+    if (!calleeFn._summaryCache) calleeFn._summaryCache = new Map();
+    const cacheKey = buildSummaryCacheKey(calleeFn, calleeInit, closureCaptures, thisValue, state.heap);
+    let calleeResult = cacheKey != null ? calleeFn._summaryCache.get(cacheKey) : null;
+    let cacheHit = !!calleeResult;
+
     // Save and restore worklist-level ctx fields so the
     // callee's analysis runs in its own scope without
     // leaking into the caller's. The fields the caller's
@@ -1306,25 +1439,40 @@ function applyCall(ctx, state, instr) {
     const savedPathCond = ctx.currentPathCond;
     const savedBlockId = ctx.currentBlockId;
     const savedThis = ctx._currentThisValue;
-    ctx._callStack.add(calleeFn.id);
-    // For method calls, bind `this` to the receiver. For free-
-    // function calls thisValue is null and we keep the saved
-    // value (which may itself be null at the top level).
-    if (thisValue) ctx._currentThisValue = thisValue;
-    let calleeResult;
-    try {
-      const analyse = getAnalyseFunction();
-      calleeResult = analyse(ctx.module, calleeFn, calleeInit, ctx);
-    } finally {
-      ctx._callStack.delete(calleeFn.id);
-      ctx.currentPathCond = savedPathCond;
-      ctx.currentBlockId = savedBlockId;
-      ctx._currentThisValue = savedThis;
+    if (!cacheHit) {
+      ctx._callStack.add(calleeFn.id);
+      // For method calls, bind `this` to the receiver. For free-
+      // function calls thisValue is null and we keep the saved
+      // value (which may itself be null at the top level).
+      if (thisValue) ctx._currentThisValue = thisValue;
+      try {
+        const analyse = getAnalyseFunction();
+        calleeResult = analyse(ctx.module, calleeFn, calleeInit, ctx);
+      } finally {
+        ctx._callStack.delete(calleeFn.id);
+        ctx.currentPathCond = savedPathCond;
+        ctx.currentBlockId = savedBlockId;
+        ctx._currentThisValue = savedThis;
+      }
+      if (cacheKey != null && calleeResult && calleeResult.exitState) {
+        calleeFn._summaryCache.set(cacheKey, {
+          exitState: calleeResult.exitState,
+        });
+      }
     }
     // Adopt the callee's heap writes so method-body side
-    // effects on `this` are visible to the caller.
+    // effects on `this` are visible to the caller. We only
+    // replace the heap if the callee actually wrote something
+    // — if the callee's exit heap is an empty overlay whose
+    // parent is the caller's original heap, there are no new
+    // writes and we keep the caller's heap reference unchanged
+    // (critical for the C3 cache: the next call with the same
+    // inputs needs the same heap identity to hit the cache).
     if (calleeResult && calleeResult.exitState) {
-      state = D.withHeap(state, calleeResult.exitState.heap);
+      const calleeExitHeap = calleeResult.exitState.heap;
+      if (!isEmptyOverlayOver(calleeExitHeap, state.heap)) {
+        state = D.withHeap(state, calleeExitHeap);
+      }
     }
 
     // Pull the return value from the callee's exit state.

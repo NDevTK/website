@@ -725,6 +725,43 @@ function canonKey(v) {
   return typeof v + ':' + String(v);
 }
 
+// valueFingerprint — produce a stable, hashable string summary
+// of a Value. Used by the C3 summary cache (transfer.applyCall)
+// to key analysed-function results on the shape of their input
+// state: two calls with the same argument fingerprints share a
+// summary, and on a hit we replay the cached exit state without
+// re-walking the callee.
+//
+// The fingerprint is deliberately coarse: it encodes enough to
+// guarantee two fingerprint-equal values are LATTICE-EQUAL under
+// `equals`, but doesn't try to capture every microdetail. Labels
+// and assumption chains ARE part of the fingerprint because
+// they affect the callee's behaviour (a tainted string arg
+// propagates through differently from a clean one).
+function valueFingerprint(v) {
+  if (!v) return 'none';
+  const k = v.kind;
+  const labelPart = (v.labels && v.labels.size > 0)
+    ? ':L[' + Array.from(v.labels).sort().join(',') + ']'
+    : '';
+  switch (k) {
+    case V.BOTTOM:   return '_';
+    case V.TOP:      return 'T' + labelPart;
+    case V.CONCRETE: return 'c:' + (typeof v.value) + ':' + String(v.value) + labelPart;
+    case V.ONE_OF:   return 'o:' + (v.values || []).map(x => String(x)).sort().join(',') + labelPart;
+    case V.INTERVAL: return 'i:' + v.lo + ':' + v.hi + labelPart;
+    case V.STR_PATTERN: return 's:' + (v.prefix || '') + ':' + (v.suffix || '') + labelPart;
+    case V.OPAQUE:   return 'O:' + (v.typeName || '?') + labelPart;
+    case V.OBJECT:   return 'R:' + v.objectId + ':' + (v.typeName || '?') + labelPart;
+    case V.CLOSURE:  return 'f:' + v.functionId + labelPart;
+    case V.DISJUNCT: {
+      const parts = v.variants.map(valueFingerprint).sort();
+      return 'D[' + parts.join('|') + ']' + labelPart;
+    }
+    default: return String(k) + labelPart;
+  }
+}
+
 function freezeProvenance(p) {
   if (!p) return Object.freeze([]);
   if (Array.isArray(p)) return Object.freeze(p.slice());
@@ -1412,5 +1449,5 @@ module.exports = {
   createState, createStateSharingHeap, withHeap, withPathCond, setReg, getReg, joinStates, joinPathConds, stateLeq, stateEquals,
   unfreezeState, freezeState,
   overlayGet, overlayHas, overlayEntries, overlaySize, overlayFlatten,
-  inferTypeName, canonKey,
+  inferTypeName, canonKey, valueFingerprint,
 };
