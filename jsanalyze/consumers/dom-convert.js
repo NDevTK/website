@@ -558,63 +558,93 @@ function detectLoopBuiltInnerHtml(jsSource, assignStmtPos) {
   if (!rhs || rhs.type !== 'Identifier') return null;
   const htmlVarName = rhs.name;
 
-  // Walk backward from `assignIdx` to find [C] (X += '</tag>'),
-  // [B] (for loop), [A] (var X = '<tag>').
+  // Walk backward from `assignIdx` to find the loop and the
+  // optional open/close accumulator statements wrapping it.
+  //
+  // Shapes supported:
+  //
+  //   A) wrapped — `var X = '<tag>'; for (...) { ... } X += '</tag>';`
+  //   B) no-wrap — `var X = ''; for (...) { ... }`  (or the
+  //                var decl absent entirely if X is a
+  //                pre-existing empty-string accumulator)
+  //
+  // In both shapes the for loop is the statement immediately
+  // preceding the innerHTML assignment (modulo an optional
+  // close-accum statement). The open-accum statement must
+  // exist and declare X as a string literal, but that literal
+  // can be empty — distinguishing shape (B) from (A).
   let closeStmtIdx = -1;
   let loopStmtIdx = -1;
   let openStmtIdx = -1;
-  for (let i = assignIdx - 1; i >= 0; i--) {
-    const s = stmts[i];
-    if (closeStmtIdx < 0) {
-      if (isAccumAssign(s, htmlVarName)) {
-        const lit = literalOfAccumAssign(s);
-        if (typeof lit === 'string' && /<\/[a-z][^>]*>/i.test(lit)) {
-          closeStmtIdx = i;
-          continue;
-        }
-      }
-    }
-    if (closeStmtIdx >= 0 && loopStmtIdx < 0) {
-      if (s.type === 'ForStatement' && s.body && s.body.type === 'BlockStatement') {
-        loopStmtIdx = i;
-        continue;
-      }
-    }
-    if (loopStmtIdx >= 0 && openStmtIdx < 0) {
-      if (s.type === 'VariableDeclaration') {
-        for (const d of s.declarations) {
-          if (d.id && d.id.type === 'Identifier' && d.id.name === htmlVarName &&
-              d.init && d.init.type === 'Literal' && typeof d.init.value === 'string') {
-            openStmtIdx = i;
-            break;
-          }
-        }
-        if (openStmtIdx >= 0) break;
+
+  // First pass: look for a close-accum statement immediately
+  // before the assignment (shape A). It's OPTIONAL.
+  if (assignIdx - 1 >= 0) {
+    const prev = stmts[assignIdx - 1];
+    if (isAccumAssign(prev, htmlVarName)) {
+      const lit = literalOfAccumAssign(prev);
+      if (typeof lit === 'string' && /<\/[a-z][^>]*>/i.test(lit)) {
+        closeStmtIdx = assignIdx - 1;
       }
     }
   }
-  if (openStmtIdx < 0 || loopStmtIdx < 0 || closeStmtIdx < 0) return null;
+
+  // Second pass: the for loop must sit at position
+  // `assignIdx - 1` (shape B) OR `closeStmtIdx - 1` (shape A).
+  const afterLoopIdx = closeStmtIdx >= 0 ? closeStmtIdx : assignIdx;
+  if (afterLoopIdx - 1 >= 0) {
+    const s = stmts[afterLoopIdx - 1];
+    if (s.type === 'ForStatement' && s.body && s.body.type === 'BlockStatement') {
+      loopStmtIdx = afterLoopIdx - 1;
+    }
+  }
+  if (loopStmtIdx < 0) return null;
+
+  // Third pass: the open-accum statement must sit BEFORE the
+  // loop and declare X as a string literal (possibly empty).
+  for (let i = loopStmtIdx - 1; i >= 0; i--) {
+    const s = stmts[i];
+    if (s.type === 'VariableDeclaration') {
+      for (const d of s.declarations) {
+        if (d.id && d.id.type === 'Identifier' && d.id.name === htmlVarName &&
+            d.init && d.init.type === 'Literal' && typeof d.init.value === 'string') {
+          openStmtIdx = i;
+          break;
+        }
+      }
+      if (openStmtIdx >= 0) break;
+    }
+  }
+  if (openStmtIdx < 0) return null;
 
   const openStmt = stmts[openStmtIdx];
   const loopStmt = stmts[loopStmtIdx];
-  const closeStmt = stmts[closeStmtIdx];
+  const closeStmt = closeStmtIdx >= 0 ? stmts[closeStmtIdx] : null;
 
   // Extract the literal fragments.
   const openInit = openStmt.declarations.find(d => d.id.name === htmlVarName).init;
   const openLit = openInit.value;
-  const closeLit = literalOfAccumAssign(closeStmt);
+  const closeLit = closeStmt ? literalOfAccumAssign(closeStmt) : null;
 
-  // The open literal should be a single start tag; the close
-  // literal should be the matching end tag. Parse both via
-  // src/html.js to identify the outer-tag name.
-  const openTree = html.parse(openLit);
+  // Shape (A) has a matching open/close tag pair; shape (B)
+  // has an empty open literal (no wrapper element at all) and
+  // no close statement.
   let outerTag = null;
-  for (const c of openTree.children) {
-    if (c.type === 'element') { outerTag = c.tag; break; }
+  if (openLit.length > 0) {
+    const openTree = html.parse(openLit);
+    for (const c of openTree.children) {
+      if (c.type === 'element') { outerTag = c.tag; break; }
+    }
+    if (outerTag == null) return null;
+    if (closeLit == null) return null;   // open tag without close: malformed
+    const closeMatch = closeLit.match(/<\/([a-z][a-z0-9]*)/i);
+    if (!closeMatch || closeMatch[1].toLowerCase() !== outerTag) return null;
+  } else {
+    // Shape B: empty accumulator. The loop's children are
+    // appended directly to the innerHTML target with no
+    // wrapper element. closeLit must also be empty (or null).
+    if (closeLit != null && closeLit.length > 0) return null;
   }
-  if (!outerTag) return null;
-  const closeMatch = closeLit.match(/<\/([a-z][a-z0-9]*)/i);
-  if (!closeMatch || closeMatch[1].toLowerCase() !== outerTag) return null;
 
   // The loop body must contain exactly one statement:
   // `H += <concat expression>;`.
@@ -873,6 +903,9 @@ function parseStaticAttrsFragment(s) {
 
 // buildReplacementSource — emit the imperative DOM-call
 // replacement for a matched loop-built innerHTML pattern.
+// When `outerTag` is null the pattern is the shape-B
+// "no wrapper" form, where children are appended directly
+// to the innerHTML target with no outer wrapper element.
 function buildReplacementSource(ctx) {
   const jsSource = ctx.jsSource;
   const outerTag = ctx.outerTag;
@@ -890,19 +923,27 @@ function buildReplacementSource(ctx) {
 
   const lines = [];
   lines.push(receiver + '.replaceChildren();');
-  // Parent container (outer tag).
-  lines.push('var __p = document.createElement(' + JSON.stringify(outerTag) + ');');
-  // Static outer attributes from the opening literal: we
-  // only honour the pure-attribute shape (no holes). Parse
-  // the opening literal once more via html.js to lift them.
-  const openTree = html.parse(ctx.outerAttrsStr);
-  const openElem = openTree.children.find(c => c.type === 'element' && c.tag === outerTag);
-  if (openElem && openElem.attrList) {
-    for (const a of openElem.attrList) {
-      lines.push('__p.setAttribute(' + JSON.stringify(a.name) + ', ' + JSON.stringify(a.value) + ');');
+  // Parent container. Shape A has an outer wrapper element;
+  // shape B (no wrapper) appends children directly to the
+  // innerHTML target.
+  let parentRef;
+  if (outerTag) {
+    lines.push('var __p = document.createElement(' + JSON.stringify(outerTag) + ');');
+    // Static outer attributes from the opening literal: we
+    // only honour the pure-attribute shape (no holes). Parse
+    // the opening literal once more via html.js to lift them.
+    const openTree = html.parse(ctx.outerAttrsStr || '');
+    const openElem = openTree.children.find(c => c.type === 'element' && c.tag === outerTag);
+    if (openElem && openElem.attrList) {
+      for (const a of openElem.attrList) {
+        lines.push('__p.setAttribute(' + JSON.stringify(a.name) + ', ' + JSON.stringify(a.value) + ');');
+      }
     }
+    lines.push(receiver + '.appendChild(__p);');
+    parentRef = '__p';
+  } else {
+    parentRef = receiver;
   }
-  lines.push(receiver + '.appendChild(__p);');
   // The for loop.
   lines.push('for (' + initSrc + '; ' + testSrc + '; ' + updateSrc + ') {');
   lines.push('  var __c = document.createElement(' + JSON.stringify(childTag) + ');');
@@ -923,7 +964,7 @@ function buildReplacementSource(ctx) {
     lines.push('  __c.setAttribute(' + JSON.stringify(attr.name) + ', ' +
       pieces.join(' + ') + ');');
   }
-  lines.push('  __p.appendChild(__c);');
+  lines.push('  ' + parentRef + '.appendChild(__c);');
   if (textExpr) {
     const textSrc = jsSource.slice(textExpr.start, textExpr.end);
     lines.push('  __c.appendChild(document.createTextNode(' + textSrc + '));');
@@ -972,14 +1013,41 @@ function convertJsFile(jsSource, trace, filename) {
   };
 
   // --- 1. innerHTML / outerHTML → DOM calls -----------------------------
+  //
+  // Ordering matters. We try the LOOP-BUILT pattern matcher
+  // FIRST, then fall back to the concrete parsedHtml path.
+  //
+  // Why loop-first: the engine's value-level analysis can
+  // sometimes fold a loop down to a concrete value (e.g.
+  // when the loop bound is a global array whose declared
+  // contents are empty, items.length === 0 folds the entire
+  // loop to an empty string). That's a PRECISE static answer
+  // but a WRONG rewrite — at runtime the loop's array can be
+  // mutated by code the analyser didn't see. The loop-built
+  // detector preserves the runtime iteration semantics, so we
+  // prefer it whenever the source shape matches.
+  //
+  // parsedHtml emission is the correct fallback when the
+  // value really is a concrete compile-time string with no
+  // surrounding loop pattern (e.g. `el.innerHTML = "<p>hi</p>"`).
+  const stmtOffsets = new Set();
   for (const ih of trace.innerHtmlAssignments || []) {
     if (!matchesFile(ih.location)) continue;
     if (ih.kind !== 'innerHTML' && ih.kind !== 'outerHTML') continue;
+    // Dedup: B4 multi-variant can emit the same assignment
+    // twice (once per caller variant). Skip duplicates.
+    const key = ih.location.pos + ':' + ih.location.endPos;
+    if (stmtOffsets.has(key)) continue;
+    stmtOffsets.add(key);
 
-    // Concrete case: the engine already parsed the string
-    // eagerly at trace-projection time and attached the HTML
-    // tree. Emit createElement / setAttribute / appendChild
-    // calls recursively.
+    // Loop-built shape first.
+    const looped = detectLoopBuiltInnerHtml(jsSource, ih.location.pos);
+    if (looped) {
+      replacements.push(looped);
+      continue;
+    }
+
+    // Concrete value → parsedHtml tree → imperative DOM calls.
     if (ih.parsedHtml) {
       const stmtText = sliceStatement(jsSource, ih.location);
       const m = stmtText.match(/^(.+?)\.(innerHTML|outerHTML)\s*=/);
@@ -992,21 +1060,6 @@ function convertJsFile(jsSource, trace, filename) {
         end: ih.location.endPos,
         replacement,
       });
-      continue;
-    }
-
-    // Non-concrete case: the assigned value was built at
-    // runtime. Try the loop-built innerHTML pattern matcher
-    // for the common navigation-builder shape
-    // `var H = '<tag>'; for (...) { H += '<child>' + … + '</child>'; } H += '</tag>'; elem.innerHTML = H;`.
-    // On a match we replace the entire var / loop / close /
-    // assign block with an iterative createElement loop.
-    // On any mismatch we leave the assignment alone (the
-    // consumer's caller sees the InnerHtmlAssignment record
-    // on the trace and can decide what to do).
-    const looped = detectLoopBuiltInnerHtml(jsSource, ih.location.pos);
-    if (looped) {
-      replacements.push(looped);
       continue;
     }
   }
@@ -1125,9 +1178,15 @@ async function convertProject(files, options) {
   const keys = Object.keys(files);
   const htmlPaths = keys.filter(p => /\.html?$/i.test(p)).sort();
 
-  // Stage 1: HTML-side conversion. Collect extracted JS/CSS
-  // blocks so we can run the JS-side pass on them too.
-  const pendingJs = Object.create(null);   // filename → source
+  // --- Stage 1: HTML-side conversion ------------------------------------
+  //
+  // For each HTML page we extract inline <script>, inline
+  // <style>, and per-element inline events + styles into
+  // separate files. The extracted scripts are remembered in
+  // per-page script-src order so Stage 2 knows which files
+  // are siblings (analyzed together with shared scope).
+  const pageScripts = Object.create(null);  // page → [jsPath, ...] in source order
+  const pendingJs = Object.create(null);    // filename → source
   for (const page of htmlPaths) {
     const result = convertHtmlMarkup(files[page], page);
     let anyChange = false;
@@ -1135,6 +1194,19 @@ async function convertProject(files, options) {
       output[result.handlers.name] = result.handlers.content;
       anyChange = true;
     }
+    // Walk the rewritten HTML's tokens and record every
+    // <script src="..."> in source order so Stage 2 can
+    // analyze the page's scripts as siblings.
+    const pageScriptList = [];
+    const orderedTokens = html.tokenize(result.html);
+    for (const tok of orderedTokens) {
+      if (tok.type !== 'start' || tok.tagName !== 'script') continue;
+      const srcAttr = (tok.attrs || []).find(a => a.name === 'src');
+      if (!srcAttr) continue;
+      pageScriptList.push(srcAttr.value);
+    }
+    pageScripts[page] = pageScriptList;
+
     for (const s of result.extractedScripts) {
       output[s.name] = s.content;
       pendingJs[s.name] = s.content;
@@ -1149,30 +1221,79 @@ async function convertProject(files, options) {
     }
   }
 
-  // Stage 2: JS-side conversion. Union of (original JS files
-  // from the input) and (extracted inline scripts from HTML).
+  // --- Stage 2: JS-side conversion with project-level scope ------------
+  //
+  // Each HTML page's scripts are siblings — declarations in
+  // one are visible in later ones because the runtime evaluates
+  // them in order into the same global scope. The new engine
+  // supports this via `analyze(files, {project: [...ordered
+  // filenames...]})`: the files in `project` are parsed
+  // individually but joined into ONE top-function whose
+  // body is the concatenation of their top-level
+  // statements, preserving per-instruction file+pos
+  // locations for trace projection.
+  //
+  // Files not referenced by any HTML page are analyzed
+  // standalone, one per analyze() call.
   const jsPaths = keys.filter(p => /\.m?js$/.test(p));
   for (const p of jsPaths) pendingJs[p] = files[p];
 
-  // Run the engine once per JS file. Passing just this file
-  // gives the Trace a single-file view; a future extension
-  // could pass the whole project for cross-file scope
-  // resolution.
-  //
-  // Require lazily so the consumer file can be loaded by
-  // non-Node hosts that don't want to pull in the engine
-  // (e.g. unit tests of convertHtmlMarkup alone).
   const { analyze } = require('../src/index.js');
   const TDB = options.typeDB || require('../src/default-typedb.js');
-  for (const jsPath of Object.keys(pendingJs)) {
-    const src = pendingJs[jsPath];
-    const trace = await analyze({ [jsPath]: src }, {
+
+  // Which JS file is loaded by which HTML page (if any).
+  // A JS file that's not loaded by any HTML page analyses
+  // as a standalone single-file project.
+  const pageOfJs = Object.create(null);
+  for (const page of htmlPaths) {
+    for (const sp of (pageScripts[page] || [])) {
+      if (pageOfJs[sp] == null) pageOfJs[sp] = page;
+    }
+  }
+
+  // Group JS files by their owning HTML page (or null for
+  // standalone). The project order for each group is the
+  // page's script-src order; standalone files each form a
+  // single-element group.
+  const projects = [];    // Array<{ order: string[], files: {name: src} }>
+  const seen = new Set();
+  for (const page of htmlPaths) {
+    const order = pageScripts[page] || [];
+    if (order.length === 0) continue;
+    const projFiles = Object.create(null);
+    for (const p of order) {
+      if (pendingJs[p] != null) {
+        projFiles[p] = pendingJs[p];
+        seen.add(p);
+      }
+    }
+    if (Object.keys(projFiles).length > 0) {
+      projects.push({ order, files: projFiles });
+    }
+  }
+  for (const p of Object.keys(pendingJs)) {
+    if (seen.has(p)) continue;
+    projects.push({ order: [p], files: { [p]: pendingJs[p] } });
+  }
+
+  // Analyse each project and rewrite every file in it. The
+  // new engine's `project: [...]` option tells it to treat
+  // the files as ordered siblings sharing the top-level
+  // scope, so `app.js` sees `var items` declared in
+  // `store.js` without needing a precedingCode hack.
+  for (const project of projects) {
+    const trace = await analyze(project.files, {
       typeDB: TDB,
       precision: options.precision || 'precise',
+      project: project.order,
     });
-    const rewritten = convertJsFile(src, trace, jsPath);
-    if (rewritten !== src) {
-      output[jsPath] = rewritten;
+    for (const jsPath of project.order) {
+      const src = project.files[jsPath];
+      if (src == null) continue;
+      const rewritten = convertJsFile(src, trace, jsPath);
+      if (rewritten !== src) {
+        output[jsPath] = rewritten;
+      }
     }
   }
 

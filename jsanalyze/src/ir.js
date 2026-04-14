@@ -294,6 +294,77 @@ function buildModule(source, filename) {
   };
 
   lowerProgram(ctx, ast);
+  return finalizeModule(module, ctx, entry);
+}
+
+// buildProjectModule(files, orderedNames, moduleName)
+//
+// Lowers a set of JavaScript files into ONE module whose top
+// function's body is the concatenation of the files' top-level
+// statements in the given order. Declarations in earlier files
+// are visible to later files (shared module-level scope),
+// matching the way a browser evaluates multiple `<script src>`
+// tags into the same global scope.
+//
+// Each file is parsed independently so per-statement source
+// locations (loc.file + loc.pos + loc.endPos) reference the
+// ORIGINATING file, not a concatenated virtual source. The
+// ctx.filename is switched per file before lowering its
+// statements so `locFromNode(n, ctx.filename)` attributes each
+// instruction to the right file.
+//
+// Files whose parse or lowering fails don't abort the whole
+// module; the boundary catch in src/index.js already handles
+// per-file errors. `buildProjectModule` itself is synchronous
+// and throws on any parse error, matching `buildModule`'s
+// semantics; the caller runs it inside its existing try/catch.
+//
+// Arguments:
+//   files         — { [filename]: source } map
+//   orderedNames  — Array<string> of filenames to lower, in order
+//   moduleName    — display name for the module (the first
+//                   filename in the list by default)
+function buildProjectModule(files, orderedNames, moduleName) {
+  const module = createModule(moduleName || orderedNames[0] || '<project>');
+  const topFn = createFunction(module, '<top>', []);
+  module.top = topFn;
+
+  const scope = createScopeMap();
+  const entry = createBlock(module);
+  topFn.cfg = { entry: entry.id, exit: null, blocks: new Map([[entry.id, entry]]) };
+
+  const ctx = {
+    module,
+    filename: moduleName || orderedNames[0] || '<project>',
+    fn: topFn,
+    scope,
+    blocks: topFn.cfg.blocks,
+    currentBlock: entry,
+    catchStack: [],
+  };
+
+  // Lower each file into the SAME top function. ctx.filename
+  // is swapped per file so locFromNode stamps each instruction
+  // with its originating file — this is what makes the per-
+  // file trace projection work (every call / innerHTML
+  // assignment / mutation knows which file it came from).
+  for (const fname of orderedNames) {
+    const src = files[fname];
+    if (src == null) continue;
+    const ast = parseModule(src, fname, { sourceType: 'script' });
+    ctx.filename = fname;
+    lowerProgram(ctx, ast);
+  }
+
+  return finalizeModule(module, ctx, entry);
+}
+
+// finalizeModule — shared tail logic between buildModule and
+// buildProjectModule. Ensures the top function has an exit
+// block, runs the closure-capture fixup, and returns the
+// module for downstream analysis.
+function finalizeModule(module, ctx, entry) {
+  const topFn = module.top;
 
   // Ensure the top-level function has an exit block: any fall-through
   // at the end of the program becomes an implicit `Return(undefined)`.
@@ -4056,6 +4127,7 @@ module.exports = {
   OP,
   TERMINATOR_KINDS,
   buildModule,
+  buildProjectModule,
   createModule,
   createFunction,
   createBlock,

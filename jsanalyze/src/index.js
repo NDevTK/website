@@ -6,7 +6,7 @@
 
 'use strict';
 
-const { buildModule } = require('./ir.js');
+const { buildModule, buildProjectModule } = require('./ir.js');
 const { analyseFunction } = require('./worklist.js');
 const { AssumptionTracker, REASONS, SEVERITIES } = require('./assumptions.js');
 const D = require('./domain.js');
@@ -174,7 +174,28 @@ async function analyze(input, options) {
     ? null
     : (formula) => Z3.checkPathSat(formula, smtTimeoutMs);
 
-  for (const filename of Object.keys(workingFiles)) {
+  // Project-mode walk: when `options.project` is set, we
+  // build a SINGLE module whose top function body is the
+  // concatenation of the listed files' top-level statements
+  // in the given order. Declarations in earlier files are
+  // visible to later files (shared module-level scope),
+  // matching the way a browser evaluates multiple
+  // `<script src>` tags into the same global scope. This
+  // replaces the per-file-isolated walk below with one
+  // project-wide walk.
+  //
+  // The file iteration (for loop below) is skipped when
+  // project mode is active; instead we synthesize a single
+  // iteration over the virtual "project module" whose name
+  // is the first file's name (for display / trace
+  // attribution). Per-instruction source locations already
+  // carry their originating file via the sourceMap — see
+  // buildProjectModule — so trace projection attributes
+  // each observation to the right file.
+  const projectOrder = Array.isArray(options.project) ? options.project : null;
+  const iterFiles = projectOrder ? [projectOrder[0]] : Object.keys(workingFiles);
+
+  for (const filename of iterFiles) {
     let module;
     // Boundary: parse/IR errors. We catch here — and ONLY here —
     // so one bad file doesn't tank the whole multi-file analysis.
@@ -184,7 +205,16 @@ async function analyze(input, options) {
     // human-readable entry in `trace.warnings`. The underlying
     // exception's message is recorded on both.
     try {
-      module = buildModule(workingFiles[filename], filename);
+      if (projectOrder) {
+        // Build the shared-scope module from the ordered file list.
+        const projectFiles = Object.create(null);
+        for (const p of projectOrder) {
+          if (workingFiles[p] != null) projectFiles[p] = workingFiles[p];
+        }
+        module = buildProjectModule(projectFiles, projectOrder, filename);
+      } else {
+        module = buildModule(workingFiles[filename], filename);
+      }
     } catch (e) {
       trace.partial = true;
       trace.warnings.push({

@@ -144,6 +144,59 @@ const tests = [
     },
   },
 
+  // --- Legacy case 7: cross-file scope ---
+  {
+    name: 'legacy-replay: case 7 (cross-file scope, loop-built list)',
+    fn: async () => {
+      // app.js references `items` declared in store.js. Both
+      // files are listed as <script src="..."> in index.html
+      // so the new engine's project mode walks them as
+      // siblings sharing the top-level scope.
+      //
+      // The app.js inner loop builds `<li>` children via
+      // string concat — shape B of the loop-pattern detector
+      // (empty-string accumulator, no wrapper element). The
+      // rewrite produces a for-loop emitting createElement
+      // + createTextNode for each item.
+      await expectProject('case 7',
+        {
+          'index.html': '<html><body><div id="app"></div><script src="store.js"></script><script src="app.js"></script></body></html>',
+          'store.js': 'var items = []; function addItem(t) { items.push(t); }',
+          'app.js':
+            'var html = "";' +
+            'for (var i = 0; i < items.length; i++) {' +
+            '  html += "<li>" + items[i] + "</li>";' +
+            '}' +
+            'document.getElementById("app").innerHTML = html;',
+        },
+        ['app.js'],
+        {
+          'app.js': c => /createElement\("li"\)/.test(c) &&
+                          /for \(var i = 0;/.test(c) &&
+                          /items\[i\]/.test(c),
+        });
+    },
+  },
+
+  // --- Legacy case 2: clean JS not in output ---
+  {
+    name: 'legacy-replay: case 2 (helper from utils.js visible in app.js)',
+    fn: async () => {
+      // app.js references `helper()` declared in utils.js.
+      // Cross-file scope via project mode lets the engine
+      // walk app.js with helper() visible, so the innerHTML
+      // assignment's string-concat is recognised.
+      await expectProject('case 2',
+        {
+          'index.html': '<html><body><script src="utils.js"></script><script src="app.js"></script></body></html>',
+          'utils.js': 'function helper() { return 1; }',
+          'app.js': 'var el = document.body; el.innerHTML = "<div>" + helper() + "</div>";',
+        },
+        ['app.js'],
+        { 'app.js': c => /createElement/.test(c) || /createTextNode/.test(c) });
+    },
+  },
+
   // --- Legacy case 10: mixed inline + external scripts ---
   {
     name: 'legacy-replay: case 10 (mixed inline + external)',
