@@ -2865,6 +2865,30 @@ module.exports = {
 //         rangeStart: number;            -- full source range to replace
 //         rangeEnd: number;
 //       }
+//     | { kind: 'switch';
+//         // Switch-built HTML assignment:
+//         //
+//         //   var H;
+//         //   switch (x) {
+//         //     case 'a': H = '<a>'; break;
+//         //     case 'b': H = '<b>'; break;
+//         //     default:  H = '<c>';
+//         //   }
+//         //   elem.innerHTML = H;
+//         //
+//         // Each case branch must contain a single
+//         // `H = <string literal>;` assignment (optionally
+//         // followed by a `break`). Fall-through between
+//         // cases isn't supported yet.
+//         receiver: { start, end };
+//         discriminant: { start, end }; -- the switch value
+//         cases: Array<{
+//           testExpr: { start, end } | null;  -- null for `default`
+//           template: HtmlTemplate;
+//         }>;
+//         rangeStart: number;
+//         rangeEnd: number;
+//       }
 //     | { kind: 'opaque'; reason: string };
 //
 //   type HtmlAttrTemplate = {
@@ -2949,12 +2973,23 @@ function extractTemplate(jsSource, assignStmtPos, filename, astCache) {
   const assignStmt = stmts[assignIdx];
   if (assignStmt.type !== 'ExpressionStatement') return null;
   const expr = assignStmt.expression;
-  if (!expr || expr.type !== 'AssignmentExpression' || expr.operator !== '=') return null;
+  if (!expr || expr.type !== 'AssignmentExpression') return null;
+  if (expr.operator !== '=' && expr.operator !== '+=') return null;
   const lhs = expr.left;
   const rhs = expr.right;
   if (!lhs || lhs.type !== 'MemberExpression') return null;
   if (lhs.computed || !lhs.property || lhs.property.type !== 'Identifier') return null;
   if (lhs.property.name !== 'innerHTML' && lhs.property.name !== 'outerHTML') return null;
+
+  // `el.innerHTML += <rhs>` — append-shaped assignment. The
+  // semantic difference from `=` is that there is no
+  // replaceChildren(); the new nodes are appended to the
+  // receiver. The template extractor produces an `append`
+  // template describing the new nodes, and the consumer
+  // emits appendChild calls directly on the receiver.
+  if (expr.operator === '+=') {
+    return extractAppend(jsSource, stmts, assignStmt, assignIdx, lhs.object, rhs);
+  }
 
   // The RHS must be a plain Identifier referencing an
   // accumulator variable or a string concatenation / literal.
@@ -2973,6 +3008,63 @@ function extractTemplate(jsSource, assignStmtPos, filename, astCache) {
   }
 
   return { kind: 'opaque', reason: 'unrecognised rhs shape' };
+}
+
+// extractAppend — build an `append` template for `el.innerHTML
+// += <rhs>`. Two RHS shapes are accepted:
+//
+//   1. Literal string — parse via html.parse; the template
+//      carries the parsed node list and the consumer emits
+//      createElement / appendChild calls without a preceding
+//      replaceChildren.
+//
+//   2. Concat chain (BinaryExpression of `+`) — flatten
+//      via flattenConcat and match the single-child shape
+//      from parseLoopBodyFragments. The template carries
+//      the parsed child descriptor so the consumer emits
+//      one appendChild per iteration.
+//
+// Anything else falls to opaque so the consumer leaves the
+// site alone.
+//
+// HtmlTemplate shape for append:
+//   { kind: 'append';
+//     receiver: { start, end };
+//     nodes: HtmlNode[] | null;         -- literal rhs
+//     child: ChildShape | null;          -- concat rhs
+//     rangeStart, rangeEnd }
+function extractAppend(jsSource, stmts, assignStmt, assignIdx, receiverNode, rhs) {
+  if (rhs && rhs.type === 'Literal' && typeof rhs.value === 'string') {
+    return {
+      kind: 'append',
+      receiver: { start: receiverNode.start, end: receiverNode.end },
+      nodes: html.parse(rhs.value),
+      child: null,
+      rangeStart: assignStmt.start,
+      rangeEnd: assignStmt.end,
+    };
+  }
+  const frags = flattenConcat(rhs);
+  if (frags) {
+    const parsed = parseLoopBodyFragments(frags);
+    if (parsed) {
+      return {
+        kind: 'append',
+        receiver: { start: receiverNode.start, end: receiverNode.end },
+        nodes: null,
+        child: {
+          tag: parsed.childTag,
+          attrs: parsed.childAttrs,
+          textExpr: parsed.textExpr
+            ? { start: parsed.textExpr.start, end: parsed.textExpr.end }
+            : null,
+        },
+        rangeStart: assignStmt.start,
+        rangeEnd: assignStmt.end,
+      };
+    }
+  }
+  return { kind: 'opaque', reason: 'append rhs not recognised' };
 }
 
 function getAst(jsSource, filename, astCache) {
@@ -3068,6 +3160,75 @@ function detectBranchAccumulator(jsSource, stmts, assignIdx, varName, receiverNo
   };
 }
 
+// detectSwitchAccumulator — recognise the shape
+//
+//   var H;
+//   switch (disc) {
+//     case lit1: H = '<a>'; break;
+//     case lit2: H = '<b>'; break;
+//     default:   H = '<c>';
+//   }
+//   elem.innerHTML = H;
+//
+// Each case's consequent statements must be exactly
+// `H = <string literal>;` optionally followed by `break;`.
+// Multi-statement cases, fall-through, and non-literal
+// writes fall through to null.
+function detectSwitchAccumulator(jsSource, stmts, assignIdx, varName, receiverNode) {
+  if (assignIdx - 1 < 0) return null;
+  const swStmt = stmts[assignIdx - 1];
+  if (!swStmt || swStmt.type !== 'SwitchStatement') return null;
+  if (!Array.isArray(swStmt.cases) || swStmt.cases.length === 0) return null;
+
+  const cases = [];
+  for (const c of swStmt.cases) {
+    // Each case has `test` (null for default) and `consequent`
+    // (an array of statements). We accept:
+    //   [ExpressionStatement(H = '<lit>')]
+    //   [ExpressionStatement(H = '<lit>'), BreakStatement]
+    const stmtsInCase = c.consequent || [];
+    if (stmtsInCase.length < 1 || stmtsInCase.length > 2) return null;
+    const write = getSingleStringWrite(
+      { type: 'BlockStatement', body: [stmtsInCase[0]] },
+      varName);
+    if (write == null) return null;
+    if (stmtsInCase.length === 2 && stmtsInCase[1].type !== 'BreakStatement') return null;
+    cases.push({
+      testExpr: c.test
+        ? { start: c.test.start, end: c.test.end }
+        : null,
+      template: concreteTemplate(write),
+    });
+  }
+
+  // Extend the replacement range backward through the
+  // optional `var H;` declaration that precedes the switch.
+  let rangeStart = swStmt.start;
+  for (let i = assignIdx - 2; i >= 0; i--) {
+    const s = stmts[i];
+    if (s.type !== 'VariableDeclaration') break;
+    let matches = false;
+    for (const d of s.declarations) {
+      if (d.id && d.id.type === 'Identifier' && d.id.name === varName) {
+        matches = true;
+        break;
+      }
+    }
+    if (!matches) break;
+    rangeStart = s.start;
+    break;
+  }
+
+  return {
+    kind: 'switch',
+    receiver: { start: receiverNode.start, end: receiverNode.end },
+    discriminant: { start: swStmt.discriminant.start, end: swStmt.discriminant.end },
+    cases,
+    rangeStart,
+    rangeEnd: stmts[assignIdx].end,
+  };
+}
+
 // getSingleStringWrite — look inside an IfStatement branch
 // body and return the string literal assigned to `varName`,
 // or null when the shape isn't `{ varName = <lit> }` or
@@ -3138,6 +3299,10 @@ function extractFromAccumulator(jsSource, stmts, assignIdx, varName, receiverNod
   const branch = detectBranchAccumulator(jsSource, stmts, assignIdx, varName, receiverNode);
   if (branch) return branch;
 
+  // Switch shape: `switch (x) { case ...: H = '...'; break; ... }`.
+  const sw = detectSwitchAccumulator(jsSource, stmts, assignIdx, varName, receiverNode);
+  if (sw) return sw;
+
   let closeStmtIdx = -1;
   let loopStmtIdx = -1;
   let openStmtIdx = -1;
@@ -3154,32 +3319,53 @@ function extractFromAccumulator(jsSource, stmts, assignIdx, varName, receiverNod
     }
   }
 
-  // For loop must sit at assignIdx-1 (shape B no-wrap) or
-  // closeStmtIdx-1 (shape A with wrapper).
+  // Find the nearest loop statement walking backward from
+  // `afterLoopIdx`, skipping over non-loop / non-accum
+  // statements. `var i = 0;` style bookkeeping counts as
+  // "skippable" — its presence between the var H declaration
+  // and the loop is normal for while loops.
   const afterLoopIdx = closeStmtIdx >= 0 ? closeStmtIdx : assignIdx;
-  if (afterLoopIdx - 1 >= 0) {
-    const s = stmts[afterLoopIdx - 1];
-    if (s.type === 'ForStatement' && s.body && s.body.type === 'BlockStatement') {
-      loopStmtIdx = afterLoopIdx - 1;
+  for (let i = afterLoopIdx - 1; i >= 0; i--) {
+    const s = stmts[i];
+    if (isLoopStatement(s) && s.body && s.body.type === 'BlockStatement') {
+      loopStmtIdx = i;
+      break;
     }
+    // Skippable: plain var decl that doesn't touch the accumulator.
+    if (s.type === 'VariableDeclaration') {
+      let touchesAccum = false;
+      for (const d of s.declarations) {
+        if (d.id && d.id.type === 'Identifier' && d.id.name === varName) {
+          touchesAccum = true;
+          break;
+        }
+      }
+      if (!touchesAccum) continue;   // bookkeeping var, keep looking
+    }
+    break;
   }
   if (loopStmtIdx < 0) {
-    return { kind: 'opaque', reason: 'no for-loop before innerHTML assignment' };
+    return { kind: 'opaque', reason: 'no loop before innerHTML assignment' };
   }
 
   // Open-accum statement (the var X = '<…>' declaration).
   for (let i = loopStmtIdx - 1; i >= 0; i--) {
     const s = stmts[i];
     if (s.type === 'VariableDeclaration') {
+      let matched = false;
       for (const d of s.declarations) {
         if (d.id && d.id.type === 'Identifier' && d.id.name === varName &&
             d.init && d.init.type === 'Literal' && typeof d.init.value === 'string') {
           openStmtIdx = i;
+          matched = true;
           break;
         }
       }
-      if (openStmtIdx >= 0) break;
+      if (matched) break;
+      // Non-matching var decl (e.g. `var i = 0;`) — skip.
+      continue;
     }
+    break;
   }
   if (openStmtIdx < 0) {
     return { kind: 'opaque', reason: 'no var declaration of accumulator' };
@@ -3221,47 +3407,107 @@ function extractFromAccumulator(jsSource, stmts, assignIdx, varName, receiverNod
     }
   }
 
-  // Loop body must be exactly `X += <concat expression>;`.
-  const body = loopStmt.body.body;
-  if (body.length !== 1) {
-    return { kind: 'opaque', reason: 'loop body is not a single accum' };
+  // Walk the loop body (including any nested blocks /
+  // if / else) and collect every accumulator-append
+  // statement. Each append's parsed child shape becomes a
+  // splice site the consumer replaces with DOM calls. This
+  // handles branches-inside-loops uniformly: every
+  // `html += '<li>' + ...` statement anywhere inside the
+  // loop body contributes one site, regardless of whether
+  // it sits in the top of the body or nested inside an
+  // IfStatement.
+  const accumSites = [];
+  collectAccumAppends(loopStmt.body, varName, accumSites);
+  if (accumSites.length === 0) {
+    return { kind: 'opaque', reason: 'no accum assign in loop body' };
   }
-  const bodyStmt = body[0];
-  if (!isAccumAssign(bodyStmt, varName)) {
-    return { kind: 'opaque', reason: 'loop body is not an accum assign' };
+  // Every site must parse into a recognisable child shape.
+  // Sites that don't parse fall the whole template over to
+  // opaque (partial rewrites would silently drop some
+  // iterations).
+  for (const site of accumSites) {
+    if (!site.child) {
+      return { kind: 'opaque', reason: 'loop body append shape unrecognised' };
+    }
   }
-
-  // Flatten the concat chain and recognise the
-  // `<child attr="prefix' + E + '">' + T + '</child>` shape.
-  const frags = flattenConcat(bodyStmt.expression.right);
-  if (!frags) return { kind: 'opaque', reason: 'concat flatten failed' };
-  const parsed = parseLoopBodyFragments(frags);
-  if (!parsed) return { kind: 'opaque', reason: 'loop body shape unrecognised' };
 
   return {
     kind: 'loop',
     receiver: { start: receiverNode.start, end: receiverNode.end },
     outer,
     loopShape: {
-      initSrc: loopStmt.init ? jsSource.slice(loopStmt.init.start, loopStmt.init.end) : '',
-      testSrc: loopStmt.test ? jsSource.slice(loopStmt.test.start, loopStmt.test.end) : '',
-      updateSrc: loopStmt.update ? jsSource.slice(loopStmt.update.start, loopStmt.update.end) : '',
-      bodyStart: loopStmt.body.start,
-      bodyEnd: loopStmt.body.end,
+      loopType: loopStmt.type,
+      headerEnd: loopStmt.body.start + 1,   // position past the `{`
+      bodyEnd:   loopStmt.body.end - 1,     // position of the closing `}`
+      loopStart: loopStmt.start,
+      loopEnd: loopStmt.end,
     },
-    child: {
-      tag: parsed.childTag,
-      attrs: parsed.childAttrs,
-      textExpr: parsed.textExpr
-        ? { start: parsed.textExpr.start, end: parsed.textExpr.end }
-        : null,
-    },
+    accumSites,
     rangeStart: openStmt.start,
     rangeEnd: stmts[assignIdx].end,
   };
 }
 
+// collectAccumAppends(bodyNode, varName, out)
+//
+// Recursive walk that finds every `varName += <concat>`
+// statement inside a body node, descending into
+// BlockStatement and IfStatement alternatives. Each append
+// is pushed onto `out` with its source range and its
+// parsed child shape (null if the concat didn't match a
+// recognisable pattern). The caller checks the null case
+// and falls the whole template over to opaque if any site
+// didn't parse.
+function collectAccumAppends(node, varName, out) {
+  if (!node) return;
+  if (node.type === 'BlockStatement') {
+    for (const s of node.body) collectAccumAppends(s, varName, out);
+    return;
+  }
+  if (node.type === 'IfStatement') {
+    collectAccumAppends(node.consequent, varName, out);
+    if (node.alternate) collectAccumAppends(node.alternate, varName, out);
+    return;
+  }
+  if (node.type === 'ExpressionStatement' && isAccumAssign(node, varName)) {
+    const frags = flattenConcat(node.expression.right);
+    const parsed = frags ? parseLoopBodyFragments(frags) : null;
+    out.push({
+      start: node.start,
+      end: node.end,
+      child: parsed ? {
+        tag: parsed.childTag,
+        attrs: parsed.childAttrs,
+        textExpr: parsed.textExpr
+          ? { start: parsed.textExpr.start, end: parsed.textExpr.end }
+          : null,
+      } : null,
+    });
+    return;
+  }
+  // Other control-flow nodes (loops, switch, try) aren't
+  // recursed into — the MVP supports one level of if/else
+  // nesting inside a loop body. A deeper pattern falls
+  // through to opaque via the empty-site check below.
+}
+
 // --- Helpers -----------------------------------------------------------
+
+// isLoopStatement — true for any JS loop node type that
+// carries a body block. Used by the accumulator detector to
+// handle for / while / do-while / for-in / for-of
+// uniformly; each type's loop header is sliced verbatim
+// from the source so the emitter doesn't need per-type
+// handling.
+function isLoopStatement(s) {
+  return s && (
+    s.type === 'ForStatement' ||
+    s.type === 'WhileStatement' ||
+    s.type === 'DoWhileStatement' ||
+    s.type === 'ForInStatement' ||
+    s.type === 'ForOfStatement'
+  );
+}
 
 function isAccumAssign(stmt, varName) {
   if (!stmt || stmt.type !== 'ExpressionStatement') return false;
@@ -3330,6 +3576,11 @@ function parseLoopBodyFragments(rawFrags) {
   let i = 1;
 
   if (childMatch[3] === '>') {
+    // Opening literal is complete — `attrsStr` holds all
+    // static attributes (possibly empty). Parse them in
+    // full, then drop straight into the children state.
+    const staticAttrs = parseStaticAttrsFragment(attrsStr);
+    for (const a of staticAttrs) childAttrs.push(a);
     state = 'children';
   } else {
     // Parse static attrs from the opening literal's attr portion.
@@ -17415,6 +17666,94 @@ function sliceStatement(source, loc) {
   return source.slice(loc.pos, loc.endPos);
 }
 
+// detectLineIndent(source, pos) — return the whitespace
+// prefix of the line containing `pos`. Used by the loop
+// emitter to align the emitted child-block with the
+// accumulator-append statement's original indentation.
+function detectLineIndent(source, pos) {
+  let lineStart = pos;
+  while (lineStart > 0 && source[lineStart - 1] !== '\n') lineStart--;
+  let end = lineStart;
+  while (end < source.length) {
+    const ch = source[end];
+    if (ch === ' ' || ch === '\t') end++;
+    else break;
+  }
+  return source.slice(lineStart, end);
+}
+
+// findOpenStmtEnd(source, openStart, loopStart) — walk
+// forward from the open-accum var declaration's start
+// position and return the position just past the `;`
+// terminator. The open-accum is always the FIRST statement
+// in the replacement range, and it ends before any
+// bookkeeping statements (which we want to re-emit
+// between `pre` and the rewritten loop).
+function findOpenStmtEnd(source, openStart, loopStart) {
+  // Scan for the first `;` after openStart that isn't
+  // inside a string literal. We use a tiny state machine
+  // because the open literal itself contains HTML with `;`
+  // characters that shouldn't count.
+  let i = openStart;
+  let state = 'code';
+  let quote = null;
+  while (i < loopStart) {
+    const ch = source[i];
+    if (state === 'code') {
+      if (ch === '"' || ch === "'" || ch === '`') {
+        quote = ch;
+        state = 'string';
+        i++;
+        continue;
+      }
+      if (ch === ';') return i + 1;
+      i++;
+      continue;
+    }
+    if (state === 'string') {
+      if (ch === '\\') { i += 2; continue; }
+      if (ch === quote) { state = 'code'; i++; continue; }
+      i++;
+      continue;
+    }
+  }
+  return loopStart;
+}
+
+// emitChildBlock(child, parentRef, jsSource) — return the
+// list of source lines that re-create one accumulator-append
+// site's child element (a `var __c = …; parent.appendChild
+// (__c); __c.appendChild(textNode);` sequence). The caller
+// joins the lines with its chosen indent and splices the
+// result into the surrounding loop-body source.
+//
+// Factored out so the loop emitter can call it once per
+// accumSite — multiple sites arise when the loop body
+// contains branching `H += …` appends (one per branch).
+function emitChildBlock(child, parentRef, jsSource) {
+  const lines = [];
+  lines.push('var __c = document.createElement(' + JSON.stringify(child.tag) + ');');
+  for (const attr of child.attrs) {
+    if (attr.parts.length === 1 && attr.parts[0].kind === 'literal') {
+      lines.push('__c.setAttribute(' + JSON.stringify(attr.name) + ', ' +
+        JSON.stringify(attr.parts[0].value) + ');');
+      continue;
+    }
+    const pieces = attr.parts.map(p => {
+      if (p.kind === 'literal') return JSON.stringify(p.value);
+      return '(' + jsSource.slice(p.start, p.end) + ')';
+    });
+    lines.push('__c.setAttribute(' + JSON.stringify(attr.name) + ', ' +
+      pieces.join(' + ') + ');');
+  }
+  lines.push(parentRef + '.appendChild(__c);');
+  if (child.textExpr) {
+    const textSrc = jsSource.slice(child.textExpr.start, child.textExpr.end);
+    lines.push('__c.appendChild(document.createTextNode(' + textSrc + '));');
+  }
+  return lines;
+}
+
 // emitBranchBody — emit DOM calls for a nested template
 // inside a caller-provided receiver expression. Used by the
 // `branch` emitter to recursively lower each if/else
@@ -17458,14 +17797,83 @@ function emitFromTemplate(jsSource, ih) {
 
   if (tmpl.kind === 'concrete' && ih.parsedHtml) {
     const stmtText = sliceStatement(jsSource, ih.location);
-    const m = stmtText.match(/^(.+?)\.(innerHTML|outerHTML)\s*=/);
+    const m = stmtText.match(/^(.+?)\.(innerHTML|outerHTML|insertAdjacentHTML)\b/);
     if (!m) return null;
     const receiver = m[1];
+
+    // outerHTML replaces the element itself, not its
+    // contents. We build a DocumentFragment holding the new
+    // nodes and call `receiver.parentNode.replaceChild
+    // (__f, receiver)` so the fragment's children take
+    // receiver's position in the tree and receiver is
+    // removed.
+    if (ih.kind === 'outerHTML') {
+      const body = emitDomCalls(ih.parsedHtml, '__f');
+      const lines = [];
+      lines.push('var __f = document.createDocumentFragment();');
+      if (body) lines.push(body);
+      lines.push(receiver + '.parentNode.replaceChild(__f, ' + receiver + ');');
+      return {
+        start: ih.location.pos,
+        end: ih.location.endPos,
+        replacement: lines.join('\n'),
+      };
+    }
+
     const body = emitDomCalls(ih.parsedHtml, receiver);
     return {
       start: ih.location.pos,
       end: ih.location.endPos,
       replacement: receiver + '.replaceChildren();\n' + body,
+    };
+  }
+
+  if (tmpl.kind === 'append') {
+    // `el.innerHTML += <rhs>` — append, not replace. Emits
+    // createElement / appendChild calls targeted at the
+    // receiver; no replaceChildren, so existing children
+    // stay in place.
+    const receiver = jsSource.slice(tmpl.receiver.start, tmpl.receiver.end);
+    let body;
+    if (tmpl.nodes) {
+      body = emitDomCalls(tmpl.nodes, receiver);
+    } else if (tmpl.child) {
+      body = emitChildBlock(tmpl.child, receiver, jsSource).join('\n');
+    } else {
+      return null;
+    }
+    return {
+      start: tmpl.rangeStart,
+      end: tmpl.rangeEnd,
+      replacement: body,
+    };
+  }
+
+  if (tmpl.kind === 'switch') {
+    const receiver = jsSource.slice(tmpl.receiver.start, tmpl.receiver.end);
+    const discSrc = jsSource.slice(tmpl.discriminant.start, tmpl.discriminant.end);
+    const lines = [];
+    lines.push(receiver + '.replaceChildren();');
+    lines.push('switch (' + discSrc + ') {');
+    for (const c of tmpl.cases) {
+      if (c.testExpr) {
+        const testSrc = jsSource.slice(c.testExpr.start, c.testExpr.end);
+        lines.push('  case ' + testSrc + ': {');
+      } else {
+        lines.push('  default: {');
+      }
+      const body = emitBranchBody(c.template, receiver);
+      if (body) {
+        for (const l of body.split('\n')) lines.push('    ' + l);
+      }
+      lines.push('    break;');
+      lines.push('  }');
+    }
+    lines.push('}');
+    return {
+      start: tmpl.rangeStart,
+      end: tmpl.rangeEnd,
+      replacement: lines.join('\n'),
     };
   }
 
@@ -17494,46 +17902,69 @@ function emitFromTemplate(jsSource, ih) {
 
   if (tmpl.kind === 'loop') {
     const receiver = jsSource.slice(tmpl.receiver.start, tmpl.receiver.end);
-    const lines = [];
-    lines.push(receiver + '.replaceChildren();');
+    const pre = [];
+    pre.push(receiver + '.replaceChildren();');
     let parentRef;
     if (tmpl.outer) {
-      lines.push('var __p = document.createElement(' + JSON.stringify(tmpl.outer.tag) + ');');
+      pre.push('var __p = document.createElement(' + JSON.stringify(tmpl.outer.tag) + ');');
       for (const a of tmpl.outer.attrList) {
-        lines.push('__p.setAttribute(' + JSON.stringify(a.name) + ', ' +
+        pre.push('__p.setAttribute(' + JSON.stringify(a.name) + ', ' +
           JSON.stringify(a.value) + ');');
       }
-      lines.push(receiver + '.appendChild(__p);');
+      pre.push(receiver + '.appendChild(__p);');
       parentRef = '__p';
     } else {
       parentRef = receiver;
     }
+
+    // Emit the per-iteration child element creation. The
+    // library's template gives us one `accumSite` per
+    // accumulator-append statement found anywhere in the
+    // loop body (including inside nested IfStatement
+    // branches). We walk the original loop-body source from
+    // `headerEnd` to `bodyEnd`, splicing each site's child
+    // block in place of its statement and re-emitting
+    // everything else verbatim. The surrounding loop header
+    // and closing brace are sliced verbatim from the source
+    // so while / do-while / for-in / for-of all work without
+    // per-type handling.
     const sh = tmpl.loopShape;
-    lines.push('for (' + sh.initSrc + '; ' + sh.testSrc + '; ' + sh.updateSrc + ') {');
-    lines.push('  var __c = document.createElement(' + JSON.stringify(tmpl.child.tag) + ');');
-    for (const attr of tmpl.child.attrs) {
-      if (attr.parts.length === 1 && attr.parts[0].kind === 'literal') {
-        lines.push('  __c.setAttribute(' + JSON.stringify(attr.name) + ', ' +
-          JSON.stringify(attr.parts[0].value) + ');');
-        continue;
-      }
-      const pieces = attr.parts.map(p => {
-        if (p.kind === 'literal') return JSON.stringify(p.value);
-        return '(' + jsSource.slice(p.start, p.end) + ')';
-      });
-      lines.push('  __c.setAttribute(' + JSON.stringify(attr.name) + ', ' +
-        pieces.join(' + ') + ');');
+    const sites = (tmpl.accumSites || []).slice().sort((a, b) => a.start - b.start);
+
+    let loopSrc = jsSource.slice(sh.loopStart, sh.headerEnd);
+    let cursor = sh.headerEnd;
+    for (const site of sites) {
+      loopSrc += jsSource.slice(cursor, site.start);
+      // Match the indentation of the accumulator-append
+      // statement at this site so the spliced-in child-
+      // block aligns with its neighbours. The first line's
+      // indent is already supplied by the verbatim slice
+      // ending at `site.start`; subsequent lines need the
+      // indent prefix.
+      const indent = detectLineIndent(jsSource, site.start);
+      const childLines = emitChildBlock(site.child, parentRef, jsSource);
+      loopSrc += childLines.join('\n' + indent);
+      cursor = site.end;
     }
-    lines.push('  ' + parentRef + '.appendChild(__c);');
-    if (tmpl.child.textExpr) {
-      const textSrc = jsSource.slice(tmpl.child.textExpr.start, tmpl.child.textExpr.end);
-      lines.push('  __c.appendChild(document.createTextNode(' + textSrc + '));');
-    }
-    lines.push('}');
+    loopSrc += jsSource.slice(cursor, sh.bodyEnd);
+    loopSrc += jsSource.slice(sh.bodyEnd, sh.loopEnd);
+
+    // Preserve bookkeeping statements that live BETWEEN
+    // the openStmt and the loopStmt (e.g. `var i = 0;`
+    // before a while-loop). They sit inside the replacement
+    // range so we re-emit them verbatim between pre and
+    // the rewritten loop.
+    //
+    // We slice from the end of openStmt to the start of
+    // the loop, stripping the open-accum's own text, to
+    // recover the original bookkeeping region.
+    const openStmtEnd = findOpenStmtEnd(jsSource, tmpl.rangeStart, sh.loopStart);
+    const bookkeeping = jsSource.slice(openStmtEnd, sh.loopStart);
+
     return {
       start: tmpl.rangeStart,
       end: tmpl.rangeEnd,
-      replacement: lines.join('\n'),
+      replacement: pre.join('\n') + '\n' + bookkeeping.trimStart() + loopSrc,
     };
   }
 
@@ -17647,7 +18078,9 @@ function convertJsFile(jsSource, trace, filename) {
     const text = c.callee.text;
     const isEval = text === 'eval' ||
       (c.callee.calleeName === 'eval' && !c.callee.typeName);
-    const isDocWrite = text === 'Document.write' || text === 'document.write';
+    const isDocWrite =
+      text === 'Document.write' || text === 'document.write' ||
+      text === 'Document.writeln' || text === 'document.writeln';
     if (!isEval && !isDocWrite) continue;
     const arg0 = c.args[0];
     if (isEval) {
@@ -17675,6 +18108,66 @@ function convertJsFile(jsSource, trace, filename) {
       });
       continue;
     }
+  }
+
+  // --- 5. insertAdjacentHTML → createElement + insertBefore/appendChild -
+  //
+  // `el.insertAdjacentHTML(position, html)` is a DOM-sink
+  // method call — the engine records it in trace.calls with
+  // methodName === 'insertAdjacentHTML'. For concrete-literal
+  // html values we parse the HTML via the library's
+  // html.parse and emit DOM construction targeted at the
+  // position-correct parent.
+  //
+  //   * 'beforebegin' → parent.insertBefore(new, el)
+  //   * 'afterbegin'  → el.insertBefore(new, el.firstChild)
+  //   * 'beforeend'   → el.appendChild(new)
+  //   * 'afterend'    → parent.insertBefore(new, el.nextSibling)
+  //
+  // We build into a DocumentFragment so the same emitDomCalls
+  // path works for every position and a single DOM operation
+  // at the end places all new nodes. Non-concrete positions /
+  // non-concrete html / unknown positions fall through.
+  for (const c of trace.calls || []) {
+    if (!matchesFile(c.site)) continue;
+    if (!c.callee || c.callee.methodName !== 'insertAdjacentHTML') continue;
+    const pos = c.args[0];
+    const htmlArg = c.args[1];
+    if (!pos || pos.kind !== 'concrete' || typeof pos.value !== 'string') continue;
+    if (!htmlArg || htmlArg.kind !== 'concrete' ||
+        typeof htmlArg.value !== 'string') continue;
+    const position = pos.value;
+    const known = ['beforebegin', 'afterbegin', 'beforeend', 'afterend'];
+    if (known.indexOf(position) < 0) continue;
+
+    // Recover the receiver text from the call site's source
+    // slice: `recv.insertAdjacentHTML(…)`. The IR hasn't
+    // preserved the receiver's source range, but the call
+    // site's pos / endPos covers the whole expression and
+    // the call shape is unambiguous.
+    const stmtText = jsSource.slice(c.site.pos, c.site.endPos);
+    const m = stmtText.match(/^(.+?)\.insertAdjacentHTML\s*\(/);
+    if (!m) continue;
+    const recv = m[1];
+    const parsed = html.parse(htmlArg.value);
+    const body = emitDomCalls(parsed, '__f');
+    const lines = [];
+    lines.push('var __f = document.createDocumentFragment();');
+    if (body) lines.push(body);
+    if (position === 'beforeend') {
+      lines.push(recv + '.appendChild(__f);');
+    } else if (position === 'afterbegin') {
+      lines.push(recv + '.insertBefore(__f, ' + recv + '.firstChild);');
+    } else if (position === 'beforebegin') {
+      lines.push(recv + '.parentNode.insertBefore(__f, ' + recv + ');');
+    } else if (position === 'afterend') {
+      lines.push(recv + '.parentNode.insertBefore(__f, ' + recv + '.nextSibling);');
+    }
+    replacements.push({
+      start: c.site.pos,
+      end: c.site.endPos,
+      replacement: lines.join('\n'),
+    });
   }
 
   // --- Apply replacements in reverse order ------------------------------
