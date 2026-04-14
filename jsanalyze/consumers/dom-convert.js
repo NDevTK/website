@@ -598,9 +598,29 @@ function emitFromTemplate(jsSource, ih) {
 
   if (tmpl.kind === 'concrete' && ih.parsedHtml) {
     const stmtText = sliceStatement(jsSource, ih.location);
-    const m = stmtText.match(/^(.+?)\.(innerHTML|outerHTML)\s*=/);
+    const m = stmtText.match(/^(.+?)\.(innerHTML|outerHTML|insertAdjacentHTML)\b/);
     if (!m) return null;
     const receiver = m[1];
+
+    // outerHTML replaces the element itself, not its
+    // contents. We build a DocumentFragment holding the new
+    // nodes and call `receiver.parentNode.replaceChild
+    // (__f, receiver)` so the fragment's children take
+    // receiver's position in the tree and receiver is
+    // removed.
+    if (ih.kind === 'outerHTML') {
+      const body = emitDomCalls(ih.parsedHtml, '__f');
+      const lines = [];
+      lines.push('var __f = document.createDocumentFragment();');
+      if (body) lines.push(body);
+      lines.push(receiver + '.parentNode.replaceChild(__f, ' + receiver + ');');
+      return {
+        start: ih.location.pos,
+        end: ih.location.endPos,
+        replacement: lines.join('\n'),
+      };
+    }
+
     const body = emitDomCalls(ih.parsedHtml, receiver);
     return {
       start: ih.location.pos,
@@ -838,7 +858,9 @@ function convertJsFile(jsSource, trace, filename) {
     const text = c.callee.text;
     const isEval = text === 'eval' ||
       (c.callee.calleeName === 'eval' && !c.callee.typeName);
-    const isDocWrite = text === 'Document.write' || text === 'document.write';
+    const isDocWrite =
+      text === 'Document.write' || text === 'document.write' ||
+      text === 'Document.writeln' || text === 'document.writeln';
     if (!isEval && !isDocWrite) continue;
     const arg0 = c.args[0];
     if (isEval) {
@@ -866,6 +888,66 @@ function convertJsFile(jsSource, trace, filename) {
       });
       continue;
     }
+  }
+
+  // --- 5. insertAdjacentHTML → createElement + insertBefore/appendChild -
+  //
+  // `el.insertAdjacentHTML(position, html)` is a DOM-sink
+  // method call — the engine records it in trace.calls with
+  // methodName === 'insertAdjacentHTML'. For concrete-literal
+  // html values we parse the HTML via the library's
+  // html.parse and emit DOM construction targeted at the
+  // position-correct parent.
+  //
+  //   * 'beforebegin' → parent.insertBefore(new, el)
+  //   * 'afterbegin'  → el.insertBefore(new, el.firstChild)
+  //   * 'beforeend'   → el.appendChild(new)
+  //   * 'afterend'    → parent.insertBefore(new, el.nextSibling)
+  //
+  // We build into a DocumentFragment so the same emitDomCalls
+  // path works for every position and a single DOM operation
+  // at the end places all new nodes. Non-concrete positions /
+  // non-concrete html / unknown positions fall through.
+  for (const c of trace.calls || []) {
+    if (!matchesFile(c.site)) continue;
+    if (!c.callee || c.callee.methodName !== 'insertAdjacentHTML') continue;
+    const pos = c.args[0];
+    const htmlArg = c.args[1];
+    if (!pos || pos.kind !== 'concrete' || typeof pos.value !== 'string') continue;
+    if (!htmlArg || htmlArg.kind !== 'concrete' ||
+        typeof htmlArg.value !== 'string') continue;
+    const position = pos.value;
+    const known = ['beforebegin', 'afterbegin', 'beforeend', 'afterend'];
+    if (known.indexOf(position) < 0) continue;
+
+    // Recover the receiver text from the call site's source
+    // slice: `recv.insertAdjacentHTML(…)`. The IR hasn't
+    // preserved the receiver's source range, but the call
+    // site's pos / endPos covers the whole expression and
+    // the call shape is unambiguous.
+    const stmtText = jsSource.slice(c.site.pos, c.site.endPos);
+    const m = stmtText.match(/^(.+?)\.insertAdjacentHTML\s*\(/);
+    if (!m) continue;
+    const recv = m[1];
+    const parsed = html.parse(htmlArg.value);
+    const body = emitDomCalls(parsed, '__f');
+    const lines = [];
+    lines.push('var __f = document.createDocumentFragment();');
+    if (body) lines.push(body);
+    if (position === 'beforeend') {
+      lines.push(recv + '.appendChild(__f);');
+    } else if (position === 'afterbegin') {
+      lines.push(recv + '.insertBefore(__f, ' + recv + '.firstChild);');
+    } else if (position === 'beforebegin') {
+      lines.push(recv + '.parentNode.insertBefore(__f, ' + recv + ');');
+    } else if (position === 'afterend') {
+      lines.push(recv + '.parentNode.insertBefore(__f, ' + recv + '.nextSibling);');
+    }
+    replacements.push({
+      start: c.site.pos,
+      end: c.site.endPos,
+      replacement: lines.join('\n'),
+    });
   }
 
   // --- Apply replacements in reverse order ------------------------------

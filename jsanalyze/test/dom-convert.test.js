@@ -702,6 +702,157 @@ const tests = [
         'tainted assignment wrapped: ' + out);
     },
   },
+
+  // --- Wave 12d8: legacy adversarial convertProject cases ---
+  //
+  // These port the adversarial cases from
+  // htmldom/htmldom.test.js §adversarial into the new engine
+  // via convertJsFile. The negatives check that the engine
+  // doesn't mis-recognise innerHTML strings / plain objects
+  // as real DOM sinks; the positives check that the
+  // additional sink forms (writeln, outerHTML,
+  // insertAdjacentHTML, innerHTML +=) are all rewritten.
+  {
+    name: 'dom-convert js: var named innerHTML is NOT rewritten',
+    fn: async () => {
+      // A local `var innerHTML = …` declaration is not a DOM
+      // sink — the engine's sink classifier gates on the
+      // receiver's typeName. Since `innerHTML` is a plain
+      // binding with no DOM-chain type, no innerHtmlAssignment
+      // record is produced and convertJsFile leaves the source
+      // untouched.
+      const src = 'var innerHTML = "<p>safe</p>";\nconsole.log(innerHTML);';
+      const out = await convertJs(src);
+      assert(out === src,
+        'var innerHTML must not be rewritten. Got:\n' + out);
+    },
+  },
+  {
+    name: 'dom-convert js: innerHTML inside a comment is NOT rewritten',
+    fn: async () => {
+      const src = '// el.innerHTML = "<b>xss</b>";\nconsole.log("safe");';
+      const out = await convertJs(src);
+      assert(out === src, 'comment-only innerHTML rewritten: ' + out);
+    },
+  },
+  {
+    name: 'dom-convert js: innerHTML inside a string literal is NOT rewritten',
+    fn: async () => {
+      const src = 'var s = "el.innerHTML = bad";\nconsole.log(s);';
+      const out = await convertJs(src);
+      assert(out === src, 'string-literal innerHTML rewritten: ' + out);
+    },
+  },
+  {
+    name: 'dom-convert js: obj.innerHTML on plain object is NOT rewritten',
+    fn: async () => {
+      const src = [
+        'var obj = { innerHTML: "" };',
+        'obj.innerHTML = "<div>test</div>";',
+      ].join('\n');
+      const out = await convertJs(src);
+      assert(out === src,
+        'plain-object innerHTML rewritten: ' + out);
+    },
+  },
+  {
+    name: 'dom-convert js: empty innerHTML → replaceChildren only',
+    fn: async () => {
+      const src = 'document.body.innerHTML = "";';
+      const out = await convertJs(src);
+      assert(/document\.body\.replaceChildren\(\);/.test(out),
+        'empty innerHTML emits replaceChildren: ' + out);
+      assert(!/innerHTML =/.test(out),
+        'original assignment removed: ' + out);
+    },
+  },
+  {
+    name: 'dom-convert js: double innerHTML → two independent rewrites',
+    fn: async () => {
+      const src = [
+        'var x = 1, y = 2;',
+        'document.body.innerHTML = "<a>" + x + "</a>";',
+        'document.body.innerHTML = "<b>" + y + "</b>";',
+      ].join('\n');
+      const out = await convertJs(src);
+      assert(/createElement\("a"\)/.test(out), 'a element: ' + out);
+      assert(/createElement\("b"\)/.test(out), 'b element: ' + out);
+      assert(!/innerHTML =/.test(out),
+        'both original assignments removed: ' + out);
+    },
+  },
+  {
+    name: 'dom-convert js: script tag in split concat → createElement',
+    fn: async () => {
+      // "<scr" + "ipt>alert(1)</" + "script>" — the concat
+      // folds to "<script>alert(1)</script>". The engine's
+      // concrete-value path emits createElement("script")
+      // etc., which the consumer treats structurally.
+      const src = 'document.body.innerHTML = "<scr" + "ipt>alert(1)</" + "script>";';
+      const out = await convertJs(src);
+      assert(!/innerHTML =/.test(out),
+        'original innerHTML removed: ' + out);
+    },
+  },
+  {
+    name: 'dom-convert js: outerHTML = literal → parentNode.replaceChild',
+    fn: async () => {
+      const src = [
+        'var el = document.getElementById("x");',
+        'el.outerHTML = "<div id=\\"new\\">hello</div>";',
+      ].join('\n');
+      const out = await convertJs(src);
+      assert(/createDocumentFragment|createElement\("div"\)/.test(out),
+        'fragment or div emitted: ' + out);
+      assert(/parentNode\.replaceChild/.test(out),
+        'parentNode.replaceChild emitted: ' + out);
+      assert(!/outerHTML =/.test(out),
+        'original outerHTML removed: ' + out);
+    },
+  },
+  {
+    name: 'dom-convert js: insertAdjacentHTML(beforeend, literal) → appendChild',
+    fn: async () => {
+      const src = [
+        'var el = document.getElementById("x");',
+        'el.insertAdjacentHTML("beforeend", "<li>item</li>");',
+      ].join('\n');
+      const out = await convertJs(src);
+      assert(/createElement\("li"\)/.test(out),
+        'li created: ' + out);
+      assert(/el\.appendChild/.test(out),
+        'appendChild on receiver: ' + out);
+      assert(!/insertAdjacentHTML/.test(out),
+        'original call removed: ' + out);
+    },
+  },
+  {
+    name: 'dom-convert js: insertAdjacentHTML(beforebegin, literal) → parentNode.insertBefore',
+    fn: async () => {
+      const src = [
+        'var ref = document.getElementById("r");',
+        'ref.insertAdjacentHTML("beforebegin", "<hr>");',
+      ].join('\n');
+      const out = await convertJs(src);
+      assert(/createElement\("hr"\)/.test(out),
+        'hr created: ' + out);
+      assert(/parentNode\.insertBefore/.test(out),
+        'parentNode.insertBefore emitted: ' + out);
+      assert(!/insertAdjacentHTML/.test(out),
+        'original call removed: ' + out);
+    },
+  },
+  {
+    name: 'dom-convert js: document.writeln(literal) → appendChild createTextNode',
+    fn: async () => {
+      const src = 'document.writeln("Hello");';
+      const out = await convertJs(src);
+      assert(/createTextNode\("Hello"\)/.test(out),
+        'createTextNode emitted: ' + out);
+      assert(!/document\.writeln\(/.test(out),
+        'original writeln removed: ' + out);
+    },
+  },
 ];
 
 module.exports = { tests };
