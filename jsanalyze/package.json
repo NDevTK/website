@@ -6,6 +6,9 @@
   "scripts": {
     "test": "node test/run.js"
   },
+  "dependencies": {
+    "z3-solver": "^4.16.0"
+  },
   "author": "",
   "license": "MIT"
 }

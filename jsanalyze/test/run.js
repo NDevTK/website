@@ -41,6 +41,7 @@ const testFiles = [
   'closure.test.js',
   'switch.test.js',
   'wave10.test.js',
+  'wave11.test.js',
 ];
 
 async function main() {

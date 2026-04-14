@@ -1099,7 +1099,7 @@ function applyFunc(ctx, state, instr) {
 // the same overlay REFERENCE share contents (overlays are
 // immutable after freeze); a different reference may or may
 // not have equal contents, so we conservatively miss.
-function buildSummaryCacheKey(calleeFn, calleeInit, closureCaptures, thisValue, callerHeap) {
+function buildSummaryCacheKey(calleeFn, calleeInit, closureCaptures, thisValue, callerHeap, callerPathCond) {
   const parts = [calleeFn.id];
   // Parameter fingerprints, in param order.
   if (calleeFn.params) {
@@ -1125,6 +1125,17 @@ function buildSummaryCacheKey(calleeFn, calleeInit, closureCaptures, thisValue, 
   }
   parts.push('|h=');
   parts.push(heapIdentityTag(callerHeap));
+  // Caller pathCond is part of the state correlation: two
+  // calls with the same args but different caller-side
+  // reachability conditions produce different interprocedural
+  // pathFormulas on any flows they emit, so they must not
+  // share a cache entry. Using the formula's string expression
+  // is a conservative but precise key: syntactically identical
+  // formulas share entries, syntactically different ones
+  // don't. A null caller pathCond (top / unconditional) gets
+  // a fixed sentinel.
+  parts.push('|pc=');
+  parts.push(callerPathCond ? callerPathCond.expr : 'top');
   return parts.join('');
 }
 
@@ -1319,6 +1330,20 @@ function applyCall(ctx, state, instr) {
     // no-op).
     const effectiveArgs = expandSpreadArgs(state, argValues, instr.spreadAt, loc);
     let calleeInit = D.createStateSharingHeap(state);
+    // Interprocedural path-sensitivity (Phase D / Wave 11):
+    // seed the callee's initial pathCond with the caller's
+    // current pathCond. As the callee branches, every split
+    // refines this by conjoining the local branch formula, so
+    // any sink fired anywhere inside the callee carries the
+    // FULL path from the outermost function entry down to the
+    // sink — including all caller-side branches. Without this
+    // seeding, the callee analyses under an empty pathCond
+    // and the Z3 refutation layer cannot use caller-side
+    // constraints to prove infeasibility.
+    const callerPathCond = ctx.currentPathCond || null;
+    if (callerPathCond) {
+      calleeInit = D.withPathCond(calleeInit, callerPathCond);
+    }
     // Closure captures: bind each captured register in the
     // callee's init state. We prefer the caller's CURRENT
     // state over the applyFunc-time snapshot:
@@ -1427,7 +1452,7 @@ function applyCall(ctx, state, instr) {
     // precise per-caller formula can disable the cache by
     // bumping calleeFn._summaryCacheBypass.
     if (!calleeFn._summaryCache) calleeFn._summaryCache = new Map();
-    const cacheKey = buildSummaryCacheKey(calleeFn, calleeInit, closureCaptures, thisValue, state.heap);
+    const cacheKey = buildSummaryCacheKey(calleeFn, calleeInit, closureCaptures, thisValue, state.heap, callerPathCond);
     let calleeResult = cacheKey != null ? calleeFn._summaryCache.get(cacheKey) : null;
     let cacheHit = !!calleeResult;
 

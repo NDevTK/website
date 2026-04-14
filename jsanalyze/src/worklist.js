@@ -361,11 +361,15 @@ function analyseFunction(module, fn, initialState, ctx) {
     if (added) enqueueVariant(blockId, variantIdx);
   }
 
-  // Entry block is unconditionally reachable. The initial state's
-  // pathCond is forced to null (top) so entry-block flows have
-  // no reachability constraint.
-  const entryState = D.withPathCond(initialState, null);
-  enqueue(cfg.entry, entryState, null);
+  // Entry block is reachable under whatever pathCond the
+  // caller passed in — null for the top-level (outermost)
+  // function, a non-trivial formula for a callee walked from
+  // transfer.applyCall (the caller seeds the callee's initial
+  // pathCond with its own current pathCond so any flow fired
+  // inside the callee inherits the full interprocedural path
+  // condition). We preserve `initialState.pathCond` instead of
+  // forcing it to null.
+  enqueue(cfg.entry, initialState, null);
 
   // No iteration cap. The value lattice has finite height and
   // the per-block variant set is bounded by the distinct

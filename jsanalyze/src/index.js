@@ -11,6 +11,7 @@ const { analyseFunction } = require('./worklist.js');
 const { AssumptionTracker, REASONS, SEVERITIES } = require('./assumptions.js');
 const D = require('./domain.js');
 const { overlayEntries } = require('./domain.js');
+const Z3 = require('./z3.js');
 const query = require('./query.js');
 
 // analyze(input, options) → Promise<Trace>
@@ -142,6 +143,16 @@ async function analyze(input, options) {
       trace.taintFlows.push(flow);
     }
   }
+
+  // Wave 11 / Phase D: Z3 refutation pass. Runs the real SMT
+  // solver over every taint flow's pathFormula and drops flows
+  // whose path is statically infeasible (unsat). This is the
+  // single post-pass integration point — the worklist and
+  // transfer loop remain fully synchronous, and Z3's async
+  // init is confined to this boundary. Z3 is a required
+  // dependency; a missing install or init failure surfaces
+  // as a load-time error, not a silent precision regression.
+  await Z3.refuteTrace(trace);
 
   trace.assumptions = assumptions.snapshot();
   return trace;
