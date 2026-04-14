@@ -609,12 +609,18 @@ function applyGetGlobal(ctx, state, instr) {
 
 function applyGetThis(ctx, state, instr) {
   const loc = instrLoc(ctx, instr);
-  // `this` at the top level resolves to the module-level this
-  // binding, which in script mode is the global. We don't model
-  // the global yet, so this is opaque with an unimplemented mark.
+  // If the engine is currently walking a constructor / method
+  // body that was entered with an explicit `this` value (see
+  // applyNew / applyCall), return that. Otherwise `this` at
+  // the top level resolves to the module-level this binding,
+  // which in script mode is the global — we model that as an
+  // opaque with a soundness assumption.
+  if (ctx._currentThisValue) {
+    return D.setReg(state, instr.dest, ctx._currentThisValue);
+  }
   const a = ctx.assumptions.raise(
     REASONS.UNIMPLEMENTED,
-    'this-binding resolution not yet modeled',
+    'this-binding resolution outside constructor / method context',
     loc
   );
   return D.setReg(state, instr.dest, D.opaque([a.id], null, loc));
@@ -891,15 +897,29 @@ function applyAlloc(ctx, state, instr) {
       fields[key] = D.getReg(state, reg);
     }
   }
+  // For class objects (kind='Class'), the typeName is the class
+  // name so instances created via `new ClassName(...)` can
+  // resolve their method lookups through the TypeDB (when the
+  // consumer provides one) and so applyNew can surface the
+  // class name on the allocated instance.
+  const cellTypeName = instr.kind === 'Class'
+    ? (instr.className || null)
+    : null;
   const cell = Object.freeze({
     kind: instr.kind || 'object',
     fields: Object.freeze(fields),
-    typeName: null,
+    typeName: cellTypeName,
     origin: loc,
   });
+  // The ObjectRef's typeName mirrors the cell's typeName (for
+  // class objects) or the IR kind (for plain objects/arrays).
+  // For plain objects we keep the legacy behaviour of passing
+  // instr.kind through.
+  const refTypeName = instr.kind === 'Class' ? 'class:' + (instr.className || 'anon')
+    : (instr.kind || null);
   if (!state._frozen) {
     state.heap.own.set(objId, cell);
-    return D.setReg(state, instr.dest, D.objectRef(objId, instr.kind || null, loc));
+    return D.setReg(state, instr.dest, D.objectRef(objId, refTypeName, loc));
   }
   const newHeap = { own: new Map([[objId, cell]]), parent: state.heap };
   const newState = Object.freeze({
@@ -910,7 +930,7 @@ function applyAlloc(ctx, state, instr) {
     callStack: state.callStack,
     _frozen: true,
   });
-  return D.setReg(newState, instr.dest, D.objectRef(objId, instr.kind || null, loc));
+  return D.setReg(newState, instr.dest, D.objectRef(objId, refTypeName, loc));
 }
 
 function applyFunc(ctx, state, instr) {
@@ -1058,10 +1078,15 @@ function applyCall(ctx, state, instr) {
     // callee's analysis runs in its own scope without
     // leaking into the caller's. The fields the caller's
     // worklist may have set:
-    //   currentPathCond, currentBlockId
+    //   currentPathCond, currentBlockId, _currentThisValue
     const savedPathCond = ctx.currentPathCond;
     const savedBlockId = ctx.currentBlockId;
+    const savedThis = ctx._currentThisValue;
     ctx._callStack.add(calleeFn.id);
+    // For method calls, bind `this` to the receiver. For free-
+    // function calls thisValue is null and we keep the saved
+    // value (which may itself be null at the top level).
+    if (thisValue) ctx._currentThisValue = thisValue;
     let calleeResult;
     try {
       const analyse = getAnalyseFunction();
@@ -1070,6 +1095,12 @@ function applyCall(ctx, state, instr) {
       ctx._callStack.delete(calleeFn.id);
       ctx.currentPathCond = savedPathCond;
       ctx.currentBlockId = savedBlockId;
+      ctx._currentThisValue = savedThis;
+    }
+    // Adopt the callee's heap writes so method-body side
+    // effects on `this` are visible to the caller.
+    if (calleeResult && calleeResult.exitState) {
+      state = D.withHeap(state, calleeResult.exitState.heap);
     }
 
     // Pull the return value from the callee's exit state.
@@ -1359,12 +1390,157 @@ function maybeEmitSinkFlowForCall(ctx, instr, thisValue, argValues, loc) {
 
 function applyNew(ctx, state, instr) {
   const loc = instrLoc(ctx, instr);
-  const a = ctx.assumptions.raise(
-    REASONS.UNIMPLEMENTED,
-    '`new` expression not yet modeled',
-    loc
-  );
-  return D.setReg(state, instr.dest, D.opaque([a.id], null, loc));
+  let ctorValue = D.getReg(state, instr.ctor);
+  const argValues = instr.args.map(r => D.getReg(state, r));
+
+  // Class objects: when a class is lowered via ClassDeclaration,
+  // the class name is bound to a heap-allocated object with a
+  // `__ctor__` field pointing at the real constructor closure.
+  // If extends is present, the class object also has a
+  // `__parent__` field pointing at the parent class object.
+  //
+  // When the ctor value is a class ObjectRef, we collect the
+  // ctor chain by walking __parent__ from root to leaf so the
+  // parent's constructor body runs before the child's (matching
+  // JS's `super()` semantics: the parent initialises its
+  // instance fields first, then the child overrides/adds its
+  // own).
+  let classTypeName = null;
+  let ctorChain = null;      // ordered root-first
+  if (ctorValue && ctorValue.kind === D.V.OBJECT) {
+    const cell = D.overlayGet(state.heap, ctorValue.objId);
+    if (cell && cell.fields && cell.fields.__ctor__) {
+      if (ctorValue.typeName && ctorValue.typeName.startsWith('class:')) {
+        classTypeName = ctorValue.typeName.slice('class:'.length);
+      }
+      ctorChain = [];
+      // Walk down from the leaf class collecting ctors; we
+      // unshift to build a root-first list so applyNew walks
+      // parents first.
+      let cur = ctorValue;
+      const seen = new Set();
+      while (cur && cur.kind === D.V.OBJECT && !seen.has(cur.objId)) {
+        seen.add(cur.objId);
+        const c = D.overlayGet(state.heap, cur.objId);
+        if (!c || !c.fields || !c.fields.__ctor__) break;
+        ctorChain.unshift(c.fields.__ctor__);
+        cur = c.fields.__parent__ || null;
+      }
+      ctorValue = cell.fields.__ctor__;
+    }
+  }
+
+  // Allocate a fresh object that will be the `this` inside the
+  // constructor body. The object's typeName is either the class
+  // name recovered above, or the ctor's own typeName (function
+  // name / calleeName hint) so instance property reads and sink
+  // classification can use the TypeDB to walk the prototype
+  // chain.
+  const typeName = classTypeName || ctorTypeName(ctx, ctorValue, instr);
+  const objId = nextObjId(ctx);
+  const thisRef = D.objectRef(objId, typeName, loc);
+  // Initialise an empty heap cell for the new object so
+  // constructor-body SetProps land somewhere.
+  let newState = initHeapCell(state, objId, typeName);
+
+  // Resolve the ctor chain. For a non-extends class the chain
+  // contains just the single ctor closure. For `Child extends
+  // Parent extends Grandparent`, the chain is [Grandparent,
+  // Parent, Child] (root-first) so their constructor bodies
+  // run in inheritance order with `this` bound to the same
+  // new object.
+  const chainFns = [];
+  if (ctorChain) {
+    for (const cv of ctorChain) {
+      let fn = null;
+      if (cv && cv.kind === D.V.CLOSURE && cv.functionId) {
+        fn = ctx.module.functions.find(f => f.id === cv.functionId);
+      }
+      if (fn && fn.cfg) chainFns.push(fn);
+    }
+  } else {
+    // Non-class ctor (regular `new Foo(args)` where Foo is a
+    // plain function). Fall back to the single-function path.
+    let calleeFn = null;
+    if (ctorValue && ctorValue.kind === D.V.CLOSURE && ctorValue.functionId) {
+      calleeFn = ctx.module.functions.find(f => f.id === ctorValue.functionId);
+    } else if (ctorValue && ctorValue.kind === D.V.OPAQUE && instr.calleeName) {
+      calleeFn = ctx.module.functions.find(f => f.name === instr.calleeName);
+    }
+    if (calleeFn && calleeFn.cfg) chainFns.push(calleeFn);
+  }
+  // Walk every ctor in the chain, root first. Each ctor sees
+  // the same `this` and (for simplicity) the same args — real
+  // JS would forward only what the child explicitly passes to
+  // super(args), but our Super support is coarse so we pass
+  // all args to every ctor. Overrides: a child ctor's SetProp
+  // on the same field replaces the parent's value.
+  for (const fn of chainFns) {
+    if (!ctx._callStack) ctx._callStack = new Set();
+    if (ctx._callStack.has(fn.id)) continue;   // recursion fallback
+    let calleeInit = D.createStateSharingHeap(newState);
+    for (let i = 0; i < fn.params.length; i++) {
+      const paramReg = fn.params[i];
+      const argValue = argValues[i] || D.concrete(undefined, undefined, loc);
+      calleeInit = D.setReg(calleeInit, paramReg, argValue);
+    }
+    const savedPathCond = ctx.currentPathCond;
+    const savedBlockId = ctx.currentBlockId;
+    const savedThis = ctx._currentThisValue;
+    ctx._callStack.add(fn.id);
+    ctx._currentThisValue = thisRef;
+    let calleeResult;
+    try {
+      const analyse = getAnalyseFunction();
+      calleeResult = analyse(ctx.module, fn, calleeInit, ctx);
+    } finally {
+      ctx._callStack.delete(fn.id);
+      ctx.currentPathCond = savedPathCond;
+      ctx.currentBlockId = savedBlockId;
+      ctx._currentThisValue = savedThis;
+    }
+    // Adopt the callee's heap so the caller sees each ctor's
+    // SetProps on `this`. Subsequent ctors in the chain run
+    // against this updated state.
+    if (calleeResult && calleeResult.exitState) {
+      newState = D.withHeap(newState, calleeResult.exitState.heap);
+    }
+  }
+  return D.setReg(newState, instr.dest, thisRef);
+}
+
+// initHeapCell — create an empty heap cell for a freshly
+// allocated object. Used by applyNew before walking the
+// constructor body so SetProp writes land in the cell.
+function initHeapCell(state, objId, typeName) {
+  const emptyCell = Object.freeze({
+    kind: 'object',
+    fields: Object.freeze(Object.create(null)),
+    typeName: typeName || null,
+    origin: null,
+  });
+  if (!state._frozen) {
+    state.heap.own.set(objId, emptyCell);
+    return state;
+  }
+  const newHeap = { own: new Map([[objId, emptyCell]]), parent: state.heap };
+  return Object.freeze({
+    regs: state.regs,
+    heap: newHeap,
+    pathConds: state.pathConds,
+    assumptionIds: state.assumptionIds,
+    callStack: state.callStack,
+    _frozen: true,
+  });
+}
+
+// Recover a TypeDB type name for a `new Ctor(args)` call. First
+// try the IR's `calleeName` hint (bare-identifier ctors like
+// `new Foo(...)`). Fall back to the ctor value's typeName.
+function ctorTypeName(ctx, ctorValue, instr) {
+  if (instr.calleeName) return instr.calleeName;
+  if (ctorValue && ctorValue.typeName) return ctorValue.typeName;
+  return null;
 }
 
 function applyCast(ctx, state, instr) {

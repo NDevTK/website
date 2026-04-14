@@ -36,6 +36,7 @@ const testFiles = [
   'arrow.test.js',
   'destructure.test.js',
   'modern-js.test.js',
+  'class.test.js',
 ];
 
 async function main() {

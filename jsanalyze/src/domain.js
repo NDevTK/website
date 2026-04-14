@@ -1110,6 +1110,20 @@ function createState() {
   });
 }
 
+// withHeap — return a new frozen state whose heap is replaced
+// by the given overlay. Used by applyNew to adopt a callee's
+// heap writes after a constructor walk completes.
+function withHeap(state, newHeap) {
+  return Object.freeze({
+    regs: state.regs,
+    heap: newHeap,
+    pathConds: state.pathConds,
+    assumptionIds: state.assumptionIds,
+    callStack: state.callStack,
+    _frozen: true,
+  });
+}
+
 // createStateSharingHeap — used by inter-procedural call
 // lowering (applyCall). Produces a fresh state whose `regs`
 // are empty but whose `heap` overlays the caller's, so the
@@ -1331,7 +1345,7 @@ module.exports = {
   withFormula, valueFormula,
   refineEq, refineNeq, refineByType, refineNotByType,
   refineInstanceof, refineNotInstanceof, typeChainIncludes,
-  createState, createStateSharingHeap, setReg, getReg, joinStates, stateLeq, stateEquals,
+  createState, createStateSharingHeap, withHeap, setReg, getReg, joinStates, stateLeq, stateEquals,
   unfreezeState, freezeState,
   overlayGet, overlayHas, overlayEntries, overlaySize, overlayFlatten,
   inferTypeName, canonKey,

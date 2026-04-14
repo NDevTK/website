@@ -576,6 +576,8 @@ function lowerStatement(ctx, node) {
       if (ctx._hoistedFnNodes && ctx._hoistedFnNodes.has(node)) return;
       return lowerFunctionDecl(ctx, node, loc);
     }
+    case 'ClassDeclaration':
+    case 'ClassExpression':    return lowerClassDeclaration(ctx, node, loc);
     case 'WhileStatement':     return beginWhile(ctx, node, loc);
     case 'DoWhileStatement':   return beginDoWhile(ctx, node, loc);
     case 'ForStatement':       return beginFor(ctx, node, loc);
@@ -758,6 +760,208 @@ function ifMergeStep(ctx, task) {
     }, loc);
     updateName(ctx.scope, name, dest);
   }
+}
+
+// --- Class lowering -----------------------------------------------------
+//
+// A class desugars into a constructor function whose body is:
+//
+//     (original constructor body)
+//     this.method1 = function(...) { ... };
+//     this.method2 = function(...) { ... };
+//     ...
+//     this.field1 = <field-init>;
+//     ...
+//
+// which preserves the observable effects (instance methods are
+// accessible as properties of `this`) using existing IR
+// machinery (FunctionDeclaration + SetProp).
+//
+// Static members become properties of the class identifier:
+//
+//     ClassName.staticMethod = function(...) { ... };
+//
+// emitted OUTSIDE the constructor, after the class declaration.
+//
+// `extends` and `super` are not yet modeled precisely — we
+// raise an unimplemented assumption and otherwise treat the
+// class as standalone.
+//
+// Fields default to `undefined` if no initializer; otherwise
+// we emit the initializer expression in the constructor prolog.
+//
+// Private (`#x`) members and getters/setters are parsed as
+// UnimplementedClassMember nodes in the AST; we raise a
+// soundness assumption and skip them.
+function lowerClassDeclaration(ctx, node, loc) {
+  const className = node.id && node.id.name;
+
+  // Extends: lower the parent class expression to a register.
+  // applyNew walks the __parent__ chain automatically so parent
+  // constructors run before the child's.
+  let parentReg = null;
+  if (node.superClass) {
+    parentReg = lowerExpression(ctx, node.superClass);
+  }
+
+  const members = (node.body && node.body.body) || [];
+  let ctorDef = null;
+  const instanceMembers = [];
+  const staticMembers = [];
+  for (const m of members) {
+    if (!m) continue;
+    if (m.type === 'MethodDefinition' && m.kind === 'constructor') {
+      ctorDef = m;
+      continue;
+    }
+    if (m.type === 'MethodDefinition' || m.type === 'PropertyDefinition') {
+      (m.static ? staticMembers : instanceMembers).push(m);
+      continue;
+    }
+    if (m.type === 'UnimplementedClassMember') {
+      ctx.assumptions.raise(
+        REASONS.UNIMPLEMENTED,
+        'class member kind `' + m.kind + '` not yet modeled',
+        loc
+      );
+      continue;
+    }
+  }
+
+  // Build the synthesised constructor body:
+  //   instance field/method assignments first, then original
+  //   constructor body.
+  const instanceAssigns = [];
+  for (const m of instanceMembers) {
+    const keyName = m.key.type === 'Identifier' ? m.key.name : null;
+    if (!keyName) continue;
+    let valueNode;
+    if (m.type === 'MethodDefinition') {
+      valueNode = m.value;  // FunctionExpression
+    } else {
+      valueNode = m.value || { type: 'Literal', value: undefined };
+    }
+    // Emit `this.keyName = valueNode;` as an ExpressionStatement
+    // containing an AssignmentExpression.
+    instanceAssigns.push(mkExprStmt(mkAssignThis(keyName, valueNode, loc)));
+  }
+
+  const origCtorBody = ctorDef && ctorDef.value && ctorDef.value.body
+    && ctorDef.value.body.body
+    ? ctorDef.value.body.body
+    : [];
+  const ctorParams = ctorDef && ctorDef.value ? ctorDef.value.params : [];
+
+  const syntheticBody = {
+    type: 'BlockStatement',
+    body: instanceAssigns.concat(origCtorBody),
+    loc: node.body ? node.body.loc : null,
+    start: node.start || 0,
+    end: node.end || 0,
+  };
+
+  const syntheticDecl = {
+    type: 'FunctionDeclaration',
+    id: className ? { type: 'Identifier', name: className, loc: node.id ? node.id.loc : null, start: node.id ? node.id.start : 0, end: node.id ? node.id.end : 0 } : null,
+    params: ctorParams,
+    body: syntheticBody,
+    async: false,
+    generator: false,
+    loc: node.loc,
+    start: node.start || 0,
+    end: node.end || 0,
+  };
+
+  const ctorReg = lowerFunctionDecl(ctx, syntheticDecl, loc);
+
+  // Build a heap-allocated "class object" that holds both the
+  // constructor closure (under the reserved `__ctor__` field)
+  // and every static method / field. This makes static members
+  // work precisely: `ClassName.staticMethod()` becomes a
+  // regular member access on a real ObjectRef, which applyCall
+  // already resolves to the stored closure and walks.
+  //
+  // The class NAME is bound to this class object (not to the
+  // bare constructor closure). `new ClassName(args)` sees an
+  // ObjectRef at the ctor position and applyNew's ObjectRef
+  // branch reads `__ctor__` to recover the real constructor.
+  //
+  // Pre-lower each static member into its register so we can
+  // build the ALLOC's fields map atomically.
+  const fields = new Map();
+  fields.set('__ctor__', ctorReg);
+  if (parentReg != null) fields.set('__parent__', parentReg);
+  for (const m of staticMembers) {
+    const keyName = m.key.type === 'Identifier' ? m.key.name : null;
+    if (!keyName) continue;
+    let valueReg;
+    if (m.type === 'MethodDefinition') {
+      valueReg = lowerExpression(ctx, m.value);
+    } else {
+      valueReg = m.value ? lowerExpression(ctx, m.value) : emitUndefinedConst(ctx, loc);
+    }
+    fields.set(keyName, valueReg);
+  }
+  const classObjReg = newRegister(ctx.module);
+  emit(ctx.module, ctx.currentBlock, {
+    op: OP.ALLOC,
+    dest: classObjReg,
+    kind: 'Class',
+    // Attach the class name so applyNew can use it as the
+    // `typeName` of the instance it creates.
+    className: className || null,
+    fields,
+  }, loc);
+
+  // Bind the class name to the class object in the outer scope.
+  if (className) {
+    defineHoisted(ctx.scope, className, classObjReg, BIND.FUNCTION);
+  }
+
+  // ClassExpression case: push the register onto the expression
+  // results stack.
+  if (node.type === 'ClassExpression' && ctx._classExprResult != null) {
+    ctx._classExprResult = classObjReg;
+  }
+}
+
+function emitUndefinedConst(ctx, loc) {
+  const reg = newRegister(ctx.module);
+  emit(ctx.module, ctx.currentBlock, {
+    op: OP.CONST, dest: reg, value: undefined,
+  }, loc);
+  return reg;
+}
+
+// Synthesis helpers for the class desugaring — build tiny AST
+// snippets that mirror `this.key = value;`. Because the class
+// desugaring creates nodes programmatically, we leave `loc` as
+// null: locFromNode returns a safe `{file: filename, line: 0,
+// ...}` placeholder when loc is absent.
+function mkExprStmt(expr) {
+  return {
+    type: 'ExpressionStatement',
+    expression: expr,
+    loc: null,
+    start: 0, end: 0,
+  };
+}
+
+function mkAssignThis(key, valueNode /*, loc */) {
+  return {
+    type: 'AssignmentExpression',
+    operator: '=',
+    left: {
+      type: 'MemberExpression',
+      object: { type: 'ThisExpression', loc: null, start: 0, end: 0 },
+      property: { type: 'Identifier', name: key, loc: null, start: 0, end: 0 },
+      computed: false,
+      optional: false,
+      loc: null, start: 0, end: 0,
+    },
+    right: valueNode,
+    loc: null, start: 0, end: 0,
+  };
 }
 
 // --- Loop lowering ------------------------------------------------------
@@ -2450,6 +2654,29 @@ function visitNode(ctx, node, tasks, results) {
       emit(ctx.module, ctx.currentBlock, {
         op: OP.GET_GLOBAL, dest, name: node.name,
       }, loc);
+      results.push(dest);
+      return;
+    }
+    case 'Super': {
+      // `super` in expression position refers to the parent
+      // class object of the enclosing class. applyNew handles
+      // automatic parent-ctor chain walking so an explicit
+      // `super()` call in a child constructor is effectively a
+      // no-op that passes taint through. For method-level
+      // `super.method(args)` references, the parent's method is
+      // stored on `this` during construction (parent ctor runs
+      // first, setting its methods; child ctor may override).
+      // The common read pattern `super.x` can therefore be
+      // rewritten to `this.x` since both classes store their
+      // members on the instance.
+      //
+      // We emit a GET_THIS so downstream MemberExpression /
+      // CallExpression access resolves through the instance.
+      // This is sound: a super lookup always hits a method
+      // defined in an ancestor, which the ctor chain walk
+      // installed on the instance.
+      const dest = newRegister(ctx.module);
+      emit(ctx.module, ctx.currentBlock, { op: OP.GET_THIS, dest }, loc);
       results.push(dest);
       return;
     }

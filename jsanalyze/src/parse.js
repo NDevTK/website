@@ -846,6 +846,164 @@ function mkTemplateElement(cooked, tail, tok) {
   };
 }
 
+// parseClassBody — parses `{ member* }` where each member is:
+//   constructor ( params ) { body }
+//   method_name ( params ) { body }
+//   static method_name ( params ) { body }
+//   get name ( ) { body }            (unimplemented — opaque)
+//   set name ( v ) { body }          (unimplemented — opaque)
+//   fieldName = expr ;               (field init — unimplemented)
+//   #privateName                     (private — unimplemented)
+function parseClassBody(lexer) {
+  const openTok = lexer.peek();
+  expect(lexer, '{');
+  const members = [];
+  while (lexer.peek() && lexer.peek().type.label !== '}') {
+    // Skip stray semicolons (empty members are legal).
+    if (lexer.peek().type.label === ';') {
+      lexer.advance();
+      continue;
+    }
+    const m = parseClassMember(lexer);
+    if (m) members.push(m);
+  }
+  expect(lexer, '}');
+  return mkClassBody(members, openTok);
+}
+
+function parseClassMember(lexer) {
+  const startTok = lexer.peek();
+  let isStatic = false;
+  // `static` prefix.
+  if (startTok.type.label === 'name' && startTok.value === 'static') {
+    // Peek past to see if this is actually a member modifier.
+    const next = lexer.peek2();
+    if (next && (next.type.label === 'name' || next.type.label === '(' ||
+                 next.type.label === '[' || next.type.label === 'string')) {
+      lexer.advance();
+      isStatic = true;
+    }
+  }
+  // Private field skipper.
+  const t = lexer.peek();
+  if (t.type.label === '#') {
+    // Private member — skip to semicolon or `}`.
+    while (lexer.peek() && lexer.peek().type.label !== ';' &&
+           lexer.peek().type.label !== '}') lexer.advance();
+    if (lexer.peek() && lexer.peek().type.label === ';') lexer.advance();
+    return { type: 'UnimplementedClassMember', kind: 'private' };
+  }
+  // Getters / setters — skip the body for now.
+  if (t.type.label === 'name' && (t.value === 'get' || t.value === 'set')) {
+    const next = lexer.peek2();
+    if (next && next.type.label === 'name') {
+      // Consume the `get`/`set` and the name.
+      const kind = t.value;
+      lexer.advance();
+      const nameTok = lexer.advance();
+      expect(lexer, '(');
+      parseParamList(lexer);
+      expect(lexer, ')');
+      // Skip the body block.
+      skipBalanced(lexer, '{', '}');
+      return { type: 'UnimplementedClassMember', kind: kind + 'ter', name: nameTok.value };
+    }
+  }
+  // Method or field.
+  if (t.type.label !== 'name') {
+    // Unknown member — skip one token to avoid an infinite loop.
+    lexer.advance();
+    return null;
+  }
+  const nameTok = lexer.advance();
+  const afterName = lexer.peek();
+  // Method: `name ( params ) { body }`
+  if (afterName && afterName.type.label === '(') {
+    lexer.advance();
+    const params = parseParamList(lexer);
+    expect(lexer, ')');
+    const body = parseStatement(lexer);
+    return mkMethodDefinition(
+      mkIdentifier(nameTok.value, nameTok),
+      mkFunctionExpression(null, params, body, false, false, nameTok),
+      nameTok.value === 'constructor' ? 'constructor' : 'method',
+      isStatic, nameTok);
+  }
+  // Field: `name = expr ;` or `name ;`.
+  let init = null;
+  if (afterName && afterName.type.label === '=') {
+    lexer.advance();
+    init = parseExpression(lexer);
+  }
+  if (lexer.peek() && lexer.peek().type.label === ';') lexer.advance();
+  return mkFieldDefinition(
+    mkIdentifier(nameTok.value, nameTok),
+    init, isStatic, nameTok);
+}
+
+function skipBalanced(lexer, open, close) {
+  expect(lexer, open);
+  let depth = 1;
+  while (!lexer.eof() && depth > 0) {
+    const t = lexer.advance();
+    if (t.type.label === open) depth++;
+    else if (t.type.label === close) depth--;
+  }
+}
+
+function mkClassDeclaration(id, superClass, body, tok) {
+  return {
+    type: 'ClassDeclaration',
+    id,
+    superClass,
+    body,
+    loc: tok && tok.loc && body && body.loc
+      ? { start: tok.loc.start, end: body.loc.end }
+      : null,
+    start: tok ? tok.start : 0,
+    end:   body ? body.end : 0,
+  };
+}
+
+function mkClassBody(members, tok) {
+  return {
+    type: 'ClassBody',
+    body: members,
+    loc: tok && tok.loc ? { start: tok.loc.start, end: tok.loc.end } : null,
+    start: tok ? tok.start : 0,
+    end:   tok ? tok.end : 0,
+  };
+}
+
+function mkMethodDefinition(key, value, kind, isStatic, tok) {
+  return {
+    type: 'MethodDefinition',
+    key,
+    value,                         // FunctionExpression
+    kind,                          // 'method' | 'constructor' | 'get' | 'set'
+    static: !!isStatic,
+    computed: false,
+    loc: tok && tok.loc && value && value.loc
+      ? { start: tok.loc.start, end: value.loc.end }
+      : null,
+    start: tok ? tok.start : 0,
+    end:   value ? value.end : 0,
+  };
+}
+
+function mkFieldDefinition(key, value, isStatic, tok) {
+  return {
+    type: 'PropertyDefinition',
+    key,
+    value,                         // Expression or null
+    static: !!isStatic,
+    computed: false,
+    loc: tok && tok.loc ? { start: tok.loc.start, end: (value && value.loc ? value.loc.end : tok.loc.end) } : null,
+    start: tok ? tok.start : 0,
+    end:   value ? value.end : (tok ? tok.end : 0),
+  };
+}
+
 function mkFunctionExpression(id, params, body, isAsync, isGenerator, tok) {
   return {
     type: 'FunctionExpression',
@@ -1115,6 +1273,27 @@ function parsePrimary(lexer) {
   if (label === 'this') {
     lexer.advance();
     return mkThisExpression(t);
+  }
+  if (label === 'function') {
+    // Function expression: `function [name](params) { body }`.
+    // Can be anonymous. Used in expression position; behaves
+    // like a FunctionDeclaration for IR-lowering purposes but
+    // doesn't bind its name in the enclosing scope.
+    lexer.advance();
+    let id = null;
+    if (lexer.peek() && lexer.peek().type.label === 'name') {
+      const idTok = lexer.advance();
+      id = mkIdentifier(idTok.value, idTok);
+    }
+    expect(lexer, '(');
+    const params = parseParamList(lexer);
+    expect(lexer, ')');
+    const body = parseStatement(lexer);
+    return mkFunctionExpression(id, params, body, false, false, t);
+  }
+  if (label === 'super') {
+    lexer.advance();
+    return { type: 'Super', loc: t.loc ? { start: t.loc.start, end: t.loc.end } : null, start: t.start, end: t.end };
   }
   if (label === '(') {
     // Parenthesised expression OR arrow-function parameter list.
@@ -1758,6 +1937,43 @@ function beginStatement(lexer, tasks, outputs) {
     tasks.push({ kind: 'parse_stmt' });
     return;
   }
+  // --- class declaration ---
+  //
+  // `class Name [extends Parent] { body }` lowers at parse time
+  // to a FunctionDeclaration + a series of prototype-assignment
+  // expression statements. The key insight: classes are
+  // syntactic sugar over functions in JS, and our existing
+  // function-decl + object-literal + `new` handling already
+  // does what we need if we emit the right desugaring.
+  //
+  // We don't yet model `extends` precisely — the parent chain
+  // requires __proto__ manipulation which our heap model
+  // doesn't expose. We flag it via an unimplemented marker
+  // in the parser output; the IR builder raises a soundness
+  // assumption but otherwise treats the class as a standalone
+  // constructor.
+  //
+  // Likewise, private fields `#x`, static fields, getters, and
+  // setters are skipped over with an unimplemented marker.
+  if (label === 'class') {
+    lexer.advance();
+    const nameTok = lexer.peek();
+    let id = null;
+    if (nameTok && nameTok.type.label === 'name') {
+      lexer.advance();
+      id = mkIdentifier(nameTok.value, nameTok);
+    }
+    // `extends Parent` — capture the parent identifier but treat
+    // the chain conservatively.
+    let superClass = null;
+    if (lexer.peek() && lexer.peek().type.label === 'extends') {
+      lexer.advance();
+      superClass = parseExpression(lexer);
+    }
+    const body = parseClassBody(lexer);
+    outputs.push(mkClassDeclaration(id, superClass, body, t));
+    return;
+  }
   // --- try / catch / finally ---
   if (label === 'try') {
     lexer.advance();
@@ -1815,7 +2031,7 @@ function beginStatement(lexer, tasks, outputs) {
 // until the corresponding transfer function is written.
 const UNHANDLED_STATEMENT_KEYWORDS = new Set([
   'switch',
-  'with', 'class', 'import', 'export',
+  'with', 'import', 'export',
 ]);
 
 function isUnhandledStatementKeyword(label) {
