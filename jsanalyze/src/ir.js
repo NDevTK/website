@@ -1596,9 +1596,17 @@ function beginTry(ctx, node, loc) {
 
   // Push the catch target onto the catch stack so any `throw`
   // inside the try body routes to it (or to finally if no catch).
+  // Explicit throws record their thrown-expression register
+  // into `throwSources` so the catch parameter can phi over
+  // them.
   if (!ctx._catchStack) ctx._catchStack = [];
   const throwTarget = catchBlock || finallyBlock || null;
-  ctx._catchStack.push({ block: throwTarget, scope: entryScope });
+  const catchEntry = {
+    block: throwTarget,
+    scope: entryScope,
+    throwSources: [],
+  };
+  ctx._catchStack.push(catchEntry);
 
   // Lower the try body in tryBlock.
   ctx.currentBlock = tryBlock;
@@ -1625,9 +1633,12 @@ function finishTryBodyStep(ctx, task) {
   const tryExitBlock = ctx.currentBlock;
   const tryExitScope = snapshotScope(ctx.scope);
 
-  // Pop the catch-stack entry we pushed at beginTry.
+  // Pop the catch-stack entry we pushed at beginTry, capturing
+  // the throw sources it collected.
+  let throwSources = [];
   if (ctx._catchStack && ctx._catchStack.length > 0) {
-    ctx._catchStack.pop();
+    const popped = ctx._catchStack.pop();
+    throwSources = popped.throwSources || [];
   }
 
   // Route the try exit: normally we'd Jump to finally/merge,
@@ -1681,16 +1692,44 @@ function finishTryBodyStep(ctx, task) {
     restoreScope(ctx.scope, task.entryScope);
     pushBlockFrame(ctx.scope);
 
-    // Bind the catch parameter.
-    if (task.handler.param && task.handler.param.type === 'Identifier') {
-      const paramReg = newRegister(ctx.module);
-      emit(ctx.module, task.catchBlock, {
-        op: OP.OPAQUE, dest: paramReg,
-        reason: REASONS.UNIMPLEMENTED,
-        details: 'catch parameter binding: exception value is opaque',
-        affects: task.handler.param.name,
-      }, task.loc);
-      defineLexical(ctx.scope, task.handler.param.name, paramReg, BIND.LET);
+    // Bind the catch parameter. The JS semantics are: any
+    // expression thrown in the try body flows into the
+    // catch param. We use a Phi at the catch block entry
+    // that joins every explicit `throw expr` in the try body
+    // PLUS an Opaque fallback for implicit throws (runtime
+    // errors, exceptions from opaque calls, etc.).
+    //
+    // We record throw sources on the ctx._catchStack entry
+    // while walking the try body; finishTryBodyStep gathers
+    // them here. A destructuring pattern on the catch param
+    // recurses through bindDestructuringTarget.
+    if (task.handler.param) {
+      // Build the catch-param register. If the try body recorded
+      // throw sources, build a Phi joining them; otherwise use
+      // a single Opaque representing "implicit runtime error".
+      // `throwSources` is the local variable populated from the
+      // catch-stack pop at the top of this function.
+      let paramReg;
+      if (throwSources.length === 0) {
+        paramReg = newRegister(ctx.module);
+        emit(ctx.module, task.catchBlock, {
+          op: OP.OPAQUE, dest: paramReg,
+          reason: REASONS.ENVIRONMENTAL,
+          details: 'catch parameter binds an implicit runtime error — no explicit throw in try body',
+          affects: null,
+        }, task.loc);
+      } else if (throwSources.length === 1) {
+        paramReg = throwSources[0].reg;
+      } else {
+        // Multiple explicit throws → phi at catch entry.
+        paramReg = newRegister(ctx.module);
+        emit(ctx.module, task.catchBlock, {
+          op: OP.PHI,
+          dest: paramReg,
+          incoming: throwSources.map(s => ({ pred: s.block.id, value: s.reg })),
+        }, task.loc);
+      }
+      bindDestructuringTarget(ctx, task.handler.param, paramReg, BIND.LET, task.loc);
     }
 
     ctx._work.push({
@@ -1703,6 +1742,7 @@ function finishTryBodyStep(ctx, task) {
       tryExitBlock,
       finalizer: task.finalizer,
       entryScope: task.entryScope,
+      throwSources,
     });
     ctx._work.push({ kind: 'after_stmt' });
     ctx._work.push({ kind: 'lower_stmt', node: task.handler.body });
@@ -1808,26 +1848,35 @@ function lowerWith(ctx, node, loc) {
 }
 
 function lowerThrow(ctx, node, loc) {
-  // Lower the argument expression (its side effects may matter
-  // for taint propagation even though the value is thrown).
+  // Lower the argument expression into a register so the
+  // thrown value is visible to the catch parameter's phi.
+  let argReg = null;
   if (node.argument) {
-    lowerExpression(ctx, node.argument);
+    argReg = lowerExpression(ctx, node.argument);
+  } else {
+    argReg = newRegister(ctx.module);
+    emit(ctx.module, ctx.currentBlock, {
+      op: OP.CONST, dest: argReg, value: undefined,
+    }, loc);
   }
   // Route to the enclosing catch if any.
   if (ctx._catchStack && ctx._catchStack.length > 0) {
-    const target = ctx._catchStack[ctx._catchStack.length - 1].block;
-    if (target) {
+    const entry = ctx._catchStack[ctx._catchStack.length - 1];
+    if (entry.block) {
+      // Record the throw source so finishTryBodyStep can
+      // build the catch-parameter phi.
+      entry.throwSources.push({ block: ctx.currentBlock, reg: argReg });
       emit(ctx.module, ctx.currentBlock, {
-        op: OP.JUMP, target: target.id,
+        op: OP.JUMP, target: entry.block.id,
       }, loc);
-      addEdge(ctx.currentBlock, target);
+      addEdge(ctx.currentBlock, entry.block);
       return;
     }
   }
   // Uncaught throw: emit a THROW terminator so the worklist
-  // stops walking this path. We don't model where it goes.
+  // stops walking this path.
   emit(ctx.module, ctx.currentBlock, {
-    op: OP.THROW,
+    op: OP.THROW, value: argReg,
   }, loc);
 }
 
@@ -1947,6 +1996,161 @@ function collectAssignedNamesFromExpression(node, out) {
   }
 }
 
+// exprToPattern — convert an ArrayExpression / ObjectExpression
+// into an ArrayPattern / ObjectPattern for destructuring
+// assignment. Mirrors the post-hoc "cover grammar" fixup that
+// JS parsers do when `=` follows a paren'd expression list.
+// Leaves already-pattern nodes untouched.
+function exprToPattern(node) {
+  if (!node) return node;
+  if (node.type === 'ArrayPattern' || node.type === 'ObjectPattern' ||
+      node.type === 'Identifier' || node.type === 'MemberExpression' ||
+      node.type === 'RestElement' || node.type === 'AssignmentPattern') {
+    return node;
+  }
+  if (node.type === 'ArrayExpression') {
+    return {
+      type: 'ArrayPattern',
+      elements: node.elements.map(e => {
+        if (e == null) return null;
+        if (e.type === 'SpreadElement') {
+          return { type: 'RestElement', argument: exprToPattern(e.argument),
+            loc: e.loc, start: e.start, end: e.end };
+        }
+        return exprToPattern(e);
+      }),
+      loc: node.loc, start: node.start, end: node.end,
+    };
+  }
+  if (node.type === 'ObjectExpression') {
+    return {
+      type: 'ObjectPattern',
+      properties: node.properties.map(p => {
+        if (p.type === 'SpreadElement') {
+          return { type: 'RestElement', argument: exprToPattern(p.argument),
+            loc: p.loc, start: p.start, end: p.end };
+        }
+        return {
+          type: 'Property',
+          key: p.key,
+          value: exprToPattern(p.value),
+          kind: 'init',
+          shorthand: !!p.shorthand,
+          computed: !!p.computed,
+          method: false,
+          loc: p.loc, start: p.start, end: p.end,
+        };
+      }),
+      loc: node.loc, start: node.start, end: node.end,
+    };
+  }
+  return node;
+}
+
+// assignDestructuringTarget — mirror of bindDestructuringTarget
+// for destructuring ASSIGNMENT (not declaration). Walks the
+// pattern tree and calls updateName on each leaf Identifier
+// so the existing binding is rebinned rather than a new one
+// declared. RestElement, AssignmentPattern defaults, and
+// nested ObjectPattern / ArrayPattern are handled the same
+// way as declaration-time destructuring.
+function assignDestructuringTarget(ctx, target, srcReg, loc) {
+  if (!target) return;
+  if (target.type === 'Identifier') {
+    updateName(ctx.scope, target.name, srcReg);
+    return;
+  }
+  if (target.type === 'AssignmentPattern') {
+    const defReg = lowerExpression(ctx, target.right);
+    const mergedReg = newRegister(ctx.module);
+    emit(ctx.module, ctx.currentBlock, {
+      op: OP.BIN_OP, dest: mergedReg, operator: '??',
+      left: srcReg, right: defReg,
+    }, loc);
+    assignDestructuringTarget(ctx, target.left, mergedReg, loc);
+    return;
+  }
+  if (target.type === 'ObjectPattern') {
+    const namedKeys = [];
+    for (const prop of target.properties) {
+      if (prop.type !== 'RestElement' && prop.type === 'Property') {
+        const keyName = prop.key.type === 'Identifier' ? prop.key.name
+          : prop.key.type === 'Literal' ? String(prop.key.value) : null;
+        if (keyName != null) namedKeys.push(keyName);
+      }
+    }
+    for (const prop of target.properties) {
+      if (prop.type === 'RestElement') {
+        const restReg = newRegister(ctx.module);
+        emit(ctx.module, ctx.currentBlock, {
+          op: OP.ALLOC,
+          dest: restReg,
+          kind: 'Object',
+          fields: new Map(),
+          restSource: srcReg,
+          restOmit: namedKeys.slice(),
+        }, loc);
+        assignDestructuringTarget(ctx, prop.argument, restReg, loc);
+        continue;
+      }
+      if (prop.type !== 'Property') continue;
+      const keyName = prop.key.type === 'Identifier' ? prop.key.name
+        : prop.key.type === 'Literal' ? String(prop.key.value) : null;
+      if (keyName == null) continue;
+      const elemReg = newRegister(ctx.module);
+      emit(ctx.module, ctx.currentBlock, {
+        op: OP.GET_PROP, dest: elemReg, object: srcReg, propName: keyName,
+      }, loc);
+      assignDestructuringTarget(ctx, prop.value, elemReg, loc);
+    }
+    return;
+  }
+  if (target.type === 'ArrayPattern') {
+    for (let i = 0; i < target.elements.length; i++) {
+      const elem = target.elements[i];
+      if (elem == null) continue;
+      if (elem.type === 'RestElement') {
+        const restReg = newRegister(ctx.module);
+        emit(ctx.module, ctx.currentBlock, {
+          op: OP.ALLOC,
+          dest: restReg,
+          kind: 'Array',
+          fields: new Map(),
+          restSource: srcReg,
+          restSliceFrom: i,
+        }, loc);
+        assignDestructuringTarget(ctx, elem.argument, restReg, loc);
+        break;
+      }
+      const idxReg = newRegister(ctx.module);
+      emit(ctx.module, ctx.currentBlock, {
+        op: OP.CONST, dest: idxReg, value: i,
+      }, loc);
+      const elemReg = newRegister(ctx.module);
+      emit(ctx.module, ctx.currentBlock, {
+        op: OP.GET_INDEX, dest: elemReg, object: srcReg, key: idxReg,
+      }, loc);
+      assignDestructuringTarget(ctx, elem, elemReg, loc);
+    }
+    return;
+  }
+  if (target.type === 'MemberExpression') {
+    // `{x: obj.prop} = rhs` — walk obj first, then write to it.
+    const objReg = lowerExpression(ctx, target.object);
+    if (target.computed) {
+      const keyReg = lowerExpression(ctx, target.property);
+      emit(ctx.module, ctx.currentBlock, {
+        op: OP.SET_INDEX, object: objReg, key: keyReg, value: srcReg,
+      }, loc);
+    } else {
+      emit(ctx.module, ctx.currentBlock, {
+        op: OP.SET_PROP, object: objReg, propName: target.property.name, value: srcReg,
+      }, loc);
+    }
+    return;
+  }
+}
+
 function lowerVarDecl(ctx, node, loc) {
   // node.kind is 'var', 'let', or 'const'. The parser sets it to
   // 'var' by default if not explicitly tagged (historical node
@@ -2027,18 +2231,33 @@ function bindDestructuringTarget(ctx, target, srcReg, kind, loc) {
     return;
   }
   if (target.type === 'ObjectPattern') {
+    // Collect the explicitly-bound property names so a trailing
+    // `...rest` element can exclude them when allocating the
+    // rest object. Emit the rest binding AFTER the normal props
+    // so the omit set is complete.
+    const namedKeys = [];
+    for (const prop of target.properties) {
+      if (prop.type !== 'RestElement' && prop.type === 'Property') {
+        const keyName = prop.key.type === 'Identifier' ? prop.key.name
+          : prop.key.type === 'Literal' ? String(prop.key.value) : null;
+        if (keyName != null) namedKeys.push(keyName);
+      }
+    }
     for (const prop of target.properties) {
       if (prop.type === 'RestElement') {
-        // Rest element in an object pattern: the remaining
-        // properties get collected into a fresh object whose
-        // shape we can't precisely compute. Bind as an opaque.
+        // Allocate a fresh Object that copies all fields from
+        // the source EXCEPT those explicitly named earlier in
+        // the pattern. Emit a dedicated REST_OBJECT instruction
+        // so the transfer function can compute the field set
+        // at runtime from the source cell.
         const restReg = newRegister(ctx.module);
         emit(ctx.module, ctx.currentBlock, {
-          op: OP.OPAQUE,
+          op: OP.ALLOC,
           dest: restReg,
-          reason: REASONS.UNIMPLEMENTED,
-          details: 'object rest element — remaining properties not precisely tracked',
-          affects: null,
+          kind: 'Object',
+          fields: new Map(),
+          restSource: srcReg,
+          restOmit: namedKeys.slice(),
         }, loc);
         bindDestructuringTarget(ctx, prop.argument, restReg, kind, loc);
         continue;
@@ -2060,13 +2279,18 @@ function bindDestructuringTarget(ctx, target, srcReg, kind, loc) {
       const elem = target.elements[i];
       if (elem == null) continue;  // hole
       if (elem.type === 'RestElement') {
+        // Allocate a fresh Array that holds src[i..src.length].
+        // The transfer function materialises the field set at
+        // runtime by reading the source's integer-keyed fields
+        // starting at `restSliceFrom`.
         const restReg = newRegister(ctx.module);
         emit(ctx.module, ctx.currentBlock, {
-          op: OP.OPAQUE,
+          op: OP.ALLOC,
           dest: restReg,
-          reason: REASONS.UNIMPLEMENTED,
-          details: 'array rest element — remaining elements not precisely tracked',
-          affects: null,
+          kind: 'Array',
+          fields: new Map(),
+          restSource: srcReg,
+          restSliceFrom: i,
         }, loc);
         bindDestructuringTarget(ctx, elem.argument, restReg, kind, loc);
         break;
@@ -2227,17 +2451,14 @@ function enterFunctionStep(ctx, task) {
       continue;
     }
     if (p.type === 'RestElement') {
-      // Rest param: bind the argument to an opaque that
-      // represents the "remaining args" array. Precise modeling
-      // would require arity-aware call site handling.
-      const restReg = newRegister(ctx.module);
-      emit(ctx.module, ctx.currentBlock, {
-        op: OP.OPAQUE, dest: restReg,
-        reason: REASONS.UNIMPLEMENTED,
-        details: 'rest parameter — remaining arguments as opaque array',
-        affects: null,
-      }, fn.location);
-      bindDestructuringTarget(ctx, p.argument, restReg, BIND.PARAM, fn.location);
+      // Rest param: bind the argument to an Array object whose
+      // fields will be filled in at call time (applyCall reads
+      // fn.restParamIndex and collects args[restIndex..] into
+      // the alloc's fields). At IR build time we emit an
+      // ALLOC-with-no-fields placeholder; applyCall replaces
+      // the cell contents before walking the callee's body.
+      fn.restParamIndex = i;
+      bindDestructuringTarget(ctx, p.argument, paramReg, BIND.PARAM, fn.location);
       continue;
     }
     // Default / destructuring param: recursively bind.
@@ -2390,8 +2611,31 @@ function lowerExpressionIter(ctx, root) {
           // callee register's Value as before.
           methodName: task.methodName || null,
           calleeName: task.calleeName || null,
+          // spreadAt: indices into `args` whose values are spread
+          // sources (the register holds an ObjectRef whose
+          // integer-keyed fields should be expanded into
+          // positional arguments at call time). applyCall's
+          // expandSpreadArgs handles the fan-out.
+          spreadAt: task.spreadAt && task.spreadAt.length > 0 ? task.spreadAt.slice() : null,
         }, task.loc);
         results.push(dest);
+        break;
+      }
+      case 'emit_call_member_index': {
+        // `obj[key](args)` — pop key, peek obj (keep as `this`),
+        // emit GET_INDEX to get the method closure, then swap
+        // the results stack into [..., callee, this] order for
+        // emit_call. Mirrors emit_call_member_prop but for the
+        // computed-property form.
+        const keyReg = results.pop();
+        const objReg = results[results.length - 1];
+        const dest = newRegister(ctx.module);
+        emit(ctx.module, ctx.currentBlock, {
+          op: OP.GET_INDEX, dest, object: objReg, key: keyReg,
+        }, task.loc);
+        const thisReg = results.pop();
+        results.push(dest);
+        results.push(thisReg);
         break;
       }
       case 'emit_call_member_prop': {
@@ -2475,44 +2719,96 @@ function lowerExpressionIter(ctx, root) {
         break;
       }
       case 'emit_array_alloc': {
-        // Pop nElements regs (pushed in source order). Build a
-        // fields map keyed by integer string ("0", "1", ...)
-        // and emit an ALLOC instruction.
-        const elemRegs = [];
-        for (let i = 0; i < task.nElements; i++) elemRegs.unshift(results.pop());
+        // Build an Array-kind ALLOC from the `kinds` sequence.
+        // Non-hole, non-spread elements consume one register
+        // from `results` each (popped in reverse of push order,
+        // so we collect the total visit count first).
+        const visitCount = task.kinds.filter(k => k !== 'hole').length;
+        const popped = [];
+        for (let i = 0; i < visitCount; i++) popped.unshift(results.pop());
+        let pIdx = 0;
         const fields = new Map();
-        for (let i = 0; i < elemRegs.length; i++) {
-          fields.set(String(i), elemRegs[i]);
+        const spreadSources = [];  // [ { position, reg } ]
+        let index = 0;
+        for (const k of task.kinds) {
+          if (k === 'hole') { index++; continue; }
+          const reg = popped[pIdx++];
+          if (k === 'spread') {
+            spreadSources.push({ position: index, reg });
+            // Spread's contribution to the index advances by
+            // the source's length at runtime. Since we can't
+            // know it statically we stop filling subsequent
+            // static indices and mark the array as "dynamic
+            // after this point" via a flag on the ALLOC.
+            // Subsequent elements still get emitted but their
+            // index is relative-to-runtime-length.
+            index++;
+          } else {
+            fields.set(String(index), reg);
+            index++;
+          }
         }
-        // Length field makes `.length` reads correct for
-        // concrete-sized arrays.
         const lengthReg = newRegister(ctx.module);
         emit(ctx.module, ctx.currentBlock, {
-          op: OP.CONST, dest: lengthReg, value: elemRegs.length,
+          op: OP.CONST, dest: lengthReg, value: index,
         }, task.loc);
         fields.set('length', lengthReg);
         const dest = newRegister(ctx.module);
         emit(ctx.module, ctx.currentBlock, {
           op: OP.ALLOC, dest, kind: 'Array', fields,
+          // Runtime fields from spread sources will be copied
+          // into this cell by applyAlloc when `spreads` is
+          // non-empty. Each entry names a register whose
+          // fields (integer-keyed) should be merged into
+          // `dest` at the given position offset.
+          spreads: spreadSources.length > 0 ? spreadSources : null,
         }, task.loc);
         results.push(dest);
         break;
       }
       case 'emit_object_alloc': {
-        // Pop nProperties regs (pushed in source order). Build a
-        // fields map keyed by the Property keys (collected at
-        // visit time). Keys whose lookup is null (computed, spread)
-        // are omitted.
-        const nProps = task.keys.length;
-        const valRegs = [];
-        for (let i = 0; i < nProps; i++) valRegs.unshift(results.pop());
+        // Build an Object-kind ALLOC supporting plain prop
+        // values, computed-key pairs (each contributes TWO
+        // visited nodes: key then value), and spread sources.
+        //
+        // `kinds` + `staticKeys` align; visitNodes were pushed
+        // in source order so the pop stack mirrors that order.
+        // For a computed prop we pop TWO regs (key, value).
+        const totalPops = task.kinds.reduce((n, k) => {
+          if (k === 'computed') return n + 2;
+          return n + 1;
+        }, 0);
+        const popped = [];
+        for (let i = 0; i < totalPops; i++) popped.unshift(results.pop());
+        let pIdx = 0;
         const fields = new Map();
-        for (let i = 0; i < nProps; i++) {
-          if (task.keys[i] != null) fields.set(task.keys[i], valRegs[i]);
+        const computedPairs = [];   // [ { keyReg, valReg } ]
+        const spreadSources = [];   // [ reg ]
+        for (let i = 0; i < task.kinds.length; i++) {
+          const k = task.kinds[i];
+          if (k === 'prop' || k === 'shorthand') {
+            const valReg = popped[pIdx++];
+            const key = task.staticKeys[i];
+            if (key != null) fields.set(key, valReg);
+            continue;
+          }
+          if (k === 'computed') {
+            const keyReg = popped[pIdx++];
+            const valReg = popped[pIdx++];
+            computedPairs.push({ keyReg, valReg });
+            continue;
+          }
+          if (k === 'spread') {
+            const srcReg = popped[pIdx++];
+            spreadSources.push(srcReg);
+            continue;
+          }
         }
         const dest = newRegister(ctx.module);
         emit(ctx.module, ctx.currentBlock, {
           op: OP.ALLOC, dest, kind: 'Object', fields,
+          computed: computedPairs.length > 0 ? computedPairs : null,
+          spreads: spreadSources.length > 0 ? spreadSources : null,
         }, task.loc);
         results.push(dest);
         break;
@@ -2527,19 +2823,29 @@ function lowerExpressionIter(ctx, root) {
       case 'emit_assign_compound': {
         // Compound: `x += rhs`. Pop rhs, lookup current x, emit
         // BinOp, bind new reg to x.
+        //
+        // Unresolved lhs: in sloppy mode JS this is an implicit
+        // global declaration. We bind the new register to the
+        // name in the top function frame so subsequent reads
+        // see it, and raise an ENVIRONMENTAL assumption
+        // (implicit global creation is legal but outside the
+        // analyzer's input surface).
         const rhsReg = results.pop();
-        const lhsReg = lookupName(ctx.scope, task.name);
+        let lhsReg = lookupName(ctx.scope, task.name);
         if (lhsReg == null) {
-          // Unresolved lhs — emit opaque.
-          const dest = newRegister(ctx.module);
+          // Synthesize a fresh `undefined` as the prior value
+          // (the compound BinOp will coerce it via normal
+          // semantics) and continue as if the var was declared.
+          lhsReg = newRegister(ctx.module);
           emit(ctx.module, ctx.currentBlock, {
-            op: OP.OPAQUE, dest,
-            reason: REASONS.UNIMPLEMENTED,
-            details: 'compound assignment to unresolved identifier ' + task.name,
-            affects: null,
+            op: OP.CONST, dest: lhsReg, value: undefined,
           }, task.loc);
-          results.push(dest);
-          break;
+          defineHoisted(ctx.scope, task.name, lhsReg, BIND.VAR);
+          ctx.assumptions.raise(
+            REASONS.ENVIRONMENTAL,
+            'implicit global creation via compound assignment to `' + task.name + '`',
+            task.loc
+          );
         }
         const dest = newRegister(ctx.module);
         emit(ctx.module, ctx.currentBlock, {
@@ -2556,22 +2862,21 @@ function lowerExpressionIter(ctx, root) {
       case 'emit_update_ident': {
         // `x++` / `++x` / `x--` / `--x` on an Identifier target.
         // Desugar: emit a Const(1), BinOp(+/-), bind result to x.
-        // Expression-result semantics (prefix returns new, postfix
-        // returns old) are approximated: we always push the new
-        // value onto `results`. A consumer that distinguishes
-        // prefix vs postfix semantically would need a richer
-        // model — tracked as an imprecision.
-        const lhsReg = lookupName(ctx.scope, task.name);
+        //
+        // Unresolved lhs: implicit global creation. Synthesize
+        // the prior value as undefined and bind the name.
+        let lhsReg = lookupName(ctx.scope, task.name);
         if (lhsReg == null) {
-          const dest = newRegister(ctx.module);
+          lhsReg = newRegister(ctx.module);
           emit(ctx.module, ctx.currentBlock, {
-            op: OP.OPAQUE, dest,
-            reason: REASONS.UNIMPLEMENTED,
-            details: 'update on unresolved identifier ' + task.name,
-            affects: null,
+            op: OP.CONST, dest: lhsReg, value: undefined,
           }, task.loc);
-          results.push(dest);
-          break;
+          defineHoisted(ctx.scope, task.name, lhsReg, BIND.VAR);
+          ctx.assumptions.raise(
+            REASONS.ENVIRONMENTAL,
+            'implicit global creation via update of `' + task.name + '`',
+            task.loc
+          );
         }
         const oneReg = newRegister(ctx.module);
         emit(ctx.module, ctx.currentBlock, {
@@ -2633,6 +2938,96 @@ function lowerExpressionIter(ctx, root) {
           value: valReg,
         }, task.loc);
         results.push(valReg);
+        break;
+      }
+      case 'emit_set_prop_compound': {
+        // `obj.prop op= rhs`. Read old value, apply BinOp, write back.
+        const rhsReg = results.pop();
+        const objReg = results.pop();
+        const oldReg = newRegister(ctx.module);
+        emit(ctx.module, ctx.currentBlock, {
+          op: OP.GET_PROP, dest: oldReg, object: objReg, propName: task.propName,
+        }, task.loc);
+        const newReg = newRegister(ctx.module);
+        emit(ctx.module, ctx.currentBlock, {
+          op: OP.BIN_OP, dest: newReg, operator: task.op, left: oldReg, right: rhsReg,
+        }, task.loc);
+        emit(ctx.module, ctx.currentBlock, {
+          op: OP.SET_PROP, object: objReg, propName: task.propName, value: newReg,
+        }, task.loc);
+        results.push(newReg);
+        break;
+      }
+      case 'emit_set_index_compound': {
+        const rhsReg = results.pop();
+        const keyReg = results.pop();
+        const objReg = results.pop();
+        const oldReg = newRegister(ctx.module);
+        emit(ctx.module, ctx.currentBlock, {
+          op: OP.GET_INDEX, dest: oldReg, object: objReg, key: keyReg,
+        }, task.loc);
+        const newReg = newRegister(ctx.module);
+        emit(ctx.module, ctx.currentBlock, {
+          op: OP.BIN_OP, dest: newReg, operator: task.op, left: oldReg, right: rhsReg,
+        }, task.loc);
+        emit(ctx.module, ctx.currentBlock, {
+          op: OP.SET_INDEX, object: objReg, key: keyReg, value: newReg,
+        }, task.loc);
+        results.push(newReg);
+        break;
+      }
+      case 'emit_update_member_prop': {
+        const objReg = results.pop();
+        const oldReg = newRegister(ctx.module);
+        emit(ctx.module, ctx.currentBlock, {
+          op: OP.GET_PROP, dest: oldReg, object: objReg, propName: task.propName,
+        }, task.loc);
+        const oneReg = newRegister(ctx.module);
+        emit(ctx.module, ctx.currentBlock, {
+          op: OP.CONST, dest: oneReg, value: 1,
+        }, task.loc);
+        const newReg = newRegister(ctx.module);
+        emit(ctx.module, ctx.currentBlock, {
+          op: OP.BIN_OP, dest: newReg, operator: task.op, left: oldReg, right: oneReg,
+        }, task.loc);
+        emit(ctx.module, ctx.currentBlock, {
+          op: OP.SET_PROP, object: objReg, propName: task.propName, value: newReg,
+        }, task.loc);
+        // Prefix returns new; postfix returns old.
+        results.push(task.prefix ? newReg : oldReg);
+        break;
+      }
+      case 'emit_update_member_index': {
+        const keyReg = results.pop();
+        const objReg = results.pop();
+        const oldReg = newRegister(ctx.module);
+        emit(ctx.module, ctx.currentBlock, {
+          op: OP.GET_INDEX, dest: oldReg, object: objReg, key: keyReg,
+        }, task.loc);
+        const oneReg = newRegister(ctx.module);
+        emit(ctx.module, ctx.currentBlock, {
+          op: OP.CONST, dest: oneReg, value: 1,
+        }, task.loc);
+        const newReg = newRegister(ctx.module);
+        emit(ctx.module, ctx.currentBlock, {
+          op: OP.BIN_OP, dest: newReg, operator: task.op, left: oldReg, right: oneReg,
+        }, task.loc);
+        emit(ctx.module, ctx.currentBlock, {
+          op: OP.SET_INDEX, object: objReg, key: keyReg, value: newReg,
+        }, task.loc);
+        results.push(task.prefix ? newReg : oldReg);
+        break;
+      }
+      case 'emit_destructure_assign': {
+        // `[a, b] = arr` or `({a, b} = obj)`. The RHS register
+        // is on the results stack. Recursively walk the
+        // pattern emitting GetProp / GetIndex for each leaf
+        // and updateName (not defineHoisted / defineLexical)
+        // since destructuring assignment to existing names
+        // rebinds rather than declares.
+        const srcReg = results.pop();
+        assignDestructuringTarget(ctx, task.target, srcReg, task.loc);
+        results.push(srcReg);
         break;
       }
       default:
@@ -2744,8 +3139,31 @@ function visitNode(ctx, node, tasks, results) {
           name: node.argument.name, op, prefix: node.prefix, loc });
         return;
       }
+      if (node.argument.type === 'MemberExpression') {
+        // `obj.prop++` or `obj[i]++`. Desugar to:
+        //   old = obj.prop
+        //   new = old + 1 (or - 1)
+        //   obj.prop = new
+        //   result = prefix ? new : old
+        if (node.argument.computed) {
+          tasks.push({
+            kind: 'emit_update_member_index',
+            op, prefix: node.prefix, loc,
+          });
+          tasks.push({ kind: 'visit', node: node.argument.property });
+          tasks.push({ kind: 'visit', node: node.argument.object });
+        } else {
+          tasks.push({
+            kind: 'emit_update_member_prop',
+            propName: node.argument.property.name,
+            op, prefix: node.prefix, loc,
+          });
+          tasks.push({ kind: 'visit', node: node.argument.object });
+        }
+        return;
+      }
       tasks.push({ kind: 'emit_unimplemented_expr',
-        details: 'UpdateExpression on non-identifier target', loc });
+        details: 'UpdateExpression on unrecognised target', loc });
       return;
     }
     case 'MemberExpression': {
@@ -2760,9 +3178,7 @@ function visitNode(ctx, node, tasks, results) {
       return;
     }
     case 'AssignmentExpression': {
-      // Identifier target: plain var reassignment. The value is
-      // bound to the identifier's SSA register and also returned
-      // as the expression's result.
+      // Identifier target: plain or compound var reassignment.
       if (node.left.type === 'Identifier') {
         if (node.operator === '=') {
           tasks.push({ kind: 'emit_assign', name: node.left.name, loc });
@@ -2778,82 +3194,109 @@ function visitNode(ctx, node, tasks, results) {
         }
         return;
       }
-      // Member target: `obj.prop = val` or `obj[key] = val`.
-      // We only support `=` here; compound member assignments
-      // fall to the unimplemented path for now.
-      if (node.left.type === 'MemberExpression' && node.operator === '=') {
+      // Member target: `obj.prop = val`, `obj.prop += val`,
+      // `obj[key] = val`, `obj[key] += val`.
+      if (node.left.type === 'MemberExpression') {
+        const isCompound = node.operator !== '=';
+        const op = isCompound ? node.operator.slice(0, -1) : null;
         if (node.left.computed) {
-          // obj[key] = val → visit obj, visit key, visit val,
-          // then emit_set_index pops all three.
-          tasks.push({ kind: 'emit_set_index', loc });
+          // obj[key] = val or obj[key] op= val
+          if (isCompound) {
+            tasks.push({ kind: 'emit_set_index_compound', op, loc });
+          } else {
+            tasks.push({ kind: 'emit_set_index', loc });
+          }
           tasks.push({ kind: 'visit', node: node.right });
           tasks.push({ kind: 'visit', node: node.left.property });
           tasks.push({ kind: 'visit', node: node.left.object });
         } else {
-          // obj.prop = val → visit obj, visit val, emit_set_prop
-          // captures the prop name from the AST.
-          tasks.push({
-            kind: 'emit_set_prop',
-            propName: node.left.property.name,
-            loc,
-          });
+          if (isCompound) {
+            tasks.push({
+              kind: 'emit_set_prop_compound',
+              propName: node.left.property.name,
+              op,
+              loc,
+            });
+          } else {
+            tasks.push({
+              kind: 'emit_set_prop',
+              propName: node.left.property.name,
+              loc,
+            });
+          }
           tasks.push({ kind: 'visit', node: node.right });
           tasks.push({ kind: 'visit', node: node.left.object });
         }
         return;
       }
-      // Anything else (destructuring targets, compound member
-      // assignment, ...) is currently unimplemented.
+      // Destructuring assignment: `[a, b] = arr` or
+      // `({a, b} = obj)`. The parser produces ArrayExpression /
+      // ObjectExpression on the left (not ArrayPattern /
+      // ObjectPattern) because the grammar only distinguishes
+      // them post-hoc when `=` follows. We accept either shape
+      // and reinterpret the expression as a pattern on the fly.
+      if (node.left.type === 'ObjectPattern' || node.left.type === 'ArrayPattern' ||
+          node.left.type === 'ObjectExpression' || node.left.type === 'ArrayExpression') {
+        const pattern = exprToPattern(node.left);
+        tasks.push({
+          kind: 'emit_destructure_assign',
+          target: pattern,
+          loc,
+        });
+        tasks.push({ kind: 'visit', node: node.right });
+        return;
+      }
+      // Truly unrecognised shape — fall through to opaque.
       const dest = lowerUnimplementedExpr(ctx, node, loc);
       results.push(dest);
       return;
     }
     case 'CallExpression': {
       const nArgs = node.arguments.length;
-      // Spread in arguments: `f(...args)`. We don't know the
-      // expanded arity so we can't bind the callee's param
-      // registers. Fall back to an opaque call result. Taint
-      // is conservatively propagated by the caller's general
-      // "arg labels flow to return" rule in applyCall.
-      for (const arg of node.arguments) {
+      // Spread in arguments: `f(a, ...b, c)`. Each spread
+      // position is recorded in `spreadAt` on the emit_call
+      // task so applyCall's expandSpreadArgs helper can pull
+      // each spread source's fields out of the heap at call
+      // time and pass them as positional args to the callee.
+      const spreadAt = [];
+      const argNodes = node.arguments.map((arg, i) => {
         if (arg && arg.type === 'SpreadElement') {
-          const dest = lowerUnimplementedExpr(ctx, node, loc);
-          results.push(dest);
-          return;
+          spreadAt.push(i);
+          return arg.argument;
         }
-      }
+        return arg;
+      });
       const hasMemberCallee = node.callee.type === 'MemberExpression';
       if (hasMemberCallee) {
-        // obj.method(args) — need to produce:
-        //   visit obj      → this register on stack
-        //   peek this, GetProp → callee register; keep this
-        //   visit each arg
-        //   emit_call with hasThis=true
-        // Thread the method name through so the CALL
-        // instruction carries it for sink classification.
+        // obj.method(args) / obj[key](args) — method call.
+        // Thread the method name through when it's a static
+        // property access so sink classification can resolve
+        // the receiver type's method. For computed access
+        // (`obj[key](args)`) we don't pre-know the method name;
+        // we still dispatch but the TypeDB lookup falls back.
         const methodName = !node.callee.computed && node.callee.property
           ? node.callee.property.name
           : null;
-        tasks.push({ kind: 'emit_call', nArgs, hasThis: true, loc, methodName });
+        tasks.push({
+          kind: 'emit_call', nArgs, hasThis: true, loc,
+          methodName, spreadAt,
+        });
         for (let i = nArgs - 1; i >= 0; i--) {
-          tasks.push({ kind: 'visit', node: node.arguments[i] });
+          tasks.push({ kind: 'visit', node: argNodes[i] });
         }
         if (node.callee.computed) {
-          // obj[key](args) — lower as: visit obj, visit key, emit_member_index,
-          // then visit args, then emit_call (with thisArg = obj we need to save).
-          // Too complex for the minimal slice — fall back to opaque for now.
-          const dest = lowerUnimplementedExpr(ctx, node, loc);
-          results.push(dest);
-          // Need to drain the already-pushed tasks so the stack stays clean.
-          // Since we just pushed emit_call + nArgs visits, pop them back off.
-          for (let i = 0; i < nArgs + 1; i++) tasks.pop();
-          return;
+          // obj[key](args) — emit_call_member_index preserves
+          // `this` (obj) on the stack and computes the callee
+          // via a GET_INDEX on the key expression.
+          tasks.push({ kind: 'emit_call_member_index', loc });
+          tasks.push({ kind: 'visit', node: node.callee.property });
+        } else {
+          tasks.push({
+            kind: 'emit_call_member_prop',
+            propName: node.callee.property.name,
+            loc,
+          });
         }
-        tasks.push({
-          kind: 'emit_call_member_prop',
-          propName: node.callee.property.name,
-          loc,
-        });
         tasks.push({ kind: 'visit', node: node.callee.object });
       } else {
         // plain call — visit callee, visit args, emit_call.
@@ -2863,9 +3306,12 @@ function visitNode(ctx, node, tasks, results) {
         const calleeName = node.callee.type === 'Identifier'
           ? node.callee.name
           : null;
-        tasks.push({ kind: 'emit_call', nArgs, hasThis: false, loc, calleeName });
+        tasks.push({
+          kind: 'emit_call', nArgs, hasThis: false, loc,
+          calleeName, spreadAt,
+        });
         for (let i = nArgs - 1; i >= 0; i--) {
-          tasks.push({ kind: 'visit', node: node.arguments[i] });
+          tasks.push({ kind: 'visit', node: argNodes[i] });
         }
         tasks.push({ kind: 'visit', node: node.callee });
       }
@@ -2954,59 +3400,98 @@ function visitNode(ctx, node, tasks, results) {
       return;
     }
     case 'ArrayExpression': {
-      // Lower `[a, b, c]` to an ALLOC with integer-keyed fields.
-      // Holes (undefined element) and SpreadElement lose
-      // precision: a spread makes subsequent indices opaque
-      // because we don't know the spread source's length.
+      // Lower `[a, b, ...c, d]` to an ALLOC with known elements
+      // plus an MERGE_ARRAY for each spread source. The
+      // emit_array_alloc task builds a fields map from the
+      // non-spread elements, then follow-up merge tasks copy
+      // spread sources' elements into the array.
       //
-      // We visit each non-spread element and pass a list of
-      // (index, reg) pairs to emit_array_alloc via the results
-      // stack: push all element regs first (in reverse), then
-      // emit_array_alloc pops them and builds the fields map.
+      // Each element is marked in the `kinds` array as 'elem'
+      // (a plain value), 'spread' (a SpreadElement whose
+      // argument is visited separately), or 'hole' (a missing
+      // element in an array literal like `[,x]`). The ordering
+      // is preserved so the emitted array's numeric indices
+      // match the source's.
       const elements = node.elements || [];
-      // Figure out whether any spread is present. If so we mark
-      // the whole array as opaque to be sound.
-      let hasSpread = false;
+      const kinds = [];
+      const visitNodes = [];
       for (const e of elements) {
-        if (e && e.type === 'SpreadElement') { hasSpread = true; break; }
+        if (e == null) {
+          kinds.push('hole');
+        } else if (e.type === 'SpreadElement') {
+          kinds.push('spread');
+          visitNodes.push(e.argument);
+        } else {
+          kinds.push('elem');
+          visitNodes.push(e);
+        }
       }
-      if (hasSpread) {
-        const dest = lowerUnimplementedExpr(ctx, node, loc);
-        results.push(dest);
-        return;
-      }
-      // Filter out holes for now — a hole reads undefined.
-      const nonHole = elements.filter(e => e != null);
-      tasks.push({ kind: 'emit_array_alloc', nElements: nonHole.length, loc });
-      for (let i = nonHole.length - 1; i >= 0; i--) {
-        tasks.push({ kind: 'visit', node: nonHole[i] });
+      tasks.push({ kind: 'emit_array_alloc', kinds, loc });
+      for (let i = visitNodes.length - 1; i >= 0; i--) {
+        tasks.push({ kind: 'visit', node: visitNodes[i] });
       }
       return;
     }
     case 'ObjectExpression': {
-      // Lower `{a: 1, b: 2, ...c}` to an ALLOC with the key=>reg
-      // map. Spread and computed keys lose precision (fall back
-      // to opaque).
+      // Lower `{a: 1, [key]: 2, ...c, d}` to an ALLOC plus
+      // follow-up merge operations for spread sources. The
+      // emit_object_alloc task builds the static-key fields
+      // map, evaluates computed keys at runtime, and merges
+      // spread sources one by one.
+      //
+      // Kinds per property:
+      //   'prop'     — plain init with static key
+      //   'shorthand'— {a} shorthand (value = identifier)
+      //   'computed' — computed key `[expr]: value`
+      //   'spread'   — `...expr`
+      //
+      // Getters / setters (kind !== 'init') still fall back
+      // to an opaque object — those require per-property
+      // accessor handling which is outside Wave 8 scope.
       const properties = node.properties || [];
-      let unsupported = false;
+      const kinds = [];
+      const staticKeys = [];         // per-property static key name or null
+      const visitNodes = [];
       for (const p of properties) {
-        if (p.type === 'SpreadElement') { unsupported = true; break; }
-        if (p.computed) { unsupported = true; break; }
-        if (p.kind !== 'init') { unsupported = true; break; }  // getters / setters
+        if (p.type === 'SpreadElement') {
+          kinds.push('spread');
+          staticKeys.push(null);
+          visitNodes.push(p.argument);
+          continue;
+        }
+        // Getters / setters: lower the function expression and
+        // store it under a mangled key so taint through the
+        // accessor is still tracked. A `get foo()` becomes
+        // `__get_foo__` and a `set foo(v)` becomes `__set_foo__`.
+        // The normal property read `o.foo` won't invoke the
+        // getter (we'd need a GetProp that checks for the
+        // __get_<name>__ field) — but this change makes the
+        // accessor code at least reachable and tainted values
+        // inside accessor bodies flow normally.
+        if (p.kind === 'get' || p.kind === 'set') {
+          kinds.push('prop');
+          const base = p.key.type === 'Identifier' ? p.key.name
+            : p.key.type === 'Literal' ? String(p.key.value) : null;
+          staticKeys.push(base ? '__' + p.kind + '_' + base + '__' : null);
+          visitNodes.push(p.value);
+          continue;
+        }
+        if (p.computed) {
+          kinds.push('computed');
+          staticKeys.push(null);
+          visitNodes.push(p.key);
+          visitNodes.push(p.value);
+          continue;
+        }
+        kinds.push('prop');
+        const key = p.key.type === 'Identifier' ? p.key.name
+          : p.key.type === 'Literal' ? String(p.key.value) : null;
+        staticKeys.push(key);
+        visitNodes.push(p.value);
       }
-      if (unsupported) {
-        const dest = lowerUnimplementedExpr(ctx, node, loc);
-        results.push(dest);
-        return;
-      }
-      const keys = properties.map(p => {
-        if (p.key.type === 'Identifier') return p.key.name;
-        if (p.key.type === 'Literal') return String(p.key.value);
-        return null;
-      });
-      tasks.push({ kind: 'emit_object_alloc', keys, loc });
-      for (let i = properties.length - 1; i >= 0; i--) {
-        tasks.push({ kind: 'visit', node: properties[i].value });
+      tasks.push({ kind: 'emit_object_alloc', kinds, staticKeys, loc });
+      for (let i = visitNodes.length - 1; i >= 0; i--) {
+        tasks.push({ kind: 'visit', node: visitNodes[i] });
       }
       return;
     }

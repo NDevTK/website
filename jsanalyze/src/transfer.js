@@ -897,6 +897,128 @@ function applyAlloc(ctx, state, instr) {
       fields[key] = D.getReg(state, reg);
     }
   }
+  // Object rest destructuring: copy all own fields from the
+  // source that are NOT in the restOmit set.
+  if (instr.restSource && instr.kind === 'Object') {
+    const src = D.getReg(state, instr.restSource);
+    if (src && src.kind === D.V.OBJECT) {
+      const srcCell = D.overlayGet(state.heap, src.objId);
+      if (srcCell && srcCell.fields) {
+        const omit = new Set(instr.restOmit || []);
+        for (const k in srcCell.fields) {
+          if (omit.has(k)) continue;
+          fields[k] = srcCell.fields[k];
+        }
+      }
+    }
+  }
+  // Array rest destructuring: copy src[restSliceFrom..length]
+  // into the new array with indices starting at 0.
+  if (instr.restSource && instr.kind === 'Array' && instr.restSliceFrom != null) {
+    const src = D.getReg(state, instr.restSource);
+    if (src && src.kind === D.V.OBJECT) {
+      const srcCell = D.overlayGet(state.heap, src.objId);
+      if (srcCell && srcCell.fields) {
+        let srcLen = 0;
+        const lenVal = srcCell.fields.length;
+        if (lenVal && lenVal.kind === D.V.CONCRETE && typeof lenVal.value === 'number') {
+          srcLen = lenVal.value;
+        }
+        let outIdx = 0;
+        for (let j = instr.restSliceFrom; j < srcLen; j++) {
+          const e = srcCell.fields[String(j)];
+          if (e) fields[String(outIdx)] = e;
+          outIdx++;
+        }
+        fields.length = D.concrete(outIdx, 'number', loc);
+      }
+    }
+  }
+  // Object spread: copy all fields from each spread source into
+  // this cell. Own fields from later spreads override earlier
+  // ones; explicit static fields override spreads. Since
+  // applyAlloc evaluates fields in source order (they were
+  // listed in `instr.fields` first), we overwrite from spreads
+  // BEFORE re-applying the static map. That matches JS
+  // semantics: `{a: 1, ...obj, b: 2}` lets `obj.a` overwrite
+  // the literal a, and explicit `b: 2` overwrite obj.b.
+  //
+  // Our IR doesn't interleave spread and literal fields — the
+  // literal fields are set in instr.fields (which already ran)
+  // and all spreads come after. JS semantics for an exact
+  // alternating `{a: 1, ...b, c: 2}` would need interleaving;
+  // we approximate by: start with empty, apply all spreads in
+  // order, then apply all static fields on top.
+  if (instr.spreads && instr.kind === 'Object') {
+    // Reset fields and re-apply in "spreads first, statics on top" order.
+    const staticFields = Object.create(null);
+    for (const k in fields) staticFields[k] = fields[k];
+    for (const k in fields) delete fields[k];
+    for (const srcReg of instr.spreads) {
+      const srcVal = D.getReg(state, srcReg);
+      if (srcVal && srcVal.kind === D.V.OBJECT) {
+        const srcCell = D.overlayGet(state.heap, srcVal.objId);
+        if (srcCell && srcCell.fields) {
+          for (const k in srcCell.fields) {
+            if (k === 'length') continue;  // array metadata
+            fields[k] = srcCell.fields[k];
+          }
+        }
+      }
+    }
+    for (const k in staticFields) fields[k] = staticFields[k];
+  }
+  // Computed keys: at runtime, evaluate each keyReg. If it's a
+  // Concrete string we store under that exact key; otherwise
+  // we store under a synthetic `__computed_<n>__` name (precise
+  // reads can't hit it, but the field value is still tracked so
+  // taint flows through).
+  if (instr.computed && instr.kind === 'Object') {
+    for (let ci = 0; ci < instr.computed.length; ci++) {
+      const pair = instr.computed[ci];
+      const keyVal = D.getReg(state, pair.keyReg);
+      const valVal = D.getReg(state, pair.valReg);
+      let keyName = null;
+      if (keyVal && keyVal.kind === D.V.CONCRETE) {
+        keyName = String(keyVal.value);
+      }
+      if (keyName == null) keyName = '__computed_' + ci + '__';
+      fields[keyName] = valVal;
+    }
+  }
+  // Array spread: merge integer-keyed fields from each spread
+  // source into this Array cell, offset by the position where
+  // the spread appears. Since static elements were already
+  // written above using their nominal source-order index, we
+  // shift later static indices by the spread source's runtime
+  // length. For a precise model we'd rewrite indices; for
+  // soundness we overwrite any index from the spread source.
+  if (instr.spreads && instr.kind === 'Array') {
+    let indexOffset = 0;  // tracks how many runtime elements we've added beyond the static count
+    for (const sp of instr.spreads) {
+      const srcVal = D.getReg(state, sp.reg);
+      if (srcVal && srcVal.kind === D.V.OBJECT) {
+        const srcCell = D.overlayGet(state.heap, srcVal.objId);
+        if (srcCell && srcCell.fields) {
+          let sLen = 0;
+          const lenVal = srcCell.fields.length;
+          if (lenVal && lenVal.kind === D.V.CONCRETE && typeof lenVal.value === 'number') {
+            sLen = lenVal.value;
+          }
+          for (let k = 0; k < sLen; k++) {
+            const e = srcCell.fields[String(k)];
+            if (e) fields[String(sp.position + indexOffset + k)] = e;
+          }
+          indexOffset += Math.max(0, sLen - 1);  // -1 because the spread itself occupied one position
+        }
+      }
+    }
+    // Update length to reflect the new total.
+    const maxIndex = Object.keys(fields)
+      .filter(k => /^\d+$/.test(k))
+      .reduce((m, k) => Math.max(m, parseInt(k, 10) + 1), 0);
+    fields.length = D.concrete(maxIndex, 'number', loc);
+  }
   // For class objects (kind='Class'), the typeName is the class
   // name so instances created via `new ClassName(...)` can
   // resolve their method lookups through the TypeDB (when the
@@ -1056,6 +1178,18 @@ function applyCall(ctx, state, instr) {
     // read the destructured field because the ObjectRef's
     // heap cell lives in the caller's state.
     //
+    // Spread args: if instr.spreadAt is set (indices of spread
+    // positions in instr.args), the corresponding argValues
+    // are "spread sources" whose elements are expanded into
+    // the positional arg sequence. We expand them against the
+    // current heap so the callee sees a flat arg list.
+    //
+    // Rest params: if calleeFn.restParamIndex is set, the
+    // remaining args beyond that index are collected into a
+    // fresh Array ObjectRef which is bound to the rest param
+    // register. applyCall allocates the array + writes the
+    // collected args as integer-keyed fields.
+    //
     // Sharing the heap overlay is sound: the callee may mutate
     // cells the caller can see, which is the JS semantics.
     // Precise points-to analysis (Phase C3) would clone the
@@ -1067,11 +1201,22 @@ function applyCall(ctx, state, instr) {
     // be bound to the function's capture registers (Phase C2
     // — for now closures capture nothing, so this is a
     // no-op).
+    const effectiveArgs = expandSpreadArgs(state, argValues, instr.spreadAt, loc);
     let calleeInit = D.createStateSharingHeap(state);
-    for (let i = 0; i < calleeFn.params.length; i++) {
+    const restIdx = calleeFn.restParamIndex != null ? calleeFn.restParamIndex : -1;
+    const normalParamCount = restIdx >= 0 ? restIdx : calleeFn.params.length;
+    for (let i = 0; i < normalParamCount && i < calleeFn.params.length; i++) {
       const paramReg = calleeFn.params[i];
-      const argValue = argValues[i] || D.concrete(undefined, undefined, loc);
+      const argValue = effectiveArgs[i] || D.concrete(undefined, undefined, loc);
       calleeInit = D.setReg(calleeInit, paramReg, argValue);
+    }
+    if (restIdx >= 0 && restIdx < calleeFn.params.length) {
+      // Collect the remaining args into a fresh Array object.
+      const restParamReg = calleeFn.params[restIdx];
+      const tailArgs = effectiveArgs.slice(restIdx);
+      const restObj = allocRestArray(ctx, tailArgs, loc);
+      calleeInit = writeHeapCell(calleeInit, restObj.objId, restObj.cell);
+      calleeInit = D.setReg(calleeInit, restParamReg, restObj.ref);
     }
 
     // Save and restore worklist-level ctx fields so the
@@ -1507,6 +1652,102 @@ function applyNew(ctx, state, instr) {
     }
   }
   return D.setReg(newState, instr.dest, thisRef);
+}
+
+// expandSpreadArgs — expand SpreadElement positions in a call's
+// argument list into positional arguments. `spreadAt` is a
+// (possibly undefined) array of indices whose corresponding
+// entries in `argValues` should be spread. The spread source
+// is read as an array-shaped ObjectRef: we pull out the
+// integer-keyed fields up to the length, and any missing ones
+// fall through as undefined.
+//
+// When the spread source isn't a known ObjectRef (it's an
+// opaque, a disjunct, or not an array shape), we append a
+// single "opaque remainder" value marked with the source's
+// labels — sound but imprecise about the arity.
+function expandSpreadArgs(state, argValues, spreadAt, loc) {
+  if (!spreadAt || spreadAt.length === 0) return argValues;
+  const out = [];
+  const spreadSet = new Set(spreadAt);
+  for (let i = 0; i < argValues.length; i++) {
+    if (!spreadSet.has(i)) {
+      out.push(argValues[i]);
+      continue;
+    }
+    const src = argValues[i];
+    if (src && src.kind === D.V.OBJECT) {
+      const cell = D.overlayGet(state.heap, src.objId);
+      if (cell && cell.fields) {
+        const lengthVal = cell.fields.length;
+        let length = 0;
+        if (lengthVal && lengthVal.kind === D.V.CONCRETE &&
+            typeof lengthVal.value === 'number') {
+          length = lengthVal.value;
+        } else {
+          // Unknown length — enumerate integer-keyed fields.
+          for (const k of Object.keys(cell.fields)) {
+            if (/^\d+$/.test(k)) {
+              const n = parseInt(k, 10) + 1;
+              if (n > length) length = n;
+            }
+          }
+        }
+        for (let j = 0; j < length; j++) {
+          const elem = cell.fields[String(j)];
+          out.push(elem || D.concrete(undefined, undefined, loc));
+        }
+        continue;
+      }
+    }
+    // Unknown spread source — conservatively propagate its
+    // labels into the return via a single remainder Opaque.
+    // The callee may or may not reference the spread portion;
+    // we attach the source's labels so taint flows through.
+    const lbls = (src && src.labels) || D.EMPTY_LABELS;
+    out.push(D.opaque([], null, loc, lbls));
+  }
+  return out;
+}
+
+// allocRestArray — create a fresh Array-shaped heap cell holding
+// `values` as its integer-keyed fields and a Concrete `length`.
+// Returns { objId, cell, ref } so the caller can both write the
+// cell and bind the ObjectRef to the rest param register.
+function allocRestArray(ctx, values, loc) {
+  const objId = nextObjId(ctx);
+  const fields = Object.create(null);
+  for (let i = 0; i < values.length; i++) {
+    fields[String(i)] = values[i];
+  }
+  fields.length = D.concrete(values.length, 'number', loc);
+  const cell = Object.freeze({
+    kind: 'Array',
+    fields: Object.freeze(fields),
+    typeName: 'Array',
+    origin: loc,
+  });
+  const ref = D.objectRef(objId, 'Array', loc);
+  return { objId, cell, ref };
+}
+
+// writeHeapCell — write a complete cell for `objId` into the
+// state's heap overlay. Used by applyCall / applyNew to install
+// fresh alloc cells during pre-call state setup.
+function writeHeapCell(state, objId, cell) {
+  if (!state._frozen) {
+    state.heap.own.set(objId, cell);
+    return state;
+  }
+  const newHeap = { own: new Map([[objId, cell]]), parent: state.heap };
+  return Object.freeze({
+    regs: state.regs,
+    heap: newHeap,
+    pathConds: state.pathConds,
+    assumptionIds: state.assumptionIds,
+    callStack: state.callStack,
+    _frozen: true,
+  });
 }
 
 // initHeapCell — create an empty heap cell for a freshly

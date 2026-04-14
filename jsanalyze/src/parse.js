@@ -566,11 +566,17 @@ function parseOperand(lexer) {
     if (label === '.') {
       lexer.advance();
       const nameTok = lexer.peek();
-      if (!nameTok || (nameTok.type.label !== 'name' && !nameTok.type.keyword)) {
+      if (!nameTok || (nameTok.type.label !== 'name' &&
+                       nameTok.type.label !== 'privateId' &&
+                       !nameTok.type.keyword)) {
         throw parseError(lexer, 'expected property name after `.`');
       }
       lexer.advance();
-      const propNode = mkIdentifier(nameTok.value || nameTok.type.label, nameTok);
+      // Private access `obj.#field` is lowered as a regular
+      // property read on the mangled name `#field`.
+      const baseName = nameTok.value || nameTok.type.label;
+      const propName = nameTok.type.label === 'privateId' ? '#' + baseName : baseName;
+      const propNode = mkIdentifier(propName, nameTok);
       base = mkMember(base, propNode, false);
       continue;
     }
@@ -744,7 +750,42 @@ function parseObjectExpression(lexer) {
       if (lexer.peek() && lexer.peek().type.label === ',') lexer.advance();
       continue;
     }
-    // Name key.
+    // Name key. `get` / `set` act as getter/setter modifiers
+    // when followed by another name (the property they cover)
+    // and an open paren — `{ get foo() { ... } }` means a
+    // getter whose key is `foo`. In other positions (`{ get: 1 }`,
+    // `{ get }` shorthand) they're plain property names.
+    if (t.type.label === 'name' &&
+        (t.value === 'get' || t.value === 'set')) {
+      const next = lexer.peek2();
+      if (next && next.type.label === 'name') {
+        // Peek-past: is there a `(` after the next name? If
+        // yes, this is a getter/setter definition.
+        // We can't lookahead 3 tokens cheaply; use advance-and-
+        // save instead: consume `get`, then look at the next
+        // token. If it's a name followed by `(`, commit.
+        const kindName = t.value;  // 'get' | 'set'
+        lexer.advance();   // consume `get`/`set`
+        const nameTok2 = lexer.advance();  // property name
+        if (lexer.peek() && lexer.peek().type.label === '(') {
+          lexer.advance();
+          const params = parseParamList(lexer);
+          expect(lexer, ')');
+          const body = parseStatement(lexer);
+          const mangledName = '__' + kindName + '_' + nameTok2.value + '__';
+          const fnExpr = mkFunctionExpression(null, params, body, false, false, nameTok2);
+          properties.push(mkProperty(
+            mkIdentifier(mangledName, nameTok2), fnExpr, 'init', false, false, true, t));
+          if (lexer.peek() && lexer.peek().type.label === ',') lexer.advance();
+          continue;
+        }
+        // Not a getter/setter — rewind by treating `get` as
+        // the property name and nameTok2 as a syntax error.
+        // We can't rewind, so fall through: treat nameTok2 as
+        // an error.
+        throw parseError(lexer, 'unexpected token after `' + kindName + '` in object literal');
+      }
+    }
     if (t.type.label === 'name') {
       lexer.advance();
       // `name: value`
@@ -874,62 +915,79 @@ function parseClassBody(lexer) {
 function parseClassMember(lexer) {
   const startTok = lexer.peek();
   let isStatic = false;
-  // `static` prefix.
+  // `static` prefix. Peek past to see if this is actually a
+  // member modifier — it must be followed by another valid
+  // member starter (a name, privateId, `(`, `[`, or a string
+  // literal).
   if (startTok.type.label === 'name' && startTok.value === 'static') {
-    // Peek past to see if this is actually a member modifier.
     const next = lexer.peek2();
-    if (next && (next.type.label === 'name' || next.type.label === '(' ||
-                 next.type.label === '[' || next.type.label === 'string')) {
+    if (next && (next.type.label === 'name' || next.type.label === 'privateId' ||
+                 next.type.label === '(' || next.type.label === '[' ||
+                 next.type.label === 'string')) {
       lexer.advance();
       isStatic = true;
     }
   }
-  // Private field skipper.
+  // Private member: acorn tokenises `#name` as a single
+  // `privateId` token with value = the bare name. We prefix
+  // it with `#` and treat it as a normal identifier for all
+  // subsequent stages — GetProp / SetProp on `#foo` are
+  // indistinguishable from other property accesses at the IR
+  // level, which is what we need for taint tracking.
   const t = lexer.peek();
-  if (t.type.label === '#') {
-    // Private member — skip to semicolon or `}`.
-    while (lexer.peek() && lexer.peek().type.label !== ';' &&
-           lexer.peek().type.label !== '}') lexer.advance();
-    if (lexer.peek() && lexer.peek().type.label === ';') lexer.advance();
-    return { type: 'UnimplementedClassMember', kind: 'private' };
+  let privatePrefix = '';
+  if (t.type.label === 'privateId') {
+    // Leave the token for parseClassMember's name-consumption
+    // branch below; the memberName will use the '#' prefix.
+    privatePrefix = '#';
   }
-  // Getters / setters — skip the body for now.
-  if (t.type.label === 'name' && (t.value === 'get' || t.value === 'set')) {
+  // Getter / setter: `get name(...) { body }`, `set name(v) { body }`.
+  // Stored on the instance under a mangled key `__get_<name>__`
+  // or `__set_<name>__` so the method body is still walked for
+  // taint. (Precise accessor semantics — invoking the getter
+  // on every property read — are out of scope.)
+  if (!privatePrefix && t.type.label === 'name' &&
+      (t.value === 'get' || t.value === 'set')) {
     const next = lexer.peek2();
     if (next && next.type.label === 'name') {
-      // Consume the `get`/`set` and the name.
-      const kind = t.value;
+      const accessorKind = t.value;
       lexer.advance();
       const nameTok = lexer.advance();
       expect(lexer, '(');
-      parseParamList(lexer);
+      const params = parseParamList(lexer);
       expect(lexer, ')');
-      // Skip the body block.
-      skipBalanced(lexer, '{', '}');
-      return { type: 'UnimplementedClassMember', kind: kind + 'ter', name: nameTok.value };
+      const body = parseStatement(lexer);
+      const mangledName = '__' + accessorKind + '_' + nameTok.value + '__';
+      return mkMethodDefinition(
+        mkIdentifier(mangledName, nameTok),
+        mkFunctionExpression(null, params, body, false, false, nameTok),
+        'method',
+        isStatic, nameTok);
     }
   }
-  // Method or field.
-  if (t.type.label !== 'name') {
-    // Unknown member — skip one token to avoid an infinite loop.
+  // Method or field (possibly private).
+  const memberTok = lexer.peek();
+  if (memberTok.type.label !== 'name' && memberTok.type.label !== 'privateId') {
     lexer.advance();
     return null;
   }
   const nameTok = lexer.advance();
+  const memberName = privatePrefix + nameTok.value;
   const afterName = lexer.peek();
-  // Method: `name ( params ) { body }`
+  // Method: `name ( params ) { body }` (or `#name (...)` for
+  // private methods).
   if (afterName && afterName.type.label === '(') {
     lexer.advance();
     const params = parseParamList(lexer);
     expect(lexer, ')');
     const body = parseStatement(lexer);
     return mkMethodDefinition(
-      mkIdentifier(nameTok.value, nameTok),
+      mkIdentifier(memberName, nameTok),
       mkFunctionExpression(null, params, body, false, false, nameTok),
-      nameTok.value === 'constructor' ? 'constructor' : 'method',
+      memberName === 'constructor' ? 'constructor' : 'method',
       isStatic, nameTok);
   }
-  // Field: `name = expr ;` or `name ;`.
+  // Field: `name = expr ;` or `name ;` (or `#name = expr ;`).
   let init = null;
   if (afterName && afterName.type.label === '=') {
     lexer.advance();
@@ -937,7 +995,7 @@ function parseClassMember(lexer) {
   }
   if (lexer.peek() && lexer.peek().type.label === ';') lexer.advance();
   return mkFieldDefinition(
-    mkIdentifier(nameTok.value, nameTok),
+    mkIdentifier(memberName, nameTok),
     init, isStatic, nameTok);
 }
 
@@ -2366,15 +2424,13 @@ function finishTryBody(lexer, task, tasks, outputs) {
     hasCatch = true;
     catchStartTok = next;
     lexer.advance();
-    // Optional catch-binding: `catch /e/` or `catch`.
+    // Optional catch-binding: `catch /e/`, `catch /{a, b}/`,
+    // `catch /[x, y]/`, or bare `catch` (ES2019 optional-
+    // catch-binding). The param accepts any BindingTarget
+    // (identifier or destructuring pattern).
     if (lexer.peek() && lexer.peek().type.label === '(') {
       lexer.advance();
-      const paramTok = lexer.peek();
-      if (paramTok && paramTok.type.label === 'name') {
-        catchParam = mkIdentifier(paramTok.value, paramTok);
-        lexer.advance();
-      }
-      // Destructuring patterns in catch param not yet supported.
+      catchParam = parseBindingTarget(lexer);
       expect(lexer, ')');
     }
   }

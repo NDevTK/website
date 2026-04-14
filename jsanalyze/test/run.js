@@ -37,6 +37,7 @@ const testFiles = [
   'destructure.test.js',
   'modern-js.test.js',
   'class.test.js',
+  'wave8.test.js',
 ];
 
 async function main() {
