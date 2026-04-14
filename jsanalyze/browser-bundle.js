@@ -3225,7 +3225,9 @@ function branchTemplateFromStmt(ifStmt, varName, receiverNode) {
 // branchChildFromStmt — resolve one branch of an if/else
 // chain into a nested HtmlTemplate. Accepts a direct literal
 // write, a BlockStatement wrapping a single literal write,
-// or a nested IfStatement (else-if).
+// a nested IfStatement (else-if), or a multi-statement
+// block whose contents match the loop-accumulator pattern
+// (loop-in-branch).
 function branchChildFromStmt(branchNode, varName, receiverNode) {
   if (!branchNode) return null;
   if (branchNode.type === 'IfStatement') {
@@ -3233,7 +3235,115 @@ function branchChildFromStmt(branchNode, varName, receiverNode) {
   }
   const lit = getSingleStringWrite(branchNode, varName);
   if (lit != null) return concreteTemplate(lit);
+  // Multi-statement block — try the loop-accumulator pattern
+  // on the block's statements. If a loop template comes out,
+  // we wrap it as a `block-loop` sub-template the branch
+  // emitter knows how to inline (no replaceChildren on the
+  // receiver, appendChild into the outer branch arm).
+  if (branchNode.type === 'BlockStatement' && branchNode.body.length >= 2) {
+    return extractBlockLoop(branchNode.body, varName, receiverNode);
+  }
   return null;
+}
+
+// extractBlockLoop — loop-in-branch detector. Similar to
+// extractFromAccumulator but:
+//   * no innerHTML assignment at the end (the branch's last
+//     statement is the close-accum if present, or just the
+//     loop)
+//   * the open-accum is an assignment `X = '<lit>'` (not a
+//     var decl — the var lives outside the branch)
+//   * produces a `block-loop` template with rangeStart set
+//     to the first open statement's position so the outer
+//     branch emitter can slice it cleanly.
+function extractBlockLoop(stmts, varName, receiverNode) {
+  // Find the open-accum statement: a top-of-block
+  // `X = '<lit>';` assignment. Non-accum statements before it
+  // are allowed (they'll be re-emitted verbatim later) but we
+  // don't walk past a non-matching assignment.
+  let openIdx = -1;
+  let loopIdx = -1;
+  let closeIdx = -1;
+  for (let i = 0; i < stmts.length; i++) {
+    const s = stmts[i];
+    if (s.type !== 'ExpressionStatement') continue;
+    const e = s.expression;
+    if (!e || e.type !== 'AssignmentExpression' || e.operator !== '=') continue;
+    if (!e.left || e.left.type !== 'Identifier' || e.left.name !== varName) continue;
+    if (!e.right || e.right.type !== 'Literal' || typeof e.right.value !== 'string') continue;
+    openIdx = i;
+    break;
+  }
+  if (openIdx < 0) return null;
+
+  // Find the loop after the open statement.
+  for (let i = openIdx + 1; i < stmts.length; i++) {
+    const s = stmts[i];
+    if (isLoopStatement(s) && s.body && s.body.type === 'BlockStatement') {
+      loopIdx = i;
+      break;
+    }
+    // Skip bookkeeping var decls (e.g. `var j = 0;`).
+    if (s.type === 'VariableDeclaration') continue;
+    return null;
+  }
+  if (loopIdx < 0) return null;
+
+  // Optional close-accum `X += '</lit>';` after the loop.
+  if (loopIdx + 1 < stmts.length) {
+    const post = stmts[loopIdx + 1];
+    if (isAccumAssign(post, varName)) {
+      const lit = literalOfAccumAssign(post);
+      if (typeof lit === 'string' && /<\/[a-z][^>]*>/i.test(lit)) {
+        closeIdx = loopIdx + 1;
+      }
+    }
+  }
+
+  const openStmt = stmts[openIdx];
+  const loopStmt = stmts[loopIdx];
+  const closeStmt = closeIdx >= 0 ? stmts[closeIdx] : null;
+  const openLit = openStmt.expression.right.value;
+  const closeLit = closeStmt ? literalOfAccumAssign(closeStmt) : null;
+
+  let outer = null;
+  if (openLit.length > 0) {
+    const openTree = html.parse(openLit);
+    let outerElem = null;
+    for (const c of openTree.children) {
+      if (c.type === 'element') { outerElem = c; break; }
+    }
+    if (outerElem == null) return null;
+    if (closeLit == null) return null;
+    const closeMatch = closeLit.match(/<\/([a-z][a-z0-9]*)/i);
+    if (!closeMatch || closeMatch[1].toLowerCase() !== outerElem.tag) return null;
+    outer = {
+      tag: outerElem.tag,
+      attrList: outerElem.attrList || [],
+    };
+  } else if (closeLit != null && closeLit.length > 0) {
+    return null;
+  }
+
+  const accumSites = [];
+  collectAccumAppends(loopStmt.body, varName, accumSites);
+  if (accumSites.length === 0) return null;
+  for (const site of accumSites) {
+    if (!site.child) return null;
+  }
+
+  return {
+    kind: 'block-loop',
+    outer,
+    loopShape: {
+      loopType: loopStmt.type,
+      headerEnd: loopStmt.body.start + 1,
+      bodyEnd:   loopStmt.body.end - 1,
+      loopStart: loopStmt.start,
+      loopEnd: loopStmt.end,
+    },
+    accumSites,
+  };
 }
 
 // branchTemplateFromExpr — recursive counterpart for
@@ -17934,10 +18044,45 @@ function emitBranchBody(tmpl, receiver, jsSource) {
     lines.push('}');
     return lines.join('\n');
   }
-  // Nested loop inside a branch isn't covered by the MVP;
-  // returning null leaves the body empty and the consumer
-  // surrounds it with a `{}` placeholder in the generated
-  // source so the runtime still has two branches.
+  // Loop inside a branch arm. The `block-loop` template
+  // carries the extracted loop shape (outer wrapper, loop
+  // header, accumSites) without the top-level replaceChildren
+  // concerns that apply to the primary loop emitter. We
+  // emit into the outer branch's receiver: a
+  // document.createElement for the wrapper, append it, then
+  // the original loop source with each accumSite replaced
+  // by its child block keyed to the wrapper parent.
+  if (tmpl.kind === 'block-loop') {
+    const sh = tmpl.loopShape;
+    const lines = [];
+    let parentRef;
+    if (tmpl.outer) {
+      lines.push('var __p = document.createElement(' +
+        JSON.stringify(tmpl.outer.tag) + ');');
+      for (const a of tmpl.outer.attrList) {
+        lines.push('__p.setAttribute(' + JSON.stringify(a.name) + ', ' +
+          JSON.stringify(a.value) + ');');
+      }
+      lines.push(receiver + '.appendChild(__p);');
+      parentRef = '__p';
+    } else {
+      parentRef = receiver;
+    }
+    const sites = (tmpl.accumSites || []).slice().sort((a, b) => a.start - b.start);
+    let loopSrc = jsSource.slice(sh.loopStart, sh.headerEnd);
+    let cursor = sh.headerEnd;
+    for (const site of sites) {
+      loopSrc += jsSource.slice(cursor, site.start);
+      const indent = detectLineIndent(jsSource, site.start);
+      const childLines = emitChildBlock(site.child, parentRef, jsSource);
+      loopSrc += childLines.join('\n' + indent);
+      cursor = site.end;
+    }
+    loopSrc += jsSource.slice(cursor, sh.bodyEnd);
+    loopSrc += jsSource.slice(sh.bodyEnd, sh.loopEnd);
+    lines.push(loopSrc);
+    return lines.join('\n');
+  }
   return null;
 }
 

@@ -587,10 +587,45 @@ function emitBranchBody(tmpl, receiver, jsSource) {
     lines.push('}');
     return lines.join('\n');
   }
-  // Nested loop inside a branch isn't covered by the MVP;
-  // returning null leaves the body empty and the consumer
-  // surrounds it with a `{}` placeholder in the generated
-  // source so the runtime still has two branches.
+  // Loop inside a branch arm. The `block-loop` template
+  // carries the extracted loop shape (outer wrapper, loop
+  // header, accumSites) without the top-level replaceChildren
+  // concerns that apply to the primary loop emitter. We
+  // emit into the outer branch's receiver: a
+  // document.createElement for the wrapper, append it, then
+  // the original loop source with each accumSite replaced
+  // by its child block keyed to the wrapper parent.
+  if (tmpl.kind === 'block-loop') {
+    const sh = tmpl.loopShape;
+    const lines = [];
+    let parentRef;
+    if (tmpl.outer) {
+      lines.push('var __p = document.createElement(' +
+        JSON.stringify(tmpl.outer.tag) + ');');
+      for (const a of tmpl.outer.attrList) {
+        lines.push('__p.setAttribute(' + JSON.stringify(a.name) + ', ' +
+          JSON.stringify(a.value) + ');');
+      }
+      lines.push(receiver + '.appendChild(__p);');
+      parentRef = '__p';
+    } else {
+      parentRef = receiver;
+    }
+    const sites = (tmpl.accumSites || []).slice().sort((a, b) => a.start - b.start);
+    let loopSrc = jsSource.slice(sh.loopStart, sh.headerEnd);
+    let cursor = sh.headerEnd;
+    for (const site of sites) {
+      loopSrc += jsSource.slice(cursor, site.start);
+      const indent = detectLineIndent(jsSource, site.start);
+      const childLines = emitChildBlock(site.child, parentRef, jsSource);
+      loopSrc += childLines.join('\n' + indent);
+      cursor = site.end;
+    }
+    loopSrc += jsSource.slice(cursor, sh.bodyEnd);
+    loopSrc += jsSource.slice(sh.bodyEnd, sh.loopEnd);
+    lines.push(loopSrc);
+    return lines.join('\n');
+  }
   return null;
 }
 

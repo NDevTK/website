@@ -823,6 +823,47 @@ const tests = [
         'original innerHTML removed: ' + out);
     },
   },
+  // --- Wave 12d12: loop inside a branch arm ---
+  {
+    name: 'dom-convert js: loop inside if/else branch arm',
+    fn: async () => {
+      // The consequent is a block with open-accum + loop +
+      // close-accum. The alternate is a simple literal
+      // write. The branch detector treats each arm as a
+      // sub-accumulator: the consequent recursively
+      // delegates to the loop extractor via the branch
+      // template's nested child slot.
+      const src = [
+        'var items = ["a", "b"];',
+        'var flag = items.length > 0;',
+        'var html;',
+        'if (flag) {',
+        '  html = "<ul>";',
+        '  for (var i = 0; i < items.length; i++) {',
+        '    html += "<li>" + items[i] + "</li>";',
+        '  }',
+        '  html += "</ul>";',
+        '} else {',
+        '  html = "<p>empty</p>";',
+        '}',
+        'document.body.innerHTML = html;',
+      ].join('\n');
+      const out = await convertJs(src);
+      assert(/if \(flag\) \{/.test(out),
+        'if test preserved: ' + out);
+      assert(/createElement\("ul"\)/.test(out),
+        'ul wrapper from consequent: ' + out);
+      assert(/for \(var i = 0; i < items\.length; i\+\+\)/.test(out),
+        'inner for preserved: ' + out);
+      assert(/createElement\("li"\)/.test(out),
+        'li per iteration: ' + out);
+      assert(/createTextNode\("empty"\)/.test(out),
+        'else branch emits "empty": ' + out);
+      assert(!/innerHTML = html/.test(out),
+        'original assignment removed: ' + out);
+    },
+  },
+
   // --- Wave 12d10: nested if-else-if and nested ternary ---
   {
     name: 'dom-convert js: else-if chain → nested branch template',
