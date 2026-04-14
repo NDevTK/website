@@ -248,6 +248,35 @@ type InnerHtmlAssignment = {
   concrete: string | null;           // raw string when concrete
   parsedHtml: HtmlNode | null;       // parsed fragment when concrete
   htmlTokens: HtmlToken[] | null;    // flat token stream when concrete
+
+  // Structured shape template for the assignment. The
+  // engine walks the JS AST at the innerHTML site and tries
+  // to recognise a known accumulator / branch / loop /
+  // template pattern. When a pattern matches, `template` is
+  // non-null and carries the recognised shape so consumers
+  // can emit a precise source rewrite without re-parsing
+  // the JS. When no pattern matches, `template` is an
+  // `{ kind: 'opaque', reason }` record (or null) and the
+  // consumer leaves the site alone.
+  //
+  // Template shapes (see src/html-templates.js for details):
+  //
+  //   kind: 'concrete' — fully static literal string; the
+  //     template carries the parsed HTML tree.
+  //   kind: 'append'   — `innerHTML =` or `+=` with a concat
+  //     or TemplateLiteral RHS; the `operator` field
+  //     distinguishes the two so consumers know whether to
+  //     clear existing children.
+  //   kind: 'branch'   — if/else, ternary, else-if chain, or
+  //     nested ternary. Consequent/alternate are themselves
+  //     templates (recursive).
+  //   kind: 'switch'   — switch/case accumulator. Each case
+  //     carries its own template.
+  //   kind: 'loop'     — for/while/do-while/for-in/for-of
+  //     accumulator, including branch-in-loop. Each
+  //     accumulator-append site is a separate accumSite.
+  //   kind: 'opaque'   — engine couldn't recognise the shape.
+  template: HtmlTemplate | null;
 };
 
 type HtmlNode =

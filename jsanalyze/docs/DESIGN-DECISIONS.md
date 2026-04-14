@@ -274,8 +274,18 @@ Specifically:
     attaches a structured `HtmlTemplate` to the
     innerHtmlAssignment. The template covers:
       - `kind: 'concrete'` — fully static string (parsed HTML tree)
-      - `kind: 'loop'`     — per-iteration template + loop shape
-      - `kind: 'branch'`   — alternatives from if/else / switch
+      - `kind: 'loop'`     — for / while / do-while / for-in /
+                             for-of accumulator, including
+                             branch-in-loop patterns that
+                             collect one accumSite per
+                             append inside the body
+      - `kind: 'branch'`   — if/else, ternary, else-if chains
+                             and nested ternaries (recursive
+                             branch templates)
+      - `kind: 'switch'`   — switch/case accumulator
+      - `kind: 'append'`   — `innerHTML +=` or one-shot
+                             fragment build from a concat chain
+                             or TemplateLiteral RHS
       - `kind: 'opaque'`   — the engine couldn't recognise
                              a pattern (the consumer decides
                              what to do: leave alone, wrap
