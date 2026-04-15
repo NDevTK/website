@@ -5207,6 +5207,56 @@ module.exports = {
 
 'use strict';
 
+// countNewlines(src, from, to) — count '\n' characters in
+// the half-open range [from, to). Used by the inline-script
+// extraction to prepend matching line padding.
+function countNewlines(src, from, to) {
+  let n = 0;
+  for (let i = from; i < to; i++) {
+    if (src.charCodeAt(i) === 10) n++;
+  }
+  return n;
+}
+
+// remapLocation(loc, inlineOrigin) — if `loc.file` is a
+// synthetic inline-script filename, replace it with the
+// originating HTML filename. Line numbers stay as-is
+// because the inline extractor already prepended the
+// right number of newlines to the script body. Returns a
+// new location object or `loc` unchanged when no remap
+// applies (non-inline file, or loc is falsy).
+function remapLocation(loc, inlineOrigin) {
+  if (!loc || !loc.file) return loc;
+  const origin = inlineOrigin[loc.file];
+  if (!origin) return loc;
+  return Object.assign({}, loc, { file: origin });
+}
+
+// remapFlowLocations — walk a TaintFlow record and rewrite
+// every embedded location's `file` via remapLocation. The
+// flow object is mutated in-place; consumers see HTML
+// filenames on every location field.
+function remapFlowLocations(flow, inlineOrigin) {
+  if (flow.sink && flow.sink.location) {
+    flow.sink.location = remapLocation(flow.sink.location, inlineOrigin);
+  }
+  if (Array.isArray(flow.source)) {
+    for (const s of flow.source) {
+      if (s && s.location) {
+        s.location = remapLocation(s.location, inlineOrigin);
+      }
+    }
+  }
+}
+
+// remapLocationField — helper for mutating an object's
+// `location` property in-place when the object has one.
+function remapLocationField(obj, inlineOrigin) {
+  if (obj && obj.location) {
+    obj.location = remapLocation(obj.location, inlineOrigin);
+  }
+}
+
 const { buildModule, buildProjectModule } = require('./ir.js');
 const { analyseFunction } = require('./worklist.js');
 const { AssumptionTracker, REASONS, SEVERITIES, DEFAULT_ACCEPT } = require('./assumptions.js');
@@ -5332,12 +5382,19 @@ async function analyze(input, options) {
   // legacy engine did inline inside its walker, lifted here
   // to the public entry so every consumer benefits.
   const extracted = Object.create(null);
+  // `inlineOrigin[synth]` records the originating HTML file
+  // for each extracted inline script. The trace projection
+  // rewrites sink locations from synth → original so the
+  // UI can click through to example.html:N without a
+  // bridge-side filename remapping.
+  const inlineOrigin = Object.create(null);
   for (const filename of Object.keys(files)) {
     if (!/\.html?$/i.test(filename)) {
       extracted[filename] = files[filename];
       continue;
     }
-    const toks = HTML.tokenize(files[filename]);
+    const htmlSource = files[filename];
+    const toks = HTML.tokenize(htmlSource);
     let idx = 0;
     const base = filename.replace(/\.html?$/i, '');
     for (let i = 0; i < toks.length; i++) {
@@ -5347,16 +5404,29 @@ async function analyze(input, options) {
       if (hasSrc) continue;
       // Scan for the matching </script> and collect inner TEXT.
       let body = '';
+      let bodyStart = -1;
       let j = i + 1;
       for (; j < toks.length; j++) {
         if (toks[j].type === 'end' && toks[j].tagName === 'script') break;
-        if (toks[j].type === 'text') body += toks[j].value;
+        if (toks[j].type === 'text') {
+          if (bodyStart < 0) bodyStart = toks[j].start;
+          body += toks[j].value;
+        }
       }
-      body = body.trim();
-      if (body) {
+      if (bodyStart >= 0 && body.length > 0) {
+        // Align line numbers: count the newlines in the HTML
+        // source before the first body character and prepend
+        // that many newlines to the extracted script. acorn
+        // then parses the script with line numbers that match
+        // the HTML verbatim, so sink locations emitted from
+        // inside the script point at the correct HTML line
+        // when displayed in the original file.
+        const linesBeforeBody = countNewlines(htmlSource, 0, bodyStart);
+        const aligned = '\n'.repeat(linesBeforeBody) + body;
         const synth = base + '.inline.' + idx + '.js';
         idx++;
-        extracted[synth] = body;
+        extracted[synth] = aligned;
+        inlineOrigin[synth] = filename;
       }
       i = j;
     }
@@ -5580,7 +5650,18 @@ async function analyze(input, options) {
     // Each flow already has its source labels, sink info,
     // assumption ids, and location attached. Also fire the
     // onFinding watcher for streaming consumers.
+    //
+    // The location-remap pass rewrites every sink / source
+    // location's `file` from the synthetic
+    // `<page>.inline.N.js` name back to the originating
+    // HTML file, and it propagates the line number as-is
+    // (which is already HTML-aligned thanks to the
+    // prepended-newlines step in the inline extractor).
+    // Consumers then see `example.html:12` instead of
+    // `example.inline.0.js:12`, matching the file the user
+    // opened in the editor.
     for (const flow of ctx.taintFlows) {
+      remapFlowLocations(flow, inlineOrigin);
       trace.taintFlows.push(flow);
       if (watchers && typeof watchers.onFinding === 'function') {
         watchers.onFinding(flow);
@@ -5679,12 +5760,30 @@ async function analyze(input, options) {
       } else {
         ih.template = astTemplate;  // opaque with reason, or null
       }
+      // Remap the location back to the originating HTML
+      // file now that we're done using the synth name for
+      // the template-extractor lookup.
+      remapLocationField(ih, inlineOrigin);
       trace.innerHtmlAssignments.push(ih);
     }
-    for (const c of ctx.calls) trace.calls.push(c);
-    for (const s of ctx.stringLiterals) trace.stringLiterals.push(s);
-    for (const d of ctx.domMutations) trace.domMutations.push(d);
-    for (const w of ctx.walkedHtmlSites) trace.walkedHtmlSites.push(w);
+    for (const c of ctx.calls) {
+      if (c.site) c.site = remapLocation(c.site, inlineOrigin);
+      trace.calls.push(c);
+    }
+    for (const s of ctx.stringLiterals) {
+      remapLocationField(s, inlineOrigin);
+      trace.stringLiterals.push(s);
+    }
+    for (const d of ctx.domMutations) {
+      if (d.site) d.site = remapLocation(d.site, inlineOrigin);
+      trace.domMutations.push(d);
+    }
+    for (const w of ctx.walkedHtmlSites) {
+      if (w.file && inlineOrigin[w.file]) {
+        w.file = inlineOrigin[w.file];
+      }
+      trace.walkedHtmlSites.push(w);
+    }
 
     // Projection: trace.callGraph is derived from ctx.calls.
     // Nodes are unique callee identities (by calleeName +
@@ -5728,6 +5827,18 @@ async function analyze(input, options) {
   }
 
   trace.assumptions = assumptions.snapshot();
+  // Remap assumption locations back to their originating
+  // HTML files. Assumptions are frozen records, so we build
+  // a new array of unfrozen copies with remapped locations
+  // and reassign.
+  if (Object.keys(inlineOrigin).length > 0) {
+    trace.assumptions = trace.assumptions.map((a) => {
+      if (!a || !a.location || !inlineOrigin[a.location.file]) return a;
+      const clone = Object.assign({}, a);
+      clone.location = remapLocation(a.location, inlineOrigin);
+      return Object.freeze(clone);
+    });
+  }
 
   // Assumption rejection pass. The accept set is
   // prescriptive — every assumption with a reason NOT in the
@@ -13369,7 +13480,7 @@ function sourceLabelToReason(label) {
 // human-readable strings) and is left empty for now. The
 // machine-readable formulas live on `pathFormula` (current
 // block) and `valueFormula` (the value at the sink).
-function emitTaintFlow(ctx, sinkInfo, sinkLoc, value) {
+function emitTaintFlow(ctx, sinkInfo, sinkLoc, value, targetType) {
   if (!ctx.taintFlows) return;
   if (!value || !value.labels || value.labels.size === 0) return;
 
@@ -13432,12 +13543,23 @@ function emitTaintFlow(ctx, sinkInfo, sinkLoc, value) {
       if (!seen.has(id)) { seen.add(id); flowIds.push(id); }
     }
   }
+  // Resolve the element tag name from the receiver's
+  // typeName via the TypeDB's tagMap. `HTMLIFrameElement`
+  // → `iframe`, `HTMLScriptElement` → `script`, etc. The
+  // UI renders this as "src on <iframe>" so reviewers can
+  // tell iframe.src (an XSS sink) from video.src (a
+  // network-fetch, not a sink) at a glance. The targetType
+  // field stays too so consumers that want the raw IDL
+  // interface name get both.
+  const tagName = resolveTagFromType(ctx, targetType);
   const flow = {
     id: ctx.nextFlowId++,
     source: sources,
     sink: {
       kind: sinkInfo.type,
       prop: sinkInfo.prop,
+      targetType: targetType || null,
+      elementTag: tagName,
       location: sinkLoc,
     },
     severity: sinkInfo.severity,
@@ -13447,6 +13569,22 @@ function emitTaintFlow(ctx, sinkInfo, sinkLoc, value) {
     assumptionIds: flowIds,
   };
   ctx.taintFlows.push(flow);
+}
+
+// resolveTagFromType — reverse the TypeDB's tagMap from
+// `IDL-interface-name → tagName` so taint flows can surface
+// `<iframe>` as well as `HTMLIFrameElement`. Cached on the
+// TypeDB object so the lookup is O(1) per flow.
+function resolveTagFromType(ctx, typeName) {
+  if (!typeName || !ctx.typeDB || !ctx.typeDB.tagMap) return null;
+  if (!ctx.typeDB._tagByType) {
+    const rev = Object.create(null);
+    for (const tag in ctx.typeDB.tagMap) {
+      rev[ctx.typeDB.tagMap[tag]] = tag;
+    }
+    ctx.typeDB._tagByType = rev;
+  }
+  return ctx.typeDB._tagByType[typeName] || null;
 }
 
 // Look up the source location for an instruction, falling back to
@@ -14323,7 +14461,7 @@ function maybeEmitSinkFlowForWrite(ctx, obj, propName, val, loc) {
   if (!val || !val.labels || val.labels.size === 0) return;
   const sinkInfo = TDB.classifySinkByTypeViaDB(ctx.typeDB, obj.typeName, propName);
   if (!sinkInfo) return;
-  emitTaintFlow(ctx, sinkInfo, loc, val);
+  emitTaintFlow(ctx, sinkInfo, loc, val, obj.typeName);
 }
 
 // --- Wave 12b: trace-enrichment recorders -------------------------------
@@ -15650,6 +15788,13 @@ function maybeEmitSinkFlowForCall(ctx, instr, thisValue, argValues, loc) {
   }
   if (!desc) return;
 
+  // Receiver type: for method calls, the receiver's
+  // typeName; for root calls like eval / fetch, the root
+  // type (e.g. 'GlobalEval') so flows stay attributed to
+  // the object the sink hangs off.
+  const targetType = (thisValue && thisValue.typeName) ||
+                     (instr.calleeName && db.roots && db.roots[instr.calleeName]) ||
+                     null;
   // Method-level / call-level sink: every argument contributes
   // to the sink. Report once per tainted argument.
   if (desc.sink) {
@@ -15658,7 +15803,7 @@ function maybeEmitSinkFlowForCall(ctx, instr, thisValue, argValues, loc) {
       const sinkInfo = { type: desc.sink, severity, prop: sinkProp };
       for (const arg of argValues) {
         if (arg && arg.labels && arg.labels.size > 0) {
-          emitTaintFlow(ctx, sinkInfo, loc, arg);
+          emitTaintFlow(ctx, sinkInfo, loc, arg, targetType);
         }
       }
     }
@@ -15677,7 +15822,7 @@ function maybeEmitSinkFlowForCall(ctx, instr, thisValue, argValues, loc) {
         severity,
         prop: sinkProp + '.arg' + i,
       };
-      emitTaintFlow(ctx, sinkInfo, loc, arg);
+      emitTaintFlow(ctx, sinkInfo, loc, arg, targetType);
     }
   }
 }

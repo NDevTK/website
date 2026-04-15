@@ -162,7 +162,7 @@ function sourceLabelToReason(label) {
 // human-readable strings) and is left empty for now. The
 // machine-readable formulas live on `pathFormula` (current
 // block) and `valueFormula` (the value at the sink).
-function emitTaintFlow(ctx, sinkInfo, sinkLoc, value) {
+function emitTaintFlow(ctx, sinkInfo, sinkLoc, value, targetType) {
   if (!ctx.taintFlows) return;
   if (!value || !value.labels || value.labels.size === 0) return;
 
@@ -225,12 +225,23 @@ function emitTaintFlow(ctx, sinkInfo, sinkLoc, value) {
       if (!seen.has(id)) { seen.add(id); flowIds.push(id); }
     }
   }
+  // Resolve the element tag name from the receiver's
+  // typeName via the TypeDB's tagMap. `HTMLIFrameElement`
+  // → `iframe`, `HTMLScriptElement` → `script`, etc. The
+  // UI renders this as "src on <iframe>" so reviewers can
+  // tell iframe.src (an XSS sink) from video.src (a
+  // network-fetch, not a sink) at a glance. The targetType
+  // field stays too so consumers that want the raw IDL
+  // interface name get both.
+  const tagName = resolveTagFromType(ctx, targetType);
   const flow = {
     id: ctx.nextFlowId++,
     source: sources,
     sink: {
       kind: sinkInfo.type,
       prop: sinkInfo.prop,
+      targetType: targetType || null,
+      elementTag: tagName,
       location: sinkLoc,
     },
     severity: sinkInfo.severity,
@@ -240,6 +251,22 @@ function emitTaintFlow(ctx, sinkInfo, sinkLoc, value) {
     assumptionIds: flowIds,
   };
   ctx.taintFlows.push(flow);
+}
+
+// resolveTagFromType — reverse the TypeDB's tagMap from
+// `IDL-interface-name → tagName` so taint flows can surface
+// `<iframe>` as well as `HTMLIFrameElement`. Cached on the
+// TypeDB object so the lookup is O(1) per flow.
+function resolveTagFromType(ctx, typeName) {
+  if (!typeName || !ctx.typeDB || !ctx.typeDB.tagMap) return null;
+  if (!ctx.typeDB._tagByType) {
+    const rev = Object.create(null);
+    for (const tag in ctx.typeDB.tagMap) {
+      rev[ctx.typeDB.tagMap[tag]] = tag;
+    }
+    ctx.typeDB._tagByType = rev;
+  }
+  return ctx.typeDB._tagByType[typeName] || null;
 }
 
 // Look up the source location for an instruction, falling back to
@@ -1116,7 +1143,7 @@ function maybeEmitSinkFlowForWrite(ctx, obj, propName, val, loc) {
   if (!val || !val.labels || val.labels.size === 0) return;
   const sinkInfo = TDB.classifySinkByTypeViaDB(ctx.typeDB, obj.typeName, propName);
   if (!sinkInfo) return;
-  emitTaintFlow(ctx, sinkInfo, loc, val);
+  emitTaintFlow(ctx, sinkInfo, loc, val, obj.typeName);
 }
 
 // --- Wave 12b: trace-enrichment recorders -------------------------------
@@ -2443,6 +2470,13 @@ function maybeEmitSinkFlowForCall(ctx, instr, thisValue, argValues, loc) {
   }
   if (!desc) return;
 
+  // Receiver type: for method calls, the receiver's
+  // typeName; for root calls like eval / fetch, the root
+  // type (e.g. 'GlobalEval') so flows stay attributed to
+  // the object the sink hangs off.
+  const targetType = (thisValue && thisValue.typeName) ||
+                     (instr.calleeName && db.roots && db.roots[instr.calleeName]) ||
+                     null;
   // Method-level / call-level sink: every argument contributes
   // to the sink. Report once per tainted argument.
   if (desc.sink) {
@@ -2451,7 +2485,7 @@ function maybeEmitSinkFlowForCall(ctx, instr, thisValue, argValues, loc) {
       const sinkInfo = { type: desc.sink, severity, prop: sinkProp };
       for (const arg of argValues) {
         if (arg && arg.labels && arg.labels.size > 0) {
-          emitTaintFlow(ctx, sinkInfo, loc, arg);
+          emitTaintFlow(ctx, sinkInfo, loc, arg, targetType);
         }
       }
     }
@@ -2470,7 +2504,7 @@ function maybeEmitSinkFlowForCall(ctx, instr, thisValue, argValues, loc) {
         severity,
         prop: sinkProp + '.arg' + i,
       };
-      emitTaintFlow(ctx, sinkInfo, loc, arg);
+      emitTaintFlow(ctx, sinkInfo, loc, arg, targetType);
     }
   }
 }

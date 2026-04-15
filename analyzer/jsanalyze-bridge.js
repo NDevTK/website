@@ -201,6 +201,13 @@
       if (f.pathFormula && f.pathFormula.expr) {
         conditions.push(f.pathFormula.expr);
       }
+      // The engine now remaps inline-script filenames back
+      // to their originating HTML at trace projection time,
+      // so sinkLoc.file is already 'example.html' rather
+      // than 'example.inline.0.js'. We still route through
+      // resolveOriginatingFile for belt-and-suspenders
+      // compatibility with callers that hand us a trace
+      // built by an older engine build.
       var originatingFile = resolveOriginatingFile(
         sinkLoc ? sinkLoc.file : null, files);
       findings.push({
@@ -209,7 +216,8 @@
         sink: {
           prop: (f.sink && f.sink.prop) || null,
           kind: (f.sink && f.sink.kind) || null,
-          elementTag: null,
+          targetType:  (f.sink && f.sink.targetType)  || null,
+          elementTag:  (f.sink && f.sink.elementTag)  || null,
         },
         severity: f.severity || 'medium',
         file: originatingFile,

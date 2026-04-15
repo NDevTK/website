@@ -385,6 +385,58 @@ const tests = [
           .map(a => a.details).join(', '));
     },
   },
+  // --- Element-type + line-number fidelity ---
+  {
+    name: 'sink tracking: iframe.src fires but img.src does not',
+    fn: async () => {
+      // IDL inheritance-based classification: the TypeDB
+      // has HTMLIFrameElement.src as a `url` sink but
+      // HTMLImageElement has no such descriptor, so img.src
+      // is not an XSS sink. Tag-based element creation
+      // (createElement) threads the right type through
+      // via tagMap.
+      const t1 = await analyze(
+        'var el = document.createElement("iframe"); el.src = location.hash;',
+        { typeDB: TDB });
+      assertEqual(t1.taintFlows.length, 1,
+        'iframe.src should fire');
+      assertEqual(t1.taintFlows[0].sink.elementTag, 'iframe',
+        'sink.elementTag resolved from tagMap');
+      assertEqual(t1.taintFlows[0].sink.targetType, 'HTMLIFrameElement',
+        'sink.targetType is the IDL interface name');
+
+      const t2 = await analyze(
+        'var el = document.createElement("img"); el.src = location.hash;',
+        { typeDB: TDB });
+      assertEqual(t2.taintFlows.length, 0,
+        'img.src should NOT fire as an XSS sink');
+    },
+  },
+  {
+    name: 'line number fidelity: inline-script sinks report HTML line',
+    fn: async () => {
+      // An innerHTML sink on HTML line 5 (inside an inline
+      // <script>) must surface as line 5 in the finding,
+      // not as the extracted synth-script's own line 1.
+      const html = [
+        '<html>',          // line 1
+        '<body>',          // line 2
+        '<div id="x"></div>',  // line 3
+        '<script>',        // line 4
+        'document.body.innerHTML = location.hash;',  // line 5
+        '</script>',       // line 6
+        '</body>',         // line 7
+        '</html>',         // line 8
+      ].join('\n');
+      const t = await analyze({ 'page.html': html }, { typeDB: TDB });
+      assertEqual(t.taintFlows.length, 1, 'one flow emitted');
+      const loc = t.taintFlows[0].sink.location;
+      assertEqual(loc.file, 'page.html',
+        'file remapped from synth back to HTML');
+      assertEqual(loc.line, 5,
+        'line matches original HTML line, not extracted-script line');
+    },
+  },
   {
     name: 'applyGetIndex fallback: items[window.foo] DOES raise imprecise-index',
     fn: async () => {
