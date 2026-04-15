@@ -95,7 +95,12 @@
   function installWorkerErrorSpy(z3BuiltUrl) {
     if (window.__htmldomZ3WorkerSpyInstalled) return;
     window.__htmldomZ3WorkerSpyInstalled = true;
+    console.log('[z3-spy] env',
+      'crossOriginIsolated=', window.crossOriginIsolated,
+      'SharedArrayBuffer=', typeof SharedArrayBuffer,
+      'wasmThreads=', typeof WebAssembly !== 'undefined' && typeof WebAssembly.Memory === 'function');
     var OrigWorker = window.Worker;
+    var nextWorkerSpyId = 0;
     function PatchedWorker(scriptURL, options) {
       var w = new OrigWorker(scriptURL, options);
       var urlStr = '';
@@ -104,6 +109,17 @@
                  urlStr === z3BuiltUrl ||
                  urlStr.indexOf('blob:') === 0;
       if (isZ3) {
+        var spyId = ++nextWorkerSpyId;
+        console.log('[z3-spy] worker#' + spyId, 'created scriptURL=', urlStr,
+          'name=', options && options.name);
+        w.addEventListener('message', function (e) {
+          var d = e && e.data;
+          var cmd = d && d.cmd;
+          if (cmd) {
+            console.log('[z3-spy] worker#' + spyId, '<- message cmd=', cmd,
+              'keys=', d && Object.keys(d));
+          }
+        }, true);
         w.addEventListener('error', function (e) {
           var props = {};
           try {
@@ -112,9 +128,10 @@
               props[k] = e[k];
             }
           } catch (_) {}
-          console.error('[z3-worker-error]',
+          console.error('[z3-worker-error]', 'worker#' + spyId,
             'scriptURL=', urlStr,
             'workerName=', (options && options.name) || (w && w.name),
+            'crossOriginIsolated=', window.crossOriginIsolated,
             'type=', e.type,
             'isTrusted=', e.isTrusted,
             'message=', e.message,
@@ -123,13 +140,28 @@
             'colno=', e.colno,
             'error=', e.error,
             'errorStack=', e.error && e.error.stack,
-            'props=', props);
+            'eventProps=', props);
         }, true);
         w.addEventListener('messageerror', function (e) {
-          console.error('[z3-worker-messageerror]',
-            'scriptURL=', urlStr,
+          console.error('[z3-worker-messageerror]', 'worker#' + spyId,
             'data=', e && e.data);
         }, true);
+        var origPostMessage = w.postMessage.bind(w);
+        w.postMessage = function (msg, transfer) {
+          try {
+            var cmd = msg && msg.cmd;
+            var msgKeys = msg ? Object.keys(msg) : null;
+            var wm = msg && msg.wasmMemory;
+            var wmBuf = wm && wm.buffer;
+            console.log('[z3-spy] worker#' + spyId, '-> postMessage cmd=', cmd,
+              'keys=', msgKeys,
+              'wasmMemoryBufferType=', wmBuf && wmBuf.constructor && wmBuf.constructor.name,
+              'sabByteLength=', wmBuf && wmBuf.byteLength);
+          } catch (logErr) {
+            console.warn('[z3-spy] worker#' + spyId, 'postMessage log failed', logErr);
+          }
+          return origPostMessage(msg, transfer);
+        };
       }
       return w;
     }
@@ -142,19 +174,38 @@
   }
 
   // Wrap window.initZ3 so every invocation gets a Module object
-  // carrying our diagnostic hooks. browser.esm.js calls
-  // `await initZ3()` with no arguments, so without this wrapper
-  // Emscripten's print / printErr default to console.log /
-  // console.warn with no prefix and onAbort is a silent throw —
-  // which is why a WASM abort surfaces as a plain `error` Event
-  // on the main thread with no location info. The wrapper is
-  // idempotent via a sentinel flag.
-  function installInitZ3Wrapper() {
+  // carrying our diagnostic hooks AND `mainScriptUrlOrBlob` set
+  // to a Blob of z3-built.js's source. browser.esm.js calls
+  // `await initZ3()` with no arguments, so without this wrapper:
+  //
+  //   * Emscripten's print / printErr default to console.log /
+  //     console.warn with no prefix and onAbort is a silent
+  //     throw — which is why WASM aborts surface as a plain
+  //     `error` Event on the main thread with no location info.
+  //
+  //   * Emscripten uses `_scriptName` (document.currentScript.src
+  //     captured at load time) as the pthread worker's script
+  //     URL. That URL re-fetches z3-built.js through the COI
+  //     service worker on every pthread spawn. SW-intercepted
+  //     worker fetches can terminate silently (plain `Event`
+  //     on onerror, all fields undefined) in Chromium when the
+  //     response body stream is consumed a second time. Passing
+  //     a pre-built Blob sidesteps the network fetch entirely:
+  //     emscripten calls `URL.createObjectURL` on the Blob and
+  //     uses the blob URL for `new Worker`, which never goes
+  //     through the SW.
+  //
+  // The wrapper is idempotent via a sentinel flag.
+  function installInitZ3Wrapper(z3BuiltBlob) {
     if (window.__htmldomZ3InitWrapped) return;
     window.__htmldomZ3InitWrapped = true;
     var origInitZ3 = window.initZ3;
     window.initZ3 = function (moduleArg) {
       moduleArg = moduleArg || {};
+      if (z3BuiltBlob && !moduleArg.mainScriptUrlOrBlob) {
+        moduleArg.mainScriptUrlOrBlob = z3BuiltBlob;
+        console.log('[z3-spy] injected mainScriptUrlOrBlob size=', z3BuiltBlob.size);
+      }
       var userPrint    = moduleArg.print;
       var userPrintErr = moduleArg.printErr;
       var userOnAbort  = moduleArg.onAbort;
@@ -172,8 +223,73 @@
         console.error('[z3-abort]', reason, new Error('[z3-abort stack]').stack);
         if (typeof userOnAbort === 'function') userOnAbort.call(this, reason);
       };
-      return origInitZ3.call(this, moduleArg);
+      var promise = origInitZ3.call(this, moduleArg);
+      // The factory body runs synchronously inside origInitZ3
+      // and assigns `moduleArg.async_call` before returning the
+      // promise (see z3-built.js line ~113). Wrap it now with a
+      // watchdog so a pthread that dies silently (plain Event
+      // on worker.onerror, no cmd: 'resolved'/'rejected' ever
+      // reaches the main thread) doesn't leave the caller's
+      // await hanging forever. The watchdog budget is the
+      // per-check solver timeout plus a generous slop — we
+      // don't want to pre-empt healthy checks.
+      if (typeof moduleArg.async_call === 'function') {
+        var origAsyncCall = moduleArg.async_call;
+        moduleArg.async_call = function (f) {
+          var args = Array.prototype.slice.call(arguments, 1);
+          var callId = ++asyncCallCounter;
+          console.log('[z3-spy] async_call#' + callId, 'entry');
+          return new Promise(function (resolve, reject) {
+            var watchdog = setTimeout(function () {
+              console.error('[z3-spy] async_call#' + callId, 'WATCHDOG timed out after 15s — pthread likely died silently');
+              reject(new Error('z3 async_call watchdog timed out (pthread worker died)'));
+            }, 15000);
+            var inner;
+            try {
+              inner = origAsyncCall.apply(moduleArg, [f].concat(args));
+            } catch (syncErr) {
+              clearTimeout(watchdog);
+              console.error('[z3-spy] async_call#' + callId, 'SYNC THREW', syncErr);
+              reject(syncErr);
+              return;
+            }
+            Promise.resolve(inner).then(
+              function (v) {
+                clearTimeout(watchdog);
+                console.log('[z3-spy] async_call#' + callId, 'resolved');
+                resolve(v);
+              },
+              function (e) {
+                clearTimeout(watchdog);
+                console.error('[z3-spy] async_call#' + callId, 'rejected', e);
+                reject(e);
+              }
+            );
+          });
+        };
+      } else {
+        console.warn('[z3-spy] moduleArg.async_call not set after origInitZ3 — watchdog skipped');
+      }
+      return promise;
     };
+  }
+  var asyncCallCounter = 0;
+
+  // Fetch z3-built.js as a Blob so we can hand it to
+  // `Module.mainScriptUrlOrBlob`. Returns null on failure
+  // (caller falls back to the script-URL path).
+  async function fetchZ3BuiltBlob(z3BuiltUrl) {
+    try {
+      var resp = await fetch(z3BuiltUrl, { credentials: 'same-origin' });
+      if (!resp.ok) {
+        console.warn('[z3-spy] fetch z3-built.js failed status=', resp.status);
+        return null;
+      }
+      return await resp.blob();
+    } catch (err) {
+      console.warn('[z3-spy] fetch z3-built.js threw', err);
+      return null;
+    }
   }
 
   async function initZ3Browser() {
@@ -187,13 +303,15 @@
     // of whether the page is served at the site root or a subpath.
     var z3BuiltUrl = new URL(VENDOR_DIR + 'z3-built.js', document.baseURI).href;
     installWorkerErrorSpy(z3BuiltUrl);
+    var blobPromise = fetchZ3BuiltBlob(z3BuiltUrl);
     if (typeof window.initZ3 !== 'function') {
       await loadClassicScript(z3BuiltUrl);
       if (typeof window.initZ3 !== 'function') {
         throw new Error('jsanalyze-z3-browser: z3-built.js loaded but window.initZ3 is not a function');
       }
     }
-    installInitZ3Wrapper();
+    var z3BuiltBlob = await blobPromise;
+    installInitZ3Wrapper(z3BuiltBlob);
 
     // Step 3: dynamic-import the pre-bundled ESM wrapper.
     //
