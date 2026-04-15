@@ -137,7 +137,6 @@ const footer = `
     cspDerive:   __require('consumers/csp-derive.js'),
     fetchTrace:  __require('consumers/fetch-trace.js'),
     taintReport: __require('consumers/taint-report.js'),
-    pocSynth:    __require('consumers/poc-synth.js'),
   };
   var out = {};
   for (var k in api) out[k] = api[k];

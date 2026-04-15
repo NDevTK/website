@@ -64,16 +64,17 @@ code { background: #2a2e33; padding: 0.05rem 0.25rem; border-radius: 3px; font-s
 .taint-decoration-high { background: rgba(231, 76, 60, 0.12) !important; }
 .taint-decoration-medium { background: rgba(241, 196, 15, 0.08) !important; }
 
-.poc-item, .csp-row, .fetch-item { padding: 0.4rem 0.75rem; font-size: 0.8rem; border-bottom: 1px solid #2a2e33; cursor: pointer; }
-.poc-item:hover, .csp-row:hover, .fetch-item:hover { background: #2a2e33; }
-.poc-item .poc-verdict { font-weight: bold; font-size: 0.68rem; padding: 0.1rem 0.3rem; border-radius: 3px; margin-right: 0.4rem; }
-.poc-item .poc-verdict.synthesised { background: #e74c3c33; color: #e74c3c; }
-.poc-item .poc-verdict.infeasible  { background: #2ecc7133; color: #2ecc71; }
-.poc-item .poc-verdict.unsolvable  { background: #f39c1233; color: #f39c12; }
-.poc-item .poc-verdict.trivial     { background: #33333366; color: #888; }
-.poc-item .poc-verdict.no-constraint { background: #33333366; color: #888; }
-.poc-item .poc-payload { color: #fff; font-family: ui-monospace, SFMono-Regular, monospace; word-break: break-all; margin-top: 0.15rem; }
-.poc-item .poc-flow { color: #888; font-size: 0.7rem; margin-top: 0.1rem; }
+.csp-row, .fetch-item { padding: 0.4rem 0.75rem; font-size: 0.8rem; border-bottom: 1px solid #2a2e33; cursor: pointer; }
+.csp-row:hover, .fetch-item:hover { background: #2a2e33; }
+.finding-item .finding-verdict { display: inline-block; font-weight: bold; font-size: 0.6rem; padding: 0.05rem 0.3rem; border-radius: 3px; margin-left: 0.4rem; vertical-align: middle; }
+.finding-item .finding-verdict.synthesised { background: #e74c3c33; color: #e74c3c; }
+.finding-item .finding-verdict.infeasible  { background: #2ecc7133; color: #2ecc71; }
+.finding-item .finding-verdict.unsolvable  { background: #f39c1233; color: #f39c12; }
+.finding-item .finding-verdict.trivial     { background: #33333366; color: #888; }
+.finding-item .finding-verdict.no-constraint { background: #33333366; color: #888; }
+.finding-item .finding-payload { color: #fff; font-family: ui-monospace, SFMono-Regular, monospace; word-break: break-all; margin-top: 0.15rem; font-size: 0.72rem; }
+.finding-item .finding-payload-label { color: #888; font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.05em; margin-right: 0.3rem; }
+.finding-item .finding-note { color: #888; font-size: 0.7rem; margin-top: 0.1rem; font-style: italic; }
 .csp-row .csp-dir { color: #6ea8fe; font-weight: bold; }
 .csp-row .csp-val { color: #aaa; font-size: 0.75rem; margin-top: 0.15rem; word-break: break-all; font-family: ui-monospace, SFMono-Regular, monospace; }
 .csp-row .csp-warn { color: #f39c12; font-size: 0.7rem; margin-top: 0.1rem; font-style: italic; }
@@ -102,7 +103,6 @@ code { background: #2a2e33; padding: 0.05rem 0.25rem; border-radius: 3px; font-s
 .assumption-chip.severity-precision { border-color: #f39c1255; color: #f39c12; }
 .assumption-chip.rejected { border-color: #e74c3c; color: #fff; background: #e74c3c33; font-weight: bold; }
 .finding-item .finding-assumptions { margin-top: 0.25rem; }
-.poc-item .poc-assumptions { margin-top: 0.25rem; }
 
 .rejected-item { padding: 0.4rem 0.75rem; font-size: 0.75rem; border-bottom: 1px solid #2a2e33; }
 .rejected-item .rejected-reason { color: #e74c3c; font-weight: bold; font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.72rem; }
@@ -185,10 +185,6 @@ code { background: #2a2e33; padding: 0.05rem 0.25rem; border-radius: 3px; font-s
     <div id="taintSummary" class="taint-summary" style="display:none;"></div>
     <div class="file-list" id="taintFindings">
       <div class="empty-hint">Taint analysis runs automatically</div>
-    </div>
-    <div class="section-header">PoC Payloads</div>
-    <div class="file-list" id="pocList">
-      <div class="empty-hint">Z3-synthesised exploit payloads per flow</div>
     </div>
     <div class="section-header">CSP Policy</div>
     <div class="file-list" id="cspList">

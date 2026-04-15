@@ -21,7 +21,6 @@
 //     taint:   { findings, summary },       // taint-report reshaped
 //     csp:     { 'script-src': [...], ... },// csp-derive policy
 //     fetches: FetchCallSite[],             // fetch-trace
-//     pocs:    PocResult[],                 // poc-synth
 //     accept:  string[],                    // echo of the accept set used
 //     allAssumptions: Assumption[],         // every assumption raised
 //     rejectedAssumptions: Assumption[],    // ones outside the accept set
@@ -224,6 +223,15 @@
         location: sinkLoc ? { line: sinkLoc.line || 0, col: sinkLoc.col || 0 } : null,
         conditions: conditions,
         assumptions: assumptionsFor(f.assumptionIds, byId),
+        // PoC witness is attached to each flow by src/z3.js's
+        // synthesisePocs pass (called inline from refuteTrace).
+        // Shape: { verdict, payload, note } — the solver-level
+        // `witness` map is left off the UI side of the wire.
+        poc: f.poc ? {
+          verdict: f.poc.verdict || null,
+          payload: f.poc.payload != null ? f.poc.payload : null,
+          note:    f.poc.note || null,
+        } : null,
       });
     }
     var counts = { high: 0, medium: 0, low: 0, total: findings.length };
@@ -232,33 +240,6 @@
       if (counts[s] != null) counts[s]++;
     }
     return { findings: findings, summary: counts };
-  }
-
-  // Enrich PoC results with the assumptions that applied to
-  // the flow. The poc-synth consumer returns records keyed by
-  // `flowId`, so we look up the original flow and copy its
-  // resolved assumptions. When Z3 is skipped (accept includes
-  // 'smt-skipped'), the witness itself is gated on that
-  // assumption — we annotate that case explicitly so the UI
-  // can say "no real solver proof was run for this payload".
-  function enrichPocResults(pocs, trace) {
-    var byId = buildAssumptionIndex(trace);
-    var flowsById = Object.create(null);
-    for (var i = 0; i < (trace.taintFlows || []).length; i++) {
-      var f = trace.taintFlows[i];
-      flowsById[f.id] = f;
-    }
-    var out = [];
-    for (var j = 0; j < pocs.length; j++) {
-      var r = pocs[j];
-      var flow = flowsById[r.flowId];
-      var a = flow ? assumptionsFor(flow.assumptionIds, byId) : [];
-      var enriched = {};
-      for (var k in r) enriched[k] = r[k];
-      enriched.assumptions = a;
-      out.push(enriched);
-    }
-    return out;
   }
 
   // Kept for backwards compat — monaco-init.js historically
@@ -312,7 +293,6 @@
         taint:   { findings: [], summary: { total: 0, high: 0, medium: 0, low: 0 } },
         csp:     null,
         fetches: [],
-        pocs:    [],
         accept:  options.accept || null,
         allAssumptions: [],
         rejectedAssumptions: [],
@@ -330,7 +310,6 @@
     var taint  = taintFindingsFromTrace(trace, files);
     var csp    = null;
     var fetches = [];
-    var pocs   = [];
     // Each consumer is independent — a failure in one shouldn't
     // take down the others. The UI panel just shows empty for
     // a failing consumer.
@@ -348,21 +327,12 @@
       console.error('[bridge] step fetchTrace THREW', e && (e.stack || e.message), e);
     }
     console.log('[bridge] step fetchTrace END', 'count=', (fetches || []).length);
-    console.log('[bridge] step pocSynth START');
-    try {
-      pocs = await J.consumers.pocSynth.synthesiseTrace(trace);
-    } catch (e) {
-      console.error('[bridge] step pocSynth THREW', e && (e.stack || e.message), e);
-    }
-    console.log('[bridge] step pocSynth END', 'count=', (pocs || []).length);
-    pocs = enrichPocResults(pocs || [], trace);
 
     var result = {
       convertedFiles: convertedFiles,
       taint:   taint,
       csp:     csp,
       fetches: fetches,
-      pocs:    pocs,
       accept:  options.accept || null,
       allAssumptions:      trace.assumptions || [],
       rejectedAssumptions: trace.rejectedAssumptions || [],
@@ -372,7 +342,6 @@
       'convertedFiles=', Object.keys(result.convertedFiles).length,
       'csp=', result.csp && Object.keys(result.csp),
       'fetches=', result.fetches.length,
-      'pocs=', result.pocs.length,
       'allAssumptions=', result.allAssumptions.length);
     return result;
   };

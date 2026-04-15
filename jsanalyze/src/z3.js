@@ -269,8 +269,8 @@ async function checkPathSat(formula, timeoutMs) {
 //
 // This is the witness-extraction half of the solver interface:
 // `checkPathSat` decides feasibility, `getModel` turns a
-// feasible formula into a concrete attacker input. The PoC
-// synthesis consumer (`consumers/poc-synth.js`) conjoins a
+// feasible formula into a concrete attacker input. The inline
+// PoC synthesis pass below (`synthesisePocs`) conjoins a
 // taint flow's pathFormula with a sink-specific exploitability
 // constraint and calls this function to get a payload.
 //
@@ -374,7 +374,11 @@ function astToJs(ast, sort) {
 // whose pathFormula is non-trivial, ask checkPathSat; drop
 // flows with 'unsat' verdicts into `trace.refutedFlows`.
 // Flows already killed during the Layer 5 cascade never reach
-// this pass (they weren't emitted in the first place).
+// this pass (they weren't emitted in the first place). After
+// refutation, surviving flows get a PoC witness attached via
+// synthesisePocs — the same SMT system drives both refutation
+// and witness extraction so we don't need a separate consumer
+// pass.
 async function refuteTrace(trace, timeoutMs) {
   if (!trace || !trace.taintFlows || trace.taintFlows.length === 0) {
     return trace;
@@ -396,7 +400,139 @@ async function refuteTrace(trace, timeoutMs) {
   }
   trace.taintFlows = kept;
   if (refuted.length > 0) trace.refutedFlows = refuted;
+  await synthesisePocs(trace, timeoutMs);
   return trace;
+}
+
+// --- PoC synthesis ---------------------------------------------------------
+//
+// Per-sink exploit constraints. Each entry takes the flow's
+// valueFormula (the SMT expression for the value reaching the
+// sink) and returns a predicate that an attacker-controllable
+// witness must satisfy. The conjunction of pathFormula ∧
+// exploit(valueFormula) is handed to Z3; a SAT model gives us
+// a concrete payload.
+//
+//   html       — innerHTML / outerHTML / document.write /
+//                insertAdjacentHTML. A payload containing a
+//                `<script>` open tag is parsed as an element
+//                whose content is executed inline.
+//   navigation — location.href / location.assign /
+//                window.open. `javascript:` URLs execute as
+//                code in the current origin.
+//   url        — iframe.src / frame.src / img.src. Same
+//                `javascript:` vector inside a frame.
+//   code       — eval / Function / setTimeout(string). Any
+//                non-empty string suffices to demonstrate
+//                attacker control.
+const EXPLOIT_CONSTRAINTS = {
+  html:       (val) => SMT.mkContains(val, SMT.mkConst('<script>')),
+  navigation: (val) => SMT.mkPrefixOf(SMT.mkConst('javascript:'), val),
+  url:        (val) => SMT.mkPrefixOf(SMT.mkConst('javascript:'), val),
+  code:       (val) => SMT.mkCmp('>', SMT.mkLength(val), SMT.mkConst(0)),
+};
+
+// extractPayload — pick a single value from the witness map
+// most likely to interest a human reviewer. String bindings
+// come first (those are the attacker-visible payloads);
+// everything else falls back to a JSON dump.
+function extractPayload(witness) {
+  if (!witness) return null;
+  const keys = Object.keys(witness);
+  if (keys.length === 0) return '';
+  for (const k of keys) {
+    if (typeof witness[k] === 'string') return witness[k];
+  }
+  return JSON.stringify(witness);
+}
+
+// synthesisePocs — attach a PoC witness to every surviving
+// taint flow. Runs immediately after refuteTrace so the
+// witness is built from the same solver state that already
+// determined the flow's feasibility. Per-flow results are
+// written onto `flow.poc`:
+//
+//   { verdict: 'synthesised' | 'trivial' | 'infeasible'
+//              | 'unsolvable' | 'no-constraint',
+//     payload: string | null,
+//     witness: {symName: value} | null,
+//     note:    string | null }
+//
+// verdict meanings:
+//   trivial       — valueFormula is already a concrete string
+//                   literal; no solver round-trip needed.
+//   synthesised   — Z3 returned a model that satisfies path ∧
+//                   exploit constraint.
+//   infeasible    — path ∧ exploit is UNSAT. Flow is real but
+//                   the exploit shape is blocked.
+//   unsolvable    — no exploit shape registered for the sink
+//                   kind, or solver returned unknown.
+//   no-constraint — flow has neither a pathFormula nor a
+//                   known exploit builder; nothing to solve.
+async function synthesisePocs(trace, timeoutMs) {
+  if (!trace || !trace.taintFlows || trace.taintFlows.length === 0) {
+    return;
+  }
+  for (const flow of trace.taintFlows) {
+    flow.poc = await synthesisePocForFlow(flow, timeoutMs);
+  }
+}
+
+async function synthesisePocForFlow(flow, timeoutMs) {
+  const val = flow.valueFormula;
+
+  // Trivial case: the value is already a concrete literal in
+  // the source. Report the literal as the payload without
+  // touching Z3.
+  if (val && val.value && typeof val.value.val === 'string') {
+    return {
+      verdict: 'trivial',
+      payload: val.value.val,
+      witness: { __const__: val.value.val },
+      note: null,
+    };
+  }
+
+  const sinkKind = flow.sink && flow.sink.kind;
+  const builder = EXPLOIT_CONSTRAINTS[sinkKind];
+
+  let formula = flow.pathFormula || null;
+  let exploited = false;
+  if (builder && val) {
+    const exploitC = builder(val);
+    if (exploitC) {
+      formula = formula ? SMT.mkAnd(formula, exploitC) : exploitC;
+      exploited = true;
+    }
+  }
+
+  if (!formula) {
+    return {
+      verdict: 'no-constraint',
+      payload: null,
+      witness: null,
+      note: 'no pathFormula and no valueFormula to constrain',
+    };
+  }
+
+  const witness = await getModel(formula, timeoutMs);
+  if (witness === null) {
+    return {
+      verdict: exploited ? 'infeasible' : 'unsolvable',
+      payload: null,
+      witness: null,
+      note: exploited
+        ? 'path condition + exploit constraint is UNSAT'
+        : 'Z3 returned unknown (timeout or unhandled theory)',
+    };
+  }
+
+  return {
+    verdict: exploited ? 'synthesised' : 'no-constraint',
+    payload: extractPayload(witness),
+    witness,
+    note: null,
+  };
 }
 
 module.exports = {
@@ -404,5 +540,6 @@ module.exports = {
   checkPathSat,
   getModel,
   refuteTrace,
+  synthesisePocs,
   resetCache,
 };

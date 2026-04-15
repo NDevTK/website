@@ -212,8 +212,10 @@
     // Uses globalThis.__runAllConsumers (from jsanalyze-bridge.js),
     // which runs the dom-convert project rewrite AND a shared
     // analyze() pass whose trace feeds taint-report, csp-derive,
-    // fetch-trace, and poc-synth. One engine walk per file ->
-    // five consumer outputs -> five UI panels.
+    // and fetch-trace. PoC witnesses are attached to each taint
+    // flow inline by src/z3.js's synthesisePocs pass, so the
+    // Taint Findings panel shows verdict + payload next to each
+    // finding without a separate consumer step.
     //
     // `analysisMode` drives the engine's accept set (the single
     // axis for all precision/performance/soundness trade-offs,
@@ -223,7 +225,6 @@
     var taintResults = null;
     var cspResults = null;
     var fetchResults = null;
-    var pocResults = null;
     var rejectedAssumptions = [];
     var allAssumptions = [];
     var editorDecorations = [];
@@ -249,7 +250,6 @@
           taintResults = all.taint  || { findings: [], summary: { total: 0 } };
           cspResults   = all.csp    || null;
           fetchResults = all.fetches|| [];
-          pocResults   = all.pocs   || [];
           rejectedAssumptions = all.rejectedAssumptions || [];
           allAssumptions = all.allAssumptions || [];
         } else {
@@ -257,7 +257,6 @@
         }
         renderSidebar();
         renderTaintFindings();
-        renderPocList();
         renderCspList();
         renderFetchList();
         renderRejectedAssumptions();
@@ -371,11 +370,32 @@
         el.appendChild(sev);
         var desc = document.createTextNode(finding.sources.join(', ') + ' \u2192 ' + finding.sink.prop + (finding.sink.elementTag ? ' on <' + finding.sink.elementTag + '>' : ''));
         el.appendChild(desc);
+        if (finding.poc && finding.poc.verdict) {
+          var verdict = document.createElement('span');
+          verdict.className = 'finding-verdict ' + finding.poc.verdict;
+          verdict.textContent = finding.poc.verdict.toUpperCase();
+          el.appendChild(verdict);
+        }
         if (finding.file) {
           var flow = document.createElement('div');
           flow.className = 'finding-flow';
           flow.textContent = finding.file + (finding.location && finding.location.line ? ':' + finding.location.line : '');
           el.appendChild(flow);
+        }
+        if (finding.poc && finding.poc.payload != null) {
+          var payload = document.createElement('div');
+          payload.className = 'finding-payload';
+          var label = document.createElement('span');
+          label.className = 'finding-payload-label';
+          label.textContent = 'payload:';
+          payload.appendChild(label);
+          payload.appendChild(document.createTextNode(finding.poc.payload));
+          el.appendChild(payload);
+        } else if (finding.poc && finding.poc.note) {
+          var note = document.createElement('div');
+          note.className = 'finding-note';
+          note.textContent = finding.poc.note;
+          el.appendChild(note);
         }
         if (finding.conditions && finding.conditions.length) {
           var cond = document.createElement('div');
@@ -397,66 +417,6 @@
         })(finding);
         container.appendChild(el);
       }
-    }
-
-    // --- PoC payloads panel ---
-    // Renders poc-synth results. 'synthesised' entries are
-    // highlighted and show the concrete attacker payload;
-    // the other verdicts are muted.
-    function renderPocList() {
-      var container = document.getElementById('pocList');
-      if (!pocResults || !pocResults.length) {
-        container.innerHTML = '<div class="empty-hint">No flows to synthesise</div>';
-        return;
-      }
-      // Synthesised payloads first, then other verdicts grouped at the bottom.
-      var order = { synthesised: 0, infeasible: 1, unsolvable: 2, 'no-constraint': 3, trivial: 4 };
-      var sorted = pocResults.slice().sort(function(a, b) {
-        return (order[a.verdict] || 9) - (order[b.verdict] || 9);
-      });
-      container.innerHTML = '';
-      sorted.forEach(function(r) {
-        var el = document.createElement('div');
-        el.className = 'poc-item';
-        var verdict = document.createElement('span');
-        verdict.className = 'poc-verdict ' + r.verdict;
-        verdict.textContent = r.verdict.toUpperCase();
-        el.appendChild(verdict);
-        var srcLabels = (r.source || []).map(function(s){ return s.label; }).join('+');
-        var sinkLabel = (r.sink && r.sink.kind) + ':' + (r.sink && r.sink.prop || '?');
-        el.appendChild(document.createTextNode(srcLabels + ' \u2192 ' + sinkLabel));
-        if (r.payload != null) {
-          var p = document.createElement('div');
-          p.className = 'poc-payload';
-          p.textContent = r.payload;
-          el.appendChild(p);
-        } else if (r.note) {
-          var note = document.createElement('div');
-          note.className = 'poc-flow';
-          note.textContent = r.note;
-          el.appendChild(note);
-        }
-        var loc = r.sink && r.sink.location;
-        if (loc && loc.file) {
-          var flow = document.createElement('div');
-          flow.className = 'poc-flow';
-          flow.textContent = loc.file + (loc.line ? ':' + loc.line : '');
-          el.appendChild(flow);
-          el.addEventListener('click', function() {
-            var file = loc.file;
-            if (folderFiles[file]) {
-              selectFile(file, 'original');
-              if (loc.line) editor.revealLineInCenter(loc.line);
-            }
-          });
-        }
-        var pocChips = buildAssumptionChips(r.assumptions);
-        if (pocChips) {
-          pocChips.className = 'poc-assumptions';
-          el.appendChild(pocChips);
-        }
-        container.appendChild(el);
-      });
     }
 
     // --- CSP panel ---

@@ -48,7 +48,6 @@ const testFiles = [
   'csp-derive.test.js',
   'fetch-trace.test.js',
   'legacy-replay.test.js',
-  'poc-synth.test.js',
 ];
 
 async function main() {
