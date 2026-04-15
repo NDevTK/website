@@ -18231,46 +18231,33 @@ async function getModel(formula, timeoutMs) {
     ? formula.expr
     : SMT._internals.toBool(formula);
   const assertText = '(assert ' + asserted + ')\n';
-  console.log('[z3/getModel] assertText=', assertText);
 
-  console.log('[z3/getModel] awaiting _initZ3');
   const z3 = await _initZ3();
-  console.log('[z3/getModel] _initZ3 resolved, Solver=', typeof z3 && typeof z3.Solver);
-  if (!_sharedSolver) {
-    console.log('[z3/getModel] creating shared solver');
-    _sharedSolver = new z3.Solver();
-  }
+  if (!_sharedSolver) _sharedSolver = new z3.Solver();
 
   let pending = computePendingDecls(formula);
   if (pending === null) {
-    console.log('[z3/getModel] sort conflict — resetting shared solver');
     _sharedSolver = new z3.Solver();
     _declaredSorts.clear();
     _satCache.clear();
     pending = computePendingDecls(formula);
   }
   if (pending) {
-    console.log('[z3/getModel] pending decls=', pending);
     _sharedSolver.fromString(pending);
     _recordDecls(formula);
   }
 
   if (typeof timeoutMs === 'number' && timeoutMs > 0) {
-    console.log('[z3/getModel] setting timeout=', timeoutMs);
     _sharedSolver.set('timeout', timeoutMs);
   }
 
   _sharedSolver.push();
-  console.log('[z3/getModel] loading assertion');
   _sharedSolver.fromString(assertText);
-  console.log('[z3/getModel] calling solver.check()');
   const verdict = await _sharedSolver.check();
-  console.log('[z3/getModel] check returned', verdict);
   if (verdict !== 'sat') {
     _sharedSolver.pop();
     return null;
   }
-  console.log('[z3/getModel] extracting model');
   const model = _sharedSolver.model();
 
   // Walk the model's declarations and pull out every sym that
@@ -18427,21 +18414,14 @@ async function synthesisePocs(trace, timeoutMs) {
   if (!trace || !trace.taintFlows || trace.taintFlows.length === 0) {
     return;
   }
-  console.log('[z3/synthesisePocs] START flows=', trace.taintFlows.length, 'timeoutMs=', timeoutMs);
-  for (let i = 0; i < trace.taintFlows.length; i++) {
-    const flow = trace.taintFlows[i];
-    const sinkKind = flow && flow.sink && flow.sink.kind;
-    const hasValue = !!(flow && flow.valueFormula);
-    const hasPath  = !!(flow && flow.pathFormula);
-    const pathLen  = hasPath && flow.pathFormula.expr ? flow.pathFormula.expr.length : 0;
-    console.log('[z3/synthesisePocs] flow', i, 'id=', flow.id, 'sinkKind=', sinkKind,
-      'hasValueFormula=', hasValue, 'hasPathFormula=', hasPath, 'pathExprLen=', pathLen);
+  for (const flow of trace.taintFlows) {
+    // A bad formula on one flow shouldn't take down witness
+    // generation for the other flows on the same trace. Each
+    // flow's failure is recorded as an `unsolvable` verdict
+    // with the error message in the note so the UI can show it.
     try {
       flow.poc = await synthesisePocForFlow(flow, timeoutMs);
-      console.log('[z3/synthesisePocs] flow', i, 'verdict=', flow.poc && flow.poc.verdict,
-        'payloadLen=', flow.poc && flow.poc.payload != null ? String(flow.poc.payload).length : 0);
     } catch (err) {
-      console.error('[z3/synthesisePocs] flow', i, 'THREW', err && (err.stack || err.message), err);
       flow.poc = {
         verdict: 'unsolvable',
         payload: null,
@@ -18450,7 +18430,6 @@ async function synthesisePocs(trace, timeoutMs) {
       };
     }
   }
-  console.log('[z3/synthesisePocs] END');
 }
 
 async function synthesisePocForFlow(flow, timeoutMs) {
@@ -18490,11 +18469,7 @@ async function synthesisePocForFlow(flow, timeoutMs) {
     };
   }
 
-  console.log('[z3/synthesisePocForFlow] calling getModel sinkKind=', sinkKind,
-    'exploited=', exploited, 'formulaExprLen=', formula.expr ? formula.expr.length : 0,
-    'isBool=', !!formula.isBool, 'sorts=', Object.keys(formula.sorts || {}));
   const witness = await getModel(formula, timeoutMs);
-  console.log('[z3/synthesisePocForFlow] getModel returned witness=', witness);
   if (witness === null) {
     return {
       verdict: exploited ? 'infeasible' : 'unsolvable',
