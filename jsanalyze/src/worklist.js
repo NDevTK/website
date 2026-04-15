@@ -160,12 +160,17 @@ function insertVariant(blockVariants, blockId, newState, wideningJoin) {
     blockVariants.set(blockId, list);
   }
   // Back-edge widening: fold into any variant with the same
-  // _fromBlock regardless of (regs, heap) equality.
+  // _fromBlock regardless of (regs, heap) equality. Use the
+  // domain's widen operator (D.widenStates), NOT join, so
+  // per-register values that grew along a numeric axis
+  // extrapolate to ±Infinity in one step. That gives the
+  // lattice finite height without any iteration cap /
+  // value-set cap / cartesian-product cap. See D14.
   if (wideningJoin) {
     for (let i = 0; i < list.length; i++) {
       const existing = list[i];
       if (existing._fromBlock !== newState._fromBlock) continue;
-      const joined = D.joinStates(existing, newState);
+      const joined = D.widenStates(existing, newState);
       if (D.stateEquals(joined, existing)) {
         // Widening is a no-op: the existing variant already
         // subsumes the newcomer. Still merge path and
@@ -696,6 +701,54 @@ function refineForBranch(state, condReg, defs, taken, db) {
     const refined = taken
       ? D.refineInstanceof(varValue, ctorName, db)
       : D.refineNotInstanceof(varValue, ctorName, db);
+    if (refined === varValue) return state;
+    return D.setReg(state, varReg, refined);
+  }
+
+  // --- numeric-range refinement (<, <=, >, >=) ---
+  //
+  // `x < lit` on true:  x ← refineNumericRange(x, '<',  lit)
+  // `x < lit` on false: x ← refineNumericRange(x, '>=', lit)
+  // Same pattern for <=, >, >=.
+  //
+  // Without this, a loop `for (var i = 0; i < N; i++) …`
+  // can't prune its counter — OneOf(i) grows monotonically
+  // until the ONE_OF_CAP promotes it to Interval, and the
+  // Interval itself has no upper bound because the branch
+  // constraint isn't applied. The consequence is that
+  // `items[i]` inside the loop body hits the imprecise-
+  // index fallback despite the loop being fully analysable.
+  // This restores proper convergence.
+  const rangeOps = {
+    '<':  { taken: '<',  notTaken: '>=' },
+    '<=': { taken: '<=', notTaken: '>'  },
+    '>':  { taken: '>',  notTaken: '<=' },
+    '>=': { taken: '>=', notTaken: '<'  },
+  };
+  if (rangeOps[op]) {
+    const lv0 = D.getReg(state, def.left);
+    const rv0 = D.getReg(state, def.right);
+    // Identify whichever side is a concrete numeric literal;
+    // refine the OTHER side. When swapping, invert the
+    // operator so the refinement remains semantically
+    // `var OP literal`.
+    let varReg, lit, effOp;
+    if (rv0 && rv0.kind === D.V.CONCRETE && typeof rv0.value === 'number') {
+      varReg = def.left;
+      lit = rv0.value;
+      effOp = op;
+    } else if (lv0 && lv0.kind === D.V.CONCRETE && typeof lv0.value === 'number') {
+      varReg = def.right;
+      lit = lv0.value;
+      // Invert: `lit < var` is equivalent to `var > lit`.
+      effOp = { '<': '>', '<=': '>=', '>': '<', '>=': '<=' }[op];
+    } else {
+      return state;
+    }
+    const actualOp = taken ? effOp : rangeOps[effOp].notTaken;
+    const varValue = D.getReg(state, varReg);
+    if (!varValue) return state;
+    const refined = D.refineNumericRange(varValue, actualOp, lit);
     if (refined === varValue) return state;
     return D.setReg(state, varReg, refined);
   }

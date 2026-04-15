@@ -303,6 +303,98 @@ function refineEq(value, literal) {
   return value;
 }
 
+// refineNumericRange(value, op, lit) — narrow a numeric
+// value to "values for which `value op lit` holds true",
+// where `op` is one of '<', '<=', '>', '>=' and `lit` is
+// a concrete number. Used by refineForBranch when a
+// branch tests `x < N` or similar.
+//
+// Rules:
+//   CONCRETE(c) op lit → c if (c op lit) holds else Bottom
+//   ONE_OF([vs])       → filter vs to ones where (v op lit)
+//                        holds; collapse to Concrete when
+//                        one remains, Bottom when none
+//   INTERVAL(lo, hi)   → shrink the bound on the side the
+//                        comparison constrains
+//   OPAQUE / TOP       → unchanged (no lattice narrowing;
+//                        the path-condition formula tracks
+//                        the constraint for SMT)
+//
+// Integer assumption: the shrink is exact for integer
+// intervals (e.g. `i < 5` → hi = min(hi, 4)). For non-
+// integer lattices the shrink is conservative — we
+// intersect with the literal boundary and accept a
+// 1-wide overlap.
+function refineNumericRange(value, op, literal) {
+  if (!value || value.kind === V.BOTTOM) return value;
+  if (typeof literal !== 'number' || !Number.isFinite(literal)) return value;
+  const satisfies = (v) => {
+    if (typeof v !== 'number') return false;
+    switch (op) {
+      case '<':  return v < literal;
+      case '<=': return v <= literal;
+      case '>':  return v > literal;
+      case '>=': return v >= literal;
+      default:   return true;
+    }
+  };
+  if (value.kind === V.CONCRETE) {
+    return satisfies(value.value) ? value : bottom();
+  }
+  if (value.kind === V.ONE_OF) {
+    const kept = value.values.filter(satisfies);
+    if (kept.length === 0) return bottom();
+    if (kept.length === 1) {
+      return concrete(kept[0], value.typeName, value.provenance, value.labels);
+    }
+    return oneOf(kept, value.typeName, value.provenance, value.labels);
+  }
+  if (value.kind === V.INTERVAL) {
+    let lo = value.lo;
+    let hi = value.hi;
+    // Treat the interval as integer-valued when its finite
+    // bound(s) are integers. Widening can produce
+    // Interval(0, +Infinity) — +Infinity is not itself an
+    // integer per Number.isInteger, but the lattice still
+    // represents an integer range because the operand that
+    // grew was an integer. We detect this by checking the
+    // finite bounds. `Number.isInteger(Infinity) === false`,
+    // so the legacy check missed this case and produced
+    // off-by-one refinements like `Interval(0, +Inf) < 3 →
+    // Interval(0, 3)` instead of `Interval(0, 2)`.
+    const loFinite = Number.isFinite(lo);
+    const hiFinite = Number.isFinite(hi);
+    const loInt = !loFinite || Number.isInteger(lo);
+    const hiInt = !hiFinite || Number.isInteger(hi);
+    const isInt = loInt && hiInt && (loFinite || hiFinite);
+    switch (op) {
+      case '<':
+        hi = isInt ? Math.min(hi, literal - 1)
+                   : Math.min(hi, literal);
+        break;
+      case '<=':
+        hi = Math.min(hi, literal);
+        break;
+      case '>':
+        lo = isInt ? Math.max(lo, literal + 1)
+                   : Math.max(lo, literal);
+        break;
+      case '>=':
+        lo = Math.max(lo, literal);
+        break;
+    }
+    if (lo > hi) return bottom();
+    if (lo === hi && Number.isFinite(lo)) {
+      return concrete(lo, value.typeName, value.provenance, value.labels);
+    }
+    return interval(lo, hi, value.provenance, value.labels);
+  }
+  if (value.kind === V.DISJUNCT) {
+    return disjunctMap(value, (v) => refineNumericRange(v, op, literal));
+  }
+  return value;
+}
+
 function refineNeq(value, literal) {
   if (!value) return value;
   if (value.kind === V.BOTTOM) return value;
@@ -572,10 +664,24 @@ function oneOf(values, typeName, provenance, labels) {
     const kb = canonKey(b);
     return ka < kb ? -1 : ka > kb ? 1 : 0;
   });
+  // Infer typeName from values when the caller didn't
+  // provide one — mirror the Concrete constructor so a
+  // OneOf of numbers has typeName 'number', which lets
+  // subsequent joins with a same-typed Concrete merge into
+  // an extended OneOf instead of falling to a Disjunct.
+  let resolvedType = typeName;
+  if (!resolvedType && clean.length > 0) {
+    const t0 = inferTypeName(clean[0]);
+    let sameType = true;
+    for (let i = 1; i < clean.length; i++) {
+      if (inferTypeName(clean[i]) !== t0) { sameType = false; break; }
+    }
+    if (sameType) resolvedType = t0;
+  }
   return Object.freeze({
     kind: V.ONE_OF,
     values: Object.freeze(clean),
-    typeName: typeName || null,
+    typeName: resolvedType || null,
     provenance: freezeProvenance(provenance),
     labels: freezeLabels(labels),
   });
@@ -847,6 +953,165 @@ function freezeProvenance(p) {
 // idempotent. Always returns a valid Value.
 //
 // leq(a, b): true iff a ⊑ b (a is no larger than b).
+
+// widen(old, new) — the widening operator ⊽, distinct from
+// join. Called on back-edge arrivals at loop headers so
+// the fixpoint terminates in finite steps regardless of
+// how many times the loop iterates.
+//
+// Classical abstract-interpretation widening: compare the
+// old and new lattice elements; on any dimension where
+// `new` grew past `old`, extrapolate that side to its
+// outer limit (±Infinity for numeric intervals). Dimensions
+// that didn't grow are preserved. The result has bounded
+// height in the number of back-edge steps — at most one
+// step to reach an extrapolated bound, one more to notice
+// it didn't grow again, fixpoint.
+//
+// Rules (α ⊽ β, where α is the "old" variant and β is
+// the incoming "new" variant):
+//
+//   Bottom ⊽ x   = x
+//   x ⊽ Bottom   = x  (idempotence)
+//   Top ⊽ _      = Top
+//   x ⊽ x        = x
+//
+//   Concrete(c)  ⊽ Concrete(c)  = Concrete(c)            (stable)
+//   Concrete(c1) ⊽ Concrete(c2) = join (lift into OneOf)
+//
+//   OneOf(Vs)    ⊽ OneOf(Ws)   — if Ws ⊆ Vs: OneOf(Vs)    (stable)
+//                                  else:       widen-promote to Interval
+//
+//   Interval(lo, hi) ⊽ Interval(lo', hi'):
+//     low  = lo' < lo ? -Infinity : lo
+//     high = hi' > hi ? +Infinity : hi
+//
+//   Mixed Concrete-number / OneOf-number / Interval on
+//   one side: lift both to Interval then widen.
+//
+//   Opaque, Object, Closure, Disjunct: fall through to
+//   join — these don't grow along a numeric axis, so
+//   ordinary join is already convergent on them.
+//
+// The widening operator is structural and parameterless.
+// No thresholds, no iteration caps, no cartesian-product
+// limits. Finiteness is a property of the lattice:
+// Interval has at most 2 "has ∞" bits × whatever
+// refinement pins at the next branch, OneOf promotes
+// monotonically, Top is an absorbing fixpoint.
+function widen(a, b) {
+  if (!a || a.kind === V.BOTTOM) return b;
+  if (!b || b.kind === V.BOTTOM) return a;
+  if (a.kind === V.TOP) return a;
+  if (b.kind === V.TOP) return b;
+
+  // Numeric widening path: look at both sides as
+  // "possibly-number-shaped". When both are number-shaped
+  // (Concrete number, OneOf of numbers, Interval), compute
+  // the classical interval widening. Otherwise fall
+  // through to join.
+  const aRange = numericRange(a);
+  const bRange = numericRange(b);
+  if (aRange && bRange) {
+    const mergedLabels = unionLabels(a, b);
+    const mergedIds = unionAssumptionIds(a, b);
+    const prov = mergeProvenance(a, b);
+    // Same bounds → stable, no widening needed.
+    if (aRange.lo === bRange.lo && aRange.hi === bRange.hi) {
+      // Preserve the richer value when both represent the
+      // same bounds (e.g. a OneOf is more precise than an
+      // Interval of the same span).
+      return join(a, b);
+    }
+    // Extrapolate any growing side to its outer limit.
+    const widenedLo = bRange.lo < aRange.lo
+      ? Number.NEGATIVE_INFINITY
+      : aRange.lo;
+    const widenedHi = bRange.hi > aRange.hi
+      ? Number.POSITIVE_INFINITY
+      : aRange.hi;
+    // Tight stable case — both bounds grew but to the same
+    // values the old already covered. Fall back to join.
+    if (widenedLo === aRange.lo && widenedHi === aRange.hi) {
+      return join(a, b);
+    }
+    // ±Infinity intervals escape the finite lattice for
+    // refinement's benefit; refineNumericRange can shrink
+    // `Interval(0, +Infinity)` back to `Interval(0, N-1)`
+    // at the next `i < N` branch, recovering precision
+    // when the bound is concrete. When the bound is
+    // opaque, the interval stays ±Infinity and
+    // applyGetIndex's fallback path (imprecise-index)
+    // kicks in — which is correct: an unbounded index
+    // read IS imprecise and deserves the assumption.
+    const i = makeNumericRange(widenedLo, widenedHi, prov, mergedLabels);
+    if (mergedIds) {
+      const base = Object.assign({}, i);
+      base.assumptionIds = Object.freeze(mergedIds.slice());
+      return Object.freeze(base);
+    }
+    return i;
+  }
+
+  // OneOf widening (non-numeric or mixed): if β ⊆ α, stable.
+  // Otherwise promote to Top — we have no axis to extrapolate
+  // along, and join would keep growing the value set.
+  if (a.kind === V.ONE_OF && b.kind === V.ONE_OF &&
+      a.typeName === b.typeName) {
+    const aSet = new Set(a.values.map(canonKey));
+    let subsumed = true;
+    for (const v of b.values) {
+      if (!aSet.has(canonKey(v))) { subsumed = false; break; }
+    }
+    if (subsumed) return a;
+    // Non-number mixed growth: fall back to top with the
+    // combined label/provenance/id bookkeeping.
+    return top(mergeProvenance(a, b), unionLabels(a, b),
+               unionAssumptionIds(a, b));
+  }
+
+  // Every other case reduces to join. Non-numeric,
+  // non-OneOf kinds (Opaque, Object, Closure, Disjunct,
+  // StrPattern) do not have a monotone-unbounded growth
+  // path at back-edges: join is already idempotent on
+  // them after the first iteration.
+  return join(a, b);
+}
+
+// Helper: coerce a number-shaped value to an (lo, hi) pair
+// or return null if it isn't a numeric lattice element.
+function numericRange(v) {
+  if (!v) return null;
+  if (v.kind === V.CONCRETE && typeof v.value === 'number' &&
+      Number.isFinite(v.value)) {
+    return { lo: v.value, hi: v.value };
+  }
+  if (v.kind === V.ONE_OF && v.typeName === 'number') {
+    let lo = Number.POSITIVE_INFINITY, hi = Number.NEGATIVE_INFINITY;
+    for (const x of v.values) {
+      if (typeof x !== 'number' || !Number.isFinite(x)) return null;
+      if (x < lo) lo = x;
+      if (x > hi) hi = x;
+    }
+    return lo <= hi ? { lo, hi } : null;
+  }
+  if (v.kind === V.INTERVAL) {
+    return { lo: v.lo, hi: v.hi };
+  }
+  return null;
+}
+
+// Construct a numeric range value from (lo, hi). If the
+// bounds are both finite integers the result is an
+// Interval; if either is infinite the result is still an
+// Interval — the interval factory accepts ±Infinity
+// explicitly.
+function makeNumericRange(lo, hi, provenance, labels) {
+  if (lo === hi && Number.isFinite(lo)) {
+    return concrete(lo, 'number', provenance, labels);
+  }
+  return interval(lo, hi, provenance, labels);
+}
 
 function join(a, b) {
   if (!a || a.kind === V.BOTTOM) return b;
@@ -1427,10 +1692,29 @@ function overlaysDelta(a, b) {
   return { shared, keys };
 }
 
+// widenStates(a, b) — per-register state widening used by
+// the worklist at back-edge arrivals. Semantically identical
+// to joinStates except that per-register values go through
+// `widen()` instead of `join()`, ensuring loop fixpoints
+// terminate in finite steps without relying on any numeric
+// cap or iteration threshold (D14). Heap cells and effects
+// still use join because they have finite lattice height
+// structurally — a heap has a bounded set of cells and each
+// field's value-widening is handled at the per-field level.
+function widenStates(a, b) {
+  return joinStatesCore(a, b, widen);
+}
+
 function joinStates(a, b) {
-  if (!a) return b;
-  if (!b) return a;
-  if (a === b) return a;
+  return joinStatesCore(a, b, join);
+}
+
+// joinStatesCore — shared implementation of joinStates and
+// widenStates parameterised by the per-value combinator
+// (join or widen). The two differ only in how per-register
+// values are combined; heap-cell and bookkeeping logic is
+// identical.
+function joinStatesCore(a, b, combine) {
 
   // Fast path: find the nearest common ancestor overlay for regs
   // and heap. Only keys that were written above the shared base
@@ -1440,7 +1724,7 @@ function joinStates(a, b) {
   for (const name of regsDelta.keys) {
     const va = overlayGet(a.regs, name) || bottom();
     const vb = overlayGet(b.regs, name) || bottom();
-    const joined = join(va, vb);
+    const joined = combine(va, vb);
     // If the joined value equals the shared-base value, we don't
     // need to write it (it's inherited). Saves allocations.
     const inherited = regsDelta.shared
@@ -1556,13 +1840,13 @@ module.exports = {
   V,
   bottom, top, concrete, oneOf, interval, strPattern, objectRef, closure, opaque,
   disjunct, disjunctMap, disjunctVariants, variantKey,
-  join, leq, equals, truthiness,
+  join, widen, leq, equals, truthiness,
   withLabels, unionLabels, freezeLabels, EMPTY_LABELS,
   withFormula, withAssumptionIds, valueFormula,
-  refineEq, refineNeq, refineByType, refineNotByType,
+  refineEq, refineNeq, refineNumericRange, refineByType, refineNotByType,
   refineInstanceof, refineNotInstanceof, typeChainIncludes,
   createState, createStateSharingHeap, withHeap, withPath, pushCallStack, callStackContains,
-  setReg, getReg, joinStates, joinPaths, stateLeq, stateEquals,
+  setReg, getReg, joinStates, widenStates, joinPaths, stateLeq, stateEquals,
   unfreezeState, freezeState,
   overlayGet, overlayHas, overlayEntries, overlaySize, overlayFlatten,
   inferTypeName, canonKey, valueFingerprint,

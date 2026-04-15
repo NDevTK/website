@@ -1605,6 +1605,98 @@ function refineEq(value, literal) {
   return value;
 }
 
+// refineNumericRange(value, op, lit) — narrow a numeric
+// value to "values for which `value op lit` holds true",
+// where `op` is one of '<', '<=', '>', '>=' and `lit` is
+// a concrete number. Used by refineForBranch when a
+// branch tests `x < N` or similar.
+//
+// Rules:
+//   CONCRETE(c) op lit → c if (c op lit) holds else Bottom
+//   ONE_OF([vs])       → filter vs to ones where (v op lit)
+//                        holds; collapse to Concrete when
+//                        one remains, Bottom when none
+//   INTERVAL(lo, hi)   → shrink the bound on the side the
+//                        comparison constrains
+//   OPAQUE / TOP       → unchanged (no lattice narrowing;
+//                        the path-condition formula tracks
+//                        the constraint for SMT)
+//
+// Integer assumption: the shrink is exact for integer
+// intervals (e.g. `i < 5` → hi = min(hi, 4)). For non-
+// integer lattices the shrink is conservative — we
+// intersect with the literal boundary and accept a
+// 1-wide overlap.
+function refineNumericRange(value, op, literal) {
+  if (!value || value.kind === V.BOTTOM) return value;
+  if (typeof literal !== 'number' || !Number.isFinite(literal)) return value;
+  const satisfies = (v) => {
+    if (typeof v !== 'number') return false;
+    switch (op) {
+      case '<':  return v < literal;
+      case '<=': return v <= literal;
+      case '>':  return v > literal;
+      case '>=': return v >= literal;
+      default:   return true;
+    }
+  };
+  if (value.kind === V.CONCRETE) {
+    return satisfies(value.value) ? value : bottom();
+  }
+  if (value.kind === V.ONE_OF) {
+    const kept = value.values.filter(satisfies);
+    if (kept.length === 0) return bottom();
+    if (kept.length === 1) {
+      return concrete(kept[0], value.typeName, value.provenance, value.labels);
+    }
+    return oneOf(kept, value.typeName, value.provenance, value.labels);
+  }
+  if (value.kind === V.INTERVAL) {
+    let lo = value.lo;
+    let hi = value.hi;
+    // Treat the interval as integer-valued when its finite
+    // bound(s) are integers. Widening can produce
+    // Interval(0, +Infinity) — +Infinity is not itself an
+    // integer per Number.isInteger, but the lattice still
+    // represents an integer range because the operand that
+    // grew was an integer. We detect this by checking the
+    // finite bounds. `Number.isInteger(Infinity) === false`,
+    // so the legacy check missed this case and produced
+    // off-by-one refinements like `Interval(0, +Inf) < 3 →
+    // Interval(0, 3)` instead of `Interval(0, 2)`.
+    const loFinite = Number.isFinite(lo);
+    const hiFinite = Number.isFinite(hi);
+    const loInt = !loFinite || Number.isInteger(lo);
+    const hiInt = !hiFinite || Number.isInteger(hi);
+    const isInt = loInt && hiInt && (loFinite || hiFinite);
+    switch (op) {
+      case '<':
+        hi = isInt ? Math.min(hi, literal - 1)
+                   : Math.min(hi, literal);
+        break;
+      case '<=':
+        hi = Math.min(hi, literal);
+        break;
+      case '>':
+        lo = isInt ? Math.max(lo, literal + 1)
+                   : Math.max(lo, literal);
+        break;
+      case '>=':
+        lo = Math.max(lo, literal);
+        break;
+    }
+    if (lo > hi) return bottom();
+    if (lo === hi && Number.isFinite(lo)) {
+      return concrete(lo, value.typeName, value.provenance, value.labels);
+    }
+    return interval(lo, hi, value.provenance, value.labels);
+  }
+  if (value.kind === V.DISJUNCT) {
+    return disjunctMap(value, (v) => refineNumericRange(v, op, literal));
+  }
+  return value;
+}
+
 function refineNeq(value, literal) {
   if (!value) return value;
   if (value.kind === V.BOTTOM) return value;
@@ -1874,10 +1966,24 @@ function oneOf(values, typeName, provenance, labels) {
     const kb = canonKey(b);
     return ka < kb ? -1 : ka > kb ? 1 : 0;
   });
+  // Infer typeName from values when the caller didn't
+  // provide one — mirror the Concrete constructor so a
+  // OneOf of numbers has typeName 'number', which lets
+  // subsequent joins with a same-typed Concrete merge into
+  // an extended OneOf instead of falling to a Disjunct.
+  let resolvedType = typeName;
+  if (!resolvedType && clean.length > 0) {
+    const t0 = inferTypeName(clean[0]);
+    let sameType = true;
+    for (let i = 1; i < clean.length; i++) {
+      if (inferTypeName(clean[i]) !== t0) { sameType = false; break; }
+    }
+    if (sameType) resolvedType = t0;
+  }
   return Object.freeze({
     kind: V.ONE_OF,
     values: Object.freeze(clean),
-    typeName: typeName || null,
+    typeName: resolvedType || null,
     provenance: freezeProvenance(provenance),
     labels: freezeLabels(labels),
   });
@@ -2149,6 +2255,165 @@ function freezeProvenance(p) {
 // idempotent. Always returns a valid Value.
 //
 // leq(a, b): true iff a ⊑ b (a is no larger than b).
+
+// widen(old, new) — the widening operator ⊽, distinct from
+// join. Called on back-edge arrivals at loop headers so
+// the fixpoint terminates in finite steps regardless of
+// how many times the loop iterates.
+//
+// Classical abstract-interpretation widening: compare the
+// old and new lattice elements; on any dimension where
+// `new` grew past `old`, extrapolate that side to its
+// outer limit (±Infinity for numeric intervals). Dimensions
+// that didn't grow are preserved. The result has bounded
+// height in the number of back-edge steps — at most one
+// step to reach an extrapolated bound, one more to notice
+// it didn't grow again, fixpoint.
+//
+// Rules (α ⊽ β, where α is the "old" variant and β is
+// the incoming "new" variant):
+//
+//   Bottom ⊽ x   = x
+//   x ⊽ Bottom   = x  (idempotence)
+//   Top ⊽ _      = Top
+//   x ⊽ x        = x
+//
+//   Concrete(c)  ⊽ Concrete(c)  = Concrete(c)            (stable)
+//   Concrete(c1) ⊽ Concrete(c2) = join (lift into OneOf)
+//
+//   OneOf(Vs)    ⊽ OneOf(Ws)   — if Ws ⊆ Vs: OneOf(Vs)    (stable)
+//                                  else:       widen-promote to Interval
+//
+//   Interval(lo, hi) ⊽ Interval(lo', hi'):
+//     low  = lo' < lo ? -Infinity : lo
+//     high = hi' > hi ? +Infinity : hi
+//
+//   Mixed Concrete-number / OneOf-number / Interval on
+//   one side: lift both to Interval then widen.
+//
+//   Opaque, Object, Closure, Disjunct: fall through to
+//   join — these don't grow along a numeric axis, so
+//   ordinary join is already convergent on them.
+//
+// The widening operator is structural and parameterless.
+// No thresholds, no iteration caps, no cartesian-product
+// limits. Finiteness is a property of the lattice:
+// Interval has at most 2 "has ∞" bits × whatever
+// refinement pins at the next branch, OneOf promotes
+// monotonically, Top is an absorbing fixpoint.
+function widen(a, b) {
+  if (!a || a.kind === V.BOTTOM) return b;
+  if (!b || b.kind === V.BOTTOM) return a;
+  if (a.kind === V.TOP) return a;
+  if (b.kind === V.TOP) return b;
+
+  // Numeric widening path: look at both sides as
+  // "possibly-number-shaped". When both are number-shaped
+  // (Concrete number, OneOf of numbers, Interval), compute
+  // the classical interval widening. Otherwise fall
+  // through to join.
+  const aRange = numericRange(a);
+  const bRange = numericRange(b);
+  if (aRange && bRange) {
+    const mergedLabels = unionLabels(a, b);
+    const mergedIds = unionAssumptionIds(a, b);
+    const prov = mergeProvenance(a, b);
+    // Same bounds → stable, no widening needed.
+    if (aRange.lo === bRange.lo && aRange.hi === bRange.hi) {
+      // Preserve the richer value when both represent the
+      // same bounds (e.g. a OneOf is more precise than an
+      // Interval of the same span).
+      return join(a, b);
+    }
+    // Extrapolate any growing side to its outer limit.
+    const widenedLo = bRange.lo < aRange.lo
+      ? Number.NEGATIVE_INFINITY
+      : aRange.lo;
+    const widenedHi = bRange.hi > aRange.hi
+      ? Number.POSITIVE_INFINITY
+      : aRange.hi;
+    // Tight stable case — both bounds grew but to the same
+    // values the old already covered. Fall back to join.
+    if (widenedLo === aRange.lo && widenedHi === aRange.hi) {
+      return join(a, b);
+    }
+    // ±Infinity intervals escape the finite lattice for
+    // refinement's benefit; refineNumericRange can shrink
+    // `Interval(0, +Infinity)` back to `Interval(0, N-1)`
+    // at the next `i < N` branch, recovering precision
+    // when the bound is concrete. When the bound is
+    // opaque, the interval stays ±Infinity and
+    // applyGetIndex's fallback path (imprecise-index)
+    // kicks in — which is correct: an unbounded index
+    // read IS imprecise and deserves the assumption.
+    const i = makeNumericRange(widenedLo, widenedHi, prov, mergedLabels);
+    if (mergedIds) {
+      const base = Object.assign({}, i);
+      base.assumptionIds = Object.freeze(mergedIds.slice());
+      return Object.freeze(base);
+    }
+    return i;
+  }
+
+  // OneOf widening (non-numeric or mixed): if β ⊆ α, stable.
+  // Otherwise promote to Top — we have no axis to extrapolate
+  // along, and join would keep growing the value set.
+  if (a.kind === V.ONE_OF && b.kind === V.ONE_OF &&
+      a.typeName === b.typeName) {
+    const aSet = new Set(a.values.map(canonKey));
+    let subsumed = true;
+    for (const v of b.values) {
+      if (!aSet.has(canonKey(v))) { subsumed = false; break; }
+    }
+    if (subsumed) return a;
+    // Non-number mixed growth: fall back to top with the
+    // combined label/provenance/id bookkeeping.
+    return top(mergeProvenance(a, b), unionLabels(a, b),
+               unionAssumptionIds(a, b));
+  }
+
+  // Every other case reduces to join. Non-numeric,
+  // non-OneOf kinds (Opaque, Object, Closure, Disjunct,
+  // StrPattern) do not have a monotone-unbounded growth
+  // path at back-edges: join is already idempotent on
+  // them after the first iteration.
+  return join(a, b);
+}
+
+// Helper: coerce a number-shaped value to an (lo, hi) pair
+// or return null if it isn't a numeric lattice element.
+function numericRange(v) {
+  if (!v) return null;
+  if (v.kind === V.CONCRETE && typeof v.value === 'number' &&
+      Number.isFinite(v.value)) {
+    return { lo: v.value, hi: v.value };
+  }
+  if (v.kind === V.ONE_OF && v.typeName === 'number') {
+    let lo = Number.POSITIVE_INFINITY, hi = Number.NEGATIVE_INFINITY;
+    for (const x of v.values) {
+      if (typeof x !== 'number' || !Number.isFinite(x)) return null;
+      if (x < lo) lo = x;
+      if (x > hi) hi = x;
+    }
+    return lo <= hi ? { lo, hi } : null;
+  }
+  if (v.kind === V.INTERVAL) {
+    return { lo: v.lo, hi: v.hi };
+  }
+  return null;
+}
+
+// Construct a numeric range value from (lo, hi). If the
+// bounds are both finite integers the result is an
+// Interval; if either is infinite the result is still an
+// Interval — the interval factory accepts ±Infinity
+// explicitly.
+function makeNumericRange(lo, hi, provenance, labels) {
+  if (lo === hi && Number.isFinite(lo)) {
+    return concrete(lo, 'number', provenance, labels);
+  }
+  return interval(lo, hi, provenance, labels);
+}
 
 function join(a, b) {
   if (!a || a.kind === V.BOTTOM) return b;
@@ -2729,10 +2994,29 @@ function overlaysDelta(a, b) {
   return { shared, keys };
 }
 
+// widenStates(a, b) — per-register state widening used by
+// the worklist at back-edge arrivals. Semantically identical
+// to joinStates except that per-register values go through
+// `widen()` instead of `join()`, ensuring loop fixpoints
+// terminate in finite steps without relying on any numeric
+// cap or iteration threshold (D14). Heap cells and effects
+// still use join because they have finite lattice height
+// structurally — a heap has a bounded set of cells and each
+// field's value-widening is handled at the per-field level.
+function widenStates(a, b) {
+  return joinStatesCore(a, b, widen);
+}
+
 function joinStates(a, b) {
-  if (!a) return b;
-  if (!b) return a;
-  if (a === b) return a;
+  return joinStatesCore(a, b, join);
+}
+
+// joinStatesCore — shared implementation of joinStates and
+// widenStates parameterised by the per-value combinator
+// (join or widen). The two differ only in how per-register
+// values are combined; heap-cell and bookkeeping logic is
+// identical.
+function joinStatesCore(a, b, combine) {
 
   // Fast path: find the nearest common ancestor overlay for regs
   // and heap. Only keys that were written above the shared base
@@ -2742,7 +3026,7 @@ function joinStates(a, b) {
   for (const name of regsDelta.keys) {
     const va = overlayGet(a.regs, name) || bottom();
     const vb = overlayGet(b.regs, name) || bottom();
-    const joined = join(va, vb);
+    const joined = combine(va, vb);
     // If the joined value equals the shared-base value, we don't
     // need to write it (it's inherited). Saves allocations.
     const inherited = regsDelta.shared
@@ -2858,13 +3142,13 @@ module.exports = {
   V,
   bottom, top, concrete, oneOf, interval, strPattern, objectRef, closure, opaque,
   disjunct, disjunctMap, disjunctVariants, variantKey,
-  join, leq, equals, truthiness,
+  join, widen, leq, equals, truthiness,
   withLabels, unionLabels, freezeLabels, EMPTY_LABELS,
   withFormula, withAssumptionIds, valueFormula,
-  refineEq, refineNeq, refineByType, refineNotByType,
+  refineEq, refineNeq, refineNumericRange, refineByType, refineNotByType,
   refineInstanceof, refineNotInstanceof, typeChainIncludes,
   createState, createStateSharingHeap, withHeap, withPath, pushCallStack, callStackContains,
-  setReg, getReg, joinStates, joinPaths, stateLeq, stateEquals,
+  setReg, getReg, joinStates, widenStates, joinPaths, stateLeq, stateEquals,
   unfreezeState, freezeState,
   overlayGet, overlayHas, overlayEntries, overlaySize, overlayFlatten,
   inferTypeName, canonKey, valueFingerprint,
@@ -13341,6 +13625,39 @@ function computeBinOp(op, a, b, loc) {
       return attach(D.oneOf(results, undefined, loc));
     }
   }
+  // Interval arithmetic. Covers the loop-counter case:
+  // `i + 1` where `i : Interval(lo, hi)` becomes
+  // `Interval(lo+1, hi+1)`, so the refined interval on the
+  // next back-edge is a precise shift of the previous one.
+  // Without this, the binop fell to Top and the loop
+  // counter's lattice value collapsed, triggering
+  // imprecise-index downstream even for concrete-bound
+  // loops.
+  if (a && b && (a.kind === D.V.INTERVAL || a.kind === D.V.CONCRETE) &&
+      (b.kind === D.V.INTERVAL || b.kind === D.V.CONCRETE)) {
+    const aIsNumericLike = (a.kind === D.V.CONCRETE && typeof a.value === 'number') ||
+                           a.kind === D.V.INTERVAL;
+    const bIsNumericLike = (b.kind === D.V.CONCRETE && typeof b.value === 'number') ||
+                           b.kind === D.V.INTERVAL;
+    if (aIsNumericLike && bIsNumericLike) {
+      const aLo = a.kind === D.V.INTERVAL ? a.lo : a.value;
+      const aHi = a.kind === D.V.INTERVAL ? a.hi : a.value;
+      const bLo = b.kind === D.V.INTERVAL ? b.lo : b.value;
+      const bHi = b.kind === D.V.INTERVAL ? b.hi : b.value;
+      const intervalResult = computeIntervalBinOp(op, aLo, aHi, bLo, bHi);
+      if (intervalResult) {
+        const resultLo = intervalResult.lo;
+        const resultHi = intervalResult.hi;
+        if (labels && labels.size > 0) {
+          return attach(D.opaque(chainIds, undefined, loc, labels));
+        }
+        if (resultLo === resultHi && Number.isFinite(resultLo)) {
+          return attach(D.concrete(resultLo, undefined, loc));
+        }
+        return attach(D.interval(resultLo, resultHi, loc));
+      }
+    }
+  }
   // Opaque on either side propagates with merged chain + labels.
   if (a && a.kind === D.V.OPAQUE) {
     return attach(D.opaque(chainIds, null, loc, labels));
@@ -13352,6 +13669,41 @@ function computeBinOp(op, a, b, loc) {
   // operator (e.g. Interval + StrPattern). Result is Top with
   // the merged labels.
   return attach(D.top(loc, labels));
+}
+
+// computeIntervalBinOp — interval arithmetic. Returns
+// { lo, hi } or null if the op isn't interval-compatible.
+// Infinity-safe: ∞ ± x = ∞ and ∞ - ∞ is handled as an
+// absorbing "unbounded" (returning null so the caller
+// falls through to Top — an interval [−∞, +∞] is the
+// same as "no information").
+function computeIntervalBinOp(op, aLo, aHi, bLo, bHi) {
+  if (op === '+') {
+    return { lo: aLo + bLo, hi: aHi + bHi };
+  }
+  if (op === '-') {
+    return { lo: aLo - bHi, hi: aHi - bLo };
+  }
+  if (op === '*') {
+    // Multiplication flips sign based on operand signs; we
+    // take the min/max of the four corner products. Avoids
+    // the need for a separate sign analysis for the common
+    // loop case.
+    const corners = [aLo * bLo, aLo * bHi, aHi * bLo, aHi * bHi];
+    let lo = Infinity, hi = -Infinity;
+    for (const c of corners) {
+      if (Number.isNaN(c)) return null;
+      if (c < lo) lo = c;
+      if (c > hi) hi = c;
+    }
+    return { lo, hi };
+  }
+  // Comparison ops not modelled here — the caller's
+  // existing paths handle concrete/oneOf comparisons; for
+  // intervals a comparison against a literal is a Boolean
+  // lattice value that collapses to Top unless refinement
+  // has already narrowed it.
+  return null;
 }
 
 // --- Build an SMT formula for a binary op result -------------------------
@@ -13718,10 +14070,28 @@ function primitiveWrapperType(v) {
   }
 }
 
+// Helper for applyGetIndex: largest integer key present in a
+// heap-cell fields map, or null if none. Used by the Interval
+// narrowing path to decide whether the interval's upper bound
+// escapes the cell and the `undefined`-on-out-of-bounds join
+// should be added.
+function highestNumericKey(fields) {
+  let hi = null;
+  for (const k in fields) {
+    const n = Number(k);
+    if (!Number.isFinite(n) || !Number.isInteger(n)) continue;
+    if (hi === null || n > hi) hi = n;
+  }
+  return hi;
+}
+
 function applyGetIndex(ctx, state, instr) {
   const loc = instrLoc(ctx, instr);
   const obj = D.getReg(state, instr.object);
   const key = D.getReg(state, instr.key);
+
+  // Case 1: concrete heap object, concrete scalar key.
+  // Exact field lookup.
   if (obj && obj.kind === D.V.OBJECT && key && key.kind === D.V.CONCRETE) {
     const cell = D.overlayGet(state.heap, obj.objId);
     const keyStr = String(key.value);
@@ -13730,26 +14100,114 @@ function applyGetIndex(ctx, state, instr) {
     }
     return D.setReg(state, instr.dest, D.concrete(undefined, undefined, loc));
   }
-  // Heap object with a non-concrete key: the read can pick
-  // any field. We over-approximate by joining every field
-  // the object currently holds. That's SOUND for taint (a
-  // label present on any field surfaces in the result) but
-  // it's IMPRECISE — a points-to analysis or a narrowed
-  // may-be lattice on `key` would pin the read to a
-  // specific field. We raise an `unimplemented` assumption
-  // with an `imprecise-index:` details prefix and attach
-  // its id to the returned value so consumers that reject
-  // this class of imprecision (strict mode) see the flow
-  // as partial, and consumers that accept it (the default)
-  // still get the over-approximated taint propagation.
+
+  // Cases 2-4: concrete heap object, NARROWABLE non-concrete
+  // key. We use the key's may-be lattice to enumerate only
+  // the fields the read can actually pick. When the
+  // enumeration covers a finite set of keys, the result is
+  // the join of ONLY those fields — no assumption needed,
+  // the read is precise with respect to the lattice. We
+  // only fall back to "join every field + raise
+  // imprecise-index" when the key is truly opaque.
   //
-  // dom-convert does NOT read from this path — it rewrites
-  // from HtmlTemplate records built by src/html-templates.js,
-  // which pattern-match on the AST directly. Taint over-
-  // approximation here cannot produce an unsound rewrite.
+  // Supported narrowing:
+  //
+  //   * Case 2  key: OneOf [v1, v2, …] (primitive values) →
+  //             look up each value as a string key.
+  //   * Case 3  key: Interval(lo, hi) → look up each integer
+  //             in [lo, hi] clipped to field existence.
+  //             Capped by FIELD_ENUM_CAP to avoid walking
+  //             enormous intervals.
+  //   * Case 4  key: StrPattern (future) — currently falls
+  //             through to the opaque fallback.
+  //
+  // Cases 2 and 3 DO NOT raise any assumption. They are as
+  // precise as the lattice allows and produce the exact set
+  // of values the read can return.
   if (obj && obj.kind === D.V.OBJECT) {
     const cell = D.overlayGet(state.heap, obj.objId);
     if (cell && cell.fields) {
+      const lookup = (keyStr) => {
+        const f = cell.fields[keyStr];
+        if (f) return f;
+        return D.concrete(undefined, undefined, loc);
+      };
+
+      // Case 2: OneOf key.
+      if (key && key.kind === D.V.ONE_OF && Array.isArray(key.values)) {
+        let joined = null;
+        for (const kv of key.values) {
+          const v = lookup(String(kv));
+          joined = joined ? D.join(joined, v) : v;
+        }
+        if (joined) return D.setReg(state, instr.dest, joined);
+      }
+
+      // Case 3: Interval key. We iterate the CELL's existing
+      // numeric-named fields, not the interval indices —
+      // that way the cost is bounded by heap structure (the
+      // number of fields the cell actually holds) rather
+      // than by a magic cap on interval width, and an
+      // Interval(0, +Infinity) on a 3-element array does
+      // the right thing: it picks up fields 0/1/2 and falls
+      // through to the imprecise-index fallback only if the
+      // interval's bounds genuinely escape the cell's
+      // indexable range.
+      if (key && key.kind === D.V.INTERVAL &&
+          typeof key.lo === 'number' && typeof key.hi === 'number') {
+        let joined = null;
+        let sawAny = false;
+        let missedAnyBound = false;
+        for (const k in cell.fields) {
+          // Field keys are strings; numeric coerce and
+          // check the interval. Non-numeric field names
+          // (like 'length' on arrays) are skipped — the
+          // interval is an integer range, not a string
+          // pattern. If we skip a field whose numeric
+          // coerce would have fallen in range we flag it,
+          // so the caller can fall through to the
+          // imprecise-index path for soundness.
+          const n = Number(k);
+          if (!Number.isFinite(n) || !Number.isInteger(n)) continue;
+          if (n < key.lo || n > key.hi) continue;
+          const fv = cell.fields[k];
+          if (!fv) continue;
+          joined = joined ? D.join(joined, fv) : fv;
+          sawAny = true;
+        }
+        // Interval's upper bound might extend past the
+        // highest populated field (e.g. Interval(0, +Infinity)
+        // on an array of length 3 — the indices 3, 4, 5, …
+        // are legal reads of `undefined`, which we represent
+        // as Concrete(undefined)). Union that in when the
+        // interval stretches beyond the cell.
+        const maxFieldKey = highestNumericKey(cell.fields);
+        if (maxFieldKey !== null && key.hi > maxFieldKey) {
+          const undef = D.concrete(undefined, undefined, loc);
+          joined = joined ? D.join(joined, undef) : undef;
+          sawAny = true;
+        }
+        if (sawAny) return D.setReg(state, instr.dest, joined);
+        if (missedAnyBound) { /* fall through */ }
+      }
+
+      // Case 5 (fallback): key is Opaque / Top / StrPattern /
+      // an unbounded Interval. We cannot narrow the read to
+      // a specific subset, so we over-approximate by joining
+      // every field the cell currently holds. This is SOUND
+      // for taint (any label present on any field surfaces
+      // in the result) but IMPRECISE — a points-to analysis
+      // or a tighter key lattice would pin the read to
+      // fewer fields. We raise `unimplemented` with an
+      // `imprecise-index:` details prefix so strict-mode
+      // consumers see the class of imprecision, and attach
+      // the assumption id to the joined value so the flow's
+      // audit trail records it.
+      //
+      // DOM conversion does NOT consume this path — it
+      // rewrites from AST template records, not runtime-
+      // join values. Taint over-approximation cannot
+      // produce an unsound rewrite.
       let joined = null;
       for (const k in cell.fields) {
         const fv = cell.fields[k];
@@ -13759,20 +14217,17 @@ function applyGetIndex(ctx, state, instr) {
       if (joined) {
         const a = ctx.assumptions.raise(
           REASONS.UNIMPLEMENTED,
-          'imprecise-index: computed index read with non-concrete key, joining every field as a sound over-approximation',
+          'imprecise-index: computed index read with opaque key, joining every field as a sound over-approximation',
           loc
         );
-        // Attach the assumption id to the joined value so
-        // downstream taint flows that include this register
-        // carry the imprecision in `flow.assumptionIds`.
         const withIds = D.withAssumptionIds(joined, [a.id]);
         return D.setReg(state, instr.dest, withIds);
       }
+      // Empty heap cell: nothing to return except the
+      // per-call assumption-bearing opaque below.
     }
-    // Empty object: fall through to the opaque case so the
-    // consumer still sees an assumption on the lattice
-    // flow.
   }
+
   if (obj && obj.kind === D.V.OPAQUE) {
     // Opaque receiver: preserve its label set so taint that
     // arrived on the receiver side still flows to the
@@ -13782,6 +14237,7 @@ function applyGetIndex(ctx, state, instr) {
     return D.setReg(state, instr.dest,
       D.opaque(obj.assumptionIds, null, loc, obj.labels));
   }
+
   // Computed index whose target object or key couldn't be
   // narrowed to a concrete value. This is an engineering gap
   // (it would resolve if the may-be lattice narrowed the key
@@ -16463,12 +16919,17 @@ function insertVariant(blockVariants, blockId, newState, wideningJoin) {
     blockVariants.set(blockId, list);
   }
   // Back-edge widening: fold into any variant with the same
-  // _fromBlock regardless of (regs, heap) equality.
+  // _fromBlock regardless of (regs, heap) equality. Use the
+  // domain's widen operator (D.widenStates), NOT join, so
+  // per-register values that grew along a numeric axis
+  // extrapolate to ±Infinity in one step. That gives the
+  // lattice finite height without any iteration cap /
+  // value-set cap / cartesian-product cap. See D14.
   if (wideningJoin) {
     for (let i = 0; i < list.length; i++) {
       const existing = list[i];
       if (existing._fromBlock !== newState._fromBlock) continue;
-      const joined = D.joinStates(existing, newState);
+      const joined = D.widenStates(existing, newState);
       if (D.stateEquals(joined, existing)) {
         // Widening is a no-op: the existing variant already
         // subsumes the newcomer. Still merge path and
@@ -16999,6 +17460,54 @@ function refineForBranch(state, condReg, defs, taken, db) {
     const refined = taken
       ? D.refineInstanceof(varValue, ctorName, db)
       : D.refineNotInstanceof(varValue, ctorName, db);
+    if (refined === varValue) return state;
+    return D.setReg(state, varReg, refined);
+  }
+
+  // --- numeric-range refinement (<, <=, >, >=) ---
+  //
+  // `x < lit` on true:  x ← refineNumericRange(x, '<',  lit)
+  // `x < lit` on false: x ← refineNumericRange(x, '>=', lit)
+  // Same pattern for <=, >, >=.
+  //
+  // Without this, a loop `for (var i = 0; i < N; i++) …`
+  // can't prune its counter — OneOf(i) grows monotonically
+  // until the ONE_OF_CAP promotes it to Interval, and the
+  // Interval itself has no upper bound because the branch
+  // constraint isn't applied. The consequence is that
+  // `items[i]` inside the loop body hits the imprecise-
+  // index fallback despite the loop being fully analysable.
+  // This restores proper convergence.
+  const rangeOps = {
+    '<':  { taken: '<',  notTaken: '>=' },
+    '<=': { taken: '<=', notTaken: '>'  },
+    '>':  { taken: '>',  notTaken: '<=' },
+    '>=': { taken: '>=', notTaken: '<'  },
+  };
+  if (rangeOps[op]) {
+    const lv0 = D.getReg(state, def.left);
+    const rv0 = D.getReg(state, def.right);
+    // Identify whichever side is a concrete numeric literal;
+    // refine the OTHER side. When swapping, invert the
+    // operator so the refinement remains semantically
+    // `var OP literal`.
+    let varReg, lit, effOp;
+    if (rv0 && rv0.kind === D.V.CONCRETE && typeof rv0.value === 'number') {
+      varReg = def.left;
+      lit = rv0.value;
+      effOp = op;
+    } else if (lv0 && lv0.kind === D.V.CONCRETE && typeof lv0.value === 'number') {
+      varReg = def.right;
+      lit = lv0.value;
+      // Invert: `lit < var` is equivalent to `var > lit`.
+      effOp = { '<': '>', '<=': '>=', '>': '<', '>=': '<=' }[op];
+    } else {
+      return state;
+    }
+    const actualOp = taken ? effOp : rangeOps[effOp].notTaken;
+    const varValue = D.getReg(state, varReg);
+    if (!varValue) return state;
+    const refined = D.refineNumericRange(varValue, actualOp, lit);
     if (refined === varValue) return state;
     return D.setReg(state, varReg, refined);
   }

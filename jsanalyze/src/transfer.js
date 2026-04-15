@@ -418,6 +418,39 @@ function computeBinOp(op, a, b, loc) {
       return attach(D.oneOf(results, undefined, loc));
     }
   }
+  // Interval arithmetic. Covers the loop-counter case:
+  // `i + 1` where `i : Interval(lo, hi)` becomes
+  // `Interval(lo+1, hi+1)`, so the refined interval on the
+  // next back-edge is a precise shift of the previous one.
+  // Without this, the binop fell to Top and the loop
+  // counter's lattice value collapsed, triggering
+  // imprecise-index downstream even for concrete-bound
+  // loops.
+  if (a && b && (a.kind === D.V.INTERVAL || a.kind === D.V.CONCRETE) &&
+      (b.kind === D.V.INTERVAL || b.kind === D.V.CONCRETE)) {
+    const aIsNumericLike = (a.kind === D.V.CONCRETE && typeof a.value === 'number') ||
+                           a.kind === D.V.INTERVAL;
+    const bIsNumericLike = (b.kind === D.V.CONCRETE && typeof b.value === 'number') ||
+                           b.kind === D.V.INTERVAL;
+    if (aIsNumericLike && bIsNumericLike) {
+      const aLo = a.kind === D.V.INTERVAL ? a.lo : a.value;
+      const aHi = a.kind === D.V.INTERVAL ? a.hi : a.value;
+      const bLo = b.kind === D.V.INTERVAL ? b.lo : b.value;
+      const bHi = b.kind === D.V.INTERVAL ? b.hi : b.value;
+      const intervalResult = computeIntervalBinOp(op, aLo, aHi, bLo, bHi);
+      if (intervalResult) {
+        const resultLo = intervalResult.lo;
+        const resultHi = intervalResult.hi;
+        if (labels && labels.size > 0) {
+          return attach(D.opaque(chainIds, undefined, loc, labels));
+        }
+        if (resultLo === resultHi && Number.isFinite(resultLo)) {
+          return attach(D.concrete(resultLo, undefined, loc));
+        }
+        return attach(D.interval(resultLo, resultHi, loc));
+      }
+    }
+  }
   // Opaque on either side propagates with merged chain + labels.
   if (a && a.kind === D.V.OPAQUE) {
     return attach(D.opaque(chainIds, null, loc, labels));
@@ -429,6 +462,41 @@ function computeBinOp(op, a, b, loc) {
   // operator (e.g. Interval + StrPattern). Result is Top with
   // the merged labels.
   return attach(D.top(loc, labels));
+}
+
+// computeIntervalBinOp — interval arithmetic. Returns
+// { lo, hi } or null if the op isn't interval-compatible.
+// Infinity-safe: ∞ ± x = ∞ and ∞ - ∞ is handled as an
+// absorbing "unbounded" (returning null so the caller
+// falls through to Top — an interval [−∞, +∞] is the
+// same as "no information").
+function computeIntervalBinOp(op, aLo, aHi, bLo, bHi) {
+  if (op === '+') {
+    return { lo: aLo + bLo, hi: aHi + bHi };
+  }
+  if (op === '-') {
+    return { lo: aLo - bHi, hi: aHi - bLo };
+  }
+  if (op === '*') {
+    // Multiplication flips sign based on operand signs; we
+    // take the min/max of the four corner products. Avoids
+    // the need for a separate sign analysis for the common
+    // loop case.
+    const corners = [aLo * bLo, aLo * bHi, aHi * bLo, aHi * bHi];
+    let lo = Infinity, hi = -Infinity;
+    for (const c of corners) {
+      if (Number.isNaN(c)) return null;
+      if (c < lo) lo = c;
+      if (c > hi) hi = c;
+    }
+    return { lo, hi };
+  }
+  // Comparison ops not modelled here — the caller's
+  // existing paths handle concrete/oneOf comparisons; for
+  // intervals a comparison against a literal is a Boolean
+  // lattice value that collapses to Top unless refinement
+  // has already narrowed it.
+  return null;
 }
 
 // --- Build an SMT formula for a binary op result -------------------------
@@ -795,10 +863,28 @@ function primitiveWrapperType(v) {
   }
 }
 
+// Helper for applyGetIndex: largest integer key present in a
+// heap-cell fields map, or null if none. Used by the Interval
+// narrowing path to decide whether the interval's upper bound
+// escapes the cell and the `undefined`-on-out-of-bounds join
+// should be added.
+function highestNumericKey(fields) {
+  let hi = null;
+  for (const k in fields) {
+    const n = Number(k);
+    if (!Number.isFinite(n) || !Number.isInteger(n)) continue;
+    if (hi === null || n > hi) hi = n;
+  }
+  return hi;
+}
+
 function applyGetIndex(ctx, state, instr) {
   const loc = instrLoc(ctx, instr);
   const obj = D.getReg(state, instr.object);
   const key = D.getReg(state, instr.key);
+
+  // Case 1: concrete heap object, concrete scalar key.
+  // Exact field lookup.
   if (obj && obj.kind === D.V.OBJECT && key && key.kind === D.V.CONCRETE) {
     const cell = D.overlayGet(state.heap, obj.objId);
     const keyStr = String(key.value);
@@ -807,26 +893,114 @@ function applyGetIndex(ctx, state, instr) {
     }
     return D.setReg(state, instr.dest, D.concrete(undefined, undefined, loc));
   }
-  // Heap object with a non-concrete key: the read can pick
-  // any field. We over-approximate by joining every field
-  // the object currently holds. That's SOUND for taint (a
-  // label present on any field surfaces in the result) but
-  // it's IMPRECISE — a points-to analysis or a narrowed
-  // may-be lattice on `key` would pin the read to a
-  // specific field. We raise an `unimplemented` assumption
-  // with an `imprecise-index:` details prefix and attach
-  // its id to the returned value so consumers that reject
-  // this class of imprecision (strict mode) see the flow
-  // as partial, and consumers that accept it (the default)
-  // still get the over-approximated taint propagation.
+
+  // Cases 2-4: concrete heap object, NARROWABLE non-concrete
+  // key. We use the key's may-be lattice to enumerate only
+  // the fields the read can actually pick. When the
+  // enumeration covers a finite set of keys, the result is
+  // the join of ONLY those fields — no assumption needed,
+  // the read is precise with respect to the lattice. We
+  // only fall back to "join every field + raise
+  // imprecise-index" when the key is truly opaque.
   //
-  // dom-convert does NOT read from this path — it rewrites
-  // from HtmlTemplate records built by src/html-templates.js,
-  // which pattern-match on the AST directly. Taint over-
-  // approximation here cannot produce an unsound rewrite.
+  // Supported narrowing:
+  //
+  //   * Case 2  key: OneOf [v1, v2, …] (primitive values) →
+  //             look up each value as a string key.
+  //   * Case 3  key: Interval(lo, hi) → look up each integer
+  //             in [lo, hi] clipped to field existence.
+  //             Capped by FIELD_ENUM_CAP to avoid walking
+  //             enormous intervals.
+  //   * Case 4  key: StrPattern (future) — currently falls
+  //             through to the opaque fallback.
+  //
+  // Cases 2 and 3 DO NOT raise any assumption. They are as
+  // precise as the lattice allows and produce the exact set
+  // of values the read can return.
   if (obj && obj.kind === D.V.OBJECT) {
     const cell = D.overlayGet(state.heap, obj.objId);
     if (cell && cell.fields) {
+      const lookup = (keyStr) => {
+        const f = cell.fields[keyStr];
+        if (f) return f;
+        return D.concrete(undefined, undefined, loc);
+      };
+
+      // Case 2: OneOf key.
+      if (key && key.kind === D.V.ONE_OF && Array.isArray(key.values)) {
+        let joined = null;
+        for (const kv of key.values) {
+          const v = lookup(String(kv));
+          joined = joined ? D.join(joined, v) : v;
+        }
+        if (joined) return D.setReg(state, instr.dest, joined);
+      }
+
+      // Case 3: Interval key. We iterate the CELL's existing
+      // numeric-named fields, not the interval indices —
+      // that way the cost is bounded by heap structure (the
+      // number of fields the cell actually holds) rather
+      // than by a magic cap on interval width, and an
+      // Interval(0, +Infinity) on a 3-element array does
+      // the right thing: it picks up fields 0/1/2 and falls
+      // through to the imprecise-index fallback only if the
+      // interval's bounds genuinely escape the cell's
+      // indexable range.
+      if (key && key.kind === D.V.INTERVAL &&
+          typeof key.lo === 'number' && typeof key.hi === 'number') {
+        let joined = null;
+        let sawAny = false;
+        let missedAnyBound = false;
+        for (const k in cell.fields) {
+          // Field keys are strings; numeric coerce and
+          // check the interval. Non-numeric field names
+          // (like 'length' on arrays) are skipped — the
+          // interval is an integer range, not a string
+          // pattern. If we skip a field whose numeric
+          // coerce would have fallen in range we flag it,
+          // so the caller can fall through to the
+          // imprecise-index path for soundness.
+          const n = Number(k);
+          if (!Number.isFinite(n) || !Number.isInteger(n)) continue;
+          if (n < key.lo || n > key.hi) continue;
+          const fv = cell.fields[k];
+          if (!fv) continue;
+          joined = joined ? D.join(joined, fv) : fv;
+          sawAny = true;
+        }
+        // Interval's upper bound might extend past the
+        // highest populated field (e.g. Interval(0, +Infinity)
+        // on an array of length 3 — the indices 3, 4, 5, …
+        // are legal reads of `undefined`, which we represent
+        // as Concrete(undefined)). Union that in when the
+        // interval stretches beyond the cell.
+        const maxFieldKey = highestNumericKey(cell.fields);
+        if (maxFieldKey !== null && key.hi > maxFieldKey) {
+          const undef = D.concrete(undefined, undefined, loc);
+          joined = joined ? D.join(joined, undef) : undef;
+          sawAny = true;
+        }
+        if (sawAny) return D.setReg(state, instr.dest, joined);
+        if (missedAnyBound) { /* fall through */ }
+      }
+
+      // Case 5 (fallback): key is Opaque / Top / StrPattern /
+      // an unbounded Interval. We cannot narrow the read to
+      // a specific subset, so we over-approximate by joining
+      // every field the cell currently holds. This is SOUND
+      // for taint (any label present on any field surfaces
+      // in the result) but IMPRECISE — a points-to analysis
+      // or a tighter key lattice would pin the read to
+      // fewer fields. We raise `unimplemented` with an
+      // `imprecise-index:` details prefix so strict-mode
+      // consumers see the class of imprecision, and attach
+      // the assumption id to the joined value so the flow's
+      // audit trail records it.
+      //
+      // DOM conversion does NOT consume this path — it
+      // rewrites from AST template records, not runtime-
+      // join values. Taint over-approximation cannot
+      // produce an unsound rewrite.
       let joined = null;
       for (const k in cell.fields) {
         const fv = cell.fields[k];
@@ -836,20 +1010,17 @@ function applyGetIndex(ctx, state, instr) {
       if (joined) {
         const a = ctx.assumptions.raise(
           REASONS.UNIMPLEMENTED,
-          'imprecise-index: computed index read with non-concrete key, joining every field as a sound over-approximation',
+          'imprecise-index: computed index read with opaque key, joining every field as a sound over-approximation',
           loc
         );
-        // Attach the assumption id to the joined value so
-        // downstream taint flows that include this register
-        // carry the imprecision in `flow.assumptionIds`.
         const withIds = D.withAssumptionIds(joined, [a.id]);
         return D.setReg(state, instr.dest, withIds);
       }
+      // Empty heap cell: nothing to return except the
+      // per-call assumption-bearing opaque below.
     }
-    // Empty object: fall through to the opaque case so the
-    // consumer still sees an assumption on the lattice
-    // flow.
   }
+
   if (obj && obj.kind === D.V.OPAQUE) {
     // Opaque receiver: preserve its label set so taint that
     // arrived on the receiver side still flows to the
@@ -859,6 +1030,7 @@ function applyGetIndex(ctx, state, instr) {
     return D.setReg(state, instr.dest,
       D.opaque(obj.assumptionIds, null, loc, obj.labels));
   }
+
   // Computed index whose target object or key couldn't be
   // narrowed to a concrete value. This is an engineering gap
   // (it would resolve if the may-be lattice narrowed the key

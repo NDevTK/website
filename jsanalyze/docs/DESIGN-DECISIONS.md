@@ -369,13 +369,37 @@ catches.
 ### D14. No arbitrary numeric thresholds
 
 No maxIterations, maxOverlayDepth, maxLatticeSize, maxPathDepth,
-maxRecursionDepth, maxCartesianProduct, maxStringLength. All
-bounds are either structural (given by the input) or decided
-structurally (SMT yes/no). Performance characteristics are
-documented as complexity classes, not hidden behind tuned
-constants.
+maxRecursionDepth, maxCartesianProduct, maxStringLength,
+maxOneOfSize, maxIntervalWidth. All bounds are either
+structural (given by the input) or decided structurally
+(SMT yes/no). Performance characteristics are documented as
+complexity classes, not hidden behind tuned constants.
 
 **Rationale.** Already committed. Same reason as D13.
+
+**How loop fixpoints terminate without a cap.** The lattice
+has finite height under the widening operator `widen()`
+defined in `src/domain.js`. Back-edge arrivals at loop
+headers call `widenStates` instead of `joinStates`; the
+per-register widening extrapolates growing bounds to
+±Infinity in one step (classical interval widening). The
+resulting Interval has four meta-states — [lo, hi],
+[-∞, hi], [lo, +∞], [-∞, +∞] — so further back-edges
+cannot grow it. Refinement on the next branch (e.g.
+`refineNumericRange` against `i < N`) pulls the widened
+bound back to a finite value when the loop bound is
+concrete. When the bound is opaque, the ∞ interval
+persists and downstream reads (like `applyGetIndex`)
+narrow structurally by the heap cell's actual field set,
+not by a numeric cap.
+
+**How computed index reads avoid a field-enumeration cap.**
+`applyGetIndex` with a non-concrete numeric key iterates
+the heap cell's EXISTING numeric fields (not the interval's
+index range) and filters by "is this field key inside the
+interval". Cost is bounded by the number of fields the
+cell actually holds, which is a structural property of
+the heap at that program point. No magic cap.
 
 ### D15. Assumption catalog is closed
 
