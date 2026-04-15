@@ -202,23 +202,44 @@
     // analyze() pass whose trace feeds taint-report, csp-derive,
     // fetch-trace, and poc-synth. One engine walk per file ->
     // five consumer outputs -> five UI panels.
+    //
+    // `analysisMode` drives the engine's accept set (the single
+    // axis for all precision/performance/soundness trade-offs,
+    // per docs/API.md). 'custom' mode lets the user pick every
+    // reason individually via the "Choose reasons…" modal.
     var convertAllRunning = false;
     var taintResults = null;
     var cspResults = null;
     var fetchResults = null;
     var pocResults = null;
+    var rejectedAssumptions = [];
+    var allAssumptions = [];
     var editorDecorations = [];
+    var analysisMode = 'precise';
+    var customAccept = null;  // explicit accept set for 'custom' mode
+
+    function currentAcceptSet() {
+      if (analysisMode === 'custom') return customAccept || [];
+      if (typeof globalThis.__buildAcceptSet === 'function') {
+        return globalThis.__buildAcceptSet(analysisMode);
+      }
+      return null;
+    }
+
     async function convertAll() {
       if (convertAllRunning || !folderFiles) return;
       convertAllRunning = true;
       try {
         if (globalThis.__runAllConsumers) {
-          var all = await globalThis.__runAllConsumers(folderFiles);
+          var opts = { accept: currentAcceptSet() };
+          var all = await globalThis.__runAllConsumers(folderFiles, opts);
           outputFiles  = all.convertedFiles || {};
           taintResults = all.taint  || { findings: [], summary: { total: 0 } };
           cspResults   = all.csp    || null;
           fetchResults = all.fetches|| [];
           pocResults   = all.pocs   || [];
+          rejectedAssumptions = all.rejectedAssumptions || [];
+          allAssumptions = all.allAssumptions || [];
         } else {
           outputFiles = {};
         }
@@ -227,10 +248,89 @@
         renderPocList();
         renderCspList();
         renderFetchList();
+        renderRejectedAssumptions();
         updateEditorDecorations();
         document.getElementById('downloadAll').disabled = !Object.keys(outputFiles).length;
       } finally {
         convertAllRunning = false;
+      }
+    }
+
+    // --- Assumption rendering helpers -------------------------------
+    //
+    // Each finding / PoC record carries `assumptions: Assumption[]`
+    // resolved by the bridge from the flow's assumptionIds. We
+    // render them as small chips keyed by reason. A chip is
+    // "rejected" iff the reason is NOT in the current accept set
+    // — that is, the engine raised the assumption but the user
+    // told it not to accept it, so the finding is partial.
+    function buildAssumptionChips(assumptions) {
+      if (!assumptions || !assumptions.length) return null;
+      var accept = currentAcceptSet();
+      var acceptSet = accept ? new Set(accept) : null; // null = engine default
+      var wrap = document.createElement('div');
+      wrap.className = 'finding-assumptions';
+      // Dedup by reason so repeated assumptions (loop bodies
+      // raise the same reason on every iteration) show once.
+      var seen = Object.create(null);
+      for (var i = 0; i < assumptions.length; i++) {
+        var a = assumptions[i];
+        if (seen[a.reason]) continue;
+        seen[a.reason] = true;
+        var chip = document.createElement('span');
+        chip.className = 'assumption-chip severity-' + (a.severity || 'precision');
+        // Accept-set semantics: null accept means engine default
+        // (accepts everything except smt-skipped). An explicit
+        // array means "exactly these". Mark 'rejected' when the
+        // reason is not in the user's explicit accept set.
+        if (acceptSet && !acceptSet.has(a.reason)) {
+          chip.className += ' rejected';
+        }
+        chip.textContent = a.reason;
+        chip.title = (a.details || '') +
+          (a.location && a.location.file
+            ? '\n@ ' + a.location.file + ':' + (a.location.line || 0)
+            : '') +
+          '\nseverity: ' + (a.severity || 'precision');
+        wrap.appendChild(chip);
+      }
+      return wrap;
+    }
+
+    function renderRejectedAssumptions() {
+      var container = document.getElementById('rejectedAssumptionsList');
+      if (!rejectedAssumptions || !rejectedAssumptions.length) {
+        container.innerHTML = '<div class="empty-hint">None — the accept set covered every raised assumption</div>';
+        return;
+      }
+      container.innerHTML = '';
+      for (var i = 0; i < rejectedAssumptions.length; i++) {
+        var a = rejectedAssumptions[i];
+        var el = document.createElement('div');
+        el.className = 'rejected-item';
+        var reason = document.createElement('div');
+        reason.className = 'rejected-reason';
+        reason.textContent = a.reason + ' [' + (a.severity || 'precision') + ']';
+        el.appendChild(reason);
+        var details = document.createElement('div');
+        details.className = 'rejected-details';
+        details.textContent = a.details || '';
+        el.appendChild(details);
+        if (a.location && a.location.file) {
+          var loc = document.createElement('div');
+          loc.className = 'rejected-loc';
+          loc.textContent = a.location.file + (a.location.line ? ':' + a.location.line : '');
+          el.appendChild(loc);
+          (function(ai) {
+            el.addEventListener('click', function() {
+              if (ai.location && ai.location.file && folderFiles[ai.location.file]) {
+                selectFile(ai.location.file, 'original');
+                if (ai.location.line) editor.revealLineInCenter(ai.location.line);
+              }
+            });
+          })(a);
+        }
+        container.appendChild(el);
       }
     }
 
@@ -271,6 +371,8 @@
           cond.textContent = 'when: ' + finding.conditions.join(' && ');
           el.appendChild(cond);
         }
+        var chips = buildAssumptionChips(finding.assumptions);
+        if (chips) el.appendChild(chips);
         (function(fi) {
           el.addEventListener('click', function() {
             if (fi.file && folderFiles[fi.file]) {
@@ -335,6 +437,11 @@
               if (loc.line) editor.revealLineInCenter(loc.line);
             }
           });
+        }
+        var pocChips = buildAssumptionChips(r.assumptions);
+        if (pocChips) {
+          pocChips.className = 'poc-assumptions';
+          el.appendChild(pocChips);
         }
         container.appendChild(el);
       });
@@ -455,6 +562,100 @@
     }
 
     // --- Event handlers ---
+
+    // --- Analysis mode + custom accept-set modal -------------------
+    //
+    // The mode <select> drives `analysisMode`; switching to
+    // 'custom' opens the modal that renders one checkbox per
+    // reason code from __assumptionCatalog. Applying the modal
+    // sets `customAccept` and re-runs convertAll so every panel
+    // refreshes against the new accept set.
+    var modeSelect = document.getElementById('analysisMode');
+    var customBtn = document.getElementById('customAccept');
+    var modal = document.getElementById('acceptModal');
+    var modalBody = document.getElementById('acceptModalBody');
+    var modalClose = document.getElementById('acceptModalClose');
+    var modalApply = document.getElementById('acceptModalApply');
+
+    function populateModal() {
+      // Clear everything except the intro hint.
+      var hint = modalBody.querySelector('.accept-modal-hint');
+      modalBody.innerHTML = '';
+      if (hint) modalBody.appendChild(hint);
+      var catalog = globalThis.__assumptionCatalog || [];
+      // Precompute which reasons are currently accepted. When
+      // switching into custom mode from precise/fast/exact, we
+      // seed the checkboxes with that preset's selection.
+      var preset = customAccept != null
+        ? customAccept
+        : (globalThis.__buildAcceptSet
+            ? (globalThis.__buildAcceptSet(analysisMode) ||
+               Array.from(globalThis.Jsanalyze.DEFAULT_ACCEPT || []))
+            : []);
+      var presetSet = new Set(preset);
+      catalog.forEach(function(group) {
+        var g = document.createElement('div');
+        g.className = 'accept-group';
+        var h = document.createElement('div');
+        h.className = 'accept-group-header';
+        h.textContent = group.group;
+        g.appendChild(h);
+        var n = document.createElement('div');
+        n.className = 'accept-group-note';
+        n.textContent = group.note;
+        g.appendChild(n);
+        group.reasons.forEach(function(reason) {
+          var lbl = document.createElement('label');
+          lbl.className = 'accept-reason';
+          var cb = document.createElement('input');
+          cb.type = 'checkbox';
+          cb.value = reason;
+          cb.checked = presetSet.has(reason);
+          lbl.appendChild(cb);
+          lbl.appendChild(document.createTextNode(reason));
+          g.appendChild(lbl);
+        });
+        modalBody.appendChild(g);
+      });
+    }
+
+    function openCustomModal() {
+      populateModal();
+      modal.style.display = 'flex';
+    }
+
+    function closeCustomModal() {
+      modal.style.display = 'none';
+    }
+
+    modeSelect.addEventListener('change', function() {
+      analysisMode = modeSelect.value;
+      customBtn.style.display = (analysisMode === 'custom') ? '' : 'none';
+      if (analysisMode === 'custom') {
+        openCustomModal();
+      } else {
+        convertAll();
+      }
+    });
+
+    customBtn.addEventListener('click', openCustomModal);
+    modalClose.addEventListener('click', closeCustomModal);
+    modal.addEventListener('click', function(e) {
+      if (e.target === modal) closeCustomModal();
+    });
+    modalApply.addEventListener('click', function() {
+      var checks = modalBody.querySelectorAll('input[type=checkbox]');
+      var picked = [];
+      for (var i = 0; i < checks.length; i++) {
+        if (checks[i].checked) picked.push(checks[i].value);
+      }
+      customAccept = picked;
+      analysisMode = 'custom';
+      modeSelect.value = 'custom';
+      customBtn.style.display = '';
+      closeCustomModal();
+      convertAll();
+    });
 
     document.getElementById('openFolder').addEventListener('click', async function() {
       if (!window.showDirectoryPicker) {

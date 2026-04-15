@@ -567,6 +567,9 @@ module.exports = {
   query,
   resetCache,
   // Re-exports for consumers that want direct access to the
-  // assumption system (e.g. tests).
+  // assumption system (e.g. tests, browser UIs that need to
+  // populate a "choose which assumptions to accept" control).
   AssumptionTracker,
+  REASONS,
+  DEFAULT_ACCEPT,
 };

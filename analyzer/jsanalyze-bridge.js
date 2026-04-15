@@ -16,20 +16,28 @@
 //     convertJsFile(jsContent, filename?)
 //   }
 //
-//   globalThis.__runAllConsumers(files) → {
+//   globalThis.__runAllConsumers(files, options?) → {
 //     convertedFiles: { path: content },   // dom-convert output
 //     taint:   { findings, summary },       // taint-report reshaped
 //     csp:     { 'script-src': [...], ... },// csp-derive policy
 //     fetches: FetchCallSite[],             // fetch-trace
 //     pocs:    PocResult[],                 // poc-synth
+//     accept:  string[],                    // echo of the accept set used
+//     allAssumptions: Assumption[],         // every assumption raised
+//     rejectedAssumptions: Assumption[],    // ones outside the accept set
 //   }
 //
-// The UI calls `__runAllConsumers` once per convert cycle and
-// renders each panel from the shared result. Consumers that
-// need their own analyze() pass (dom-convert is project-aware)
-// still get one, but anything over trace.taintFlows /
-// trace.calls / trace.stringLiterals flows through a single
-// engine walk per file.
+// `options.accept`, when passed, is forwarded to every engine
+// call (analyze + each consumer) so the UI's assumption-
+// choice control is the single knob that steers precision /
+// soundness / performance for the whole run.
+//
+// Finding records are enriched with their `assumptions` —
+// the Assumption objects reached via `flow.assumptionIds` —
+// so the UI can render "what assumptions this finding
+// depends on" next to each sink. The bridge does the id →
+// record lookup so the UI never has to cross-reference
+// trace.assumptions itself.
 //
 // Load order (set by monaco-init.js):
 //   1. jsanalyze/vendor/acorn.js            (sets globalThis.acorn)
@@ -83,6 +91,47 @@
     return f;
   }
 
+  // --- Analysis options ----------------------------------------------
+  //
+  // `__runAllConsumers` takes an optional second argument:
+  //
+  //   { accept: string[] | null }
+  //
+  // When `accept` is an array, it's forwarded as-is to every
+  // engine entry point. When null / undefined, the engine
+  // uses its own DEFAULT_ACCEPT (every reason except the
+  // opt-in 'smt-skipped', i.e. Z3 runs).
+  //
+  // The UI surfaces four presets:
+  //
+  //   * 'precise' (default) → null       — engine default: Z3 on,
+  //                                        every soundness-floor
+  //                                        reason accepted.
+  //   * 'fast'              → DEFAULT_ACCEPT ∪ ['smt-skipped']
+  //                                      — Z3 off at branches
+  //                                        and post-pass.
+  //   * 'exact'             → DEFAULT_ACCEPT − ['summary-reused',
+  //                                        'loop-widening']
+  //                                      — every call site walks
+  //                                        the callee body
+  //                                        fresh; loops iterate
+  //                                        per-iteration.
+  //   * 'strict'            → empty set  — rejects everything.
+  //                                        Every assumption raised
+  //                                        during the walk is
+  //                                        flagged on the trace
+  //                                        and surfaces in the UI.
+  //
+  // The bridge just forwards whichever array the UI built;
+  // the preset names are a UI concern.
+  function buildAnalyseOptions(options) {
+    var opts = {};
+    if (options && options.accept != null) {
+      opts.accept = options.accept;
+    }
+    return opts;
+  }
+
   // --- Shared project trace ------------------------------------------
   //
   // For every consumer that's pure-over-trace we run a single
@@ -98,21 +147,48 @@
   // is a set that already accommodates the union. Taint
   // findings get their per-file attribution via
   // flow.sink.location.file.
-  async function analyseAll(files) {
-    // `analyze()` only takes a file map directly — build one
-    // containing every .js file plus the HTML files themselves
-    // (the engine auto-extracts inline <script> blocks).
+  async function analyseAll(files, options) {
     var input = Object.create(null);
     for (var p in files) input[p] = files[p];
-    return await J.analyze(input);
+    return await J.analyze(input, buildAnalyseOptions(options));
   }
 
-  // --- Taint findings (legacy shape for the sidebar) -----------------
+  // --- Assumption helpers --------------------------------------------
   //
-  // Reshapes trace.taintFlows + refutedFlows into the UI's
-  // { findings, summary } schema.
+  // Build an index from `trace.assumptions` that lets findings
+  // resolve `assumptionIds: number[]` → Assumption[] in O(k)
+  // instead of O(k × n).
+  function buildAssumptionIndex(trace) {
+    var byId = Object.create(null);
+    var all = (trace && trace.assumptions) || [];
+    for (var i = 0; i < all.length; i++) {
+      byId[all[i].id] = all[i];
+    }
+    return byId;
+  }
+
+  function assumptionsFor(ids, byId) {
+    if (!ids || !ids.length) return [];
+    var out = [];
+    var seen = Object.create(null);
+    for (var i = 0; i < ids.length; i++) {
+      var a = byId[ids[i]];
+      if (!a || seen[a.id]) continue;
+      seen[a.id] = true;
+      out.push(a);
+    }
+    return out;
+  }
+
+  // --- Taint findings (shape for the sidebar) ------------------------
+  //
+  // Reshapes trace.taintFlows into the UI's { findings, summary }
+  // schema. Each finding carries its own `assumptions: Assumption[]`
+  // so the UI can render "what the engine had to assume" next to
+  // each sink.
   function taintFindingsFromTrace(trace, files) {
     var findings = [];
+    var byId = buildAssumptionIndex(trace);
     var flows = (trace && trace.taintFlows) || [];
     for (var i = 0; i < flows.length; i++) {
       var f = flows[i];
@@ -139,6 +215,7 @@
         file: originatingFile,
         location: sinkLoc ? { line: sinkLoc.line || 0, col: sinkLoc.col || 0 } : null,
         conditions: conditions,
+        assumptions: assumptionsFor(f.assumptionIds, byId),
       });
     }
     var counts = { high: 0, medium: 0, low: 0, total: findings.length };
@@ -149,43 +226,40 @@
     return { findings: findings, summary: counts };
   }
 
+  // Enrich PoC results with the assumptions that applied to
+  // the flow. The poc-synth consumer returns records keyed by
+  // `flowId`, so we look up the original flow and copy its
+  // resolved assumptions. When Z3 is skipped (accept includes
+  // 'smt-skipped'), the witness itself is gated on that
+  // assumption — we annotate that case explicitly so the UI
+  // can say "no real solver proof was run for this payload".
+  function enrichPocResults(pocs, trace) {
+    var byId = buildAssumptionIndex(trace);
+    var flowsById = Object.create(null);
+    for (var i = 0; i < (trace.taintFlows || []).length; i++) {
+      var f = trace.taintFlows[i];
+      flowsById[f.id] = f;
+    }
+    var out = [];
+    for (var j = 0; j < pocs.length; j++) {
+      var r = pocs[j];
+      var flow = flowsById[r.flowId];
+      var a = flow ? assumptionsFor(flow.assumptionIds, byId) : [];
+      var enriched = {};
+      for (var k in r) enriched[k] = r[k];
+      enriched.assumptions = a;
+      out.push(enriched);
+    }
+    return out;
+  }
+
   // Kept for backwards compat — monaco-init.js historically
   // called __traceTaint(files) as its own entry point. We
   // leave it pointing at the shared trace path.
-  globalThis.__traceTaint = async function (files) {
-    var trace = await analyseAll(files);
+  globalThis.__traceTaint = async function (files, options) {
+    var trace = await analyseAll(files, options);
     return taintFindingsFromTrace(trace, files);
   };
-
-  // --- CSP derivation -------------------------------------------------
-  //
-  // Returns the csp-derive consumer's full policy object.
-  // Rendered in the UI as a grouped directive → source-list
-  // view. See consumers/csp-derive.js for the shape.
-  async function runCspDerive(files) {
-    return await J.consumers.cspDerive.derive(files);
-  }
-
-  // --- Fetch trace ---------------------------------------------------
-  //
-  // Returns an array of FetchCallSite records, one per
-  // discovered fetch / XHR / WebSocket / Beacon / EventSource
-  // call. Rendered as a list of `METHOD URL @ file:line`.
-  async function runFetchTrace(files) {
-    return await J.consumers.fetchTrace.trace(files);
-  }
-
-  // --- PoC synthesis --------------------------------------------------
-  //
-  // Runs poc-synth on the shared trace. Returns an array of
-  // PocResult records. The UI renders successful
-  // 'synthesised' results with their payload inline and the
-  // other verdicts (infeasible / unsolvable / trivial /
-  // no-constraint) as a muted secondary list.
-  async function runPocSynth(trace) {
-    if (!J.consumers.pocSynth) return [];
-    return await J.consumers.pocSynth.synthesiseTrace(trace);
-  }
 
   // --- Unified runner --------------------------------------------------
   //
@@ -193,15 +267,25 @@
   // every trace-over consumer. dom-convert runs its own pass
   // via convertProject because it's project-aware (per-HTML
   // page). Returns an aggregate object the UI renders from.
-  globalThis.__runAllConsumers = async function (files) {
+  //
+  // `options.accept` is passed through to analyze() AND to
+  // every consumer's own analyze-capable entry point so the
+  // whole run obeys the same precision setting. The aggregate
+  // result echoes the accept set back so the UI can keep its
+  // control in sync with what was actually used.
+  globalThis.__runAllConsumers = async function (files, options) {
+    options = options || {};
+    var engineOpts = buildAnalyseOptions(options);
+
     var convertedFiles = {};
     try {
-      convertedFiles = (await J.consumers.domConvert.convertProject(files)) || {};
+      convertedFiles = (await J.consumers.domConvert.convertProject(
+        files, engineOpts)) || {};
     } catch (e) { /* convertProject failures are non-fatal */ }
 
     var trace;
     try {
-      trace = await analyseAll(files);
+      trace = await analyseAll(files, options);
     } catch (e) {
       return {
         convertedFiles: convertedFiles,
@@ -209,6 +293,9 @@
         csp:     null,
         fetches: [],
         pocs:    [],
+        accept:  options.accept || null,
+        allAssumptions: [],
+        rejectedAssumptions: [],
         error:   e && e.message,
       };
     }
@@ -220,9 +307,10 @@
     // Each consumer is independent — a failure in one shouldn't
     // take down the others. The UI panel just shows empty for
     // a failing consumer.
-    try { csp     = await J.consumers.cspDerive.derive(files); } catch (e) {}
-    try { fetches = await J.consumers.fetchTrace.trace(files); } catch (e) {}
-    try { pocs    = await runPocSynth(trace); } catch (e) {}
+    try { csp     = await J.consumers.cspDerive.derive(files, engineOpts); } catch (e) {}
+    try { fetches = await J.consumers.fetchTrace.trace(files, engineOpts); } catch (e) {}
+    try { pocs    = await J.consumers.pocSynth.synthesiseTrace(trace); } catch (e) {}
+    pocs = enrichPocResults(pocs || [], trace);
 
     return {
       convertedFiles: convertedFiles,
@@ -230,7 +318,67 @@
       csp:     csp,
       fetches: fetches,
       pocs:    pocs,
+      accept:  options.accept || null,
+      allAssumptions:      trace.assumptions || [],
+      rejectedAssumptions: trace.rejectedAssumptions || [],
     };
   };
+
+  // --- Preset accept-set builders ------------------------------------
+  //
+  // Exposed so monaco-init.js can build the four mode presets
+  // from the engine's own REASONS table instead of hardcoding
+  // strings. Returns an Array<string> suitable for passing as
+  // `options.accept` to __runAllConsumers.
+  globalThis.__buildAcceptSet = function (mode) {
+    var all = Object.values(J.REASONS || {});
+    var def = Array.from(J.DEFAULT_ACCEPT || []);
+    if (mode === 'fast') {
+      // DEFAULT_ACCEPT plus smt-skipped.
+      return def.concat(['smt-skipped']);
+    }
+    if (mode === 'exact') {
+      // Remove performance shortcuts from DEFAULT_ACCEPT so
+      // the engine walks every call context fresh and iterates
+      // loops per-iteration.
+      return def.filter(function (r) {
+        return r !== 'summary-reused' && r !== 'loop-widening';
+      });
+    }
+    if (mode === 'strict') {
+      // Reject everything. The engine still raises assumptions
+      // for unknowable bytes; they end up in
+      // rejectedAssumptions and the UI flags them.
+      return [];
+    }
+    // 'precise' and anything else → null (engine default).
+    return null;
+  };
+
+  // --- Expose the reason catalogue to the UI ------------------------
+  //
+  // monaco-init.js renders a "Custom accept set" checkbox list
+  // when the user wants fine-grained control. Each checkbox's
+  // label comes from this ordered list. The categories match
+  // docs/ASSUMPTIONS.md so the grouping in the UI mirrors the
+  // design doc.
+  globalThis.__assumptionCatalog = [
+    { group: 'Theoretical floor',
+      note:  'Bytes the engine cannot know at analysis time. Rejecting these is advisory — the engine still cannot read them.',
+      reasons: [
+        'network', 'attacker-input', 'persistent-state', 'dom-state',
+        'ui-interaction', 'environmental', 'runtime-time', 'pseudorandom',
+        'cryptographic-random', 'unsolvable-math',
+      ] },
+    { group: 'Environmental',
+      note:  'Can be narrowed with more input to the analyser (e.g. a consumer-supplied TypeDB).',
+      reasons: ['opaque-call', 'external-module', 'code-from-data'] },
+    { group: 'Engineering gaps',
+      note:  'Could be eliminated by implementing the missing transfer function.',
+      reasons: ['unimplemented', 'heap-escape'] },
+    { group: 'Performance shortcuts',
+      note:  'Rejecting these is PRESCRIPTIVE — the engine actually stops taking the shortcut. Costs more time; gains precision.',
+      reasons: ['loop-widening', 'summary-reused', 'smt-skipped'] },
+  ];
 
 })();
