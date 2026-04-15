@@ -265,6 +265,114 @@ async function checkPathSat(formula, timeoutMs) {
   return verdict;
 }
 
+// --- getModel -------------------------------------------------------------
+//
+// Ask Z3 to produce a satisfying assignment for `formula`. On
+// SAT, returns { [symName]: string | number | boolean } keyed
+// by the original sym names (stripped of pipe quoting). On
+// UNSAT or UNKNOWN, returns null.
+//
+// This is the witness-extraction half of the solver interface:
+// `checkPathSat` decides feasibility, `getModel` turns a
+// feasible formula into a concrete attacker input. The PoC
+// synthesis consumer (`consumers/poc-synth.js`) conjoins a
+// taint flow's pathFormula with a sink-specific exploitability
+// constraint and calls this function to get a payload.
+//
+// Like `checkPathSat`, this function uses the shared solver
+// with push/pop so concurrent `refuteTrace` calls don't
+// corrupt each other. Unlike `checkPathSat` it does NOT cache
+// results — models can grow large and the SAT cache entry
+// size is the inverse of throughput.
+async function getModel(formula, timeoutMs) {
+  if (!formula) return Object.create(null);   // top — no constraints, empty witness
+  if (formula.value && formula.value.kind === 'bool') {
+    return formula.value.val ? Object.create(null) : null;
+  }
+  if (formula.incompatible) return null;
+
+  const asserted = formula.isBool
+    ? formula.expr
+    : SMT._internals.toBool(formula);
+  const assertText = '(assert ' + asserted + ')\n';
+
+  const z3 = await _initZ3();
+  if (!_sharedSolver) _sharedSolver = new z3.Solver();
+
+  let pending = computePendingDecls(formula);
+  if (pending === null) {
+    _sharedSolver = new z3.Solver();
+    _declaredSorts.clear();
+    _satCache.clear();
+    pending = computePendingDecls(formula);
+  }
+  if (pending) {
+    _sharedSolver.fromString(pending);
+    _recordDecls(formula);
+  }
+
+  if (typeof timeoutMs === 'number' && timeoutMs > 0) {
+    _sharedSolver.set('timeout', timeoutMs);
+  }
+
+  _sharedSolver.push();
+  _sharedSolver.fromString(assertText);
+  const verdict = await _sharedSolver.check();
+  if (verdict !== 'sat') {
+    _sharedSolver.pop();
+    return null;
+  }
+  const model = _sharedSolver.model();
+
+  // Walk the model's declarations and pull out every sym that
+  // appears in `formula.sorts`. The vendored z3-solver exposes
+  // the model as an iterable of FuncDecl; each decl has a
+  // `.name()` (the symbol name) and a `.call()` that returns
+  // the corresponding application AST. `model.eval(app)`
+  // yields the value AST, whose `asString()` gives the
+  // textual form (unquoted for String sort, decimal for Int /
+  // Real, 'true'/'false' for Bool).
+  const out = Object.create(null);
+  for (const decl of model) {
+    const name = String(typeof decl.name === 'function' ? decl.name() : decl.name);
+    if (!(name in formula.sorts) || name === '__conflict') continue;
+    const ast = model.eval(decl.call());
+    out[name] = astToJs(ast, formula.sorts[name]);
+  }
+  _sharedSolver.pop();
+  return out;
+}
+
+// astToJs — decode a Z3 model AST into a JS primitive. Uses
+// `asString()` when the vendored z3-solver exposes it
+// (preferred — it already handles String sort de-quoting and
+// Int / Real formatting); falls back to `toString()` for
+// older bindings.
+function astToJs(ast, sort) {
+  if (ast == null) return undefined;
+  const raw = typeof ast.asString === 'function'
+    ? ast.asString()
+    : String(ast);
+  if (raw == null) return undefined;
+  if (sort === 'String') {
+    // `asString()` on the vendored build returns the raw
+    // characters (no outer quotes). Older bindings return
+    // `"…"`; strip quotes if present.
+    if (raw.length >= 2 && raw[0] === '"' && raw[raw.length - 1] === '"') {
+      return raw.slice(1, -1).replace(/""/g, '"');
+    }
+    return raw;
+  }
+  if (sort === 'Bool') {
+    return raw === 'true';
+  }
+  // Int / Real: `(- 5)` style negatives need parsing.
+  const m = raw.match(/^\(- (\d+(?:\.\d+)?)\)$/);
+  if (m) return -Number(m[1]);
+  const n = Number(raw);
+  return Number.isNaN(n) ? raw : n;
+}
+
 // --- refuteTrace ----------------------------------------------------------
 //
 // Post-pass refutation over a completed trace. For each flow
@@ -299,6 +407,7 @@ async function refuteTrace(trace, timeoutMs) {
 module.exports = {
   _initZ3,
   checkPathSat,
+  getModel,
   refuteTrace,
   resetCache,
 };
