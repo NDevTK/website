@@ -83,6 +83,99 @@
     });
   }
 
+  // Wrap window.Worker so that any Worker spawned from the
+  // z3-built.js URL gets a verbose `error` / `messageerror`
+  // listener attached. z3-built.js's built-in pthread onerror
+  // logs `${e.filename}:${e.lineno}: ${e.message}` — but when
+  // a pthread fires a plain `Event` (instead of `ErrorEvent`)
+  // those fields are all undefined, which hides the real
+  // reason. Listening via addEventListener fires BEFORE
+  // z3-built.js's onerror and lets us enumerate every property
+  // on the event plus the worker itself.
+  function installWorkerErrorSpy(z3BuiltUrl) {
+    if (window.__htmldomZ3WorkerSpyInstalled) return;
+    window.__htmldomZ3WorkerSpyInstalled = true;
+    var OrigWorker = window.Worker;
+    function PatchedWorker(scriptURL, options) {
+      var w = new OrigWorker(scriptURL, options);
+      var urlStr = '';
+      try { urlStr = String(scriptURL); } catch (_) {}
+      var isZ3 = urlStr.indexOf('z3-built.js') !== -1 ||
+                 urlStr === z3BuiltUrl ||
+                 urlStr.indexOf('blob:') === 0;
+      if (isZ3) {
+        w.addEventListener('error', function (e) {
+          var props = {};
+          try {
+            for (var k in e) {
+              if (k === 'path' || k === 'target' || k === 'currentTarget') continue;
+              props[k] = e[k];
+            }
+          } catch (_) {}
+          console.error('[z3-worker-error]',
+            'scriptURL=', urlStr,
+            'workerName=', (options && options.name) || (w && w.name),
+            'type=', e.type,
+            'isTrusted=', e.isTrusted,
+            'message=', e.message,
+            'filename=', e.filename,
+            'lineno=', e.lineno,
+            'colno=', e.colno,
+            'error=', e.error,
+            'errorStack=', e.error && e.error.stack,
+            'props=', props);
+        }, true);
+        w.addEventListener('messageerror', function (e) {
+          console.error('[z3-worker-messageerror]',
+            'scriptURL=', urlStr,
+            'data=', e && e.data);
+        }, true);
+      }
+      return w;
+    }
+    PatchedWorker.prototype = OrigWorker.prototype;
+    try {
+      window.Worker = PatchedWorker;
+    } catch (err) {
+      console.warn('jsanalyze-z3-browser: could not patch window.Worker', err);
+    }
+  }
+
+  // Wrap window.initZ3 so every invocation gets a Module object
+  // carrying our diagnostic hooks. browser.esm.js calls
+  // `await initZ3()` with no arguments, so without this wrapper
+  // Emscripten's print / printErr default to console.log /
+  // console.warn with no prefix and onAbort is a silent throw —
+  // which is why a WASM abort surfaces as a plain `error` Event
+  // on the main thread with no location info. The wrapper is
+  // idempotent via a sentinel flag.
+  function installInitZ3Wrapper() {
+    if (window.__htmldomZ3InitWrapped) return;
+    window.__htmldomZ3InitWrapped = true;
+    var origInitZ3 = window.initZ3;
+    window.initZ3 = function (moduleArg) {
+      moduleArg = moduleArg || {};
+      var userPrint    = moduleArg.print;
+      var userPrintErr = moduleArg.printErr;
+      var userOnAbort  = moduleArg.onAbort;
+      moduleArg.print = function () {
+        var args = Array.prototype.slice.call(arguments);
+        console.log.apply(console, ['[z3]'].concat(args));
+        if (typeof userPrint === 'function') userPrint.apply(this, args);
+      };
+      moduleArg.printErr = function () {
+        var args = Array.prototype.slice.call(arguments);
+        console.error.apply(console, ['[z3-err]'].concat(args));
+        if (typeof userPrintErr === 'function') userPrintErr.apply(this, args);
+      };
+      moduleArg.onAbort = function (reason) {
+        console.error('[z3-abort]', reason, new Error('[z3-abort stack]').stack);
+        if (typeof userOnAbort === 'function') userOnAbort.call(this, reason);
+      };
+      return origInitZ3.call(this, moduleArg);
+    };
+  }
+
   async function initZ3Browser() {
     // Step 1: alias `global` to `window`.
     if (typeof window.global === 'undefined') {
@@ -92,13 +185,15 @@
     // Step 2: load z3-built.js so it populates window.initZ3.
     // Resolve against document.baseURI so this works regardless
     // of whether the page is served at the site root or a subpath.
+    var z3BuiltUrl = new URL(VENDOR_DIR + 'z3-built.js', document.baseURI).href;
+    installWorkerErrorSpy(z3BuiltUrl);
     if (typeof window.initZ3 !== 'function') {
-      var z3BuiltUrl = new URL(VENDOR_DIR + 'z3-built.js', document.baseURI).href;
       await loadClassicScript(z3BuiltUrl);
       if (typeof window.initZ3 !== 'function') {
         throw new Error('jsanalyze-z3-browser: z3-built.js loaded but window.initZ3 is not a function');
       }
     }
+    installInitZ3Wrapper();
 
     // Step 3: dynamic-import the pre-bundled ESM wrapper.
     //
