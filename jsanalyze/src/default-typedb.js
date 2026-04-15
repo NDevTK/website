@@ -41,7 +41,7 @@ const DEFAULT_TYPE_DB = {
         // at the addEventListener site so any unsafe sinks
         // inside the handler show up on the trace even if the
         // event itself never fires.
-        addEventListener: { args: [{}, {}], callbackArgs: [1] },
+        addEventListener: { args: [{}, {}], callbackArgs: [1], callbackEventNameArg: 0 },
         removeEventListener: { args: [{}, {}] },
         dispatchEvent: { args: [{}] },
       },

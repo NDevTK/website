@@ -513,7 +513,7 @@ const DEFAULT_TYPE_DB = {
         // at the addEventListener site so any unsafe sinks
         // inside the handler show up on the trace even if the
         // event itself never fires.
-        addEventListener: { args: [{}, {}], callbackArgs: [1] },
+        addEventListener: { args: [{}, {}], callbackArgs: [1], callbackEventNameArg: 0 },
         removeEventListener: { args: [{}, {}] },
         dispatchEvent: { args: [{}] },
       },
@@ -13891,6 +13891,26 @@ async function walkCallbackArgs(ctx, state, instr, thisValue, argValues, loc) {
   }
   if (!desc || !Array.isArray(desc.callbackArgs) || desc.callbackArgs.length === 0) return;
 
+  // Infer the typeName of the callback's first parameter
+  // when the descriptor declares `callbackEventNameArg`.
+  // addEventListener('message', h) → eventMap['message'] →
+  // 'MessageEvent', so h receives a MessageEvent-typed
+  // Opaque whose `.data` read hits the postMessage source
+  // classifier. Without this, the handler walks with a
+  // bare opaque first-param and every event-data access
+  // loses its source label.
+  let firstParamType = null;
+  if (typeof desc.callbackEventNameArg === 'number' && db.eventMap) {
+    const evNameVal = argValues[desc.callbackEventNameArg];
+    if (evNameVal && evNameVal.kind === D.V.CONCRETE &&
+        typeof evNameVal.value === 'string') {
+      const mapped = db.eventMap[evNameVal.value];
+      if (mapped && db.types && db.types[mapped]) {
+        firstParamType = mapped;
+      }
+    }
+  }
+
   for (const idx of desc.callbackArgs) {
     if (typeof idx !== 'number') continue;
     const cbValue = argValues[idx];
@@ -13904,13 +13924,13 @@ async function walkCallbackArgs(ctx, state, instr, thisValue, argValues, loc) {
     if (cbValue.kind === D.V.DISJUNCT && Array.isArray(cbValue.variants)) {
       for (const v of cbValue.variants) {
         if (v && v.kind === D.V.CLOSURE && v.functionId) {
-          await walkCallback(ctx, state, v, loc);
+          await walkCallback(ctx, state, v, loc, firstParamType);
         }
       }
       continue;
     }
     if (fnId == null) continue;
-    await walkCallback(ctx, state, cbValue, loc);
+    await walkCallback(ctx, state, cbValue, loc, firstParamType);
   }
 }
 
@@ -13919,7 +13939,7 @@ async function walkCallbackArgs(ctx, state, instr, thisValue, argValues, loc) {
 // empty args (the runtime will supply them later). Captures
 // are threaded from the closure's snapshot so variables the
 // callback closes over are visible inside.
-async function walkCallback(ctx, state, closureValue, loc) {
+async function walkCallback(ctx, state, closureValue, loc, firstParamType) {
   const calleeFn = ctx.module.functions.find(f => f.id === closureValue.functionId);
   if (!calleeFn || !calleeFn.cfg) return;
 
@@ -13940,19 +13960,25 @@ async function walkCallback(ctx, state, closureValue, loc) {
   // Bind each param to an Opaque value. The callback's
   // params receive runtime data we can't predict statically
   // (the event object for addEventListener, no args for
-  // setTimeout, etc.) — Opaque is the sound floor.
-  for (const paramReg of calleeFn.params || []) {
-    // Each param gets a fresh opaque with no type and a
-    // ui-interaction assumption (the callback fires when a
-    // user event dispatches). Consumers that need tighter
-    // handling can override via the TypeDB's arg descriptors.
+  // setTimeout, etc.) — Opaque is the sound floor. When the
+  // caller supplied a `firstParamType` (e.g. MessageEvent
+  // derived from the eventMap lookup for
+  // addEventListener('message', h)), we type the first
+  // parameter so its property reads flow through the
+  // TypeDB's source classifier — `msg.data` on a
+  // MessageEvent produces a postMessage-tainted value.
+  const params = calleeFn.params || [];
+  for (let pi = 0; pi < params.length; pi++) {
+    const paramReg = params[pi];
+    const typeName = (pi === 0 && firstParamType) ? firstParamType : null;
     const a = ctx.assumptions.raise(
       REASONS.UI_INTERACTION,
-      'callback argument is supplied by the runtime — walking with an Opaque placeholder',
+      'callback argument is supplied by the runtime — walking with an Opaque placeholder' +
+        (typeName ? ' typed as ' + typeName : ''),
       loc
     );
     calleeInit = D.setReg(calleeInit, paramReg,
-      D.opaque([a.id], null, loc));
+      D.opaque([a.id], typeName, loc));
   }
   // Seed the callback's path with the caller's current path
   // so sinks inside inherit the caller-side reachability.
