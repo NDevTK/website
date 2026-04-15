@@ -20,11 +20,11 @@
 //      cannot be used here — top-level `var` in an ES module
 //      does NOT create a window property.
 //
-//      z3-built.js in turn fetches z3-built.wasm relative to its
-//      own URL via `document.currentScript?.src`. Our vendor copy
-//      sits at `htmldom/vendor/z3-solver/`, so the wasm file is
-//      resolved to `htmldom/vendor/z3-solver/z3-built.wasm` —
-//      which we vendor alongside.
+//      z3-built.js in turn fetches z3-built.wasm relative to
+//      its own URL via `document.currentScript?.src`. The
+//      single canonical vendor copy sits under
+//      `jsanalyze/vendor/z3-solver/`, so the wasm file is
+//      resolved relative to that directory.
 //
 //   3. Dynamic-imports the pre-bundled ESM wrapper
 //      `vendor/z3-solver/browser.esm.js`. That file was bundled
@@ -40,8 +40,8 @@
 //      low-level loader, returning { Z3, Context, Solver, ... }.
 //
 // After all three steps, we expose a single function on
-// `globalThis.__htmldomZ3Init` that jsanalyze.js's _initZ3 will
-// call instead of its CDN fallback paths. The function is lazy —
+// `globalThis.__htmldomZ3Init` that jsanalyze/src/z3.js's
+// _initZ3 picks up on its first branch. The function is lazy —
 // the bootstrap work only runs when the walker first needs Z3,
 // not at page load, so an analyzer session that never hits an
 // SMT path avoids the 33 MB wasm download entirely.

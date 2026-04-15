@@ -58,16 +58,17 @@
     //      taintReport}}`.
     //
     //   4. jsanalyze-bridge.js                   — thin
-    //      adapter that exposes legacy globals
-    //      (`globalThis.HtmldomConvert`, `globalThis.__traceTaint`)
-    //      backed by the new engine, reshaping the TaintFlow
-    //      trace into the legacy {findings, summary} UI shape.
+    //      adapter exposing `globalThis.HtmldomConvert`,
+    //      `globalThis.__traceTaint`, and
+    //      `globalThis.__runAllConsumers` — the last of
+    //      which is what this file calls per convert cycle
+    //      to refresh every sidebar panel (DOM output, taint
+    //      findings, PoC payloads, CSP policy, network
+    //      endpoints) from a single shared analyse() trace.
     //
-    // The legacy engine (htmldom/jsanalyze.js + htmldom-convert.js
-    // + csp-derive.js + fetch-trace.js + taint-report.js + the
-    // schemas + query helpers) is no longer loaded. Those files
-    // are preserved in the repository for reference but are not
-    // reachable from the running UI.
+    // The previous single-file engine at htmldom/jsanalyze.js
+    // has been deleted from the repository. The new engine is
+    // the only code path.
     function appendScript(src, onload) {
       var s = document.createElement('script');
       s.src = src;
@@ -116,7 +117,9 @@
       return files;
     }
 
-    // resolveScriptSrcs and convertPage are in jsanalyze.js (legacy name) / htmldom-convert — use the exported API.
+    // All project-level rewriting is done by the dom-convert
+    // consumer exposed via jsanalyze-bridge.js — this file
+    // never parses HTML or JS itself.
 
     // --- Sidebar rendering ---
     function renderSidebar() {

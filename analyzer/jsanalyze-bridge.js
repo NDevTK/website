@@ -33,9 +33,9 @@
 //
 // Load order (set by monaco-init.js):
 //   1. jsanalyze/vendor/acorn.js            (sets globalThis.acorn)
-//   2. htmldom/jsanalyze-z3-browser.js      (registers __htmldomZ3Init)
+//   2. analyzer/jsanalyze-z3-browser.js     (registers __htmldomZ3Init)
 //   3. jsanalyze/browser-bundle.js          (sets globalThis.Jsanalyze)
-//   4. htmldom/jsanalyze-bridge.js          (this file)
+//   4. analyzer/jsanalyze-bridge.js         (this file)
 
 (function () {
   'use strict';
