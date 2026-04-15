@@ -3,7 +3,7 @@
 //
 // Wraps trace.taintFlows with grouping / counting / rendering
 // logic suitable for a terminal, a PR comment, or a security
-// scanner's output. Port of the legacy htmldom/taint-report.js.
+// scanner's output.
 //
 // Public API:
 //

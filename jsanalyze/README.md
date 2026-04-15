@@ -5,11 +5,11 @@ first principles for **precision on real code**, **explicit tracking
 of every approximation**, and **iterative analysis that never blows
 the call stack**.
 
-This is a from-scratch rewrite of the engine that previously lived in
-`htmldom/jsanalyze.js`. The new engine has fully replaced the legacy
-one in the `htmldom/` UI (`htmldom/index.html`) via the browser
-bundle at `jsanalyze/browser-bundle.js` — the legacy file remains in
-the tree as reference only.
+This is a from-scratch rewrite of the engine that previously lived under
+`htmldom/`. The browser UI now lives under `analyzer/`
+(`analyzer/index.html`) and loads the new engine via the browser
+bundle at `jsanalyze/browser-bundle.js`. The legacy engine and its
+legacy consumers have been removed from the tree.
 
 ## Design principles
 
@@ -110,10 +110,10 @@ jsanalyze/
 │                         trace.stringLiterals + trace.domMutations.
 ├── vendor/
 │   ├── acorn.js          vendored parser
-│   └── z3-solver/        vendored Z3 WASM (shared with htmldom/)
+│   └── z3-solver/        vendored Z3 WASM (single canonical copy)
 ├── scripts/
 │   └── build-bundle.js   builds jsanalyze/browser-bundle.js
-├── browser-bundle.js     single-file bundle loaded by htmldom/index.html
+├── browser-bundle.js     single-file bundle loaded by analyzer/index.html
 ├── test/
 │   └── *.test.js         635 tests across engine + consumers
 ├── docs/
@@ -214,9 +214,9 @@ outcomes.
 `scripts/build-bundle.js` concatenates every file under `src/` and
 `consumers/` into a single self-contained IIFE at
 `jsanalyze/browser-bundle.js` (`globalThis.Jsanalyze`). The bundle
-is loaded by `htmldom/index.html` via `htmldom/monaco-init.js` and
-`htmldom/jsanalyze-bridge.js`; the Z3 WASM is loaded separately via
-`htmldom/jsanalyze-z3-browser.js`.
+is loaded by `analyzer/index.html` via `analyzer/monaco-init.js` and
+`analyzer/jsanalyze-bridge.js`; the Z3 WASM is loaded separately via
+`analyzer/jsanalyze-z3-browser.js`.
 
 Rebuild after library / consumer changes:
 

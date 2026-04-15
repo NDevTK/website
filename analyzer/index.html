@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>HTML DOM Security Analyzer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="script-src 'self' https://cdnjs.cloudflare.com 'wasm-unsafe-eval' 'inline-speculation-rules'; connect-src 'self'; style-src 'self' https://cdnjs.cloudflare.com 'unsafe-inline'; object-src 'none'; base-uri 'none'; worker-src 'self' blob: data:;" />
+<!--
+  Register the cross-origin isolation service worker before any
+  other script. Z3's WASM build uses pthreads, which require
+  SharedArrayBuffer, which requires the page to be cross-origin
+  isolated (COOP + COEP). Our service worker injects those
+  headers on the navigation response so the page becomes COI
+  after a single one-time reload. See coi-serviceworker.js.
+-->
+<script src="coi-register.js"></script>
+<style>
+* { box-sizing: border-box; }
+body { font-family: system-ui, sans-serif; margin: 0; background: #212529; color: #eee; display: flex; flex-direction: column; height: 100vh; }
+header { padding: 0.75rem 1rem; border-bottom: 1px solid #333; flex-shrink: 0; }
+header h1 { font-size: 1.2rem; margin: 0; display: inline; }
+header .hint { color: #aaa; font-size: 0.8rem; margin-left: 1rem; }
+.toolbar { display: flex; gap: 0.5rem; align-items: center; padding: 0.5rem 1rem; border-bottom: 1px solid #333; flex-shrink: 0; flex-wrap: wrap; }
+.toolbar button { margin: 0; padding: 0.35rem 0.75rem; background: #317EFB; color: #fff; border: 0; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
+.toolbar button:hover { background: #2568d4; }
+.toolbar button:disabled { background: #555; cursor: default; }
+.toolbar button.secondary { background: #444; }
+.toolbar button.secondary:hover { background: #555; }
+.toolbar button.success { background: #2ecc71; }
+.toolbar button.success:hover { background: #27ae60; }
+.toolbar .spacer { flex: 1; }
+.toolbar .status { color: #aaa; font-size: 0.8rem; }
+.main { display: flex; flex: 1; overflow: hidden; }
+.sidebar { width: 260px; border-right: 1px solid #333; overflow-y: auto; flex-shrink: 0; display: flex; flex-direction: column; }
+.sidebar .section-header { padding: 0.4rem 0.75rem; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: #888; background: #1a1d21; border-bottom: 1px solid #333; position: sticky; top: 0; }
+.sidebar .file-list { flex: 1; overflow-y: auto; }
+.sidebar .file-item { padding: 0.3rem 0.75rem; cursor: pointer; font-size: 0.85rem; display: flex; align-items: center; gap: 0.4rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sidebar .file-item:hover { background: #2a2e33; }
+.sidebar .file-item.active { background: #317EFB33; border-left: 2px solid #317EFB; }
+.sidebar .file-item .icon { opacity: 0.6; font-size: 0.75rem; flex-shrink: 0; }
+.sidebar .file-item .name { overflow: hidden; text-overflow: ellipsis; }
+.sidebar .file-item .badge { margin-left: auto; font-size: 0.7rem; padding: 0.1rem 0.4rem; border-radius: 3px; flex-shrink: 0; }
+.sidebar .file-item .badge.converted { background: #2ecc7133; color: #2ecc71; }
+.sidebar .file-item .badge.has-inner { background: #f39c1233; color: #f39c12; }
+.sidebar .file-item .badge.clean { background: #33333366; color: #888; }
+.sidebar .file-item .badge.generated { background: #317EFB33; color: #6ea8fe; }
+.sidebar .file-item .badge.taint-high { background: #e74c3c33; color: #e74c3c; }
+.sidebar .file-item .badge.taint-medium { background: #f1c40f33; color: #f1c40f; }
+.sidebar .empty-hint { padding: 1rem 0.75rem; color: #555; font-size: 0.8rem; font-style: italic; }
+.finding-item { padding: 0.4rem 0.75rem; cursor: pointer; font-size: 0.8rem; border-bottom: 1px solid #2a2e33; }
+.finding-item:hover { background: #2a2e33; }
+.finding-item .finding-severity { font-weight: bold; font-size: 0.7rem; padding: 0.1rem 0.3rem; border-radius: 3px; margin-right: 0.4rem; }
+.finding-item .finding-severity.high { background: #e74c3c33; color: #e74c3c; }
+.finding-item .finding-severity.medium { background: #f1c40f33; color: #f1c40f; }
+.finding-item .finding-flow { color: #aaa; font-size: 0.75rem; margin-top: 0.15rem; }
+.finding-item .finding-cond { color: #888; font-size: 0.7rem; font-style: italic; margin-top: 0.1rem; }
+.taint-summary { padding: 0.4rem 0.75rem; font-size: 0.8rem; color: #aaa; border-bottom: 1px solid #333; }
+.editor-wrap { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+.editor-filename { padding: 0.3rem 1rem; font-size: 0.8rem; color: #888; border-bottom: 1px solid #333; background: #1a1d21; flex-shrink: 0; }
+.editor-container { flex: 1; }
+.options { padding: 0.5rem 1rem; border-top: 1px solid #333; flex-shrink: 0; display: flex; gap: 1.5rem; align-items: center; font-size: 0.8rem; color: #aaa; }
+.options label { margin: 0; font-weight: normal; cursor: pointer; }
+code { background: #2a2e33; padding: 0.05rem 0.25rem; border-radius: 3px; font-size: 0.85em; }
+.taint-decoration-high { background: rgba(231, 76, 60, 0.12) !important; }
+.taint-decoration-medium { background: rgba(241, 196, 15, 0.08) !important; }
+
+.poc-item, .csp-row, .fetch-item { padding: 0.4rem 0.75rem; font-size: 0.8rem; border-bottom: 1px solid #2a2e33; cursor: pointer; }
+.poc-item:hover, .csp-row:hover, .fetch-item:hover { background: #2a2e33; }
+.poc-item .poc-verdict { font-weight: bold; font-size: 0.68rem; padding: 0.1rem 0.3rem; border-radius: 3px; margin-right: 0.4rem; }
+.poc-item .poc-verdict.synthesised { background: #e74c3c33; color: #e74c3c; }
+.poc-item .poc-verdict.infeasible  { background: #2ecc7133; color: #2ecc71; }
+.poc-item .poc-verdict.unsolvable  { background: #f39c1233; color: #f39c12; }
+.poc-item .poc-verdict.trivial     { background: #33333366; color: #888; }
+.poc-item .poc-verdict.no-constraint { background: #33333366; color: #888; }
+.poc-item .poc-payload { color: #fff; font-family: ui-monospace, SFMono-Regular, monospace; word-break: break-all; margin-top: 0.15rem; }
+.poc-item .poc-flow { color: #888; font-size: 0.7rem; margin-top: 0.1rem; }
+.csp-row .csp-dir { color: #6ea8fe; font-weight: bold; }
+.csp-row .csp-val { color: #aaa; font-size: 0.75rem; margin-top: 0.15rem; word-break: break-all; font-family: ui-monospace, SFMono-Regular, monospace; }
+.csp-row .csp-warn { color: #f39c12; font-size: 0.7rem; margin-top: 0.1rem; font-style: italic; }
+.fetch-item .fetch-api { color: #6ea8fe; font-size: 0.7rem; font-weight: bold; text-transform: uppercase; margin-right: 0.4rem; }
+.fetch-item .fetch-method { color: #f39c12; font-size: 0.7rem; font-weight: bold; margin-right: 0.3rem; }
+.fetch-item .fetch-url { color: #fff; font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.75rem; word-break: break-all; }
+.fetch-item .fetch-loc { color: #888; font-size: 0.7rem; margin-top: 0.1rem; }
+.fetch-item .fetch-tainted { color: #e74c3c; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>HTML DOM Security Analyzer</h1>
+  <span class="hint">Converts unsafe sinks to safe DOM API calls and traces taint from sources to sinks across files, functions, and control flow.</span>
+</header>
+
+<div class="toolbar">
+  <button id="openFolder">Open Folder</button>
+  <span id="folderName" class="status"></span>
+  <span class="spacer"></span>
+  <button id="downloadCurrent" class="secondary" disabled>Download File</button>
+  <button id="downloadAll" class="success" disabled>Download All</button>
+  <button id="copy" class="secondary">Copy</button>
+</div>
+
+<div class="main">
+  <div class="sidebar" id="sidebarPanel">
+    <div class="section-header">Original Files</div>
+    <div class="file-list" id="originalFiles">
+      <div class="empty-hint">Open a folder to load files</div>
+    </div>
+    <div class="section-header">Output Files</div>
+    <div class="file-list" id="outputFiles">
+      <div class="empty-hint">Convert files to see output</div>
+    </div>
+    <div class="section-header">Taint Findings</div>
+    <div id="taintSummary" class="taint-summary" style="display:none;"></div>
+    <div class="file-list" id="taintFindings">
+      <div class="empty-hint">Taint analysis runs automatically</div>
+    </div>
+    <div class="section-header">PoC Payloads</div>
+    <div class="file-list" id="pocList">
+      <div class="empty-hint">Z3-synthesised exploit payloads per flow</div>
+    </div>
+    <div class="section-header">CSP Policy</div>
+    <div class="file-list" id="cspList">
+      <div class="empty-hint">Derived from actual DOM / network use</div>
+    </div>
+    <div class="section-header">Network Endpoints</div>
+    <div class="file-list" id="fetchList">
+      <div class="empty-hint">fetch / XHR / WebSocket / Beacon / EventSource calls</div>
+    </div>
+  </div>
+
+  <div class="editor-wrap">
+    <div class="editor-filename" id="editorFilename">Open a folder or paste code directly</div>
+    <div id="editor" class="editor-container"></div>
+  </div>
+</div>
+
+<div class="options">
+  <a href="/" style="color:#6ea8fe; font-size:0.8rem;">&larr; Home</a>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.53.0/min/vs/loader.min.js"></script>
+<script src="monaco-init.js"></script>
+</body>
+</html>

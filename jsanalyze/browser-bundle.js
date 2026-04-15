@@ -11,7 +11,7 @@
 //   * Must be loaded AFTER jsanalyze/vendor/acorn.js (sets
 //     globalThis.acorn).
 //   * If analyse() will ever walk branches that need Z3, load
-//     htmldom/jsanalyze-z3-browser.js (or equivalent) before
+//     analyzer/jsanalyze-z3-browser.js (or equivalent) before
 //     the first analyse() call so globalThis.__htmldomZ3Init
 //     is registered.
 (function (global) {
@@ -482,11 +482,11 @@ module.exports = {
 // a custom `typeDB` via `analyze(input, { typeDB })`. The engine
 // treats a custom DB identically to this preset.
 //
-// This DB is ported verbatim from the legacy
-// `htmldom/jsanalyze.js` engine (the `DEFAULT_TYPE_DB` block at
-// lines 14299-15057) with no behavioural changes. The legacy
-// DB is the source of truth for browser semantics; rewriting it
-// risks losing DOM edge cases that took years to surface.
+// This DB was ported verbatim from the original single-file
+// engine's `DEFAULT_TYPE_DB` block (~1500 lines of declarative
+// data) with no behavioural changes. That DB is the source of
+// truth for browser semantics; rewriting it risks losing DOM
+// edge cases that took years to surface.
 //
 // Label vocabulary used below (sources and sink kinds):
 //   sources: 'url', 'cookie', 'referrer', 'window.name', 'storage',
@@ -16832,14 +16832,13 @@ module.exports = {
 //
 // Contract (DESIGN-DECISIONS.md §D5):
 //
-//   * Z3 is vendored under `jsanalyze/vendor/z3-solver/`
-//     (symlinked to `htmldom/vendor/z3-solver/` so both the
-//     legacy engine and the new engine share the 33 MB WASM).
+//   * Z3 is vendored under `jsanalyze/vendor/z3-solver/` as
+//     the single on-disk copy of the 33 MB WASM.
 //
 //   * The SMT layer imports Z3 through a single `_initZ3()`
 //     function that works in BOTH Node (`require('z3-solver')`)
 //     and the browser (via `globalThis.__htmldomZ3Init`, the
-//     pre-registered loader from `htmldom/jsanalyze-z3-browser.js`).
+//     pre-registered loader from `analyzer/jsanalyze-z3-browser.js`).
 //
 // Z3 is REQUIRED. There is no fallback path; if the solver
 // can't load, analysis fails loudly. This mirrors the legacy
@@ -16881,14 +16880,13 @@ const SMT = require('./smt.js');
 // engine's _initZ3 exactly:
 //
 //   1. `globalThis.__htmldomZ3Init` — browser, pre-registered
-//      by `htmldom/jsanalyze-z3-browser.js`. Returns an init
+//      by `analyzer/jsanalyze-z3-browser.js`. Returns an init
 //      function that boots the vendored WASM lazily.
 //
 //   2. Node `require('z3-solver')` — the test harness and any
-//      CommonJS consumer. Node's Module resolution starts at
-//      this file and walks up; the vendored symlink at
-//      `jsanalyze/vendor/z3-solver/` is used via a direct
-//      require of the package's node entry.
+//      CommonJS consumer. The vendored copy at
+//      `jsanalyze/vendor/z3-solver/` is required by absolute
+//      path (see below).
 //
 //   3. Error — neither path was set up. Loud failure.
 let _z3 = null;
@@ -16901,9 +16899,7 @@ function _initZ3() {
       initFn = globalThis.__htmldomZ3Init;
     } else if (typeof window === 'undefined' && typeof module === 'object' && module && module.exports && typeof require === 'function') {
       // Node: require the vendored package by its absolute
-      // path under jsanalyze/vendor/z3-solver/. This is a
-      // symlink to htmldom/vendor/z3-solver/ so both engines
-      // share one WASM copy.
+      // path under jsanalyze/vendor/z3-solver/.
       const path = require('path');
       const vendorEntry = path.join(__dirname, '..', 'vendor', 'z3-solver', 'node.js');
       const mod = require(vendorEntry);
@@ -16911,9 +16907,8 @@ function _initZ3() {
     } else {
       throw new Error(
         'jsanalyze: Z3 is not available. In the browser, load ' +
-        'htmldom/jsanalyze-z3-browser.js before jsanalyze. ' +
-        'In Node, ensure jsanalyze/vendor/z3-solver/ is populated ' +
-        '(symlinked from htmldom/vendor/z3-solver/).'
+        'analyzer/jsanalyze-z3-browser.js before jsanalyze. ' +
+        'In Node, ensure jsanalyze/vendor/z3-solver/ is populated.'
       );
     }
     const api = await initFn();
@@ -17644,7 +17639,7 @@ const html = require('../src/html.js');
 
 // --- Runtime helper injected into rewritten JS ---------------------------
 //
-// Ported verbatim from the legacy htmldom engine. Any JS file
+// Any JS file
 // whose rewritten form references `__safeNav` gets this helper
 // prepended. It's idempotent: if the input already defines
 // `function __safeNav` we don't add a second copy.
@@ -19274,7 +19269,7 @@ module.exports = {
 //
 // Wraps trace.taintFlows with grouping / counting / rendering
 // logic suitable for a terminal, a PR comment, or a security
-// scanner's output. Port of the legacy htmldom/taint-report.js.
+// scanner's output.
 //
 // Public API:
 //

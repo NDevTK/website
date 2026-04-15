@@ -20,11 +20,10 @@ primary validation targets:
    constraint, produce a concrete attacker input that triggers
    the sink.
 
-The library is integrated into `htmldom/index.html` (Monaco
-editor + sidebar + findings panel) once both consumers work.
-No backward compatibility to the legacy `htmldom/jsanalyze.js`
-engine is promised; the legacy engine keeps running during
-the transition.
+The library is integrated into `analyzer/index.html` (Monaco
+editor + sidebar + findings panel). The legacy engine that
+previously lived at `htmldom/jsanalyze.js` has been deleted
+and the `analyzer/` UI is now the only entry point.
 
 ## Architectural decisions (fixed before implementation)
 
@@ -38,11 +37,12 @@ of lookup helpers (`_lookupProp`, `_lookupMethod`,
 to replace the default DB with a custom one for Node APIs,
 Web Worker APIs, or a custom runtime.
 
-The default browser TypeDB is ported wholesale from the
-legacy engine (the `DEFAULT_TYPE_DB` block at the bottom of
-`htmldom/jsanalyze.js`, ~1500 lines of declarative data). It
-is not rewritten — the legacy DB is the source of truth for
-browser semantics and has been validated against 1000+ tests.
+The default browser TypeDB was ported wholesale from the
+original engine's `DEFAULT_TYPE_DB` block (~1500 lines of
+declarative data) and now lives at
+`jsanalyze/src/default-typedb.js`. It was not rewritten —
+the original DB is the source of truth for browser semantics
+and has been validated against 1000+ tests.
 
 **Rationale.** Rewriting the TypeDB risks losing accumulated
 knowledge about DOM edge cases that took years to surface.
@@ -108,7 +108,7 @@ The SMT layer imports Z3 through a single `_initZ3()` function
 in `src/z3.js` that works in both Node (requires the vendored
 `node.js` entry via an absolute path rooted at `__dirname`)
 and the browser (via the existing `globalThis.__htmldomZ3Init`
-hook from `htmldom/jsanalyze-z3-browser.js`, which itself
+hook from `analyzer/jsanalyze-z3-browser.js`, which itself
 loads the vendored `z3-built.js` and `browser.esm.js`). Z3 is
 REQUIRED — there is no fallback; if the solver can't load,
 analysis fails loudly.
@@ -334,7 +334,7 @@ workaround in the consumer.
 
 ### D12. Browser integration preserves the legacy UI
 
-The target is `htmldom/index.html`. The new engine will be
+The target is `analyzer/index.html`. The new engine will be
 loadable as:
 
 ```html

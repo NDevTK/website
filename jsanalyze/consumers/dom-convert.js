@@ -77,7 +77,7 @@ const html = require('../src/html.js');
 
 // --- Runtime helper injected into rewritten JS ---------------------------
 //
-// Ported verbatim from the legacy htmldom engine. Any JS file
+// Any JS file
 // whose rewritten form references `__safeNav` gets this helper
 // prepended. It's idempotent: if the input already defines
 // `function __safeNav` we don't add a second copy.

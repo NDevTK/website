@@ -1,0 +1,25 @@
+name: jsanalyze tests
+on:
+  push:
+    paths:
+      - 'jsanalyze/**'
+      - 'analyzer/**'
+      - '.github/workflows/jsanalyze-tests.yml'
+  pull_request:
+    paths:
+      - 'jsanalyze/**'
+      - 'analyzer/**'
+      - '.github/workflows/jsanalyze-tests.yml'
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install
+      - name: Run jsanalyze test harness
+        run: node jsanalyze/test/run.js
+      - name: Rebuild browser bundle (sanity check)
+        run: node jsanalyze/scripts/build-bundle.js

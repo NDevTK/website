@@ -10,11 +10,11 @@
 // a custom `typeDB` via `analyze(input, { typeDB })`. The engine
 // treats a custom DB identically to this preset.
 //
-// This DB is ported verbatim from the legacy
-// `htmldom/jsanalyze.js` engine (the `DEFAULT_TYPE_DB` block at
-// lines 14299-15057) with no behavioural changes. The legacy
-// DB is the source of truth for browser semantics; rewriting it
-// risks losing DOM edge cases that took years to surface.
+// This DB was ported verbatim from the original single-file
+// engine's `DEFAULT_TYPE_DB` block (~1500 lines of declarative
+// data) with no behavioural changes. That DB is the source of
+// truth for browser semantics; rewriting it risks losing DOM
+// edge cases that took years to surface.
 //
 // Label vocabulary used below (sources and sink kinds):
 //   sources: 'url', 'cookie', 'referrer', 'window.name', 'storage',
