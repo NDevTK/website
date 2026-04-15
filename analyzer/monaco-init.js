@@ -75,7 +75,19 @@
       if (onload) s.onload = onload;
       document.body.appendChild(s);
     }
+    // Monaco's loader.min.js defines window.define with define.amd set.
+    // vendor/acorn.js is a UMD build that checks for define.amd and, if
+    // present, registers as an anonymous AMD module instead of assigning
+    // globalThis.acorn. That leaves jsanalyze's getAcorn() unable to find
+    // acorn in the browser, and also pollutes Monaco's loader with an
+    // anonymous module that later collides with a real vs/* module
+    // ("Duplicate definition of module 'vs/workers.XXXX'"). Hide define
+    // across the acorn.js load so the UMD takes the global-assignment
+    // branch, then restore it before any other scripts load.
+    var savedDefine = window.define;
+    window.define = undefined;
     appendScript('../jsanalyze/vendor/acorn.js', function () {
+      window.define = savedDefine;
       appendScript('jsanalyze-z3-browser.js', function () {
         appendScript('../jsanalyze/browser-bundle.js', function () {
           appendScript('jsanalyze-bridge.js');
