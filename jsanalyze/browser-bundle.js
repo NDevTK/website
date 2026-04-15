@@ -1412,6 +1412,26 @@ function unionLabels(a, b) {
   return Object.freeze(out);
 }
 
+// unionAssumptionIds(a, b) — analogue of unionLabels for
+// assumption id lists. Each value carries an `assumptionIds`
+// array (undefined / empty on most values, populated on
+// Opaque / widened Top / imprecise-index over-approximations).
+// join() threads the union through so a Top produced by
+// widening keeps every id that contributed to it.
+function unionAssumptionIds(a, b) {
+  const ia = (a && a.assumptionIds) || null;
+  const ib = (b && b.assumptionIds) || null;
+  if (!ia || ia.length === 0) return ib || null;
+  if (!ib || ib.length === 0) return ia || null;
+  if (ia === ib) return ia;
+  const seen = new Set(ia);
+  const out = ia.slice();
+  for (const id of ib) {
+    if (!seen.has(id)) { seen.add(id); out.push(id); }
+  }
+  return out;
+}
+
 // Return a new value with `labels` added to its label set. Used
 // by transfer functions when a read or call produces a tainted
 // result.
@@ -1481,6 +1501,38 @@ function withFormula(value, formula) {
   base.formula = formula;
   return Object.freeze(base);
 }
+
+// `withAssumptionIds(v, ids)` — return a new frozen Value
+// with the given assumption ids unioned onto its
+// `assumptionIds` field. Works on every Value kind (not
+// just Opaque): for Concrete / OneOf / Interval / Array /
+// Object / Closure we add the field, and emitTaintFlow
+// picks it up when building the flow's assumptionIds.
+//
+// This is how over-approximations like the
+// `imprecise-index` join in applyGetIndex attach their
+// assumption id to the produced value so every downstream
+// flow carries it in `flow.assumptionIds`.
+function withAssumptionIds(value, ids) {
+  if (!value || value.kind === V.BOTTOM) return value;
+  if (!ids || !ids.length) return value;
+  if (value.kind === V.DISJUNCT) {
+    const newVariants = value.variants.map(v => withAssumptionIds(v, ids));
+    return disjunct(newVariants, value.provenance);
+  }
+  const existing = value.assumptionIds || EMPTY_IDS;
+  const seen = new Set(existing);
+  const merged = existing.slice();
+  for (const id of ids) {
+    if (!seen.has(id)) { seen.add(id); merged.push(id); }
+  }
+  if (merged.length === existing.length) return value;
+  const base = Object.assign({}, value);
+  base.assumptionIds = Object.freeze(merged);
+  return Object.freeze(base);
+}
+
+const EMPTY_IDS = Object.freeze([]);
 
 // Read a Value's formula. Falls back to a const formula for
 // concrete primitives so callers don't need to special-case.
@@ -1785,11 +1837,17 @@ function bottom() {
   return Object.freeze({ kind: V.BOTTOM, labels: EMPTY_LABELS });
 }
 
-function top(provenance, labels) {
+function top(provenance, labels, assumptionIds) {
   return Object.freeze({
     kind: V.TOP,
     provenance: freezeProvenance(provenance),
     labels: freezeLabels(labels),
+    // Top values reached via widening carry the assumption ids
+    // from the values that converged into them (loop widening,
+    // imprecise-index joins, opaque-call returns). emitTaintFlow
+    // reads this field verbatim so the flow's assumption list
+    // stays accurate across Top.
+    assumptionIds: assumptionIds ? Object.freeze(assumptionIds.slice()) : EMPTY_IDS,
   });
 }
 
@@ -1941,6 +1999,20 @@ function disjunct(variants, provenance) {
   }
   const labelsOut = unionLabelsSet ? Object.freeze(unionLabelsSet) : EMPTY_LABELS;
 
+  // Assumption ids: union of variant ids onto the envelope,
+  // mirroring the label union. emitTaintFlow reads
+  // `value.assumptionIds` on the outer value, so variants that
+  // carry ids (e.g. the `imprecise-index` over-approximation
+  // raised in applyGetIndex) must surface at the envelope too.
+  let unionIds = null;
+  for (const v of unique) {
+    if (v.assumptionIds && v.assumptionIds.length > 0) {
+      if (!unionIds) unionIds = new Set(v.assumptionIds);
+      else for (const id of v.assumptionIds) unionIds.add(id);
+    }
+  }
+  const idsOut = unionIds ? Object.freeze(Array.from(unionIds)) : EMPTY_IDS;
+
   // Provenance: union of variant provenance.
   let provOut;
   if (provenance) {
@@ -1966,6 +2038,7 @@ function disjunct(variants, provenance) {
     typeName: null,        // Disjuncts don't have a single typeName
     provenance: provOut,
     labels: labelsOut,
+    assumptionIds: idsOut,
   });
 }
 
@@ -2081,8 +2154,9 @@ function join(a, b) {
   if (!a || a.kind === V.BOTTOM) return b;
   if (!b || b.kind === V.BOTTOM) return a;
   const mergedLabels = unionLabels(a, b);
+  const mergedIds = unionAssumptionIds(a, b);
   if (a.kind === V.TOP || b.kind === V.TOP) {
-    return top(mergeProvenance(a, b), mergedLabels);
+    return top(mergeProvenance(a, b), mergedLabels, mergedIds);
   }
 
   // --- Disjunct fan-out ---
@@ -2786,7 +2860,7 @@ module.exports = {
   disjunct, disjunctMap, disjunctVariants, variantKey,
   join, leq, equals, truthiness,
   withLabels, unionLabels, freezeLabels, EMPTY_LABELS,
-  withFormula, valueFormula,
+  withFormula, withAssumptionIds, valueFormula,
   refineEq, refineNeq, refineByType, refineNotByType,
   refineInstanceof, refineNotInstanceof, typeChainIncludes,
   createState, createStateSharingHeap, withHeap, withPath, pushCallStack, callStackContains,
@@ -12862,6 +12936,33 @@ function emitTaintFlow(ctx, sinkInfo, sinkLoc, value) {
       location: prov[prov.length - 1] || sinkLoc,
     });
   }
+  // Flow assumption ids are the union of:
+  //
+  //   * `value.assumptionIds` — assumptions attached to the
+  //     specific value that reached the sink (imprecise-index
+  //     over-approximations, Opaque source chains, widened
+  //     Top envelopes).
+  //
+  //   * The current state's `_stateAssumptionIds` — per-block
+  //     assumptions (loop-widening fired on back-edges, summary-
+  //     reused flagged on summary cache hits) that apply to
+  //     everything reaching the sink in this block.
+  //
+  // Keeping both sources prevents the "I saw widening happen
+  // but the flow's audit trail is empty" problem. The UI
+  // dedups by reason when rendering chips.
+  const valueIds = value.assumptionIds ? value.assumptionIds.slice() : [];
+  const blockIds = (ctx._stateAssumptionIds &&
+                    ctx._stateAssumptionIds.length)
+    ? ctx._stateAssumptionIds
+    : [];
+  const flowIds = valueIds.slice();
+  if (blockIds.length > 0) {
+    const seen = new Set(flowIds);
+    for (const id of blockIds) {
+      if (!seen.has(id)) { seen.add(id); flowIds.push(id); }
+    }
+  }
   const flow = {
     id: ctx.nextFlowId++,
     source: sources,
@@ -12874,7 +12975,7 @@ function emitTaintFlow(ctx, sinkInfo, sinkLoc, value) {
     pathConditions: [],            // legacy human-readable list — unused in B3
     pathFormula: ctx.currentPath || null,  // SMT formula for the block's reachability
     valueFormula: (value.formula) || null,     // SMT formula for the value at the sink
-    assumptionIds: value.assumptionIds ? value.assumptionIds.slice() : [],
+    assumptionIds: flowIds,
   };
   ctx.taintFlows.push(flow);
 }
@@ -12967,11 +13068,15 @@ function computeBinOp(op, a, b, loc) {
   // `url` label.
   const labels = D.unionLabels(a, b);
 
-  // Opaque assumption ids propagate too — both operands' chains
-  // are unioned so the consumer can audit "what assumptions does
-  // this binary operation depend on".
-  const aIds = (a && a.kind === D.V.OPAQUE) ? a.assumptionIds : [];
-  const bIds = (b && b.kind === D.V.OPAQUE) ? b.assumptionIds : [];
+  // Assumption ids propagate from both operands. Previously
+  // this only pulled from Opaque — but values of any kind may
+  // carry assumption ids (a Disjunct envelope, a Top reached
+  // via widening, an imprecise-index-joined OneOf). Reading
+  // `assumptionIds` off the operand unconditionally picks up
+  // every contributing assumption so the flow's audit trail
+  // survives through every concat / arith.
+  const aIds = (a && a.assumptionIds) || [];
+  const bIds = (b && b.assumptionIds) || [];
   let chainIds = aIds;
   if (bIds.length > 0) {
     if (chainIds.length === 0) {
@@ -13440,8 +13545,57 @@ function applyGetIndex(ctx, state, instr) {
     }
     return D.setReg(state, instr.dest, D.concrete(undefined, undefined, loc));
   }
+  // Heap object with a non-concrete key: the read can pick
+  // any field. We over-approximate by joining every field
+  // the object currently holds. That's SOUND for taint (a
+  // label present on any field surfaces in the result) but
+  // it's IMPRECISE — a points-to analysis or a narrowed
+  // may-be lattice on `key` would pin the read to a
+  // specific field. We raise an `unimplemented` assumption
+  // with an `imprecise-index:` details prefix and attach
+  // its id to the returned value so consumers that reject
+  // this class of imprecision (strict mode) see the flow
+  // as partial, and consumers that accept it (the default)
+  // still get the over-approximated taint propagation.
+  //
+  // dom-convert does NOT read from this path — it rewrites
+  // from HtmlTemplate records built by src/html-templates.js,
+  // which pattern-match on the AST directly. Taint over-
+  // approximation here cannot produce an unsound rewrite.
+  if (obj && obj.kind === D.V.OBJECT) {
+    const cell = D.overlayGet(state.heap, obj.objId);
+    if (cell && cell.fields) {
+      let joined = null;
+      for (const k in cell.fields) {
+        const fv = cell.fields[k];
+        if (!fv) continue;
+        joined = joined ? D.join(joined, fv) : fv;
+      }
+      if (joined) {
+        const a = ctx.assumptions.raise(
+          REASONS.UNIMPLEMENTED,
+          'imprecise-index: computed index read with non-concrete key, joining every field as a sound over-approximation',
+          loc
+        );
+        // Attach the assumption id to the joined value so
+        // downstream taint flows that include this register
+        // carry the imprecision in `flow.assumptionIds`.
+        const withIds = D.withAssumptionIds(joined, [a.id]);
+        return D.setReg(state, instr.dest, withIds);
+      }
+    }
+    // Empty object: fall through to the opaque case so the
+    // consumer still sees an assumption on the lattice
+    // flow.
+  }
   if (obj && obj.kind === D.V.OPAQUE) {
-    return D.setReg(state, instr.dest, D.opaque(obj.assumptionIds, null, loc));
+    // Opaque receiver: preserve its label set so taint that
+    // arrived on the receiver side still flows to the
+    // read-out value. The old code built a fresh opaque and
+    // dropped labels, which lost taint across `obj[k]` reads
+    // when the receiver itself was tainted.
+    return D.setReg(state, instr.dest,
+      D.opaque(obj.assumptionIds, null, loc, obj.labels));
   }
   // Computed index whose target object or key couldn't be
   // narrowed to a concrete value. This is an engineering gap
@@ -16291,7 +16445,7 @@ async function analyseFunction(module, fn, initialState, ctx) {
     if (target && fromBlock != null) {
       baked = bakePhis(target, state, fromBlock);
     }
-    const stamped = withFromBlock(baked, fromBlock);
+    let stamped = withFromBlock(baked, fromBlock);
     const isBackEdge = fromBlock != null && backPreds.has(blockId) &&
       backPreds.get(blockId).has(fromBlock);
     // Back-edge widening is a performance shortcut per D19.
@@ -16309,11 +16463,23 @@ async function analyseFunction(module, fn, initialState, ctx) {
       const headerLoc = cfg.blocks.get(blockId) &&
         cfg.blocks.get(blockId).instructions[0] &&
         module.sourceMap.get(cfg.blocks.get(blockId).instructions[0]._id);
-      ctx.assumptions.raise(
+      const widenA = ctx.assumptions.raise(
         REASONS.LOOP_WIDENING,
         'loop header at block ' + blockId + ' widened back-edge variants into one (widening is finite but may over-approximate per-iteration state)',
         headerLoc || { file: module.name || '<input>', line: 0, col: 0, pos: 0 }
       );
+      // Attach the widening assumption id to the incoming
+      // variant's state so every taint flow emitted from this
+      // loop body (via emitTaintFlow's ctx._stateAssumptionIds
+      // read) carries it in `flow.assumptionIds`. The finding
+      // chips in the UI then show "loop-widening" next to
+      // sinks whose value depends on the widened fixpoint.
+      const existingIds = stamped.assumptionIds || [];
+      if (existingIds.indexOf(widenA.id) < 0) {
+        stamped = Object.freeze(Object.assign({}, stamped, {
+          assumptionIds: Object.freeze(existingIds.concat([widenA.id])),
+        }));
+      }
     }
     const { added, variantIdx } = insertVariant(
       blockVariants, blockId, stamped,
@@ -16373,6 +16539,15 @@ async function analyseFunction(module, fn, initialState, ctx) {
     ctx.currentPath = currentPath;
     ctx.currentBlockId = blockId;
 
+    // Per-variant assumption ids: every assumption attached to
+    // the variant's state (e.g. loop-widening raised when this
+    // variant entered a loop header) surfaces on any taint
+    // flow emitted while walking this block. emitTaintFlow
+    // reads `ctx._stateAssumptionIds` and unions it with the
+    // flowing value's own ids.
+    const prevStateIds = ctx._stateAssumptionIds;
+    ctx._stateAssumptionIds = state.assumptionIds || [];
+
     // Intra-block fast path: unfreeze, write in place, refreeze.
     // PHI instructions are already resolved by bakePhis at
     // enqueue time, so we skip them in the block body. Running
@@ -16394,6 +16569,7 @@ async function analyseFunction(module, fn, initialState, ctx) {
     state = D.freezeState(state);
 
     ctx.currentPath = prevPath;
+    ctx._stateAssumptionIds = prevStateIds;
 
     // Stash the per-variant out-state for phi resolution in
     // successors and for exit collection.

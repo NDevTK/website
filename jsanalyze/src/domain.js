@@ -110,6 +110,26 @@ function unionLabels(a, b) {
   return Object.freeze(out);
 }
 
+// unionAssumptionIds(a, b) — analogue of unionLabels for
+// assumption id lists. Each value carries an `assumptionIds`
+// array (undefined / empty on most values, populated on
+// Opaque / widened Top / imprecise-index over-approximations).
+// join() threads the union through so a Top produced by
+// widening keeps every id that contributed to it.
+function unionAssumptionIds(a, b) {
+  const ia = (a && a.assumptionIds) || null;
+  const ib = (b && b.assumptionIds) || null;
+  if (!ia || ia.length === 0) return ib || null;
+  if (!ib || ib.length === 0) return ia || null;
+  if (ia === ib) return ia;
+  const seen = new Set(ia);
+  const out = ia.slice();
+  for (const id of ib) {
+    if (!seen.has(id)) { seen.add(id); out.push(id); }
+  }
+  return out;
+}
+
 // Return a new value with `labels` added to its label set. Used
 // by transfer functions when a read or call produces a tainted
 // result.
@@ -179,6 +199,38 @@ function withFormula(value, formula) {
   base.formula = formula;
   return Object.freeze(base);
 }
+
+// `withAssumptionIds(v, ids)` — return a new frozen Value
+// with the given assumption ids unioned onto its
+// `assumptionIds` field. Works on every Value kind (not
+// just Opaque): for Concrete / OneOf / Interval / Array /
+// Object / Closure we add the field, and emitTaintFlow
+// picks it up when building the flow's assumptionIds.
+//
+// This is how over-approximations like the
+// `imprecise-index` join in applyGetIndex attach their
+// assumption id to the produced value so every downstream
+// flow carries it in `flow.assumptionIds`.
+function withAssumptionIds(value, ids) {
+  if (!value || value.kind === V.BOTTOM) return value;
+  if (!ids || !ids.length) return value;
+  if (value.kind === V.DISJUNCT) {
+    const newVariants = value.variants.map(v => withAssumptionIds(v, ids));
+    return disjunct(newVariants, value.provenance);
+  }
+  const existing = value.assumptionIds || EMPTY_IDS;
+  const seen = new Set(existing);
+  const merged = existing.slice();
+  for (const id of ids) {
+    if (!seen.has(id)) { seen.add(id); merged.push(id); }
+  }
+  if (merged.length === existing.length) return value;
+  const base = Object.assign({}, value);
+  base.assumptionIds = Object.freeze(merged);
+  return Object.freeze(base);
+}
+
+const EMPTY_IDS = Object.freeze([]);
 
 // Read a Value's formula. Falls back to a const formula for
 // concrete primitives so callers don't need to special-case.
@@ -483,11 +535,17 @@ function bottom() {
   return Object.freeze({ kind: V.BOTTOM, labels: EMPTY_LABELS });
 }
 
-function top(provenance, labels) {
+function top(provenance, labels, assumptionIds) {
   return Object.freeze({
     kind: V.TOP,
     provenance: freezeProvenance(provenance),
     labels: freezeLabels(labels),
+    // Top values reached via widening carry the assumption ids
+    // from the values that converged into them (loop widening,
+    // imprecise-index joins, opaque-call returns). emitTaintFlow
+    // reads this field verbatim so the flow's assumption list
+    // stays accurate across Top.
+    assumptionIds: assumptionIds ? Object.freeze(assumptionIds.slice()) : EMPTY_IDS,
   });
 }
 
@@ -639,6 +697,20 @@ function disjunct(variants, provenance) {
   }
   const labelsOut = unionLabelsSet ? Object.freeze(unionLabelsSet) : EMPTY_LABELS;
 
+  // Assumption ids: union of variant ids onto the envelope,
+  // mirroring the label union. emitTaintFlow reads
+  // `value.assumptionIds` on the outer value, so variants that
+  // carry ids (e.g. the `imprecise-index` over-approximation
+  // raised in applyGetIndex) must surface at the envelope too.
+  let unionIds = null;
+  for (const v of unique) {
+    if (v.assumptionIds && v.assumptionIds.length > 0) {
+      if (!unionIds) unionIds = new Set(v.assumptionIds);
+      else for (const id of v.assumptionIds) unionIds.add(id);
+    }
+  }
+  const idsOut = unionIds ? Object.freeze(Array.from(unionIds)) : EMPTY_IDS;
+
   // Provenance: union of variant provenance.
   let provOut;
   if (provenance) {
@@ -664,6 +736,7 @@ function disjunct(variants, provenance) {
     typeName: null,        // Disjuncts don't have a single typeName
     provenance: provOut,
     labels: labelsOut,
+    assumptionIds: idsOut,
   });
 }
 
@@ -779,8 +852,9 @@ function join(a, b) {
   if (!a || a.kind === V.BOTTOM) return b;
   if (!b || b.kind === V.BOTTOM) return a;
   const mergedLabels = unionLabels(a, b);
+  const mergedIds = unionAssumptionIds(a, b);
   if (a.kind === V.TOP || b.kind === V.TOP) {
-    return top(mergeProvenance(a, b), mergedLabels);
+    return top(mergeProvenance(a, b), mergedLabels, mergedIds);
   }
 
   // --- Disjunct fan-out ---
@@ -1484,7 +1558,7 @@ module.exports = {
   disjunct, disjunctMap, disjunctVariants, variantKey,
   join, leq, equals, truthiness,
   withLabels, unionLabels, freezeLabels, EMPTY_LABELS,
-  withFormula, valueFormula,
+  withFormula, withAssumptionIds, valueFormula,
   refineEq, refineNeq, refineByType, refineNotByType,
   refineInstanceof, refineNotInstanceof, typeChainIncludes,
   createState, createStateSharingHeap, withHeap, withPath, pushCallStack, callStackContains,

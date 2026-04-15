@@ -372,7 +372,7 @@ async function analyseFunction(module, fn, initialState, ctx) {
     if (target && fromBlock != null) {
       baked = bakePhis(target, state, fromBlock);
     }
-    const stamped = withFromBlock(baked, fromBlock);
+    let stamped = withFromBlock(baked, fromBlock);
     const isBackEdge = fromBlock != null && backPreds.has(blockId) &&
       backPreds.get(blockId).has(fromBlock);
     // Back-edge widening is a performance shortcut per D19.
@@ -390,11 +390,23 @@ async function analyseFunction(module, fn, initialState, ctx) {
       const headerLoc = cfg.blocks.get(blockId) &&
         cfg.blocks.get(blockId).instructions[0] &&
         module.sourceMap.get(cfg.blocks.get(blockId).instructions[0]._id);
-      ctx.assumptions.raise(
+      const widenA = ctx.assumptions.raise(
         REASONS.LOOP_WIDENING,
         'loop header at block ' + blockId + ' widened back-edge variants into one (widening is finite but may over-approximate per-iteration state)',
         headerLoc || { file: module.name || '<input>', line: 0, col: 0, pos: 0 }
       );
+      // Attach the widening assumption id to the incoming
+      // variant's state so every taint flow emitted from this
+      // loop body (via emitTaintFlow's ctx._stateAssumptionIds
+      // read) carries it in `flow.assumptionIds`. The finding
+      // chips in the UI then show "loop-widening" next to
+      // sinks whose value depends on the widened fixpoint.
+      const existingIds = stamped.assumptionIds || [];
+      if (existingIds.indexOf(widenA.id) < 0) {
+        stamped = Object.freeze(Object.assign({}, stamped, {
+          assumptionIds: Object.freeze(existingIds.concat([widenA.id])),
+        }));
+      }
     }
     const { added, variantIdx } = insertVariant(
       blockVariants, blockId, stamped,
@@ -454,6 +466,15 @@ async function analyseFunction(module, fn, initialState, ctx) {
     ctx.currentPath = currentPath;
     ctx.currentBlockId = blockId;
 
+    // Per-variant assumption ids: every assumption attached to
+    // the variant's state (e.g. loop-widening raised when this
+    // variant entered a loop header) surfaces on any taint
+    // flow emitted while walking this block. emitTaintFlow
+    // reads `ctx._stateAssumptionIds` and unions it with the
+    // flowing value's own ids.
+    const prevStateIds = ctx._stateAssumptionIds;
+    ctx._stateAssumptionIds = state.assumptionIds || [];
+
     // Intra-block fast path: unfreeze, write in place, refreeze.
     // PHI instructions are already resolved by bakePhis at
     // enqueue time, so we skip them in the block body. Running
@@ -475,6 +496,7 @@ async function analyseFunction(module, fn, initialState, ctx) {
     state = D.freezeState(state);
 
     ctx.currentPath = prevPath;
+    ctx._stateAssumptionIds = prevStateIds;
 
     // Stash the per-variant out-state for phi resolution in
     // successors and for exit collection.

@@ -198,6 +198,33 @@ function emitTaintFlow(ctx, sinkInfo, sinkLoc, value) {
       location: prov[prov.length - 1] || sinkLoc,
     });
   }
+  // Flow assumption ids are the union of:
+  //
+  //   * `value.assumptionIds` — assumptions attached to the
+  //     specific value that reached the sink (imprecise-index
+  //     over-approximations, Opaque source chains, widened
+  //     Top envelopes).
+  //
+  //   * The current state's `_stateAssumptionIds` — per-block
+  //     assumptions (loop-widening fired on back-edges, summary-
+  //     reused flagged on summary cache hits) that apply to
+  //     everything reaching the sink in this block.
+  //
+  // Keeping both sources prevents the "I saw widening happen
+  // but the flow's audit trail is empty" problem. The UI
+  // dedups by reason when rendering chips.
+  const valueIds = value.assumptionIds ? value.assumptionIds.slice() : [];
+  const blockIds = (ctx._stateAssumptionIds &&
+                    ctx._stateAssumptionIds.length)
+    ? ctx._stateAssumptionIds
+    : [];
+  const flowIds = valueIds.slice();
+  if (blockIds.length > 0) {
+    const seen = new Set(flowIds);
+    for (const id of blockIds) {
+      if (!seen.has(id)) { seen.add(id); flowIds.push(id); }
+    }
+  }
   const flow = {
     id: ctx.nextFlowId++,
     source: sources,
@@ -210,7 +237,7 @@ function emitTaintFlow(ctx, sinkInfo, sinkLoc, value) {
     pathConditions: [],            // legacy human-readable list — unused in B3
     pathFormula: ctx.currentPath || null,  // SMT formula for the block's reachability
     valueFormula: (value.formula) || null,     // SMT formula for the value at the sink
-    assumptionIds: value.assumptionIds ? value.assumptionIds.slice() : [],
+    assumptionIds: flowIds,
   };
   ctx.taintFlows.push(flow);
 }
@@ -303,11 +330,15 @@ function computeBinOp(op, a, b, loc) {
   // `url` label.
   const labels = D.unionLabels(a, b);
 
-  // Opaque assumption ids propagate too — both operands' chains
-  // are unioned so the consumer can audit "what assumptions does
-  // this binary operation depend on".
-  const aIds = (a && a.kind === D.V.OPAQUE) ? a.assumptionIds : [];
-  const bIds = (b && b.kind === D.V.OPAQUE) ? b.assumptionIds : [];
+  // Assumption ids propagate from both operands. Previously
+  // this only pulled from Opaque — but values of any kind may
+  // carry assumption ids (a Disjunct envelope, a Top reached
+  // via widening, an imprecise-index-joined OneOf). Reading
+  // `assumptionIds` off the operand unconditionally picks up
+  // every contributing assumption so the flow's audit trail
+  // survives through every concat / arith.
+  const aIds = (a && a.assumptionIds) || [];
+  const bIds = (b && b.assumptionIds) || [];
   let chainIds = aIds;
   if (bIds.length > 0) {
     if (chainIds.length === 0) {
@@ -776,8 +807,57 @@ function applyGetIndex(ctx, state, instr) {
     }
     return D.setReg(state, instr.dest, D.concrete(undefined, undefined, loc));
   }
+  // Heap object with a non-concrete key: the read can pick
+  // any field. We over-approximate by joining every field
+  // the object currently holds. That's SOUND for taint (a
+  // label present on any field surfaces in the result) but
+  // it's IMPRECISE — a points-to analysis or a narrowed
+  // may-be lattice on `key` would pin the read to a
+  // specific field. We raise an `unimplemented` assumption
+  // with an `imprecise-index:` details prefix and attach
+  // its id to the returned value so consumers that reject
+  // this class of imprecision (strict mode) see the flow
+  // as partial, and consumers that accept it (the default)
+  // still get the over-approximated taint propagation.
+  //
+  // dom-convert does NOT read from this path — it rewrites
+  // from HtmlTemplate records built by src/html-templates.js,
+  // which pattern-match on the AST directly. Taint over-
+  // approximation here cannot produce an unsound rewrite.
+  if (obj && obj.kind === D.V.OBJECT) {
+    const cell = D.overlayGet(state.heap, obj.objId);
+    if (cell && cell.fields) {
+      let joined = null;
+      for (const k in cell.fields) {
+        const fv = cell.fields[k];
+        if (!fv) continue;
+        joined = joined ? D.join(joined, fv) : fv;
+      }
+      if (joined) {
+        const a = ctx.assumptions.raise(
+          REASONS.UNIMPLEMENTED,
+          'imprecise-index: computed index read with non-concrete key, joining every field as a sound over-approximation',
+          loc
+        );
+        // Attach the assumption id to the joined value so
+        // downstream taint flows that include this register
+        // carry the imprecision in `flow.assumptionIds`.
+        const withIds = D.withAssumptionIds(joined, [a.id]);
+        return D.setReg(state, instr.dest, withIds);
+      }
+    }
+    // Empty object: fall through to the opaque case so the
+    // consumer still sees an assumption on the lattice
+    // flow.
+  }
   if (obj && obj.kind === D.V.OPAQUE) {
-    return D.setReg(state, instr.dest, D.opaque(obj.assumptionIds, null, loc));
+    // Opaque receiver: preserve its label set so taint that
+    // arrived on the receiver side still flows to the
+    // read-out value. The old code built a fresh opaque and
+    // dropped labels, which lost taint across `obj[k]` reads
+    // when the receiver itself was tainted.
+    return D.setReg(state, instr.dest,
+      D.opaque(obj.assumptionIds, null, loc, obj.labels));
   }
   // Computed index whose target object or key couldn't be
   // narrowed to a concrete value. This is an engineering gap
