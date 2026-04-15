@@ -548,13 +548,36 @@
         if (f.file !== file || !f.location || !f.location.line) continue;
         var line = f.location.line;
         var cls = f.severity === 'high' ? 'taint-decoration-high' : 'taint-decoration-medium';
+        // Build the hover tooltip. Same shape as the
+        // sidebar finding row: severity tag, source →
+        // sink:prop [on <elementTag>], plus any path
+        // conditions, plus the assumption reason codes
+        // the finding depends on.
+        var sinkLabel = (f.sink.kind ? f.sink.kind + ':' : '') + f.sink.prop +
+          (f.sink.elementTag ? ' on <' + f.sink.elementTag + '>' : '');
+        var hoverLines = [
+          '**' + f.severity.toUpperCase() + '**: ' +
+            f.sources.join(', ') + ' \u2192 ' + sinkLabel,
+        ];
+        if (f.conditions && f.conditions.length) {
+          hoverLines.push('', '_when:_ `' + f.conditions.join(' && ') + '`');
+        }
+        if (f.assumptions && f.assumptions.length) {
+          var reasons = f.assumptions.map(function(a) { return a.reason; });
+          var uniq = [];
+          var seen = {};
+          for (var ri = 0; ri < reasons.length; ri++) {
+            if (!seen[reasons[ri]]) { seen[reasons[ri]] = 1; uniq.push(reasons[ri]); }
+          }
+          hoverLines.push('', '_assumes:_ ' + uniq.join(', '));
+        }
         decorations.push({
           range: new monaco.Range(line, 1, line, 1),
           options: {
             isWholeLine: true,
             className: cls,
             glyphMarginClassName: 'taint-glyph-' + f.severity,
-            hoverMessage: { value: '**' + f.severity.toUpperCase() + '**: ' + f.sources.join(', ') + ' \u2192 ' + f.sink.prop + (f.conditions.length ? '\n\nConditions: ' + f.conditions.join(' && ') : '') },
+            hoverMessage: { value: hoverLines.join('\n') },
           }
         });
       }
