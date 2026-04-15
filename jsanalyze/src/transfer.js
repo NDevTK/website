@@ -878,6 +878,25 @@ function applySetProp(ctx, state, instr) {
   const loc = instrLoc(ctx, instr);
   const obj = D.getReg(state, instr.object);
   const val = D.getReg(state, instr.value);
+  // D11.1 completeness gate: any syntactic innerHTML /
+  // outerHTML / insertAdjacentHTML write the walker actually
+  // executed — regardless of whether the receiver resolved
+  // to a DOM type — lands in `ctx.walkedHtmlSites`. The
+  // dom-convert consumer uses this to distinguish "walked
+  // but plain-object receiver, skip rewriting" from "not
+  // walked, probably dead branch, rewrite anyway". Without
+  // this record the two cases were indistinguishable from
+  // trace.innerHtmlAssignments alone (both are absent).
+  if (ctx.walkedHtmlSites &&
+      (instr.propName === 'innerHTML' ||
+       instr.propName === 'outerHTML')) {
+    ctx.walkedHtmlSites.push({
+      kind:    instr.propName,
+      pos:     loc.pos,
+      endPos:  loc.endPos,
+      file:    loc.file,
+    });
+  }
   // Sink classification: iterate over every receiver variant so a
   // Disjunct of element types fires once per variant that has a
   // sink descriptor for this property name. This is the

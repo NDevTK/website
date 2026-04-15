@@ -732,6 +732,81 @@ const tests = [
     },
   },
 
+  // --- Completeness: conversion vs reachability ---
+  //
+  // DOM conversion must rewrite every SYNTACTIC sink
+  // regardless of whether the engine's reachability analysis
+  // walked the block. These tests lock the behaviour: the
+  // rewriter handles dead branches and uncalled functions,
+  // but preserves the existing "walked plain-object field
+  // write" skip.
+  {
+    name: 'dom-convert: rewrites innerHTML inside dead `if (1 === 2)` branch',
+    fn: async () => {
+      const out = await convertJs(
+        'if (1 === 2) { document.body.innerHTML = "<p>x</p>"; }');
+      assert(/createElement\("p"\)/.test(out),
+        'dead-branch sink still rewritten: ' + out);
+      assert(/document\.body\.replaceChildren/.test(out),
+        'replaceChildren emitted: ' + out);
+      assert(!/innerHTML\s*=/.test(out),
+        'original assignment removed: ' + out);
+    },
+  },
+  {
+    name: 'dom-convert: rewrites innerHTML inside never-called function body',
+    fn: async () => {
+      const out = await convertJs(
+        'function render() { document.body.innerHTML = "<p>y</p>"; }');
+      assert(/createElement\("p"\)/.test(out),
+        'uncalled function body rewritten: ' + out);
+      assert(/createTextNode\("y"\)/.test(out),
+        'text preserved: ' + out);
+    },
+  },
+  {
+    name: 'dom-convert: rewrites innerHTML inside nested dead branch in a function',
+    fn: async () => {
+      const out = await convertJs([
+        'function f() {',
+        '  if (false) {',
+        '    document.body.innerHTML = "<b>z</b>";',
+        '  }',
+        '}',
+      ].join('\n'));
+      assert(/createElement\("b"\)/.test(out),
+        'nested dead-branch rewrite: ' + out);
+    },
+  },
+  {
+    name: 'dom-convert: precision — infeasible taint flow not emitted',
+    fn: async () => {
+      // This is the other half of the split: TAINT is
+      // reachability-gated. A tainted value reaching a sink
+      // under an unsatisfiable path condition produces no
+      // finding (the flow is dropped by the Layer 5 cascade
+      // or the post-pass refuteTrace). The rewrite still
+      // happens (the source has a sink syntactically), but
+      // trace.taintFlows stays empty.
+      const src = [
+        'var h = location.hash;',
+        'if (1 === 2) { document.body.innerHTML = h; }',
+      ].join('\n');
+      const trace = await analyze({ '<input>.js': src }, { typeDB: TDB });
+      assert(trace.taintFlows.length === 0,
+        'infeasible path must not emit a flow: ' +
+        JSON.stringify(trace.taintFlows));
+      // Conversion either rewrites the sink structurally or
+      // leaves it alone — the important invariant is that the
+      // CALL SUCCEEDS and the result is a valid string the
+      // caller can download. `!== null` would be wrong since
+      // unchanged output === src is also valid.
+      const rewritten = dc.convertJsFile(src, trace, '<input>.js');
+      assert(typeof rewritten === 'string',
+        'convertJsFile must return a string even on dead-code sinks');
+    },
+  },
+
   // --- Wave 12d8: legacy adversarial convertProject cases ---
   //
   // These port the adversarial cases from

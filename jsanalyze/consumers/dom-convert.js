@@ -68,6 +68,7 @@
 'use strict';
 
 const html = require('../src/html.js');
+const HtmlTemplates = require('../src/html-templates.js');
 
 // Per D11.1 the consumer does NOT parse JS source itself.
 // Every piece of structured knowledge about JS accumulator
@@ -877,30 +878,82 @@ function convertJsFile(jsSource, trace, filename) {
 
   // --- 1. innerHTML / outerHTML → DOM calls -----------------------------
   //
-  // Per D11.1, the engine has already attached a structured
-  // HtmlTemplate to each innerHtmlAssignment via
-  // src/html-templates.js. The consumer just reads the
-  // template and emits the replacement source — no AST
-  // walking here. Template kinds handled by emitFromTemplate:
+  // Completeness principle (DESIGN-DECISIONS.md §D19):
+  // DOM conversion must rewrite EVERY syntactic sink,
+  // regardless of whether the engine's reachability analysis
+  // walked the block that contains it. The rewrite preserves
+  // runtime semantics, and leaving an unreachable-per-analysis
+  // sink un-rewritten would become a security hole the
+  // moment the runtime takes a path the analysis ruled out
+  // (refutation is sound w.r.t. the model, not the world).
   //
-  //   * 'concrete' — compile-time static string; emit
-  //                  createElement/appendChild from the
-  //                  pre-parsed tree.
-  //   * 'loop'     — accumulator loop; emit
-  //                  replaceChildren() + optional outer
-  //                  wrapper + per-iteration for loop.
-  //   * 'opaque' / null — engine couldn't recognise; leave
-  //                  the source alone.
-  const stmtOffsets = new Set();
+  // We therefore get the site list from the AST via
+  // html-templates.findAllAssignments — not from
+  // trace.innerHtmlAssignments, which is filtered to walked
+  // blocks. The trace entries are still consulted
+  // opportunistically: when a trace entry matches a site,
+  // its pre-built template is used; otherwise we re-run the
+  // template extractor on the AST, which works identically
+  // on dead code because it's pure source-level.
+  const traceByPos = Object.create(null);
   for (const ih of trace.innerHtmlAssignments || []) {
     if (!matchesFile(ih.location)) continue;
-    if (ih.kind !== 'innerHTML' && ih.kind !== 'outerHTML') continue;
-    // Dedup: B4 multi-variant can emit the same assignment
-    // twice (once per caller variant). Skip duplicates.
-    const key = ih.location.pos + ':' + ih.location.endPos;
+    const k = ih.location.pos + ':' + ih.location.endPos;
+    if (!traceByPos[k]) traceByPos[k] = ih;
+  }
+  // Positions the walker executed but whose receiver was
+  // NOT a DOM element (plain-object `.innerHTML = …` field
+  // writes). These are in `trace.walkedHtmlSites` but NOT
+  // in `trace.innerHtmlAssignments`, so the set difference
+  // is our "walked non-DOM" signal. Rewriting such sites
+  // would break programs that intentionally use `innerHTML`
+  // as a field name on their own data objects.
+  const walkedNonDom = new Set();
+  for (const w of trace.walkedHtmlSites || []) {
+    if (!matchesFile(w)) continue;
+    const k = w.pos + ':' + w.endPos;
+    if (!traceByPos[k]) walkedNonDom.add(k);
+  }
+  // Enumerate every syntactic innerHTML / outerHTML site.
+  const siteList = HtmlTemplates.findAllAssignments(
+    jsSource, filename || '<input>.js');
+  const stmtOffsets = new Set();
+  const astCache = Object.create(null);
+  for (const site of siteList) {
+    if (site.kind !== 'innerHTML' && site.kind !== 'outerHTML') continue;
+    const key = site.pos + ':' + site.endPos;
     if (stmtOffsets.has(key)) continue;
     stmtOffsets.add(key);
-
+    // Case A: walked, plain-object receiver — skip. The
+    // rewrite would turn a harmless field write into a
+    // broken createElement call on a non-DOM object.
+    if (walkedNonDom.has(key)) continue;
+    // Case B: walked, DOM receiver — use the trace record.
+    // It carries the full lattice-derived value plus the
+    // (usually richer) template built during analyse().
+    // Case C: not walked — dead branch or uncalled
+    // function. Per the completeness principle, we still
+    // rewrite based on whatever the AST template extractor
+    // can see structurally. This is safe because
+    // html-templates operates purely on source and never
+    // consults the lattice.
+    let ih = traceByPos[key];
+    if (!ih) {
+      const tmpl = HtmlTemplates.extractTemplate(
+        jsSource, site.pos, filename || '<input>.js', astCache);
+      ih = {
+        kind: site.kind,
+        location: {
+          file: site.file, line: site.line, col: site.col,
+          pos: site.pos, endPos: site.endPos,
+        },
+        value: null,
+        labels: [],
+        concrete: tmpl && tmpl.kind === 'concrete' ? tmpl.html : null,
+        parsedHtml: tmpl && tmpl.kind === 'concrete' ? tmpl.nodes : null,
+        template: tmpl,
+      };
+    }
     const rewrite = emitFromTemplate(jsSource, ih);
     if (rewrite) replacements.push(rewrite);
   }

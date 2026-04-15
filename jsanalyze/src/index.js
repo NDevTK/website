@@ -95,6 +95,12 @@ async function analyze(input, options) {
     calls: [],
     taintFlows: [],
     innerHtmlAssignments: [],
+    // Every syntactic innerHTML / outerHTML write the
+    // worklist actually executed, DOM-typed receiver or
+    // not. Populated by applySetProp; read by the
+    // dom-convert consumer's dead-branch recovery path to
+    // avoid rewriting walked plain-object field writes.
+    walkedHtmlSites: [],
     stringLiterals: [],
     domMutations: [],
     mayBe: Object.create(null),
@@ -277,6 +283,12 @@ async function analyze(input, options) {
       // conversion consumer (consumers/dom-convert.js) iterates
       // these to rewrite unsafe sinks into createElement trees.
       innerHtmlAssignments: [],
+      // Every syntactic innerHTML / outerHTML SetProp the
+      // walker executed, DOM or plain-object. Used by the
+      // dom-convert consumer to distinguish walked-plain-
+      // object writes (skip) from dead-branch DOM writes
+      // (rewrite anyway per the completeness principle).
+      walkedHtmlSites: [],
       // Wave 12b: generic call-site recording. Populated by
       // applyCall for every CALL instruction. fetch-trace and
       // csp-derive are the primary consumers; dom-convert reads
@@ -471,6 +483,7 @@ async function analyze(input, options) {
     for (const c of ctx.calls) trace.calls.push(c);
     for (const s of ctx.stringLiterals) trace.stringLiterals.push(s);
     for (const d of ctx.domMutations) trace.domMutations.push(d);
+    for (const w of ctx.walkedHtmlSites) trace.walkedHtmlSites.push(w);
 
     // Projection: trace.callGraph is derived from ctx.calls.
     // Nodes are unique callee identities (by calleeName +

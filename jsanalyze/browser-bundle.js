@@ -3016,6 +3016,120 @@ function parseAst(source) {
   });
 }
 
+// findAllAssignments(jsSource, filename, astCache?) →
+//   Array<{ kind, pos, endPos, line, col, file }>
+//
+// Walks the AST for `jsSource` and returns every
+// syntactically-present innerHTML / outerHTML /
+// insertAdjacentHTML / document.write / document.writeln
+// site, INCLUDING ones inside:
+//
+//   * dead branches (`if (false) { el.innerHTML = … }`)
+//   * never-called functions
+//   * nested closures / class methods
+//
+// This is the "completeness" half of the completeness /
+// precision split: DOM conversion is a source-to-source
+// rewrite and must handle every syntactic sink regardless
+// of the engine's reachability verdict, because the
+// rewrite preserves runtime behaviour and the engine's
+// reachability may disagree with what the runtime actually
+// executes (refutation is sound w.r.t. a specific model;
+// a real execution may take a path the model excluded).
+//
+// Taint-flow emission, by contrast, is reachability-gated:
+// flows behind an SMT-refuted branch are dropped at Layer 5
+// or by the post-pass (refuteTrace). That's the precision
+// half — false positives matter.
+//
+// Each record's `pos` / `endPos` match the location the
+// transfer function records on innerHtmlAssignments when
+// the block IS walked, so the consumer can match records
+// by position and merge taint / template info from the
+// trace when available.
+function findAllAssignments(jsSource, filename, astCache) {
+  const ast = getAst(jsSource, filename, astCache);
+  if (!ast) return [];
+  const sites = [];
+  walkAll(ast, (node) => {
+    // Member-expression assignment: `el.innerHTML = …` /
+    // `el.outerHTML = …` / `el.innerHTML += …`.
+    //
+    // The site's pos/endPos match the INNER
+    // AssignmentExpression, not the enclosing
+    // ExpressionStatement, so they align with the
+    // location the transfer function records on
+    // trace.innerHtmlAssignments (which excludes the
+    // trailing semicolon).
+    if (node.type === 'AssignmentExpression' &&
+        (node.operator === '=' || node.operator === '+=')) {
+      const lhs = node.left;
+      if (lhs && lhs.type === 'MemberExpression' &&
+          !lhs.computed && lhs.property && lhs.property.type === 'Identifier') {
+        const name = lhs.property.name;
+        if (name === 'innerHTML' || name === 'outerHTML') {
+          sites.push(locOf(node, name, filename));
+          return;
+        }
+      }
+    }
+    // Method call: `el.insertAdjacentHTML(pos, html)` /
+    // `document.write(html)` / `document.writeln(html)`.
+    // Same inner-CallExpression alignment as above.
+    if (node.type === 'CallExpression') {
+      const callee = node.callee;
+      if (callee && callee.type === 'MemberExpression' &&
+          !callee.computed && callee.property &&
+          callee.property.type === 'Identifier') {
+        const m = callee.property.name;
+        if (m === 'insertAdjacentHTML') {
+          sites.push(locOf(node, 'insertAdjacentHTML', filename));
+          return;
+        }
+        if (m === 'write' || m === 'writeln') {
+          sites.push(locOf(node, m, filename));
+          return;
+        }
+      }
+    }
+  });
+  return sites;
+}
+
+// walkAll(node, visitor) — minimal recursive AST walker
+// that covers every child node kind the template extractor
+// cares about: function bodies, block statements, if/else
+// branches, switch cases, loop bodies, try/catch/finally,
+// class methods, and expression children. Visitor is
+// called pre-order on every node.
+function walkAll(node, visitor) {
+  if (!node || typeof node.type !== 'string') return;
+  visitor(node);
+  for (const key in node) {
+    if (key === 'type' || key === 'start' || key === 'end' ||
+        key === 'loc' || key === 'range' || key === 'parent') continue;
+    const child = node[key];
+    if (!child) continue;
+    if (Array.isArray(child)) {
+      for (const c of child) walkAll(c, visitor);
+    } else if (typeof child === 'object' && typeof child.type === 'string') {
+      walkAll(child, visitor);
+    }
+  }
+}
+
+function locOf(node, kind, filename) {
+  const startLoc = node.loc && node.loc.start;
+  return {
+    kind,
+    pos: node.start,
+    endPos: node.end,
+    line: startLoc ? startLoc.line : 0,
+    col:  startLoc ? startLoc.column + 1 : 0,
+    file: filename,
+  };
+}
+
 // extractTemplate(jsSource, assignStmtPos, astCache?) → HtmlTemplate | null
 //
 // The main entry point. `assignStmtPos` is the absolute
@@ -3035,15 +3149,17 @@ function parseAst(source) {
 function extractTemplate(jsSource, assignStmtPos, filename, astCache) {
   const ast = getAst(jsSource, filename, astCache);
   if (!ast) return null;
-  const stmts = ast.body;
-  let assignIdx = -1;
-  for (let i = 0; i < stmts.length; i++) {
-    if (stmts[i].start <= assignStmtPos && stmts[i].end > assignStmtPos) {
-      assignIdx = i;
-      break;
-    }
-  }
-  if (assignIdx < 0) return null;
+  // Find the block (or function body, or Program) whose
+  // statement list contains the site, and the index of the
+  // containing ExpressionStatement in that list. Accumulator-
+  // pattern detection (loop/branch/switch) is scoped to this
+  // statement list — the innermost block the site lives in —
+  // so a dead-branch sink inside `if (cond) { … }` works the
+  // same way a top-level sink does.
+  const located = findEnclosingStmtList(ast, assignStmtPos);
+  if (!located) return null;
+  const stmts = located.stmts;
+  const assignIdx = located.index;
   const assignStmt = stmts[assignIdx];
   if (assignStmt.type !== 'ExpressionStatement') return null;
   const expr = assignStmt.expression;
@@ -3187,6 +3303,61 @@ function extractAppend(jsSource, stmts, assignStmt, assignIdx,
     }
   }
   return { kind: 'opaque', reason: 'append rhs not recognised' };
+}
+
+// Walk the AST looking for the innermost statement list
+// that contains `pos`. Returns `{ stmts, index }` where
+// `stmts[index]` is the ExpressionStatement containing the
+// site, or null if no such statement exists. Used by
+// extractTemplate to scope accumulator detection to the
+// block the site actually lives in, so sites inside nested
+// if/else, loop, function, or switch bodies work the same
+// as top-level sites.
+function findEnclosingStmtList(node, pos) {
+  if (!node) return null;
+  // Each candidate node carries a `body` that's an array of
+  // statements; we search the innermost array containing pos.
+  let bestMatch = null;
+  function visit(n, currentStmts) {
+    if (!n || typeof n.type !== 'string') return;
+    if (n.start > pos || n.end <= pos) return;
+    // If n itself is a block-shaped node, its own `body`
+    // becomes the current statement list for deeper search.
+    let listHere = currentStmts;
+    if ((n.type === 'Program' || n.type === 'BlockStatement' ||
+         n.type === 'StaticBlock') && Array.isArray(n.body)) {
+      listHere = n.body;
+    }
+    // FunctionDeclaration / FunctionExpression / ArrowFunction
+    // have `.body` which is a BlockStatement — recurse into it.
+    if ((n.type === 'FunctionDeclaration' ||
+         n.type === 'FunctionExpression' ||
+         n.type === 'ArrowFunctionExpression') &&
+        n.body && n.body.type === 'BlockStatement' && Array.isArray(n.body.body)) {
+      listHere = n.body.body;
+    }
+    // If this is an ExpressionStatement and its expression
+    // covers pos, record it against the current list.
+    if (n.type === 'ExpressionStatement' && currentStmts) {
+      if (n.start <= pos && n.end > pos) {
+        const idx = currentStmts.indexOf(n);
+        if (idx >= 0) bestMatch = { stmts: currentStmts, index: idx };
+      }
+    }
+    for (const key in n) {
+      if (key === 'type' || key === 'start' || key === 'end' ||
+          key === 'loc' || key === 'range' || key === 'parent') continue;
+      const child = n[key];
+      if (!child) continue;
+      if (Array.isArray(child)) {
+        for (const c of child) visit(c, listHere);
+      } else if (typeof child === 'object' && typeof child.type === 'string') {
+        visit(child, listHere);
+      }
+    }
+  }
+  visit(node, Array.isArray(node.body) ? node.body : null);
+  return bestMatch;
 }
 
 function getAst(jsSource, filename, astCache) {
@@ -3999,6 +4170,7 @@ function parseStaticAttrsFragment(s) {
 
 module.exports = {
   extractTemplate,
+  findAllAssignments,
 };
 
   };
@@ -4840,6 +5012,12 @@ async function analyze(input, options) {
     calls: [],
     taintFlows: [],
     innerHtmlAssignments: [],
+    // Every syntactic innerHTML / outerHTML write the
+    // worklist actually executed, DOM-typed receiver or
+    // not. Populated by applySetProp; read by the
+    // dom-convert consumer's dead-branch recovery path to
+    // avoid rewriting walked plain-object field writes.
+    walkedHtmlSites: [],
     stringLiterals: [],
     domMutations: [],
     mayBe: Object.create(null),
@@ -5022,6 +5200,12 @@ async function analyze(input, options) {
       // conversion consumer (consumers/dom-convert.js) iterates
       // these to rewrite unsafe sinks into createElement trees.
       innerHtmlAssignments: [],
+      // Every syntactic innerHTML / outerHTML SetProp the
+      // walker executed, DOM or plain-object. Used by the
+      // dom-convert consumer to distinguish walked-plain-
+      // object writes (skip) from dead-branch DOM writes
+      // (rewrite anyway per the completeness principle).
+      walkedHtmlSites: [],
       // Wave 12b: generic call-site recording. Populated by
       // applyCall for every CALL instruction. fetch-trace and
       // csp-derive are the primary consumers; dom-convert reads
@@ -5216,6 +5400,7 @@ async function analyze(input, options) {
     for (const c of ctx.calls) trace.calls.push(c);
     for (const s of ctx.stringLiterals) trace.stringLiterals.push(s);
     for (const d of ctx.domMutations) trace.domMutations.push(d);
+    for (const w of ctx.walkedHtmlSites) trace.walkedHtmlSites.push(w);
 
     // Projection: trace.callGraph is derived from ctx.calls.
     // Nodes are unique callee identities (by calleeName +
@@ -13616,6 +13801,25 @@ function applySetProp(ctx, state, instr) {
   const loc = instrLoc(ctx, instr);
   const obj = D.getReg(state, instr.object);
   const val = D.getReg(state, instr.value);
+  // D11.1 completeness gate: any syntactic innerHTML /
+  // outerHTML / insertAdjacentHTML write the walker actually
+  // executed — regardless of whether the receiver resolved
+  // to a DOM type — lands in `ctx.walkedHtmlSites`. The
+  // dom-convert consumer uses this to distinguish "walked
+  // but plain-object receiver, skip rewriting" from "not
+  // walked, probably dead branch, rewrite anyway". Without
+  // this record the two cases were indistinguishable from
+  // trace.innerHtmlAssignments alone (both are absent).
+  if (ctx.walkedHtmlSites &&
+      (instr.propName === 'innerHTML' ||
+       instr.propName === 'outerHTML')) {
+    ctx.walkedHtmlSites.push({
+      kind:    instr.propName,
+      pos:     loc.pos,
+      endPos:  loc.endPos,
+      file:    loc.file,
+    });
+  }
   // Sink classification: iterate over every receiver variant so a
   // Disjunct of element types fires once per variant that has a
   // sink descriptor for this property name. This is the
@@ -17835,6 +18039,7 @@ module.exports = {
 'use strict';
 
 const html = require('../src/html.js');
+const HtmlTemplates = require('../src/html-templates.js');
 
 // Per D11.1 the consumer does NOT parse JS source itself.
 // Every piece of structured knowledge about JS accumulator
@@ -18644,30 +18849,82 @@ function convertJsFile(jsSource, trace, filename) {
 
   // --- 1. innerHTML / outerHTML → DOM calls -----------------------------
   //
-  // Per D11.1, the engine has already attached a structured
-  // HtmlTemplate to each innerHtmlAssignment via
-  // src/html-templates.js. The consumer just reads the
-  // template and emits the replacement source — no AST
-  // walking here. Template kinds handled by emitFromTemplate:
+  // Completeness principle (DESIGN-DECISIONS.md §D19):
+  // DOM conversion must rewrite EVERY syntactic sink,
+  // regardless of whether the engine's reachability analysis
+  // walked the block that contains it. The rewrite preserves
+  // runtime semantics, and leaving an unreachable-per-analysis
+  // sink un-rewritten would become a security hole the
+  // moment the runtime takes a path the analysis ruled out
+  // (refutation is sound w.r.t. the model, not the world).
   //
-  //   * 'concrete' — compile-time static string; emit
-  //                  createElement/appendChild from the
-  //                  pre-parsed tree.
-  //   * 'loop'     — accumulator loop; emit
-  //                  replaceChildren() + optional outer
-  //                  wrapper + per-iteration for loop.
-  //   * 'opaque' / null — engine couldn't recognise; leave
-  //                  the source alone.
-  const stmtOffsets = new Set();
+  // We therefore get the site list from the AST via
+  // html-templates.findAllAssignments — not from
+  // trace.innerHtmlAssignments, which is filtered to walked
+  // blocks. The trace entries are still consulted
+  // opportunistically: when a trace entry matches a site,
+  // its pre-built template is used; otherwise we re-run the
+  // template extractor on the AST, which works identically
+  // on dead code because it's pure source-level.
+  const traceByPos = Object.create(null);
   for (const ih of trace.innerHtmlAssignments || []) {
     if (!matchesFile(ih.location)) continue;
-    if (ih.kind !== 'innerHTML' && ih.kind !== 'outerHTML') continue;
-    // Dedup: B4 multi-variant can emit the same assignment
-    // twice (once per caller variant). Skip duplicates.
-    const key = ih.location.pos + ':' + ih.location.endPos;
+    const k = ih.location.pos + ':' + ih.location.endPos;
+    if (!traceByPos[k]) traceByPos[k] = ih;
+  }
+  // Positions the walker executed but whose receiver was
+  // NOT a DOM element (plain-object `.innerHTML = …` field
+  // writes). These are in `trace.walkedHtmlSites` but NOT
+  // in `trace.innerHtmlAssignments`, so the set difference
+  // is our "walked non-DOM" signal. Rewriting such sites
+  // would break programs that intentionally use `innerHTML`
+  // as a field name on their own data objects.
+  const walkedNonDom = new Set();
+  for (const w of trace.walkedHtmlSites || []) {
+    if (!matchesFile(w)) continue;
+    const k = w.pos + ':' + w.endPos;
+    if (!traceByPos[k]) walkedNonDom.add(k);
+  }
+  // Enumerate every syntactic innerHTML / outerHTML site.
+  const siteList = HtmlTemplates.findAllAssignments(
+    jsSource, filename || '<input>.js');
+  const stmtOffsets = new Set();
+  const astCache = Object.create(null);
+  for (const site of siteList) {
+    if (site.kind !== 'innerHTML' && site.kind !== 'outerHTML') continue;
+    const key = site.pos + ':' + site.endPos;
     if (stmtOffsets.has(key)) continue;
     stmtOffsets.add(key);
-
+    // Case A: walked, plain-object receiver — skip. The
+    // rewrite would turn a harmless field write into a
+    // broken createElement call on a non-DOM object.
+    if (walkedNonDom.has(key)) continue;
+    // Case B: walked, DOM receiver — use the trace record.
+    // It carries the full lattice-derived value plus the
+    // (usually richer) template built during analyse().
+    // Case C: not walked — dead branch or uncalled
+    // function. Per the completeness principle, we still
+    // rewrite based on whatever the AST template extractor
+    // can see structurally. This is safe because
+    // html-templates operates purely on source and never
+    // consults the lattice.
+    let ih = traceByPos[key];
+    if (!ih) {
+      const tmpl = HtmlTemplates.extractTemplate(
+        jsSource, site.pos, filename || '<input>.js', astCache);
+      ih = {
+        kind: site.kind,
+        location: {
+          file: site.file, line: site.line, col: site.col,
+          pos: site.pos, endPos: site.endPos,
+        },
+        value: null,
+        labels: [],
+        concrete: tmpl && tmpl.kind === 'concrete' ? tmpl.html : null,
+        parsedHtml: tmpl && tmpl.kind === 'concrete' ? tmpl.nodes : null,
+        template: tmpl,
+      };
+    }
     const rewrite = emitFromTemplate(jsSource, ih);
     if (rewrite) replacements.push(rewrite);
   }

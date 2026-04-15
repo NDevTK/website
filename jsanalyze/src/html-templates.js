@@ -141,6 +141,120 @@ function parseAst(source) {
   });
 }
 
+// findAllAssignments(jsSource, filename, astCache?) →
+//   Array<{ kind, pos, endPos, line, col, file }>
+//
+// Walks the AST for `jsSource` and returns every
+// syntactically-present innerHTML / outerHTML /
+// insertAdjacentHTML / document.write / document.writeln
+// site, INCLUDING ones inside:
+//
+//   * dead branches (`if (false) { el.innerHTML = … }`)
+//   * never-called functions
+//   * nested closures / class methods
+//
+// This is the "completeness" half of the completeness /
+// precision split: DOM conversion is a source-to-source
+// rewrite and must handle every syntactic sink regardless
+// of the engine's reachability verdict, because the
+// rewrite preserves runtime behaviour and the engine's
+// reachability may disagree with what the runtime actually
+// executes (refutation is sound w.r.t. a specific model;
+// a real execution may take a path the model excluded).
+//
+// Taint-flow emission, by contrast, is reachability-gated:
+// flows behind an SMT-refuted branch are dropped at Layer 5
+// or by the post-pass (refuteTrace). That's the precision
+// half — false positives matter.
+//
+// Each record's `pos` / `endPos` match the location the
+// transfer function records on innerHtmlAssignments when
+// the block IS walked, so the consumer can match records
+// by position and merge taint / template info from the
+// trace when available.
+function findAllAssignments(jsSource, filename, astCache) {
+  const ast = getAst(jsSource, filename, astCache);
+  if (!ast) return [];
+  const sites = [];
+  walkAll(ast, (node) => {
+    // Member-expression assignment: `el.innerHTML = …` /
+    // `el.outerHTML = …` / `el.innerHTML += …`.
+    //
+    // The site's pos/endPos match the INNER
+    // AssignmentExpression, not the enclosing
+    // ExpressionStatement, so they align with the
+    // location the transfer function records on
+    // trace.innerHtmlAssignments (which excludes the
+    // trailing semicolon).
+    if (node.type === 'AssignmentExpression' &&
+        (node.operator === '=' || node.operator === '+=')) {
+      const lhs = node.left;
+      if (lhs && lhs.type === 'MemberExpression' &&
+          !lhs.computed && lhs.property && lhs.property.type === 'Identifier') {
+        const name = lhs.property.name;
+        if (name === 'innerHTML' || name === 'outerHTML') {
+          sites.push(locOf(node, name, filename));
+          return;
+        }
+      }
+    }
+    // Method call: `el.insertAdjacentHTML(pos, html)` /
+    // `document.write(html)` / `document.writeln(html)`.
+    // Same inner-CallExpression alignment as above.
+    if (node.type === 'CallExpression') {
+      const callee = node.callee;
+      if (callee && callee.type === 'MemberExpression' &&
+          !callee.computed && callee.property &&
+          callee.property.type === 'Identifier') {
+        const m = callee.property.name;
+        if (m === 'insertAdjacentHTML') {
+          sites.push(locOf(node, 'insertAdjacentHTML', filename));
+          return;
+        }
+        if (m === 'write' || m === 'writeln') {
+          sites.push(locOf(node, m, filename));
+          return;
+        }
+      }
+    }
+  });
+  return sites;
+}
+
+// walkAll(node, visitor) — minimal recursive AST walker
+// that covers every child node kind the template extractor
+// cares about: function bodies, block statements, if/else
+// branches, switch cases, loop bodies, try/catch/finally,
+// class methods, and expression children. Visitor is
+// called pre-order on every node.
+function walkAll(node, visitor) {
+  if (!node || typeof node.type !== 'string') return;
+  visitor(node);
+  for (const key in node) {
+    if (key === 'type' || key === 'start' || key === 'end' ||
+        key === 'loc' || key === 'range' || key === 'parent') continue;
+    const child = node[key];
+    if (!child) continue;
+    if (Array.isArray(child)) {
+      for (const c of child) walkAll(c, visitor);
+    } else if (typeof child === 'object' && typeof child.type === 'string') {
+      walkAll(child, visitor);
+    }
+  }
+}
+
+function locOf(node, kind, filename) {
+  const startLoc = node.loc && node.loc.start;
+  return {
+    kind,
+    pos: node.start,
+    endPos: node.end,
+    line: startLoc ? startLoc.line : 0,
+    col:  startLoc ? startLoc.column + 1 : 0,
+    file: filename,
+  };
+}
+
 // extractTemplate(jsSource, assignStmtPos, astCache?) → HtmlTemplate | null
 //
 // The main entry point. `assignStmtPos` is the absolute
@@ -160,15 +274,17 @@ function parseAst(source) {
 function extractTemplate(jsSource, assignStmtPos, filename, astCache) {
   const ast = getAst(jsSource, filename, astCache);
   if (!ast) return null;
-  const stmts = ast.body;
-  let assignIdx = -1;
-  for (let i = 0; i < stmts.length; i++) {
-    if (stmts[i].start <= assignStmtPos && stmts[i].end > assignStmtPos) {
-      assignIdx = i;
-      break;
-    }
-  }
-  if (assignIdx < 0) return null;
+  // Find the block (or function body, or Program) whose
+  // statement list contains the site, and the index of the
+  // containing ExpressionStatement in that list. Accumulator-
+  // pattern detection (loop/branch/switch) is scoped to this
+  // statement list — the innermost block the site lives in —
+  // so a dead-branch sink inside `if (cond) { … }` works the
+  // same way a top-level sink does.
+  const located = findEnclosingStmtList(ast, assignStmtPos);
+  if (!located) return null;
+  const stmts = located.stmts;
+  const assignIdx = located.index;
   const assignStmt = stmts[assignIdx];
   if (assignStmt.type !== 'ExpressionStatement') return null;
   const expr = assignStmt.expression;
@@ -312,6 +428,61 @@ function extractAppend(jsSource, stmts, assignStmt, assignIdx,
     }
   }
   return { kind: 'opaque', reason: 'append rhs not recognised' };
+}
+
+// Walk the AST looking for the innermost statement list
+// that contains `pos`. Returns `{ stmts, index }` where
+// `stmts[index]` is the ExpressionStatement containing the
+// site, or null if no such statement exists. Used by
+// extractTemplate to scope accumulator detection to the
+// block the site actually lives in, so sites inside nested
+// if/else, loop, function, or switch bodies work the same
+// as top-level sites.
+function findEnclosingStmtList(node, pos) {
+  if (!node) return null;
+  // Each candidate node carries a `body` that's an array of
+  // statements; we search the innermost array containing pos.
+  let bestMatch = null;
+  function visit(n, currentStmts) {
+    if (!n || typeof n.type !== 'string') return;
+    if (n.start > pos || n.end <= pos) return;
+    // If n itself is a block-shaped node, its own `body`
+    // becomes the current statement list for deeper search.
+    let listHere = currentStmts;
+    if ((n.type === 'Program' || n.type === 'BlockStatement' ||
+         n.type === 'StaticBlock') && Array.isArray(n.body)) {
+      listHere = n.body;
+    }
+    // FunctionDeclaration / FunctionExpression / ArrowFunction
+    // have `.body` which is a BlockStatement — recurse into it.
+    if ((n.type === 'FunctionDeclaration' ||
+         n.type === 'FunctionExpression' ||
+         n.type === 'ArrowFunctionExpression') &&
+        n.body && n.body.type === 'BlockStatement' && Array.isArray(n.body.body)) {
+      listHere = n.body.body;
+    }
+    // If this is an ExpressionStatement and its expression
+    // covers pos, record it against the current list.
+    if (n.type === 'ExpressionStatement' && currentStmts) {
+      if (n.start <= pos && n.end > pos) {
+        const idx = currentStmts.indexOf(n);
+        if (idx >= 0) bestMatch = { stmts: currentStmts, index: idx };
+      }
+    }
+    for (const key in n) {
+      if (key === 'type' || key === 'start' || key === 'end' ||
+          key === 'loc' || key === 'range' || key === 'parent') continue;
+      const child = n[key];
+      if (!child) continue;
+      if (Array.isArray(child)) {
+        for (const c of child) visit(c, listHere);
+      } else if (typeof child === 'object' && typeof child.type === 'string') {
+        visit(child, listHere);
+      }
+    }
+  }
+  visit(node, Array.isArray(node.body) ? node.body : null);
+  return bestMatch;
 }
 
 function getAst(jsSource, filename, astCache) {
@@ -1124,4 +1295,5 @@ function parseStaticAttrsFragment(s) {
 
 module.exports = {
   extractTemplate,
+  findAllAssignments,
 };

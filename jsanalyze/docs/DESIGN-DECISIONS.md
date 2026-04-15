@@ -456,6 +456,72 @@ Docs drift is a soundness bug against consumers.
 
 **Rationale.** Consumers read the docs, not the source.
 
+### D20. Conversion is complete, taint is precise
+
+The two primary consumers have DIFFERENT soundness rules.
+
+**DOM conversion** is a source-to-source rewrite whose
+output must be safe to run. It therefore MUST handle every
+syntactically-present sink, regardless of whether the
+engine's reachability analysis walked the block that
+contains it. Skipping an unreachable-per-analysis sink
+leaves an unpatched security hole the moment the runtime
+takes a path the analysis ruled out. Refutation is sound
+w.r.t. the model, not the world, so the rewriter commits
+to a literal source transformation and doesn't consult
+`checkPathSat`.
+
+Mechanically: `consumers/dom-convert.js` enumerates sites
+via `src/html-templates.js:findAllAssignments`, which
+walks the AST and returns every `innerHTML` / `outerHTML` /
+`insertAdjacentHTML` / `document.write` / `document.writeln`
+occurrence — including ones inside dead branches, never-
+called functions, and nested closures. The template
+extractor runs on each site, consulting only source-level
+structure. The trace's `innerHtmlAssignments` entries are
+merged in where the walker also reached the site, so the
+rewriter gets richer lattice-derived templates (taint
+labels, accumulator shapes) when available without
+depending on them for site discovery.
+
+The one exception is "walked plain-object receiver". The
+engine records every syntactic innerHTML / outerHTML
+SetProp it executed in `trace.walkedHtmlSites`, DOM or
+plain-object. When the AST walker finds a site that's in
+`walkedHtmlSites` but NOT in `innerHtmlAssignments`, the
+receiver is a non-DOM object and the rewrite is skipped —
+converting it would turn a harmless field write into a
+broken `createElement` call. Dead-branch sites are absent
+from `walkedHtmlSites` entirely and fall through to the
+structural rewrite path.
+
+**Taint tracking**, by contrast, is reachability-gated.
+The engine's job is to tell the user "this flow is
+actually exploitable", and false positives under
+infeasible path conditions erode the signal. Flows behind
+an SMT-refuted branch are killed at Layer 5 during the
+walk (the block isn't enqueued past the refuted edge, so
+`applySetProp` never fires at the sink). Flows that survive
+walk-time with a non-trivial `pathFormula` go through the
+post-pass `z3.refuteTrace`, which conjoins `pathFormula`
+with Z3 and drops any flow returning UNSAT (moving them
+to `trace.refutedFlows` for audit). A consumer that
+accepts `smt-skipped` loses both passes and has to live
+with the extra noise.
+
+**The two rules coexist**: taint is precise because
+refutation is sound over the analysed model, conversion
+is complete because it refuses to trust the refutation
+for a source-level transform. One trace feeds both
+consumers without either compromising the other.
+
+**Tests**: `dom-convert.test.js` has explicit regression
+cases for dead-branch rewriting (`if (1 === 2) { … }`),
+uncalled-function rewriting (`function render() { … }`),
+nested dead-branch rewriting inside a function body, and
+an infeasible-path taint-gate case that confirms the flow
+list is empty while conversion continues to run cleanly.
+
 ### D18. Every commit ends with `test/run.js` passing
 
 No half-finished commits. If the feature doesn't fit in one
