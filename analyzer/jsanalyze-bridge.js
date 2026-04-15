@@ -284,17 +284,29 @@
   globalThis.__runAllConsumers = async function (files, options) {
     options = options || {};
     var engineOpts = buildAnalyseOptions(options);
+    console.log('[bridge] __runAllConsumers entry',
+      'fileNames=', Object.keys(files || {}),
+      'accept=', options.accept,
+      'engineOpts=', engineOpts);
 
     var convertedFiles = {};
+    console.log('[bridge] step convertProject START');
     try {
       convertedFiles = (await J.consumers.domConvert.convertProject(
         files, engineOpts)) || {};
-    } catch (e) { /* convertProject failures are non-fatal */ }
+    } catch (e) {
+      console.error('[bridge] step convertProject THREW', e && (e.stack || e.message), e);
+    }
+    console.log('[bridge] step convertProject END',
+      'outputFileCount=', Object.keys(convertedFiles).length,
+      'outputFileNames=', Object.keys(convertedFiles));
 
     var trace;
+    console.log('[bridge] step analyseAll START');
     try {
       trace = await analyseAll(files, options);
     } catch (e) {
+      console.error('[bridge] step analyseAll THREW', e && (e.stack || e.message), e);
       return {
         convertedFiles: convertedFiles,
         taint:   { findings: [], summary: { total: 0, high: 0, medium: 0, low: 0 } },
@@ -307,6 +319,13 @@
         error:   e && e.message,
       };
     }
+    console.log('[bridge] step analyseAll END',
+      'taintFlows=', (trace.taintFlows || []).length,
+      'innerHtmlAssignments=', (trace.innerHtmlAssignments || []).length,
+      'calls=', (trace.calls || []).length,
+      'assumptions=', (trace.assumptions || []).length,
+      'partial=', !!trace.partial,
+      'warnings=', (trace.warnings || []).length);
 
     var taint  = taintFindingsFromTrace(trace, files);
     var csp    = null;
@@ -315,12 +334,30 @@
     // Each consumer is independent — a failure in one shouldn't
     // take down the others. The UI panel just shows empty for
     // a failing consumer.
-    try { csp     = await J.consumers.cspDerive.derive(files, engineOpts); } catch (e) {}
-    try { fetches = await J.consumers.fetchTrace.trace(files, engineOpts); } catch (e) {}
-    try { pocs    = await J.consumers.pocSynth.synthesiseTrace(trace); } catch (e) {}
+    console.log('[bridge] step cspDerive START');
+    try {
+      csp = await J.consumers.cspDerive.derive(files, engineOpts);
+    } catch (e) {
+      console.error('[bridge] step cspDerive THREW', e && (e.stack || e.message), e);
+    }
+    console.log('[bridge] step cspDerive END', csp && Object.keys(csp));
+    console.log('[bridge] step fetchTrace START');
+    try {
+      fetches = await J.consumers.fetchTrace.trace(files, engineOpts);
+    } catch (e) {
+      console.error('[bridge] step fetchTrace THREW', e && (e.stack || e.message), e);
+    }
+    console.log('[bridge] step fetchTrace END', 'count=', (fetches || []).length);
+    console.log('[bridge] step pocSynth START');
+    try {
+      pocs = await J.consumers.pocSynth.synthesiseTrace(trace);
+    } catch (e) {
+      console.error('[bridge] step pocSynth THREW', e && (e.stack || e.message), e);
+    }
+    console.log('[bridge] step pocSynth END', 'count=', (pocs || []).length);
     pocs = enrichPocResults(pocs || [], trace);
 
-    return {
+    var result = {
       convertedFiles: convertedFiles,
       taint:   taint,
       csp:     csp,
@@ -330,6 +367,14 @@
       allAssumptions:      trace.assumptions || [],
       rejectedAssumptions: trace.rejectedAssumptions || [],
     };
+    console.log('[bridge] __runAllConsumers exit',
+      'taint.findings=', result.taint.findings.length,
+      'convertedFiles=', Object.keys(result.convertedFiles).length,
+      'csp=', result.csp && Object.keys(result.csp),
+      'fetches=', result.fetches.length,
+      'pocs=', result.pocs.length,
+      'allAssumptions=', result.allAssumptions.length);
+    return result;
   };
 
   // --- Preset accept-set builders ------------------------------------

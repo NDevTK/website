@@ -123,6 +123,14 @@ const query = require('./query.js');
 //                     onFinding, onAssumption.
 async function analyze(input, options) {
   options = options || {};
+  // Verbose-logging diagnostic: surface the file set the
+  // engine was asked to analyse so the browser console
+  // shows what reached analyze() vs what actually got walked.
+  console.log('[jsanalyze] analyze() called',
+    'inputType=', typeof input,
+    'fileCount=', typeof input === 'string' ? 1 : Object.keys(input || {}).length,
+    'fileNames=', typeof input === 'string' ? ['<input>.js'] : Object.keys(input || {}),
+    'options=', { accept: options.accept, smtTimeoutMs: options.smtTimeoutMs });
   const smtTimeoutMs = options.smtTimeoutMs != null ? options.smtTimeoutMs : 5000;
   const watchers = options.watchers || null;
   // Single axis for precision / performance / soundness
@@ -283,6 +291,15 @@ async function analyze(input, options) {
   // each observation to the right file.
   const projectOrder = Array.isArray(options.project) ? options.project : null;
   const iterFiles = projectOrder ? [projectOrder[0]] : Object.keys(workingFiles);
+  // Verbose-logging diagnostic: print the per-file walk
+  // schedule. Inline-script extraction is done at this
+  // point, so workingFiles holds the .inline.N.js synth
+  // names — the listing tells us if HTML extraction
+  // produced anything.
+  console.log('[jsanalyze] walking files',
+    'projectOrder=', projectOrder,
+    'iterFiles=', iterFiles,
+    'workingFileKeys=', Object.keys(workingFiles));
 
   for (const filename of iterFiles) {
     let module;
@@ -305,6 +322,13 @@ async function analyze(input, options) {
         module = buildModule(workingFiles[filename], filename);
       }
     } catch (e) {
+      // Verbose-logging diagnostic (no behavior change): log
+      // the actual parse error to the browser console so the
+      // user can see WHY the engine couldn't build the IR for
+      // this file. Without this the error vanished into a
+      // partial-trace warning and the UI looked silently
+      // broken.
+      console.error('[jsanalyze] parse/IR error in', filename, e && (e.stack || e.message), e);
       trace.partial = true;
       trace.warnings.push({
         severity: 'error',
@@ -402,6 +426,10 @@ async function analyze(input, options) {
     try {
       result = await analyseFunction(module, module.top, initialState, ctx);
     } catch (e) {
+      // Verbose-logging diagnostic (no behavior change): log
+      // the actual walker error to the browser console so the
+      // user can see WHY the worklist gave up on this file.
+      console.error('[jsanalyze] worklist error in', filename, e && (e.stack || e.message), e);
       trace.partial = true;
       trace.warnings.push({
         severity: 'error',
@@ -658,6 +686,26 @@ async function analyze(input, options) {
     }
   }
 
+  // Verbose-logging diagnostic: trace exit summary so the
+  // browser console shows what analyze() is returning to
+  // the bridge. If this prints zeros across the board the
+  // engine ran but found nothing; if it prints non-zero
+  // counts the bridge / consumer is the next thing to
+  // suspect.
+  console.log('[jsanalyze] analyze() returning',
+    'partial=', trace.partial,
+    'taintFlows=', trace.taintFlows.length,
+    'innerHtmlAssignments=', trace.innerHtmlAssignments.length,
+    'calls=', trace.calls.length,
+    'domMutations=', trace.domMutations.length,
+    'assumptions=', trace.assumptions.length,
+    'warnings=', trace.warnings.length);
+  if (trace.warnings.length > 0) {
+    for (const w of trace.warnings) {
+      console.error('[jsanalyze] trace warning:', w.severity, w.message,
+        'in', w.file, w.stack);
+    }
+  }
   return trace;
 }
 
