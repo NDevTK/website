@@ -192,38 +192,38 @@
       updateEditorDecorations();
     }
 
-    // --- Conversion ---
-    // Uses HtmldomConvert.convertProject (a consumer built on jsanalyze)
-    // for DOM rewriting and globalThis.__traceTaint (exposed by the
-    // walker) for taint flow analysis. Both are async so convertAll
-    // is async too; callers (setTimeout, init timer) don't need to
-    // await it.
+    // --- Conversion + all-consumers pipeline ---
+    //
+    // Uses globalThis.__runAllConsumers (from jsanalyze-bridge.js),
+    // which runs the dom-convert project rewrite AND a shared
+    // analyze() pass whose trace feeds taint-report, csp-derive,
+    // fetch-trace, and poc-synth. One engine walk per file ->
+    // five consumer outputs -> five UI panels.
     var convertAllRunning = false;
     var taintResults = null;
+    var cspResults = null;
+    var fetchResults = null;
+    var pocResults = null;
     var editorDecorations = [];
     async function convertAll() {
       if (convertAllRunning || !folderFiles) return;
       convertAllRunning = true;
       try {
-        // HtmldomConvert processes every HTML page and rewrites any
-        // innerHTML sinks in the referenced JS files. The facade
-        // waits for jsanalyze.js's async IIFE to finish loading
-        // before running.
-        if (globalThis.HtmldomConvert) {
-          outputFiles = await globalThis.HtmldomConvert.convertProject(folderFiles) || {};
+        if (globalThis.__runAllConsumers) {
+          var all = await globalThis.__runAllConsumers(folderFiles);
+          outputFiles  = all.convertedFiles || {};
+          taintResults = all.taint  || { findings: [], summary: { total: 0 } };
+          cspResults   = all.csp    || null;
+          fetchResults = all.fetches|| [];
+          pocResults   = all.pocs   || [];
         } else {
           outputFiles = {};
         }
-        // Taint analysis returns { findings, summary }.
-        if (globalThis.__traceTaint) {
-          try {
-            taintResults = await globalThis.__traceTaint(folderFiles);
-          } catch (e) {
-            taintResults = { findings: [], summary: { total: 0 } };
-          }
-        }
         renderSidebar();
         renderTaintFindings();
+        renderPocList();
+        renderCspList();
+        renderFetchList();
         updateEditorDecorations();
         document.getElementById('downloadAll').disabled = !Object.keys(outputFiles).length;
       } finally {
@@ -280,6 +280,153 @@
         })(finding);
         container.appendChild(el);
       }
+    }
+
+    // --- PoC payloads panel ---
+    // Renders poc-synth results. 'synthesised' entries are
+    // highlighted and show the concrete attacker payload;
+    // the other verdicts are muted.
+    function renderPocList() {
+      var container = document.getElementById('pocList');
+      if (!pocResults || !pocResults.length) {
+        container.innerHTML = '<div class="empty-hint">No flows to synthesise</div>';
+        return;
+      }
+      // Synthesised payloads first, then other verdicts grouped at the bottom.
+      var order = { synthesised: 0, infeasible: 1, unsolvable: 2, 'no-constraint': 3, trivial: 4 };
+      var sorted = pocResults.slice().sort(function(a, b) {
+        return (order[a.verdict] || 9) - (order[b.verdict] || 9);
+      });
+      container.innerHTML = '';
+      sorted.forEach(function(r) {
+        var el = document.createElement('div');
+        el.className = 'poc-item';
+        var verdict = document.createElement('span');
+        verdict.className = 'poc-verdict ' + r.verdict;
+        verdict.textContent = r.verdict.toUpperCase();
+        el.appendChild(verdict);
+        var srcLabels = (r.source || []).map(function(s){ return s.label; }).join('+');
+        var sinkLabel = (r.sink && r.sink.kind) + ':' + (r.sink && r.sink.prop || '?');
+        el.appendChild(document.createTextNode(srcLabels + ' \u2192 ' + sinkLabel));
+        if (r.payload != null) {
+          var p = document.createElement('div');
+          p.className = 'poc-payload';
+          p.textContent = r.payload;
+          el.appendChild(p);
+        } else if (r.note) {
+          var note = document.createElement('div');
+          note.className = 'poc-flow';
+          note.textContent = r.note;
+          el.appendChild(note);
+        }
+        var loc = r.sink && r.sink.location;
+        if (loc && loc.file) {
+          var flow = document.createElement('div');
+          flow.className = 'poc-flow';
+          flow.textContent = loc.file + (loc.line ? ':' + loc.line : '');
+          el.appendChild(flow);
+          el.addEventListener('click', function() {
+            var file = loc.file;
+            if (folderFiles[file]) {
+              selectFile(file, 'original');
+              if (loc.line) editor.revealLineInCenter(loc.line);
+            }
+          });
+        }
+        container.appendChild(el);
+      });
+    }
+
+    // --- CSP panel ---
+    // Shows the derived directives as `directive: origin, …` rows.
+    // 'unsafe-inline' / 'unsafe-eval' get a warning annotation.
+    function renderCspList() {
+      var container = document.getElementById('cspList');
+      if (!cspResults) {
+        container.innerHTML = '<div class="empty-hint">CSP derivation pending</div>';
+        return;
+      }
+      container.innerHTML = '';
+      var directives = ['default-src','script-src','style-src','img-src','connect-src','frame-src','worker-src','font-src','media-src','object-src','base-uri','form-action','frame-ancestors'];
+      var hasAny = false;
+      directives.forEach(function(d) {
+        var vals = cspResults[d];
+        if (!vals || !vals.length) return;
+        hasAny = true;
+        var el = document.createElement('div');
+        el.className = 'csp-row';
+        var dir = document.createElement('div');
+        dir.className = 'csp-dir';
+        dir.textContent = d;
+        el.appendChild(dir);
+        var val = document.createElement('div');
+        val.className = 'csp-val';
+        val.textContent = vals.join(' ');
+        el.appendChild(val);
+        container.appendChild(el);
+      });
+      if (cspResults['report-unsafe-inline']) {
+        var w = document.createElement('div');
+        w.className = 'csp-row';
+        w.innerHTML = '<div class="csp-warn">! \'unsafe-inline\' required: bundle uses innerHTML / inline handlers the analyser couldn\'t otherwise justify</div>';
+        container.appendChild(w);
+        hasAny = true;
+      }
+      if (cspResults['report-unsafe-eval']) {
+        var w2 = document.createElement('div');
+        w2.className = 'csp-row';
+        w2.innerHTML = '<div class="csp-warn">! \'unsafe-eval\' required: bundle calls eval / new Function / setTimeout(string)</div>';
+        container.appendChild(w2);
+        hasAny = true;
+      }
+      if (!hasAny) {
+        container.innerHTML = '<div class="empty-hint">No directives derived</div>';
+      }
+    }
+
+    // --- Fetch endpoints panel ---
+    // fetch / XHR / WebSocket / Beacon / EventSource call sites.
+    // Tainted URLs get a red treatment so reviewers can see at
+    // a glance which endpoints accept attacker input.
+    function renderFetchList() {
+      var container = document.getElementById('fetchList');
+      if (!fetchResults || !fetchResults.length) {
+        container.innerHTML = '<div class="empty-hint">No network calls discovered</div>';
+        return;
+      }
+      container.innerHTML = '';
+      fetchResults.forEach(function(s) {
+        var el = document.createElement('div');
+        el.className = 'fetch-item';
+        var api = document.createElement('span');
+        api.className = 'fetch-api';
+        api.textContent = s.api;
+        el.appendChild(api);
+        if (s.method) {
+          var m = document.createElement('span');
+          m.className = 'fetch-method';
+          m.textContent = s.method;
+          el.appendChild(m);
+        }
+        var u = document.createElement('span');
+        u.className = 'fetch-url' + (s.urlLabels && s.urlLabels.length ? ' fetch-tainted' : '');
+        u.textContent = s.url || '<dynamic url>';
+        el.appendChild(u);
+        var loc = s.site || null;
+        if (loc && loc.file) {
+          var l = document.createElement('div');
+          l.className = 'fetch-loc';
+          l.textContent = loc.file + (loc.line ? ':' + loc.line : '');
+          el.appendChild(l);
+          el.addEventListener('click', function() {
+            if (folderFiles[loc.file]) {
+              selectFile(loc.file, 'original');
+              if (loc.line) editor.revealLineInCenter(loc.line);
+            }
+          });
+        }
+        container.appendChild(el);
+      });
     }
 
     function updateEditorDecorations() {
@@ -400,13 +547,11 @@
       reconvertTimer = setTimeout(function() { convertAll(); }, 500);
     });
 
-    // Initial conversion of the example file.
-    // Wait for HtmldomConvert (the DOM conversion consumer) to
-    // finish loading before running the first convertAll. This
-    // replaces the pre-Stage-5 check for globalThis.__convertProject
-    // which was removed when the converter moved out of jsanalyze.js.
+    // Initial conversion of the example file. Wait for the
+    // bridge's unified runner to be available (which means
+    // the bundle + acorn + Z3 bootstrap all finished loading).
     var initTimer = setInterval(function() {
-      if (globalThis.HtmldomConvert && globalThis.__traceTaint) {
+      if (globalThis.__runAllConsumers) {
         clearInterval(initTimer);
         convertAll();
         selectFile('example.html', 'original');

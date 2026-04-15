@@ -14,6 +14,7 @@ const { overlayEntries } = require('./domain.js');
 const Z3 = require('./z3.js');
 const HTML = require('./html.js');
 const HtmlTemplates = require('./html-templates.js');
+const DEFAULT_TYPEDB = require('./default-typedb.js');
 const query = require('./query.js');
 
 // analyze(input, options) → Promise<Trace>
@@ -263,7 +264,7 @@ async function analyze(input, options) {
     const ctx = {
       module,
       assumptions,
-      typeDB: options.typeDB || null,
+      typeDB: options.typeDB || DEFAULT_TYPEDB,
       nextObjId: 0,
       onCall: (watchers && typeof watchers.onCall === 'function') ? watchers.onCall : null,
       onFinding: (watchers && typeof watchers.onFinding === 'function') ? watchers.onFinding : null,
