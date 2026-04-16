@@ -930,34 +930,48 @@ const DEFAULT_TYPE_DB = {
     },
 
     // --- String (for label-preserving string methods) ---
+    //
+    // `smtOp` names a string-theory operation understood by
+    // `applySmtCallOp` in src/transfer.js. When the receiver has
+    // a formula and the arg formulas are available, the call's
+    // return value is given a derived SMT formula so downstream
+    // path-condition composition and PoC synthesis can solve for
+    // a concrete attacker input. Descriptors WITHOUT `smtOp` fall
+    // back to the opaque-with-labels behaviour and, if a taint
+    // flow reaches a sink without a valueFormula, raise an
+    // `unsolvable-math` assumption naming the unmodelled op.
     String: {
       methods: {
-        slice:       { returnType: 'String', preservesLabelsFromReceiver: true },
-        substring:   { returnType: 'String', preservesLabelsFromReceiver: true },
-        substr:      { returnType: 'String', preservesLabelsFromReceiver: true },
-        toLowerCase: { returnType: 'String', preservesLabelsFromReceiver: true },
-        toUpperCase: { returnType: 'String', preservesLabelsFromReceiver: true },
-        trim:        { returnType: 'String', preservesLabelsFromReceiver: true },
-        trimStart:   { returnType: 'String', preservesLabelsFromReceiver: true },
-        trimEnd:     { returnType: 'String', preservesLabelsFromReceiver: true },
-        charAt:      { returnType: 'String', preservesLabelsFromReceiver: true },
-        concat:      { returnType: 'String', preservesLabelsFromReceiver: true },
-        repeat:      { returnType: 'String', preservesLabelsFromReceiver: true },
-        replace:     { returnType: 'String', preservesLabelsFromReceiver: true },
-        replaceAll:  { returnType: 'String', preservesLabelsFromReceiver: true },
-        padStart:    { returnType: 'String', preservesLabelsFromReceiver: true },
-        padEnd:      { returnType: 'String', preservesLabelsFromReceiver: true },
-        normalize:   { returnType: 'String', preservesLabelsFromReceiver: true },
-        split:       { preservesLabelsFromReceiver: true },
-        indexOf:     {},
-        lastIndexOf: {},
-        includes:    {},
-        startsWith:  {},
-        endsWith:    {},
-        toString:    { returnType: 'String', preservesLabelsFromReceiver: true },
+        slice:       { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'slice'       },
+        substring:   { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'substring'   },
+        substr:      { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'substr'      },
+        // to_lower / to_upper aren't universally supported across
+        // Z3 WASM builds; keep the helpers in smt.js but route
+        // the TypeDB through the unmodelled fallback so the
+        // direct-flow demo payload fires instead of a parse error.
+        toLowerCase: { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'unmodelled:toLowerCase' },
+        toUpperCase: { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'unmodelled:toUpperCase' },
+        trim:        { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'unmodelled:trim'      },
+        trimStart:   { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'unmodelled:trimStart' },
+        trimEnd:     { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'unmodelled:trimEnd'   },
+        charAt:      { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'charAt'      },
+        concat:      { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'concat'      },
+        repeat:      { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'unmodelled:repeat' },
+        replace:     { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'replace'     },
+        replaceAll:  { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'replaceAll'  },
+        padStart:    { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'unmodelled:padStart' },
+        padEnd:      { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'unmodelled:padEnd'   },
+        normalize:   { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'unmodelled:normalize' },
+        split:       { preservesLabelsFromReceiver: true, smtOp: 'unmodelled:split' },
+        indexOf:     { returnType: 'Int', smtOp: 'indexOf'   },
+        lastIndexOf: { returnType: 'Int', smtOp: 'unmodelled:lastIndexOf' },
+        includes:    { returnType: 'Bool', smtOp: 'includes'   },
+        startsWith:  { returnType: 'Bool', smtOp: 'startsWith' },
+        endsWith:    { returnType: 'Bool', smtOp: 'endsWith'   },
+        toString:    { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'identity' },
       },
       props: {
-        length: {},
+        length: { smtOp: 'length' },
       },
     },
 
@@ -5324,14 +5338,6 @@ const query = require('./query.js');
 //                     onFinding, onAssumption.
 async function analyze(input, options) {
   options = options || {};
-  // Verbose-logging diagnostic: surface the file set the
-  // engine was asked to analyse so the browser console
-  // shows what reached analyze() vs what actually got walked.
-  console.log('[jsanalyze] analyze() called',
-    'inputType=', typeof input,
-    'fileCount=', typeof input === 'string' ? 1 : Object.keys(input || {}).length,
-    'fileNames=', typeof input === 'string' ? ['<input>.js'] : Object.keys(input || {}),
-    'options=', { accept: options.accept, smtTimeoutMs: options.smtTimeoutMs });
   const smtTimeoutMs = options.smtTimeoutMs != null ? options.smtTimeoutMs : 5000;
   const watchers = options.watchers || null;
   // Single axis for precision / performance / soundness
@@ -5493,15 +5499,6 @@ async function analyze(input, options) {
   const projectOrder = Array.isArray(options.project) ? options.project : null;
   const iterFiles = projectOrder ? [projectOrder[0]] : Object.keys(workingFiles);
   // Verbose-logging diagnostic: print the per-file walk
-  // schedule. Inline-script extraction is done at this
-  // point, so workingFiles holds the .inline.N.js synth
-  // names — the listing tells us if HTML extraction
-  // produced anything.
-  console.log('[jsanalyze] walking files',
-    'projectOrder=', projectOrder,
-    'iterFiles=', iterFiles,
-    'workingFileKeys=', Object.keys(workingFiles));
-
   for (const filename of iterFiles) {
     let module;
     // Boundary: parse/IR errors. We catch here — and ONLY here —
@@ -5888,19 +5885,6 @@ async function analyze(input, options) {
   }
 
   // Verbose-logging diagnostic: trace exit summary so the
-  // browser console shows what analyze() is returning to
-  // the bridge. If this prints zeros across the board the
-  // engine ran but found nothing; if it prints non-zero
-  // counts the bridge / consumer is the next thing to
-  // suspect.
-  console.log('[jsanalyze] analyze() returning',
-    'partial=', trace.partial,
-    'taintFlows=', trace.taintFlows.length,
-    'innerHtmlAssignments=', trace.innerHtmlAssignments.length,
-    'calls=', trace.calls.length,
-    'domMutations=', trace.domMutations.length,
-    'assumptions=', trace.assumptions.length,
-    'warnings=', trace.warnings.length);
   if (trace.warnings.length > 0) {
     for (const w of trace.warnings) {
       console.error('[jsanalyze] trace warning:', w.severity, w.message,
@@ -13300,6 +13284,116 @@ function mkSubstr(s, start, length) {
   };
 }
 
+// mkAt(s, i) — `str.at`, single-char substring. JS charAt(i)
+// returns '' when i is out of range; Z3 str.at matches.
+function mkAt(s, i) {
+  if (!s || !i) return null;
+  if (s.value && s.value.kind === 'str' &&
+      i.value && i.value.kind === 'int') {
+    return mkConst(s.value.val.charAt(i.value.val));
+  }
+  const sorts = mergeSorts(s.sorts, i.sorts);
+  if (s.symName) sorts[s.symName] = 'String';
+  return {
+    expr: '(str.at ' + s.expr + ' ' + i.expr + ')',
+    sorts,
+    isBool: false,
+    stringResult: true,
+  };
+}
+
+// mkIndexOf(haystack, needle, offset) — `str.indexof`. JS
+// indexOf returns -1 when not found; Z3 str.indexof matches.
+function mkIndexOf(haystack, needle, offset) {
+  if (!haystack || !needle) return null;
+  const off = offset || mkConst(0);
+  if (haystack.value && haystack.value.kind === 'str' &&
+      needle.value && needle.value.kind === 'str' &&
+      off.value && off.value.kind === 'int') {
+    return mkConst(haystack.value.val.indexOf(needle.value.val, off.value.val));
+  }
+  const sorts = mergeSorts(mergeSorts(haystack.sorts, needle.sorts), off.sorts);
+  if (haystack.symName) sorts[haystack.symName] = 'String';
+  if (needle.symName) sorts[needle.symName] = 'String';
+  return {
+    expr: '(str.indexof ' + haystack.expr + ' ' + needle.expr + ' ' + off.expr + ')',
+    sorts,
+    isBool: false,
+  };
+}
+
+// mkReplace(s, from, to) — `str.replace`. Replaces FIRST match
+// only, matching JS's String.prototype.replace(string, string).
+function mkReplace(s, from, to) {
+  if (!s || !from || !to) return null;
+  if (s.value && s.value.kind === 'str' &&
+      from.value && from.value.kind === 'str' &&
+      to.value && to.value.kind === 'str') {
+    const sv = s.value.val, fv = from.value.val, tv = to.value.val;
+    const i = sv.indexOf(fv);
+    return mkConst(i < 0 ? sv : sv.slice(0, i) + tv + sv.slice(i + fv.length));
+  }
+  const sorts = mergeSorts(mergeSorts(s.sorts, from.sorts), to.sorts);
+  if (s.symName) sorts[s.symName] = 'String';
+  if (from.symName) sorts[from.symName] = 'String';
+  if (to.symName) sorts[to.symName] = 'String';
+  return {
+    expr: '(str.replace ' + s.expr + ' ' + from.expr + ' ' + to.expr + ')',
+    sorts,
+    isBool: false,
+    stringResult: true,
+  };
+}
+
+// mkReplaceAll(s, from, to) — `str.replace_all` (Z3 extension).
+// Matches JS String.prototype.replaceAll(string, string).
+function mkReplaceAll(s, from, to) {
+  if (!s || !from || !to) return null;
+  if (s.value && s.value.kind === 'str' &&
+      from.value && from.value.kind === 'str' &&
+      to.value && to.value.kind === 'str') {
+    const fv = from.value.val;
+    if (fv === '') return mkConst(s.value.val);  // empty pattern: JS throws; treat as identity
+    return mkConst(s.value.val.split(fv).join(to.value.val));
+  }
+  const sorts = mergeSorts(mergeSorts(s.sorts, from.sorts), to.sorts);
+  if (s.symName) sorts[s.symName] = 'String';
+  if (from.symName) sorts[from.symName] = 'String';
+  if (to.symName) sorts[to.symName] = 'String';
+  return {
+    expr: '(str.replace_all ' + s.expr + ' ' + from.expr + ' ' + to.expr + ')',
+    sorts,
+    isBool: false,
+    stringResult: true,
+  };
+}
+
+// mkToLower(s) / mkToUpper(s) — Z3 string-theory extensions.
+function mkToLower(s) {
+  if (!s) return null;
+  if (s.value && s.value.kind === 'str') return mkConst(s.value.val.toLowerCase());
+  const sorts = mergeSorts(s.sorts, null);
+  if (s.symName) sorts[s.symName] = 'String';
+  return {
+    expr: '(str.to_lower ' + s.expr + ')',
+    sorts,
+    isBool: false,
+    stringResult: true,
+  };
+}
+function mkToUpper(s) {
+  if (!s) return null;
+  if (s.value && s.value.kind === 'str') return mkConst(s.value.val.toUpperCase());
+  const sorts = mergeSorts(s.sorts, null);
+  if (s.symName) sorts[s.symName] = 'String';
+  return {
+    expr: '(str.to_upper ' + s.expr + ')',
+    sorts,
+    isBool: false,
+    stringResult: true,
+  };
+}
+
 // mkArith(op, l, r) — integer arithmetic. Supports +, -, *, div, mod.
 // Operands must both be Int-sorted; sym×String → incompatible.
 function mkArith(op, l, r) {
@@ -13355,7 +13449,9 @@ function emitDeclarations(formula) {
 
 module.exports = {
   mkSym, mkConst, mkNot, mkAnd, mkOr, mkCmp,
-  mkConcat, mkLength, mkContains, mkPrefixOf, mkSuffixOf, mkSubstr, mkArith,
+  mkConcat, mkLength, mkContains, mkPrefixOf, mkSuffixOf, mkSubstr,
+  mkAt, mkIndexOf, mkReplace, mkReplaceAll, mkToLower, mkToUpper,
+  mkArith,
   hasSym, emitDeclarations,
   // Internals exposed for tests
   _internals: { quoteName, quoteString, mergeSorts, toBool, isStringSide },
@@ -14035,7 +14131,35 @@ function applyUnOp(ctx, state, instr) {
     return D.setReg(state, instr.dest, D.concrete(r, undefined, loc));
   }
   if (operand && operand.kind === D.V.OPAQUE) {
-    return D.setReg(state, instr.dest, D.opaque(operand.assumptionIds, null, loc));
+    const chainIds = operand.assumptionIds ? operand.assumptionIds.slice() : [];
+    // Formula preservation: translate '-', '+', '!' to SMT
+    // primitives when the operand has a formula. Other unary ops
+    // (~ / typeof / void) don't have clean SMT mappings and drop
+    // the formula — we announce via unsolvable-math when that
+    // matters.
+    let resultFormula = null;
+    const operandFormula = formulaForValue(ctx, operand, loc);
+    if (operandFormula) {
+      if (instr.operator === '!') {
+        resultFormula = SMT.mkNot(operandFormula);
+      } else if (instr.operator === '-') {
+        resultFormula = SMT.mkArith('-', SMT.mkConst(0), operandFormula);
+      } else if (instr.operator === '+') {
+        resultFormula = operandFormula;
+      } else {
+        const a = ctx.assumptions.raise(
+          REASONS.UNSOLVABLE_MATH,
+          'unary `' + instr.operator + '` on symbolic value ' +
+          'not translated to SMT; formula dropped',
+          loc,
+          { chain: chainIds.length > 0 ? chainIds : undefined }
+        );
+        chainIds.push(a.id);
+      }
+    }
+    const v = D.opaque(chainIds, null, loc);
+    return D.setReg(state, instr.dest,
+      resultFormula ? D.withFormula(v, resultFormula) : v);
   }
   return D.setReg(state, instr.dest, D.top(loc));
 }
@@ -14210,12 +14334,57 @@ function propLookupForVariant(ctx, state, obj, instr, loc) {
             obj.typeName + '.' + instr.propName,
             readTypeToSort(desc.readType));
         }
+        // Derived-formula propagation for non-source props (e.g.
+        // `.length` on a String). When the prop descriptor names
+        // an `smtOp` AND the receiver carries a formula, build a
+        // formula for the read's result so `str.length > N` style
+        // path conditions stay symbolic. When the op is
+        // unmodelled and the receiver had a formula, raise
+        // unsolvable-math so the precision drop is visible.
+        if (!resultFormula && desc.smtOp) {
+          const recvFormula = formulaForValue(ctx, obj, loc);
+          if (recvFormula) {
+            const derived = applySmtCallOp(desc.smtOp, recvFormula, []);
+            if (derived) {
+              resultFormula = derived;
+            } else {
+              const opLabel = desc.smtOp.indexOf('unmodelled:') === 0
+                ? desc.smtOp.slice('unmodelled:'.length)
+                : desc.smtOp;
+              const a = ctx.assumptions.raise(
+                REASONS.UNSOLVABLE_MATH,
+                'SMT model for property `' + instr.propName +
+                '` (op: ' + opLabel + ') not yet implemented; ' +
+                'downstream PoC synthesis loses precision here',
+                loc,
+                { chain: chainIds.length > 0 ? chainIds : undefined }
+              );
+              chainIds.push(a.id);
+            }
+          }
+        }
         const v = D.opaque(chainIds, resultType, loc, resultLabels);
         return resultFormula ? D.withFormula(v, resultFormula) : v;
       }
     }
     // No TypeDB info → propagate the receiver's opaqueness.
-    return D.opaque(obj.assumptionIds || [], null, loc, obj.labels);
+    // Precision note: if the receiver had a formula, we drop it
+    // here because we don't know what the unmodeled property
+    // returns. Raise unsolvable-math so the loss is visible to
+    // consumers running with strict accept sets.
+    const chainIds = obj.assumptionIds ? obj.assumptionIds.slice() : [];
+    if (obj.formula) {
+      const a = ctx.assumptions.raise(
+        REASONS.UNSOLVABLE_MATH,
+        'property `' + instr.propName + '` on ' +
+        (obj.typeName || 'opaque') + ' not in TypeDB; ' +
+        'receiver formula cannot be propagated',
+        loc,
+        { chain: chainIds.length > 0 ? chainIds : undefined }
+      );
+      chainIds.push(a.id);
+    }
+    return D.opaque(chainIds, null, loc, obj.labels);
   }
   // Property access on a primitive: model autoboxing via the
   // TypeDB's wrapper type when available.
@@ -15645,21 +15814,41 @@ async function applyCall(ctx, state, instr) {
   // are combined back into a Disjunct so the per-path type
   // information survives the call.
   let tdbResult = null;
+  let tdbDesc = null;
   if (thisValue && thisValue.kind === D.V.DISJUNCT) {
     const perVariantResults = [];
+    const perVariantDescs = [];
     for (const thisVariant of thisValue.variants) {
       const r = resolveCallReturnViaDB(ctx, instr, thisVariant, argValues, loc);
-      if (r) perVariantResults.push(r);
+      if (r) {
+        perVariantResults.push(r.value);
+        perVariantDescs.push(r.desc);
+      }
     }
     if (perVariantResults.length > 0) {
       tdbResult = perVariantResults.length === 1
         ? perVariantResults[0]
         : D.disjunct(perVariantResults, loc);
+      // Writes from disjunct variants: apply each variant's
+      // writes to the state. Soundness over-approximates — a
+      // variant whose runtime path isn't actually taken still
+      // contributes its writes. This matches how the engine
+      // handles other per-variant effects.
+      for (const d of perVariantDescs) {
+        state = applyCallWrites(ctx, state, thisValue, argValues, d, loc);
+      }
     }
   } else {
-    tdbResult = resolveCallReturnViaDB(ctx, instr, thisValue, argValues, loc);
+    const r = resolveCallReturnViaDB(ctx, instr, thisValue, argValues, loc);
+    if (r) {
+      tdbResult = r.value;
+      tdbDesc = r.desc;
+    }
   }
   if (tdbResult) {
+    if (tdbDesc) {
+      state = applyCallWrites(ctx, state, thisValue, argValues, tdbDesc, loc);
+    }
     return D.setReg(state, instr.dest, tdbResult);
   }
   // Fallback: truly unresolved callee. We don't know what the
@@ -15713,11 +15902,88 @@ async function applyCall(ctx, state, instr) {
     D.opaque(conservativeChain, null, loc, conservativeLabels));
 }
 
+// applySmtCallOp — build an SMT formula for a call's return value
+// from a TypeDB method descriptor's `smtOp` hint and the caller-
+// side formulas. Returns a Formula or null. Pure — no side
+// effects on ctx.
+//
+// Known string-theory ops are mapped to the corresponding
+// `src/smt.js` helper. `unmodelled:*` descriptors are explicit
+// "we know this op exists but haven't translated it" markers —
+// they return null at this layer; the call site decides whether
+// to raise an `unsolvable-math` assumption based on whether the
+// precision drop matters (i.e. whether the receiver or args
+// carried formulas that would have been composable).
+function applySmtCallOp(op, recv, args) {
+  if (!op) return null;
+  switch (op) {
+    case 'identity':
+      return recv || null;
+    case 'length':
+      return SMT.mkLength(recv);
+    case 'toLowerCase':
+      return SMT.mkToLower(recv);
+    case 'toUpperCase':
+      return SMT.mkToUpper(recv);
+    case 'charAt':
+      return SMT.mkAt(recv, args[0] || SMT.mkConst(0));
+    case 'substr': {
+      // JS substr(start, len) — Z3 str.substr has identical args.
+      const start = args[0] || SMT.mkConst(0);
+      if (!recv || !args[0]) return null;
+      const len = args[1] || SMT.mkArith('-', SMT.mkLength(recv), start);
+      return SMT.mkSubstr(recv, start, len);
+    }
+    case 'slice':
+    case 'substring': {
+      // slice(a) / substring(a) strip a prefix; slice(a, b) and
+      // substring(a, b) take chars from a (inclusive) to b
+      // (exclusive). Z3 str.substr takes (s, start, len); compute
+      // len = (b || str.len s) - a. Negative-index semantics
+      // differ between slice and substring at the JS level; for
+      // the MVP we model the non-negative case exactly — which
+      // covers location.hash.slice(1) and similar — and leave
+      // negative-arg edge cases to future work.
+      if (!recv) return null;
+      const a = args[0] || SMT.mkConst(0);
+      const b = args[1] || SMT.mkLength(recv);
+      const len = SMT.mkArith('-', b, a);
+      return SMT.mkSubstr(recv, a, len);
+    }
+    case 'concat': {
+      // String.prototype.concat(...args) — chain mkConcat.
+      let out = recv;
+      for (let i = 0; i < args.length; i++) {
+        if (!out || !args[i]) return null;
+        out = SMT.mkConcat(out, args[i]);
+      }
+      return out;
+    }
+    case 'replace':
+      return SMT.mkReplace(recv, args[0], args[1]);
+    case 'replaceAll':
+      return SMT.mkReplaceAll(recv, args[0], args[1]);
+    case 'indexOf':
+      return SMT.mkIndexOf(recv, args[0], args[1]);
+    case 'includes':
+      return SMT.mkContains(recv, args[0]);
+    case 'startsWith':
+      return SMT.mkPrefixOf(args[0], recv);
+    case 'endsWith':
+      return SMT.mkSuffixOf(args[0], recv);
+    default:
+      // 'unmodelled:*' and unknown ops fall through.
+      return null;
+  }
+}
+
 // --- Resolve a call's return value via the TypeDB ------------------------
 //
 // Returns a Value (the typed return) or null if the callee
 // cannot be resolved. The Value is an Opaque tagged with the
-// return type name and any propagated labels.
+// return type name, any propagated labels, and (when the TypeDB
+// descriptor carries an `smtOp` the engine can translate) an
+// SMT formula derived from the receiver and argument formulas.
 function resolveCallReturnViaDB(ctx, instr, thisValue, argValues, loc) {
   const db = ctx.typeDB;
   if (!db) return null;
@@ -15790,7 +16056,129 @@ function resolveCallReturnViaDB(ctx, instr, thisValue, argValues, loc) {
     }
   }
 
-  return D.opaque(chainIds, returnType, loc, resultLabels);
+  let result = D.opaque(chainIds, returnType, loc, resultLabels);
+
+  // SMT formula propagation. When the TypeDB descriptor names an
+  // `smtOp` the engine can translate AND the receiver / args
+  // carry formulas, derive the return formula and attach it so
+  // downstream path-condition composition and PoC synthesis have
+  // a symbolic expression to solve against. When the op is
+  // unmodelled but there WAS an upstream formula, raise
+  // `unsolvable-math` so the precision drop is visible to
+  // consumers (D13 — no silent imprecision). Receiver-formula
+  // fallback: if no formula is on thisValue but the value is
+  // Opaque with an attacker source label, synthesise one here
+  // via allocSourceSym so symbolic source propagation survives
+  // a lattice-level loss of formula.
+  if (desc.smtOp) {
+    const recvFormula = formulaForValue(ctx, thisValue, loc);
+    const argFormulas = argValues.map(v => formulaForValue(ctx, v, loc));
+    const upstreamHadFormula =
+      !!recvFormula || argFormulas.some(f => !!f);
+    if (upstreamHadFormula) {
+      const derived = applySmtCallOp(desc.smtOp, recvFormula, argFormulas);
+      if (derived) {
+        result = D.withFormula(result, derived);
+      } else {
+        const callName = instr.methodName || instr.calleeName || '<call>';
+        const opLabel = desc.smtOp.indexOf('unmodelled:') === 0
+          ? desc.smtOp.slice('unmodelled:'.length)
+          : desc.smtOp;
+        const a = ctx.assumptions.raise(
+          REASONS.UNSOLVABLE_MATH,
+          'SMT model for `' + callName + '` (op: ' + opLabel + ') ' +
+          'not yet implemented; downstream PoC synthesis on this ' +
+          'value will fall back to the demo payload for its sink kind',
+          loc,
+          { chain: chainIds.length > 0 ? chainIds : undefined }
+        );
+        chainIds.push(a.id);
+        result = D.opaque(chainIds, returnType, loc, resultLabels);
+      }
+    }
+  }
+
+  return { value: result, desc: desc, chainIds: chainIds };
+}
+
+// applyCallWrites — apply a TypeDB method descriptor's `writes`
+// array to the caller state. Each entry describes a heap
+// mutation the opaque method performs:
+//
+//   writes: [{
+//     target: 'self' | 'arg:N',   // receiver or N'th argument
+//     field:  string,              // property name written
+//     source?: string,             // label to attach (optional)
+//     taintFromArg?: number,       // copy labels from arg N
+//   }]
+//
+// Without write-effect modelling, mutations through opaque
+// methods (Array.push, Object.assign, user-declared wrappers
+// in consumer TypeDBs) are invisible and get a `heap-escape`
+// assumption at read time. With writes, the TypeDB author can
+// declare "this method writes this field" and the engine
+// updates the target heap cell to reflect the labels that
+// flowed in.
+function applyCallWrites(ctx, state, thisValue, argValues, desc, loc) {
+  if (!desc || !desc.writes || desc.writes.length === 0) return state;
+  for (const w of desc.writes) {
+    // Resolve target Value: 'self' → thisValue, 'arg:N' → argValues[N].
+    let targetValue = null;
+    if (w.target === 'self') {
+      targetValue = thisValue;
+    } else if (typeof w.target === 'string' && w.target.indexOf('arg:') === 0) {
+      const idx = Number(w.target.slice(4));
+      if (!Number.isNaN(idx)) targetValue = argValues[idx];
+    }
+    if (!targetValue || targetValue.kind !== D.V.OBJECT) continue;
+    // Collect labels to apply. Start empty; add `source` if given,
+    // add labels from `taintFromArg`.
+    let labels = D.EMPTY_LABELS;
+    const chainIds = [];
+    if (w.source) {
+      labels = Object.freeze(new Set([w.source]));
+    }
+    if (typeof w.taintFromArg === 'number') {
+      const src = argValues[w.taintFromArg];
+      if (src && src.labels && src.labels.size > 0) {
+        if (labels.size === 0) {
+          labels = src.labels;
+        } else {
+          const merged = new Set(labels);
+          for (const l of src.labels) merged.add(l);
+          labels = Object.freeze(merged);
+        }
+      }
+      if (src && src.assumptionIds) {
+        for (const id of src.assumptionIds) chainIds.push(id);
+      }
+    }
+    const newVal = D.opaque(chainIds, null, loc, labels);
+    state = writeHeapField(state, targetValue.objId, w.field, newVal);
+  }
+  return state;
+}
+
+// formulaForValue — coerce a Value to its SMT formula. Uses the
+// value's attached `formula` when present, otherwise the
+// concrete-literal folding via `formulaOf`. A special case:
+// Opaque values with an attacker source label but no formula
+// (can happen when a lattice merge lost the formula) get a
+// fresh sym reallocated so symbolic propagation keeps working.
+function formulaForValue(ctx, value, loc) {
+  if (!value) return null;
+  if (value.formula) return value.formula;
+  const concrete = formulaOf(value);
+  if (concrete) return concrete;
+  if (value.kind === D.V.OPAQUE && value.labels && value.labels.size > 0) {
+    for (const lab of value.labels) {
+      const reason = sourceLabelToReason(lab);
+      if (reason) {
+        return allocSourceSym(ctx, lab, loc, lab, 'String');
+      }
+    }
+  }
+  return null;
 }
 
 // --- Sink classification for call sites ----------------------------------
@@ -18210,10 +18598,11 @@ async function checkPathSat(formula, timeoutMs) {
 //
 // This is the witness-extraction half of the solver interface:
 // `checkPathSat` decides feasibility, `getModel` turns a
-// feasible formula into a concrete attacker input. The inline
-// PoC synthesis pass below (`synthesisePocs`) conjoins a
-// taint flow's pathFormula with a sink-specific exploitability
-// constraint and calls this function to get a payload.
+// feasible formula into a concrete attacker input. The
+// `taint-report` consumer conjoins a taint flow's pathFormula
+// with a sink-specific exploitability constraint and calls
+// this function to get a payload — exploit shapes don't live
+// in the engine (see docs/DESIGN-DECISIONS.md D11.1).
 //
 // Like `checkPathSat`, this function uses the shared solver
 // with push/pop so concurrent `refuteTrace` calls don't
@@ -18313,13 +18702,14 @@ function astToJs(ast, sort) {
 //
 // Post-pass refutation over a completed trace. For each flow
 // whose pathFormula is non-trivial, ask checkPathSat; drop
-// flows with 'unsat' verdicts into `trace.refutedFlows`.
-// Flows already killed during the Layer 5 cascade never reach
-// this pass (they weren't emitted in the first place). After
-// refutation, surviving flows get a PoC witness attached via
-// synthesisePocs — the same SMT system drives both refutation
-// and witness extraction so we don't need a separate consumer
-// pass.
+// flows with 'unsat' verdicts into `trace.refutedFlows`. Flows
+// already killed during the Layer 5 cascade never reach this
+// pass (they weren't emitted in the first place).
+//
+// PoC witness synthesis is NOT performed here — that's a
+// consumer concern (see consumers/taint-report.js). The engine
+// stops once feasibility is decided; exploit shapes per sink
+// kind are third-party knowledge and live outside src/.
 async function refuteTrace(trace, timeoutMs) {
   if (!trace || !trace.taintFlows || trace.taintFlows.length === 0) {
     return trace;
@@ -18341,152 +18731,7 @@ async function refuteTrace(trace, timeoutMs) {
   }
   trace.taintFlows = kept;
   if (refuted.length > 0) trace.refutedFlows = refuted;
-  await synthesisePocs(trace, timeoutMs);
   return trace;
-}
-
-// --- PoC synthesis ---------------------------------------------------------
-//
-// Per-sink exploit constraints. Each entry takes the flow's
-// valueFormula (the SMT expression for the value reaching the
-// sink) and returns a predicate that an attacker-controllable
-// witness must satisfy. The conjunction of pathFormula ∧
-// exploit(valueFormula) is handed to Z3; a SAT model gives us
-// a concrete payload.
-//
-//   html       — innerHTML / outerHTML / document.write /
-//                insertAdjacentHTML. A payload containing a
-//                `<script>` open tag is parsed as an element
-//                whose content is executed inline.
-//   navigation — location.href / location.assign /
-//                window.open. `javascript:` URLs execute as
-//                code in the current origin.
-//   url        — iframe.src / frame.src / img.src. Same
-//                `javascript:` vector inside a frame.
-//   code       — eval / Function / setTimeout(string). Any
-//                non-empty string suffices to demonstrate
-//                attacker control.
-const EXPLOIT_CONSTRAINTS = {
-  html:       (val) => SMT.mkContains(val, SMT.mkConst('<script>')),
-  navigation: (val) => SMT.mkPrefixOf(SMT.mkConst('javascript:'), val),
-  url:        (val) => SMT.mkPrefixOf(SMT.mkConst('javascript:'), val),
-  code:       (val) => SMT.mkCmp('>', SMT.mkLength(val), SMT.mkConst(0)),
-};
-
-// extractPayload — pick a single value from the witness map
-// most likely to interest a human reviewer. String bindings
-// come first (those are the attacker-visible payloads);
-// everything else falls back to a JSON dump.
-function extractPayload(witness) {
-  if (!witness) return null;
-  const keys = Object.keys(witness);
-  if (keys.length === 0) return '';
-  for (const k of keys) {
-    if (typeof witness[k] === 'string') return witness[k];
-  }
-  return JSON.stringify(witness);
-}
-
-// synthesisePocs — attach a PoC witness to every surviving
-// taint flow. Runs immediately after refuteTrace so the
-// witness is built from the same solver state that already
-// determined the flow's feasibility. Per-flow results are
-// written onto `flow.poc`:
-//
-//   { verdict: 'synthesised' | 'trivial' | 'infeasible'
-//              | 'unsolvable' | 'no-constraint',
-//     payload: string | null,
-//     witness: {symName: value} | null,
-//     note:    string | null }
-//
-// verdict meanings:
-//   trivial       — valueFormula is already a concrete string
-//                   literal; no solver round-trip needed.
-//   synthesised   — Z3 returned a model that satisfies path ∧
-//                   exploit constraint.
-//   infeasible    — path ∧ exploit is UNSAT. Flow is real but
-//                   the exploit shape is blocked.
-//   unsolvable    — no exploit shape registered for the sink
-//                   kind, or solver returned unknown.
-//   no-constraint — flow has neither a pathFormula nor a
-//                   known exploit builder; nothing to solve.
-async function synthesisePocs(trace, timeoutMs) {
-  if (!trace || !trace.taintFlows || trace.taintFlows.length === 0) {
-    return;
-  }
-  for (const flow of trace.taintFlows) {
-    // A bad formula on one flow shouldn't take down witness
-    // generation for the other flows on the same trace. Each
-    // flow's failure is recorded as an `unsolvable` verdict
-    // with the error message in the note so the UI can show it.
-    try {
-      flow.poc = await synthesisePocForFlow(flow, timeoutMs);
-    } catch (err) {
-      flow.poc = {
-        verdict: 'unsolvable',
-        payload: null,
-        witness: null,
-        note: 'synthesis threw: ' + (err && err.message),
-      };
-    }
-  }
-}
-
-async function synthesisePocForFlow(flow, timeoutMs) {
-  const val = flow.valueFormula;
-
-  // Trivial case: the value is already a concrete literal in
-  // the source. Report the literal as the payload without
-  // touching Z3.
-  if (val && val.value && typeof val.value.val === 'string') {
-    return {
-      verdict: 'trivial',
-      payload: val.value.val,
-      witness: { __const__: val.value.val },
-      note: null,
-    };
-  }
-
-  const sinkKind = flow.sink && flow.sink.kind;
-  const builder = EXPLOIT_CONSTRAINTS[sinkKind];
-
-  let formula = flow.pathFormula || null;
-  let exploited = false;
-  if (builder && val) {
-    const exploitC = builder(val);
-    if (exploitC) {
-      formula = formula ? SMT.mkAnd(formula, exploitC) : exploitC;
-      exploited = true;
-    }
-  }
-
-  if (!formula) {
-    return {
-      verdict: 'no-constraint',
-      payload: null,
-      witness: null,
-      note: 'no pathFormula and no valueFormula to constrain',
-    };
-  }
-
-  const witness = await getModel(formula, timeoutMs);
-  if (witness === null) {
-    return {
-      verdict: exploited ? 'infeasible' : 'unsolvable',
-      payload: null,
-      witness: null,
-      note: exploited
-        ? 'path condition + exploit constraint is UNSAT'
-        : 'Z3 returned unknown (timeout or unhandled theory)',
-    };
-  }
-
-  return {
-    verdict: exploited ? 'synthesised' : 'no-constraint',
-    payload: extractPayload(witness),
-    witness,
-    note: null,
-  };
 }
 
 module.exports = {
@@ -18494,7 +18739,6 @@ module.exports = {
   checkPathSat,
   getModel,
   refuteTrace,
-  synthesisePocs,
   resetCache,
 };
 
@@ -20054,37 +20298,20 @@ async function convertProject(files, options) {
     if (seen.has(p)) continue;
     projects.push({ order: [p], files: { [p]: pendingJs[p] } });
   }
-  console.log('[dom-convert] convertProject projects=', projects.map(p => p.order),
-    'pendingJs=', Object.keys(pendingJs),
-    'htmlPaths=', htmlPaths,
-    'pageScripts=', pageScripts);
-
   // Analyse each project and rewrite every file in it. The
   // new engine's `project: [...]` option tells it to treat
   // the files as ordered siblings sharing the top-level
   // scope, so `app.js` sees `var items` declared in
   // `store.js` without needing a precedingCode hack.
   for (const project of projects) {
-    console.log('[dom-convert] analysing project order=', project.order);
     const trace = await analyze(project.files, {
       typeDB: TDB,
-
       project: project.order,
     });
-    console.log('[dom-convert] project trace returned',
-      'order=', project.order,
-      'taintFlows=', trace.taintFlows.length,
-      'innerHtmlAssignments=', trace.innerHtmlAssignments.length,
-      'partial=', trace.partial,
-      'warnings=', (trace.warnings || []).length);
     for (const jsPath of project.order) {
       const src = project.files[jsPath];
       if (src == null) continue;
       const rewritten = convertJsFile(src, trace, jsPath);
-      console.log('[dom-convert] rewrite', jsPath,
-        'changed=', rewritten !== src,
-        'beforeBytes=', src.length,
-        'afterBytes=', rewritten.length);
       if (rewritten !== src) {
         output[jsPath] = rewritten;
       }
@@ -20346,40 +20573,277 @@ module.exports = {
   };
 
   __modules["consumers/taint-report.js"] = function (module, exports, require, __id) {
-// taint-report.js — human-friendly taint-flow presentation
-// consumer (Wave 12 / Phase E, D11).
+// taint-report.js — human-friendly taint-flow presentation +
+// PoC witness synthesis.
 //
-// Wraps trace.taintFlows with grouping / counting / rendering
-// logic suitable for a terminal, a PR comment, or a security
-// scanner's output.
+// Reads trace.taintFlows and attaches:
+//
+//   * `poc` — a concrete attacker-input witness for every
+//     surviving flow. Runs the sink-kind exploit constraint
+//     against the flow's pathFormula ∧ valueFormula and calls
+//     Z3.getModel to extract a payload. For flows whose source
+//     value is opaque (the common `location.hash → sink` case
+//     where no symbolic variable exists for the attacker byte),
+//     synthesises a canonical demo payload keyed off the sink
+//     kind — no solver round-trip needed, since the flow is
+//     unconstrained.
+//
+//   * grouping / counts — buckets by source label, sink prop,
+//     severity, and originating file.
+//
+// PoC synthesis lives here (not in the engine) because exploit
+// shapes are third-party knowledge about XSS / prototype /
+// navigation payloads — exactly the "emit output" work D11.1
+// assigns to consumers. The engine's job stopped when it
+// produced pathFormula + valueFormula.
 //
 // Public API:
 //
 //   const tr = require('jsanalyze/consumers/taint-report');
 //   const report = await tr.analyze(input, options?);
-//     // returns {
-//     //   schemaVersion: '1',
-//     //   flows: TaintFlow[],
-//     //   grouped: { bySource, bySink, bySeverity, byFile },
-//     //   counts: { total, high, medium, low, refuted },
-//     //   partial, warnings, trace? (when options.includeTrace),
-//     // }
-//
+//     // { schemaVersion, flows, grouped, counts, partial, warnings }
 //   const text = tr.render(report, { groupBy: 'source' });
+//   await tr.synthesisePocs(trace, { smtTimeoutMs });
+//     // mutates each flow with `flow.poc = { verdict, payload,
+//     //                                      witness, note }`
 
 'use strict';
 
 const { analyze } = require('../src/index.js');
 const TDB = require('../src/default-typedb.js');
+const SMT = require('../src/smt.js');
+const Z3 = require('../src/z3.js');
+
+// Per-sink exploit attempts. Each sink kind has an ordered list
+// of candidate payloads; when the flow is constrained, the
+// synthesiser tries each attempt against Z3 and keeps the first
+// that comes back SAT. For unconstrained direct flows, the
+// primary (first) attempt is returned verbatim.
+//
+// Multiple attempts matter because a single-shape exploit misses
+// injection contexts that require different breakouts:
+//
+//   html       — primary: a full <script> element. Alternates
+//                cover attribute context (' onerror=…'), style
+//                break-out ('</style>…'), and comment break-out
+//                ('-->…') — in case Z3 needs a specific shape to
+//                satisfy path constraints.
+//   navigation — javascript: URL, then a data:text/html URL as
+//                a fallback for frames that disallow the former.
+//   url        — same as navigation, suitable for iframe src.
+//   code       — an alert(1) canary; no real alternates needed
+//                (the body is free-form JS).
+const EXPLOIT_ATTEMPTS = {
+  html: [
+    { name: 'script-tag',    payload: '<script>alert(1)</script>' },
+    { name: 'img-onerror',   payload: '<img src=x onerror=alert(1)>' },
+    { name: 'svg-onload',    payload: '<svg onload=alert(1)>' },
+    { name: 'attr-breakout', payload: '" onerror="alert(1)' },
+    { name: 'style-breakout', payload: '</style><script>alert(1)</script>' },
+  ],
+  navigation: [
+    { name: 'javascript-url', payload: 'javascript:alert(1)' },
+    { name: 'data-html',      payload: 'data:text/html,<script>alert(1)</script>' },
+  ],
+  url: [
+    { name: 'javascript-url', payload: 'javascript:alert(1)' },
+    { name: 'data-html',      payload: 'data:text/html,<script>alert(1)</script>' },
+  ],
+  code: [
+    { name: 'alert-canary',   payload: 'alert(1)' },
+  ],
+};
+
+function buildExploitConstraint(val, payload) {
+  return SMT.mkContains(val, SMT.mkConst(payload));
+}
+
+// Extract the primary payload and per-symbol bindings from a Z3
+// witness map. A witness has one binding per declared symbol in
+// the formula; for PoC purposes we care about the string-sorted
+// ones (those are the attacker-visible source values). The
+// primary payload is picked by the selector, which falls back to
+// the first string binding.
+function extractWitness(witness, primarySelector) {
+  if (!witness) return { payload: null, bindings: {} };
+  const keys = Object.keys(witness);
+  const bindings = {};
+  for (const k of keys) bindings[k] = witness[k];
+  let payload = null;
+  if (primarySelector) payload = primarySelector(bindings);
+  if (payload == null) {
+    for (const k of keys) {
+      if (typeof witness[k] === 'string') { payload = witness[k]; break; }
+    }
+  }
+  if (payload == null && keys.length > 0) payload = JSON.stringify(bindings);
+  return { payload, bindings };
+}
+
+async function synthesisePocForFlow(flow, timeoutMs) {
+  const val = flow.valueFormula;
+
+  // Trivial: the value is a concrete source literal. Report
+  // the literal as the payload without touching Z3.
+  if (val && val.value && typeof val.value.val === 'string') {
+    return {
+      verdict: 'trivial',
+      payload: val.value.val,
+      bindings: { __const__: val.value.val },
+      witness: { __const__: val.value.val },
+      attempt: 'concrete',
+      note: null,
+    };
+  }
+
+  const sinkKind = flow.sink && flow.sink.kind;
+  const attempts = EXPLOIT_ATTEMPTS[sinkKind];
+
+  if (!attempts || attempts.length === 0) {
+    return {
+      verdict: 'unsolvable',
+      payload: null,
+      bindings: {},
+      witness: null,
+      note: 'no exploit shape registered for sink kind "' + sinkKind + '"',
+    };
+  }
+
+  // Direct attacker-controlled flow with no intermediate
+  // constraints: pathFormula is null AND valueFormula is null.
+  // The attacker picks the source bytes directly, so the
+  // primary attempt's payload IS the witness.
+  if (!flow.pathFormula && !val) {
+    const primary = attempts[0];
+    return {
+      verdict: 'synthesised',
+      payload: primary.payload,
+      bindings: buildDirectBindings(flow, primary.payload),
+      witness: null,
+      attempt: primary.name,
+      note: 'direct attacker-controlled flow; set ' +
+        describeSource(flow) + ' to the payload above',
+    };
+  }
+
+  // Constrained flow: try each exploit attempt in order.
+  // First one SAT wins. If all UNSAT, report infeasible.
+  const basePath = flow.pathFormula || null;
+  let lastVerdict = 'infeasible';
+  let lastNote = 'path condition + exploit constraint is UNSAT';
+  for (const attempt of attempts) {
+    let formula = basePath;
+    let exploited = false;
+    if (val) {
+      const c = buildExploitConstraint(val, attempt.payload);
+      if (c) {
+        formula = formula ? SMT.mkAnd(formula, c) : c;
+        exploited = true;
+      }
+    }
+    if (!formula) {
+      // No constraint at all — same as direct flow.
+      return {
+        verdict: 'synthesised',
+        payload: attempt.payload,
+        bindings: buildDirectBindings(flow, attempt.payload),
+        witness: null,
+        attempt: attempt.name,
+        note: 'unconstrained path; set ' + describeSource(flow) +
+          ' to the payload above',
+      };
+    }
+    const witness = await Z3.getModel(formula, timeoutMs);
+    if (witness === null) {
+      lastVerdict = exploited ? 'infeasible' : 'unsolvable';
+      lastNote = exploited
+        ? 'path condition + exploit constraint (' + attempt.name + ') is UNSAT'
+        : 'Z3 returned unknown (timeout or unhandled theory)';
+      continue;
+    }
+    const { payload, bindings } = extractWitness(witness);
+    return {
+      verdict: exploited ? 'synthesised' : 'no-constraint',
+      payload: payload || attempt.payload,
+      bindings,
+      witness,
+      attempt: attempt.name,
+      note: null,
+    };
+  }
+  return {
+    verdict: lastVerdict,
+    payload: null,
+    bindings: {},
+    witness: null,
+    note: lastNote + ' (tried ' + attempts.length + ' exploit shape' +
+      (attempts.length === 1 ? '' : 's') + ')',
+  };
+}
+
+// Produce a "bindings" map for direct attacker-controlled flows,
+// keyed by source label. Makes downstream delivery (see UI's
+// "Copy exploit" button) a 1:1 mapping from source label to the
+// string the attacker should supply.
+function buildDirectBindings(flow, payload) {
+  const out = {};
+  const sources = flow.source || [];
+  if (sources.length === 0) {
+    out['attacker-input'] = payload;
+    return out;
+  }
+  for (const s of sources) {
+    const k = s.label || 'attacker-input';
+    out[k] = payload;
+  }
+  return out;
+}
+
+function describeSource(flow) {
+  const sources = flow.source || [];
+  if (sources.length === 0) return 'the attacker-controlled input';
+  const labels = sources.map((s) => s.label).filter(Boolean);
+  if (labels.length === 0) return 'the attacker-controlled input';
+  return '`' + labels.join(' / ') + '`';
+}
+
+async function synthesisePocs(trace, options) {
+  options = options || {};
+  const timeoutMs = options.smtTimeoutMs != null ? options.smtTimeoutMs : 5000;
+  if (!trace || !trace.taintFlows || trace.taintFlows.length === 0) {
+    return trace;
+  }
+  for (const flow of trace.taintFlows) {
+    // Per-flow isolation: a Z3 parse error or theory mismatch on
+    // one flow (e.g. the vendored solver not supporting a string
+    // op we emitted) shouldn't take down witness generation for
+    // the other flows. Record the failure as `unsolvable` with
+    // the error note so the UI can surface it.
+    try {
+      flow.poc = await synthesisePocForFlow(flow, timeoutMs);
+    } catch (err) {
+      flow.poc = {
+        verdict: 'unsolvable',
+        payload: null,
+        witness: null,
+        note: 'synthesis threw: ' +
+          (err && err.message ? err.message : String(err)),
+      };
+    }
+  }
+  return trace;
+}
 
 async function analyzeReport(input, options) {
   options = options || {};
   const trace = await analyze(input, {
     typeDB: options.typeDB || TDB,
-    
     accept: options.accept,
     watchers: options.watchers,
+    smtTimeoutMs: options.smtTimeoutMs,
   });
+
+  await synthesisePocs(trace, options);
 
   const flows = trace.taintFlows || [];
   const refuted = trace.refutedFlows || [];
@@ -20390,7 +20854,6 @@ async function analyzeReport(input, options) {
   const byFile = Object.create(null);
 
   for (const f of flows) {
-    // Each flow has a `source` array of {label, location}.
     for (const srcEntry of f.source || []) {
       const k = srcEntry.label || '<unknown>';
       if (!bySource[k]) bySource[k] = [];
@@ -20416,7 +20879,7 @@ async function analyzeReport(input, options) {
   };
 
   return {
-    schemaVersion: '1',
+    schemaVersion: '2',
     flows,
     refuted,
     grouped: { bySource, bySink, bySeverity, byFile },
@@ -20449,8 +20912,9 @@ function render(report, opts) {
       lines.push('  source: ' + src + ' (' + report.grouped.bySource[src].length + ')');
       for (const f of report.grouped.bySource[src]) {
         const loc = f.sink && f.sink.location;
+        const poc = f.poc && f.poc.payload != null ? '  payload: ' + f.poc.payload : '';
         lines.push('    ' + (loc ? loc.file + ':' + loc.line : '?') +
-          '  →  ' + ((f.sink && f.sink.prop) || '?'));
+          '  →  ' + ((f.sink && f.sink.prop) || '?') + poc);
       }
     }
   } else if (groupBy === 'sink') {
@@ -20471,6 +20935,7 @@ function render(report, opts) {
 module.exports = {
   analyze: analyzeReport,
   render,
+  synthesisePocs,
 };
 
   };

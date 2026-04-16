@@ -393,6 +393,116 @@ function mkSubstr(s, start, length) {
   };
 }
 
+// mkAt(s, i) — `str.at`, single-char substring. JS charAt(i)
+// returns '' when i is out of range; Z3 str.at matches.
+function mkAt(s, i) {
+  if (!s || !i) return null;
+  if (s.value && s.value.kind === 'str' &&
+      i.value && i.value.kind === 'int') {
+    return mkConst(s.value.val.charAt(i.value.val));
+  }
+  const sorts = mergeSorts(s.sorts, i.sorts);
+  if (s.symName) sorts[s.symName] = 'String';
+  return {
+    expr: '(str.at ' + s.expr + ' ' + i.expr + ')',
+    sorts,
+    isBool: false,
+    stringResult: true,
+  };
+}
+
+// mkIndexOf(haystack, needle, offset) — `str.indexof`. JS
+// indexOf returns -1 when not found; Z3 str.indexof matches.
+function mkIndexOf(haystack, needle, offset) {
+  if (!haystack || !needle) return null;
+  const off = offset || mkConst(0);
+  if (haystack.value && haystack.value.kind === 'str' &&
+      needle.value && needle.value.kind === 'str' &&
+      off.value && off.value.kind === 'int') {
+    return mkConst(haystack.value.val.indexOf(needle.value.val, off.value.val));
+  }
+  const sorts = mergeSorts(mergeSorts(haystack.sorts, needle.sorts), off.sorts);
+  if (haystack.symName) sorts[haystack.symName] = 'String';
+  if (needle.symName) sorts[needle.symName] = 'String';
+  return {
+    expr: '(str.indexof ' + haystack.expr + ' ' + needle.expr + ' ' + off.expr + ')',
+    sorts,
+    isBool: false,
+  };
+}
+
+// mkReplace(s, from, to) — `str.replace`. Replaces FIRST match
+// only, matching JS's String.prototype.replace(string, string).
+function mkReplace(s, from, to) {
+  if (!s || !from || !to) return null;
+  if (s.value && s.value.kind === 'str' &&
+      from.value && from.value.kind === 'str' &&
+      to.value && to.value.kind === 'str') {
+    const sv = s.value.val, fv = from.value.val, tv = to.value.val;
+    const i = sv.indexOf(fv);
+    return mkConst(i < 0 ? sv : sv.slice(0, i) + tv + sv.slice(i + fv.length));
+  }
+  const sorts = mergeSorts(mergeSorts(s.sorts, from.sorts), to.sorts);
+  if (s.symName) sorts[s.symName] = 'String';
+  if (from.symName) sorts[from.symName] = 'String';
+  if (to.symName) sorts[to.symName] = 'String';
+  return {
+    expr: '(str.replace ' + s.expr + ' ' + from.expr + ' ' + to.expr + ')',
+    sorts,
+    isBool: false,
+    stringResult: true,
+  };
+}
+
+// mkReplaceAll(s, from, to) — `str.replace_all` (Z3 extension).
+// Matches JS String.prototype.replaceAll(string, string).
+function mkReplaceAll(s, from, to) {
+  if (!s || !from || !to) return null;
+  if (s.value && s.value.kind === 'str' &&
+      from.value && from.value.kind === 'str' &&
+      to.value && to.value.kind === 'str') {
+    const fv = from.value.val;
+    if (fv === '') return mkConst(s.value.val);  // empty pattern: JS throws; treat as identity
+    return mkConst(s.value.val.split(fv).join(to.value.val));
+  }
+  const sorts = mergeSorts(mergeSorts(s.sorts, from.sorts), to.sorts);
+  if (s.symName) sorts[s.symName] = 'String';
+  if (from.symName) sorts[from.symName] = 'String';
+  if (to.symName) sorts[to.symName] = 'String';
+  return {
+    expr: '(str.replace_all ' + s.expr + ' ' + from.expr + ' ' + to.expr + ')',
+    sorts,
+    isBool: false,
+    stringResult: true,
+  };
+}
+
+// mkToLower(s) / mkToUpper(s) — Z3 string-theory extensions.
+function mkToLower(s) {
+  if (!s) return null;
+  if (s.value && s.value.kind === 'str') return mkConst(s.value.val.toLowerCase());
+  const sorts = mergeSorts(s.sorts, null);
+  if (s.symName) sorts[s.symName] = 'String';
+  return {
+    expr: '(str.to_lower ' + s.expr + ')',
+    sorts,
+    isBool: false,
+    stringResult: true,
+  };
+}
+function mkToUpper(s) {
+  if (!s) return null;
+  if (s.value && s.value.kind === 'str') return mkConst(s.value.val.toUpperCase());
+  const sorts = mergeSorts(s.sorts, null);
+  if (s.symName) sorts[s.symName] = 'String';
+  return {
+    expr: '(str.to_upper ' + s.expr + ')',
+    sorts,
+    isBool: false,
+    stringResult: true,
+  };
+}
+
 // mkArith(op, l, r) — integer arithmetic. Supports +, -, *, div, mod.
 // Operands must both be Int-sorted; sym×String → incompatible.
 function mkArith(op, l, r) {
@@ -448,7 +558,9 @@ function emitDeclarations(formula) {
 
 module.exports = {
   mkSym, mkConst, mkNot, mkAnd, mkOr, mkCmp,
-  mkConcat, mkLength, mkContains, mkPrefixOf, mkSuffixOf, mkSubstr, mkArith,
+  mkConcat, mkLength, mkContains, mkPrefixOf, mkSuffixOf, mkSubstr,
+  mkAt, mkIndexOf, mkReplace, mkReplaceAll, mkToLower, mkToUpper,
+  mkArith,
   hasSym, emitDeclarations,
   // Internals exposed for tests
   _internals: { quoteName, quoteString, mergeSorts, toBool, isStringSide },

@@ -19,8 +19,11 @@ given a fixed input, TypeDB, and precision setting.
   - Bare string: analysed as a single top-level script file named
     `<input>.js`.
   - Object: analysed as a multi-file project. Keys are filenames,
-    values are source strings. File dependency order is inferred
-    from imports; files with no imports are walked first.
+    values are source strings. Evaluation order is supplied
+    explicitly via `options.project: string[]`; when absent the
+    engine walks files in dictionary-key order. The project files
+    share one top-level scope — mirroring how a browser evaluates
+    multiple `<script src="…">` tags into a single global.
 
 - `options?: AnalyzeOptions`
 
@@ -28,7 +31,17 @@ given a fixed input, TypeDB, and precision setting.
 
 ```ts
 type AnalyzeOptions = {
-  // Custom TypeDB. Overrides the default. See `docs/TYPEDB.md`.
+  // Explicit file evaluation order for a multi-file input.
+  // Must be a subset of the input object's keys. The engine
+  // concatenates these files' top-level statements into a
+  // single project module whose scope is shared, matching how
+  // `<script src="…">` tags evaluate in a browser. Files in
+  // the input but NOT in `project` are walked independently
+  // after the shared project module.
+  project?: string[];
+
+  // Custom TypeDB. Overrides the default browser TypeDB
+  // (see `src/default-typedb.js` for the canonical schema).
   typeDB?: TypeDB;
 
   // Soft cap per SMT call in milliseconds. Exceeded calls
@@ -359,7 +372,13 @@ type AssumptionReason =
   | 'code-from-data'
   // Engineering gaps: can be eliminated by more code
   | 'unimplemented'
-  | 'heap-escape';
+  | 'heap-escape'
+  // Performance shortcuts: rejecting these via `options.accept`
+  // makes the engine take the precise path instead of the
+  // shortcut. See docs/ASSUMPTIONS.md § Class 4.
+  | 'loop-widening'
+  | 'summary-reused'
+  | 'smt-skipped';
 
 type Location = {
   file: string;
@@ -408,12 +427,26 @@ Every observed taint flow.
 ```ts
 type TaintFlow = {
   id: number;
-  source: { label: string; location: Location };
-  sink:   { kind: string; prop: string; location: Location };
+  source: { label: string; location: Location }[];
+  sink:   { kind: string; prop: string; location: Location;
+            targetType?: string; elementTag?: string };
   severity: 'info' | 'low' | 'medium' | 'high' | 'critical';
   pathConditions: string[];
-  pathFormulas: unknown[];
-  assumptionIds: number[];  // assumptions on this flow's path
+  pathFormula:  Formula | null;   // SMT reachability formula
+  valueFormula: Formula | null;   // SMT formula for the value at the sink
+  assumptionIds: number[];
+
+  // Attached by consumers/taint-report.js via synthesisePocs.
+  // Absent when PoC synthesis wasn't run on this trace.
+  poc?: {
+    verdict: 'synthesised' | 'trivial' | 'infeasible'
+           | 'unsolvable' | 'no-constraint';
+    payload: string | null;
+    attempt: string | null;            // exploit shape that matched
+    bindings: { [sourceLabel: string]: string | number | boolean } | null;
+    witness:  { [symName:     string]: string | number | boolean } | null;
+    note:    string | null;
+  };
 };
 
 type TaintFlowsFilter = {
@@ -467,7 +500,8 @@ given taint flow, with each step's abstract state.
 ## TypeDB
 
 The TypeDB is pure data that drives source, sink, sanitiser, and
-type resolution. See `docs/TYPEDB.md` for the full schema. It is
+type resolution. See `src/default-typedb.js` for the canonical
+schema as used by the default browser TypeDB. It is
 consumer-replaceable via `options.typeDB`.
 
 ```ts
@@ -476,6 +510,50 @@ type TypeDB = {
   roots: { [globalName: string]: string };   // global → typeName
   tagMap?: { [lowercaseTag: string]: string };
   eventMap?: { [eventName: string]: string };
+};
+```
+
+### Method descriptor fields (excerpt)
+
+A method/property descriptor on a type can carry:
+
+```ts
+type MethodDescriptor = {
+  returnType?: string;           // static return type
+
+  // Label propagation.
+  preservesLabelsFromReceiver?: boolean;
+  preservesLabelsFromArg?: number;
+
+  // Source / sink classification.
+  source?: string;               // label attached to return value
+  sink?: string;                 // 'html' | 'code' | 'navigation' | ...
+  sanitizer?: boolean;
+
+  // SMT operation name — when the receiver / args carry
+  // formulas, the engine derives the return formula by
+  // dispatching on this name. Known ops: 'slice', 'substring',
+  // 'substr', 'charAt', 'concat', 'replace', 'replaceAll',
+  // 'indexOf', 'includes', 'startsWith', 'endsWith',
+  // 'toLowerCase', 'toUpperCase', 'length', 'identity'.
+  // Prefix 'unmodelled:' marks a known-op-we-cant-translate so
+  // the engine raises `unsolvable-math` instead of silently
+  // dropping the formula. See `src/transfer.js#applySmtCallOp`.
+  smtOp?: string;
+
+  // Write-effect summary — declares heap fields this method
+  // mutates. When the receiver / args are concrete objects,
+  // the engine applies the writes to the caller's heap so
+  // downstream reads see the post-mutation value. Without
+  // `writes`, mutations through opaque methods raise
+  // `heap-escape` at the write site and subsequent reads
+  // return stale values.
+  writes?: Array<{
+    target: 'self' | `arg:${number}`;
+    field:  string;
+    source?: string;        // label to attach to the new value
+    taintFromArg?: number;  // copy labels from this argument
+  }>;
 };
 ```
 

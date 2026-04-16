@@ -123,14 +123,6 @@ const query = require('./query.js');
 //                     onFinding, onAssumption.
 async function analyze(input, options) {
   options = options || {};
-  // Verbose-logging diagnostic: surface the file set the
-  // engine was asked to analyse so the browser console
-  // shows what reached analyze() vs what actually got walked.
-  console.log('[jsanalyze] analyze() called',
-    'inputType=', typeof input,
-    'fileCount=', typeof input === 'string' ? 1 : Object.keys(input || {}).length,
-    'fileNames=', typeof input === 'string' ? ['<input>.js'] : Object.keys(input || {}),
-    'options=', { accept: options.accept, smtTimeoutMs: options.smtTimeoutMs });
   const smtTimeoutMs = options.smtTimeoutMs != null ? options.smtTimeoutMs : 5000;
   const watchers = options.watchers || null;
   // Single axis for precision / performance / soundness
@@ -292,15 +284,6 @@ async function analyze(input, options) {
   const projectOrder = Array.isArray(options.project) ? options.project : null;
   const iterFiles = projectOrder ? [projectOrder[0]] : Object.keys(workingFiles);
   // Verbose-logging diagnostic: print the per-file walk
-  // schedule. Inline-script extraction is done at this
-  // point, so workingFiles holds the .inline.N.js synth
-  // names — the listing tells us if HTML extraction
-  // produced anything.
-  console.log('[jsanalyze] walking files',
-    'projectOrder=', projectOrder,
-    'iterFiles=', iterFiles,
-    'workingFileKeys=', Object.keys(workingFiles));
-
   for (const filename of iterFiles) {
     let module;
     // Boundary: parse/IR errors. We catch here — and ONLY here —
@@ -687,19 +670,6 @@ async function analyze(input, options) {
   }
 
   // Verbose-logging diagnostic: trace exit summary so the
-  // browser console shows what analyze() is returning to
-  // the bridge. If this prints zeros across the board the
-  // engine ran but found nothing; if it prints non-zero
-  // counts the bridge / consumer is the next thing to
-  // suspect.
-  console.log('[jsanalyze] analyze() returning',
-    'partial=', trace.partial,
-    'taintFlows=', trace.taintFlows.length,
-    'innerHtmlAssignments=', trace.innerHtmlAssignments.length,
-    'calls=', trace.calls.length,
-    'domMutations=', trace.domMutations.length,
-    'assumptions=', trace.assumptions.length,
-    'warnings=', trace.warnings.length);
   if (trace.warnings.length > 0) {
     for (const w of trace.warnings) {
       console.error('[jsanalyze] trace warning:', w.severity, w.message,

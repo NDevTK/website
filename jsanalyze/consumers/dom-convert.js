@@ -1231,37 +1231,20 @@ async function convertProject(files, options) {
     if (seen.has(p)) continue;
     projects.push({ order: [p], files: { [p]: pendingJs[p] } });
   }
-  console.log('[dom-convert] convertProject projects=', projects.map(p => p.order),
-    'pendingJs=', Object.keys(pendingJs),
-    'htmlPaths=', htmlPaths,
-    'pageScripts=', pageScripts);
-
   // Analyse each project and rewrite every file in it. The
   // new engine's `project: [...]` option tells it to treat
   // the files as ordered siblings sharing the top-level
   // scope, so `app.js` sees `var items` declared in
   // `store.js` without needing a precedingCode hack.
   for (const project of projects) {
-    console.log('[dom-convert] analysing project order=', project.order);
     const trace = await analyze(project.files, {
       typeDB: TDB,
-
       project: project.order,
     });
-    console.log('[dom-convert] project trace returned',
-      'order=', project.order,
-      'taintFlows=', trace.taintFlows.length,
-      'innerHtmlAssignments=', trace.innerHtmlAssignments.length,
-      'partial=', trace.partial,
-      'warnings=', (trace.warnings || []).length);
     for (const jsPath of project.order) {
       const src = project.files[jsPath];
       if (src == null) continue;
       const rewritten = convertJsFile(src, trace, jsPath);
-      console.log('[dom-convert] rewrite', jsPath,
-        'changed=', rewritten !== src,
-        'beforeBytes=', src.length,
-        'afterBytes=', rewritten.length);
       if (rewritten !== src) {
         output[jsPath] = rewritten;
       }

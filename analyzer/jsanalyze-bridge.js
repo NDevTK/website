@@ -149,7 +149,15 @@
   async function analyseAll(files, options) {
     var input = Object.create(null);
     for (var p in files) input[p] = files[p];
-    return await J.analyze(input, buildAnalyseOptions(options));
+    var trace = await J.analyze(input, buildAnalyseOptions(options));
+    // PoC synthesis lives in the taint-report consumer (D11.1 —
+    // exploit shapes are consumer output, not engine knowledge).
+    // Attach witnesses to each flow before the UI reshapes them.
+    if (J.consumers && J.consumers.taintReport &&
+        typeof J.consumers.taintReport.synthesisePocs === 'function') {
+      await J.consumers.taintReport.synthesisePocs(trace, {});
+    }
+    return trace;
   }
 
   // --- Assumption helpers --------------------------------------------
@@ -223,14 +231,21 @@
         location: sinkLoc ? { line: sinkLoc.line || 0, col: sinkLoc.col || 0 } : null,
         conditions: conditions,
         assumptions: assumptionsFor(f.assumptionIds, byId),
-        // PoC witness is attached to each flow by src/z3.js's
-        // synthesisePocs pass (called inline from refuteTrace).
-        // Shape: { verdict, payload, note } — the solver-level
-        // `witness` map is left off the UI side of the wire.
+        // PoC witness was attached by the taint-report consumer
+        // via analyseAll. Shape:
+        //   { verdict, payload, attempt, bindings, note }
+        // `bindings` is keyed by source label (so the UI can
+        // format per-source delivery snippets for the Copy-
+        // exploit action). `attempt` names which exploit shape
+        // Z3 accepted ('script-tag', 'attr-breakout', 'javascript-url'
+        // etc.). The solver-level `witness` map is dropped on
+        // the wire — consumers only need bindings.
         poc: f.poc ? {
-          verdict: f.poc.verdict || null,
-          payload: f.poc.payload != null ? f.poc.payload : null,
-          note:    f.poc.note || null,
+          verdict:  f.poc.verdict || null,
+          payload:  f.poc.payload != null ? f.poc.payload : null,
+          attempt:  f.poc.attempt || null,
+          bindings: f.poc.bindings || null,
+          note:     f.poc.note || null,
         } : null,
       });
     }
@@ -265,29 +280,20 @@
   globalThis.__runAllConsumers = async function (files, options) {
     options = options || {};
     var engineOpts = buildAnalyseOptions(options);
-    console.log('[bridge] __runAllConsumers entry',
-      'fileNames=', Object.keys(files || {}),
-      'accept=', options.accept,
-      'engineOpts=', engineOpts);
 
     var convertedFiles = {};
-    console.log('[bridge] step convertProject START');
     try {
       convertedFiles = (await J.consumers.domConvert.convertProject(
         files, engineOpts)) || {};
     } catch (e) {
-      console.error('[bridge] step convertProject THREW', e && (e.stack || e.message), e);
+      console.error('[analyzer] convertProject failed:', e && (e.stack || e.message));
     }
-    console.log('[bridge] step convertProject END',
-      'outputFileCount=', Object.keys(convertedFiles).length,
-      'outputFileNames=', Object.keys(convertedFiles));
 
     var trace;
-    console.log('[bridge] step analyseAll START');
     try {
       trace = await analyseAll(files, options);
     } catch (e) {
-      console.error('[bridge] step analyseAll THREW', e && (e.stack || e.message), e);
+      console.error('[analyzer] analyse failed:', e && (e.stack || e.message));
       return {
         convertedFiles: convertedFiles,
         taint:   { findings: [], summary: { total: 0, high: 0, medium: 0, low: 0 } },
@@ -299,13 +305,6 @@
         error:   e && e.message,
       };
     }
-    console.log('[bridge] step analyseAll END',
-      'taintFlows=', (trace.taintFlows || []).length,
-      'innerHtmlAssignments=', (trace.innerHtmlAssignments || []).length,
-      'calls=', (trace.calls || []).length,
-      'assumptions=', (trace.assumptions || []).length,
-      'partial=', !!trace.partial,
-      'warnings=', (trace.warnings || []).length);
 
     var taint  = taintFindingsFromTrace(trace, files);
     var csp    = null;
@@ -313,22 +312,18 @@
     // Each consumer is independent — a failure in one shouldn't
     // take down the others. The UI panel just shows empty for
     // a failing consumer.
-    console.log('[bridge] step cspDerive START');
     try {
       csp = await J.consumers.cspDerive.derive(files, engineOpts);
     } catch (e) {
-      console.error('[bridge] step cspDerive THREW', e && (e.stack || e.message), e);
+      console.error('[analyzer] cspDerive failed:', e && (e.stack || e.message));
     }
-    console.log('[bridge] step cspDerive END', csp && Object.keys(csp));
-    console.log('[bridge] step fetchTrace START');
     try {
       fetches = await J.consumers.fetchTrace.trace(files, engineOpts);
     } catch (e) {
-      console.error('[bridge] step fetchTrace THREW', e && (e.stack || e.message), e);
+      console.error('[analyzer] fetchTrace failed:', e && (e.stack || e.message));
     }
-    console.log('[bridge] step fetchTrace END', 'count=', (fetches || []).length);
 
-    var result = {
+    return {
       convertedFiles: convertedFiles,
       taint:   taint,
       csp:     csp,
@@ -337,13 +332,6 @@
       allAssumptions:      trace.assumptions || [],
       rejectedAssumptions: trace.rejectedAssumptions || [],
     };
-    console.log('[bridge] __runAllConsumers exit',
-      'taint.findings=', result.taint.findings.length,
-      'convertedFiles=', Object.keys(result.convertedFiles).length,
-      'csp=', result.csp && Object.keys(result.csp),
-      'fetches=', result.fetches.length,
-      'allAssumptions=', result.allAssumptions.length);
-    return result;
   };
 
   // --- Preset accept-set builders ------------------------------------

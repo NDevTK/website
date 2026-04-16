@@ -458,34 +458,48 @@ const DEFAULT_TYPE_DB = {
     },
 
     // --- String (for label-preserving string methods) ---
+    //
+    // `smtOp` names a string-theory operation understood by
+    // `applySmtCallOp` in src/transfer.js. When the receiver has
+    // a formula and the arg formulas are available, the call's
+    // return value is given a derived SMT formula so downstream
+    // path-condition composition and PoC synthesis can solve for
+    // a concrete attacker input. Descriptors WITHOUT `smtOp` fall
+    // back to the opaque-with-labels behaviour and, if a taint
+    // flow reaches a sink without a valueFormula, raise an
+    // `unsolvable-math` assumption naming the unmodelled op.
     String: {
       methods: {
-        slice:       { returnType: 'String', preservesLabelsFromReceiver: true },
-        substring:   { returnType: 'String', preservesLabelsFromReceiver: true },
-        substr:      { returnType: 'String', preservesLabelsFromReceiver: true },
-        toLowerCase: { returnType: 'String', preservesLabelsFromReceiver: true },
-        toUpperCase: { returnType: 'String', preservesLabelsFromReceiver: true },
-        trim:        { returnType: 'String', preservesLabelsFromReceiver: true },
-        trimStart:   { returnType: 'String', preservesLabelsFromReceiver: true },
-        trimEnd:     { returnType: 'String', preservesLabelsFromReceiver: true },
-        charAt:      { returnType: 'String', preservesLabelsFromReceiver: true },
-        concat:      { returnType: 'String', preservesLabelsFromReceiver: true },
-        repeat:      { returnType: 'String', preservesLabelsFromReceiver: true },
-        replace:     { returnType: 'String', preservesLabelsFromReceiver: true },
-        replaceAll:  { returnType: 'String', preservesLabelsFromReceiver: true },
-        padStart:    { returnType: 'String', preservesLabelsFromReceiver: true },
-        padEnd:      { returnType: 'String', preservesLabelsFromReceiver: true },
-        normalize:   { returnType: 'String', preservesLabelsFromReceiver: true },
-        split:       { preservesLabelsFromReceiver: true },
-        indexOf:     {},
-        lastIndexOf: {},
-        includes:    {},
-        startsWith:  {},
-        endsWith:    {},
-        toString:    { returnType: 'String', preservesLabelsFromReceiver: true },
+        slice:       { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'slice'       },
+        substring:   { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'substring'   },
+        substr:      { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'substr'      },
+        // to_lower / to_upper aren't universally supported across
+        // Z3 WASM builds; keep the helpers in smt.js but route
+        // the TypeDB through the unmodelled fallback so the
+        // direct-flow demo payload fires instead of a parse error.
+        toLowerCase: { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'unmodelled:toLowerCase' },
+        toUpperCase: { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'unmodelled:toUpperCase' },
+        trim:        { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'unmodelled:trim'      },
+        trimStart:   { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'unmodelled:trimStart' },
+        trimEnd:     { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'unmodelled:trimEnd'   },
+        charAt:      { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'charAt'      },
+        concat:      { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'concat'      },
+        repeat:      { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'unmodelled:repeat' },
+        replace:     { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'replace'     },
+        replaceAll:  { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'replaceAll'  },
+        padStart:    { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'unmodelled:padStart' },
+        padEnd:      { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'unmodelled:padEnd'   },
+        normalize:   { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'unmodelled:normalize' },
+        split:       { preservesLabelsFromReceiver: true, smtOp: 'unmodelled:split' },
+        indexOf:     { returnType: 'Int', smtOp: 'indexOf'   },
+        lastIndexOf: { returnType: 'Int', smtOp: 'unmodelled:lastIndexOf' },
+        includes:    { returnType: 'Bool', smtOp: 'includes'   },
+        startsWith:  { returnType: 'Bool', smtOp: 'startsWith' },
+        endsWith:    { returnType: 'Bool', smtOp: 'endsWith'   },
+        toString:    { returnType: 'String', preservesLabelsFromReceiver: true, smtOp: 'identity' },
       },
       props: {
-        length: {},
+        length: { smtOp: 'length' },
       },
     },
 

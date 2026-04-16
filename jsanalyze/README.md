@@ -43,10 +43,11 @@ legacy consumers have been removed from the tree.
 
 6. **Z3-backed reachability and witness generation.** The reachability
    cascade's Layer 5 and the post-pass refutation both call Z3
-   (`src/z3.js`) on the accumulated path formulas. The PoC
-   synthesis consumer uses the same solver with `getModel` to
-   extract concrete attacker inputs from reachable flows. Z3 is
-   required — there is no "disable SMT" fallback.
+   (`src/z3.js`) on the accumulated path formulas. The
+   `taint-report` consumer reuses the same solver via `getModel`
+   to extract concrete attacker inputs from reachable flows
+   (sink-specific exploit shapes live there, not in the engine).
+   Z3 is required — there is no "disable SMT" fallback.
 
 7. **Every approximation is recorded as an explicit Assumption.**
    When the analyser gives up — because the value came from the
@@ -100,11 +101,12 @@ jsanalyze/
 │   │                     Preserves loops, branches, function
 │   │                     boundaries. Ships convertProject for
 │   │                     per-HTML-file multi-file rewrites.
-│   ├── poc-synth.js      Z3-backed PoC synthesis. Takes a taint
-│   │                     flow + sink-specific exploitability
-│   │                     constraint, returns a concrete attacker
-│   │                     input witness.
-│   ├── taint-report.js   Human-readable taint flow report.
+│   ├── taint-report.js   Human-readable taint flow report AND
+│   │                     Z3-backed PoC synthesis. Takes a trace
+│   │                     + sink-specific exploit constraint,
+│   │                     attaches a concrete attacker-input
+│   │                     witness to every surviving flow via
+│   │                     `synthesisePocs`.
 │   ├── fetch-trace.js    HTTP endpoint discovery from trace.calls.
 │   └── csp-derive.js     CSP directive derivation from
 │                         trace.stringLiterals + trace.domMutations.
@@ -184,30 +186,59 @@ script-src JS files as siblings sharing the top-level scope. Pages
 are independent: `a.html` and `b.html` are processed as separate
 analyses even when they share some scripts.
 
-### PoC synthesis consumer
+### Taint report + PoC synthesis consumer
 
 ```js
-const { synthesiseTrace } = require('./jsanalyze/consumers/poc-synth.js');
+const tr = require('./jsanalyze/consumers/taint-report.js');
 
-const trace = await analyze(
-  'var h = location.hash; document.body.innerHTML = h;');
-const results = await synthesiseTrace(trace);
+const report = await tr.analyze(
+  'var h = location.hash.slice(1); document.body.innerHTML = h;');
 
-for (const r of results) {
-  if (r.verdict === 'synthesised') {
-    console.log('[' + r.sink.kind + '] payload:', r.payload);
-    // Example: "[html] payload: <script>"
-    // Visit page.html#<script> to trigger.
+for (const flow of report.flows) {
+  if (flow.poc && flow.poc.verdict === 'synthesised') {
+    console.log('[' + flow.sink.kind + '] payload:', flow.poc.payload);
+    console.log('  attempt:', flow.poc.attempt);
+    console.log('  bindings:', flow.poc.bindings);
+    // Example:
+    //   [html] payload: <script>alert(1)</script>
+    //     attempt: script-tag
+    //     bindings: { url: '<script>alert(1)</script>' }
   }
 }
 ```
 
-`synthesiseTrace` iterates every taint flow, composes the flow's
-path condition with a sink-specific exploitability constraint
-(e.g. `str.contains value "<script>"` for html sinks), and asks
-Z3 for a satisfying assignment. Returned verdicts cover the
-synthesised / infeasible / unsolvable / no-constraint / trivial
-outcomes.
+`tr.analyze` walks the program (via the engine), then for every
+surviving taint flow conjoins the flow's `pathFormula` with a
+sink-specific exploit constraint on the `valueFormula` and asks
+Z3 for a satisfying model.
+
+**Multiple exploit attempts per sink.** Each sink kind has an
+ordered list of candidate payloads — for `html` the list is
+`<script>`, `<img onerror>`, `<svg onload>`, attribute-breakout,
+style-breakout. The synthesiser tries each in order and returns
+the first that Z3 reports SAT, naming the winning shape in
+`poc.attempt`. Direct attacker-controlled flows with no
+intermediate constraints return the primary payload without a
+solver round-trip.
+
+**Per-source bindings.** `poc.bindings` is a map from source
+label (e.g. `'url'`, `'postMessage'`, `'persistent-state'`) to
+the string Z3 chose for that source. Multi-source flows get one
+binding per source so delivery consumers can format reproducers
+(URL fragments, postMessage calls, storage writes) per source.
+
+**Symbolic operations.** String methods registered with an
+`smtOp` in the TypeDB (`slice`, `substring`, `substr`, `charAt`,
+`concat`, `replace`, `replaceAll`, `indexOf`, `includes`,
+`startsWith`, `endsWith`, `length`) propagate SMT formulas
+through the lattice, so `location.hash.slice(1)` and
+`'pre:' + location.hash.replace('a', 'b')` remain solvable.
+Unmodelled ops (`trim`, `split`, `toLowerCase`, …) raise an
+`unsolvable-math` assumption at the call site so the precision
+drop is visible in strict mode.
+
+**Direct API.** `tr.synthesisePocs(trace, options)` attaches
+PoCs to a pre-built trace without re-analysing.
 
 ## Browser integration
 
@@ -226,10 +257,10 @@ node jsanalyze/scripts/build-bundle.js
 
 ## Status
 
-**Test count:** 635 passing, 0 failing.
+Run `node jsanalyze/test/run.js` to see the current pass count
+(updated every commit).
 
-**Working consumers** (all four primary consumers from the scope
-statement plus the two secondary ones):
+**Working consumers:**
 
 - `dom-convert.js`  — concrete, append, branch (incl. else-if
   chains + nested ternaries), switch, loop (for / while /
@@ -240,9 +271,9 @@ statement plus the two secondary ones):
   position-aware insertion, `document.write` /
   `document.writeln`, negative cases (plain-object receivers,
   var named `innerHTML`, innerHTML in comments / strings).
-- `poc-synth.js`    — html / navigation / url / code sinks with
-  Z3 `getModel`-based witness generation.
-- `taint-report.js` — human-readable findings.
+- `taint-report.js` — human-readable findings AND Z3
+  `getModel`-based PoC synthesis for html / navigation / url /
+  code sinks.
 - `fetch-trace.js`  — HTTP endpoint discovery.
 - `csp-derive.js`   — CSP directive derivation.
 

@@ -669,7 +669,35 @@ function applyUnOp(ctx, state, instr) {
     return D.setReg(state, instr.dest, D.concrete(r, undefined, loc));
   }
   if (operand && operand.kind === D.V.OPAQUE) {
-    return D.setReg(state, instr.dest, D.opaque(operand.assumptionIds, null, loc));
+    const chainIds = operand.assumptionIds ? operand.assumptionIds.slice() : [];
+    // Formula preservation: translate '-', '+', '!' to SMT
+    // primitives when the operand has a formula. Other unary ops
+    // (~ / typeof / void) don't have clean SMT mappings and drop
+    // the formula — we announce via unsolvable-math when that
+    // matters.
+    let resultFormula = null;
+    const operandFormula = formulaForValue(ctx, operand, loc);
+    if (operandFormula) {
+      if (instr.operator === '!') {
+        resultFormula = SMT.mkNot(operandFormula);
+      } else if (instr.operator === '-') {
+        resultFormula = SMT.mkArith('-', SMT.mkConst(0), operandFormula);
+      } else if (instr.operator === '+') {
+        resultFormula = operandFormula;
+      } else {
+        const a = ctx.assumptions.raise(
+          REASONS.UNSOLVABLE_MATH,
+          'unary `' + instr.operator + '` on symbolic value ' +
+          'not translated to SMT; formula dropped',
+          loc,
+          { chain: chainIds.length > 0 ? chainIds : undefined }
+        );
+        chainIds.push(a.id);
+      }
+    }
+    const v = D.opaque(chainIds, null, loc);
+    return D.setReg(state, instr.dest,
+      resultFormula ? D.withFormula(v, resultFormula) : v);
   }
   return D.setReg(state, instr.dest, D.top(loc));
 }
@@ -844,12 +872,57 @@ function propLookupForVariant(ctx, state, obj, instr, loc) {
             obj.typeName + '.' + instr.propName,
             readTypeToSort(desc.readType));
         }
+        // Derived-formula propagation for non-source props (e.g.
+        // `.length` on a String). When the prop descriptor names
+        // an `smtOp` AND the receiver carries a formula, build a
+        // formula for the read's result so `str.length > N` style
+        // path conditions stay symbolic. When the op is
+        // unmodelled and the receiver had a formula, raise
+        // unsolvable-math so the precision drop is visible.
+        if (!resultFormula && desc.smtOp) {
+          const recvFormula = formulaForValue(ctx, obj, loc);
+          if (recvFormula) {
+            const derived = applySmtCallOp(desc.smtOp, recvFormula, []);
+            if (derived) {
+              resultFormula = derived;
+            } else {
+              const opLabel = desc.smtOp.indexOf('unmodelled:') === 0
+                ? desc.smtOp.slice('unmodelled:'.length)
+                : desc.smtOp;
+              const a = ctx.assumptions.raise(
+                REASONS.UNSOLVABLE_MATH,
+                'SMT model for property `' + instr.propName +
+                '` (op: ' + opLabel + ') not yet implemented; ' +
+                'downstream PoC synthesis loses precision here',
+                loc,
+                { chain: chainIds.length > 0 ? chainIds : undefined }
+              );
+              chainIds.push(a.id);
+            }
+          }
+        }
         const v = D.opaque(chainIds, resultType, loc, resultLabels);
         return resultFormula ? D.withFormula(v, resultFormula) : v;
       }
     }
     // No TypeDB info → propagate the receiver's opaqueness.
-    return D.opaque(obj.assumptionIds || [], null, loc, obj.labels);
+    // Precision note: if the receiver had a formula, we drop it
+    // here because we don't know what the unmodeled property
+    // returns. Raise unsolvable-math so the loss is visible to
+    // consumers running with strict accept sets.
+    const chainIds = obj.assumptionIds ? obj.assumptionIds.slice() : [];
+    if (obj.formula) {
+      const a = ctx.assumptions.raise(
+        REASONS.UNSOLVABLE_MATH,
+        'property `' + instr.propName + '` on ' +
+        (obj.typeName || 'opaque') + ' not in TypeDB; ' +
+        'receiver formula cannot be propagated',
+        loc,
+        { chain: chainIds.length > 0 ? chainIds : undefined }
+      );
+      chainIds.push(a.id);
+    }
+    return D.opaque(chainIds, null, loc, obj.labels);
   }
   // Property access on a primitive: model autoboxing via the
   // TypeDB's wrapper type when available.
@@ -2279,21 +2352,41 @@ async function applyCall(ctx, state, instr) {
   // are combined back into a Disjunct so the per-path type
   // information survives the call.
   let tdbResult = null;
+  let tdbDesc = null;
   if (thisValue && thisValue.kind === D.V.DISJUNCT) {
     const perVariantResults = [];
+    const perVariantDescs = [];
     for (const thisVariant of thisValue.variants) {
       const r = resolveCallReturnViaDB(ctx, instr, thisVariant, argValues, loc);
-      if (r) perVariantResults.push(r);
+      if (r) {
+        perVariantResults.push(r.value);
+        perVariantDescs.push(r.desc);
+      }
     }
     if (perVariantResults.length > 0) {
       tdbResult = perVariantResults.length === 1
         ? perVariantResults[0]
         : D.disjunct(perVariantResults, loc);
+      // Writes from disjunct variants: apply each variant's
+      // writes to the state. Soundness over-approximates — a
+      // variant whose runtime path isn't actually taken still
+      // contributes its writes. This matches how the engine
+      // handles other per-variant effects.
+      for (const d of perVariantDescs) {
+        state = applyCallWrites(ctx, state, thisValue, argValues, d, loc);
+      }
     }
   } else {
-    tdbResult = resolveCallReturnViaDB(ctx, instr, thisValue, argValues, loc);
+    const r = resolveCallReturnViaDB(ctx, instr, thisValue, argValues, loc);
+    if (r) {
+      tdbResult = r.value;
+      tdbDesc = r.desc;
+    }
   }
   if (tdbResult) {
+    if (tdbDesc) {
+      state = applyCallWrites(ctx, state, thisValue, argValues, tdbDesc, loc);
+    }
     return D.setReg(state, instr.dest, tdbResult);
   }
   // Fallback: truly unresolved callee. We don't know what the
@@ -2347,11 +2440,88 @@ async function applyCall(ctx, state, instr) {
     D.opaque(conservativeChain, null, loc, conservativeLabels));
 }
 
+// applySmtCallOp — build an SMT formula for a call's return value
+// from a TypeDB method descriptor's `smtOp` hint and the caller-
+// side formulas. Returns a Formula or null. Pure — no side
+// effects on ctx.
+//
+// Known string-theory ops are mapped to the corresponding
+// `src/smt.js` helper. `unmodelled:*` descriptors are explicit
+// "we know this op exists but haven't translated it" markers —
+// they return null at this layer; the call site decides whether
+// to raise an `unsolvable-math` assumption based on whether the
+// precision drop matters (i.e. whether the receiver or args
+// carried formulas that would have been composable).
+function applySmtCallOp(op, recv, args) {
+  if (!op) return null;
+  switch (op) {
+    case 'identity':
+      return recv || null;
+    case 'length':
+      return SMT.mkLength(recv);
+    case 'toLowerCase':
+      return SMT.mkToLower(recv);
+    case 'toUpperCase':
+      return SMT.mkToUpper(recv);
+    case 'charAt':
+      return SMT.mkAt(recv, args[0] || SMT.mkConst(0));
+    case 'substr': {
+      // JS substr(start, len) — Z3 str.substr has identical args.
+      const start = args[0] || SMT.mkConst(0);
+      if (!recv || !args[0]) return null;
+      const len = args[1] || SMT.mkArith('-', SMT.mkLength(recv), start);
+      return SMT.mkSubstr(recv, start, len);
+    }
+    case 'slice':
+    case 'substring': {
+      // slice(a) / substring(a) strip a prefix; slice(a, b) and
+      // substring(a, b) take chars from a (inclusive) to b
+      // (exclusive). Z3 str.substr takes (s, start, len); compute
+      // len = (b || str.len s) - a. Negative-index semantics
+      // differ between slice and substring at the JS level; for
+      // the MVP we model the non-negative case exactly — which
+      // covers location.hash.slice(1) and similar — and leave
+      // negative-arg edge cases to future work.
+      if (!recv) return null;
+      const a = args[0] || SMT.mkConst(0);
+      const b = args[1] || SMT.mkLength(recv);
+      const len = SMT.mkArith('-', b, a);
+      return SMT.mkSubstr(recv, a, len);
+    }
+    case 'concat': {
+      // String.prototype.concat(...args) — chain mkConcat.
+      let out = recv;
+      for (let i = 0; i < args.length; i++) {
+        if (!out || !args[i]) return null;
+        out = SMT.mkConcat(out, args[i]);
+      }
+      return out;
+    }
+    case 'replace':
+      return SMT.mkReplace(recv, args[0], args[1]);
+    case 'replaceAll':
+      return SMT.mkReplaceAll(recv, args[0], args[1]);
+    case 'indexOf':
+      return SMT.mkIndexOf(recv, args[0], args[1]);
+    case 'includes':
+      return SMT.mkContains(recv, args[0]);
+    case 'startsWith':
+      return SMT.mkPrefixOf(args[0], recv);
+    case 'endsWith':
+      return SMT.mkSuffixOf(args[0], recv);
+    default:
+      // 'unmodelled:*' and unknown ops fall through.
+      return null;
+  }
+}
+
 // --- Resolve a call's return value via the TypeDB ------------------------
 //
 // Returns a Value (the typed return) or null if the callee
 // cannot be resolved. The Value is an Opaque tagged with the
-// return type name and any propagated labels.
+// return type name, any propagated labels, and (when the TypeDB
+// descriptor carries an `smtOp` the engine can translate) an
+// SMT formula derived from the receiver and argument formulas.
 function resolveCallReturnViaDB(ctx, instr, thisValue, argValues, loc) {
   const db = ctx.typeDB;
   if (!db) return null;
@@ -2424,7 +2594,129 @@ function resolveCallReturnViaDB(ctx, instr, thisValue, argValues, loc) {
     }
   }
 
-  return D.opaque(chainIds, returnType, loc, resultLabels);
+  let result = D.opaque(chainIds, returnType, loc, resultLabels);
+
+  // SMT formula propagation. When the TypeDB descriptor names an
+  // `smtOp` the engine can translate AND the receiver / args
+  // carry formulas, derive the return formula and attach it so
+  // downstream path-condition composition and PoC synthesis have
+  // a symbolic expression to solve against. When the op is
+  // unmodelled but there WAS an upstream formula, raise
+  // `unsolvable-math` so the precision drop is visible to
+  // consumers (D13 — no silent imprecision). Receiver-formula
+  // fallback: if no formula is on thisValue but the value is
+  // Opaque with an attacker source label, synthesise one here
+  // via allocSourceSym so symbolic source propagation survives
+  // a lattice-level loss of formula.
+  if (desc.smtOp) {
+    const recvFormula = formulaForValue(ctx, thisValue, loc);
+    const argFormulas = argValues.map(v => formulaForValue(ctx, v, loc));
+    const upstreamHadFormula =
+      !!recvFormula || argFormulas.some(f => !!f);
+    if (upstreamHadFormula) {
+      const derived = applySmtCallOp(desc.smtOp, recvFormula, argFormulas);
+      if (derived) {
+        result = D.withFormula(result, derived);
+      } else {
+        const callName = instr.methodName || instr.calleeName || '<call>';
+        const opLabel = desc.smtOp.indexOf('unmodelled:') === 0
+          ? desc.smtOp.slice('unmodelled:'.length)
+          : desc.smtOp;
+        const a = ctx.assumptions.raise(
+          REASONS.UNSOLVABLE_MATH,
+          'SMT model for `' + callName + '` (op: ' + opLabel + ') ' +
+          'not yet implemented; downstream PoC synthesis on this ' +
+          'value will fall back to the demo payload for its sink kind',
+          loc,
+          { chain: chainIds.length > 0 ? chainIds : undefined }
+        );
+        chainIds.push(a.id);
+        result = D.opaque(chainIds, returnType, loc, resultLabels);
+      }
+    }
+  }
+
+  return { value: result, desc: desc, chainIds: chainIds };
+}
+
+// applyCallWrites — apply a TypeDB method descriptor's `writes`
+// array to the caller state. Each entry describes a heap
+// mutation the opaque method performs:
+//
+//   writes: [{
+//     target: 'self' | 'arg:N',   // receiver or N'th argument
+//     field:  string,              // property name written
+//     source?: string,             // label to attach (optional)
+//     taintFromArg?: number,       // copy labels from arg N
+//   }]
+//
+// Without write-effect modelling, mutations through opaque
+// methods (Array.push, Object.assign, user-declared wrappers
+// in consumer TypeDBs) are invisible and get a `heap-escape`
+// assumption at read time. With writes, the TypeDB author can
+// declare "this method writes this field" and the engine
+// updates the target heap cell to reflect the labels that
+// flowed in.
+function applyCallWrites(ctx, state, thisValue, argValues, desc, loc) {
+  if (!desc || !desc.writes || desc.writes.length === 0) return state;
+  for (const w of desc.writes) {
+    // Resolve target Value: 'self' → thisValue, 'arg:N' → argValues[N].
+    let targetValue = null;
+    if (w.target === 'self') {
+      targetValue = thisValue;
+    } else if (typeof w.target === 'string' && w.target.indexOf('arg:') === 0) {
+      const idx = Number(w.target.slice(4));
+      if (!Number.isNaN(idx)) targetValue = argValues[idx];
+    }
+    if (!targetValue || targetValue.kind !== D.V.OBJECT) continue;
+    // Collect labels to apply. Start empty; add `source` if given,
+    // add labels from `taintFromArg`.
+    let labels = D.EMPTY_LABELS;
+    const chainIds = [];
+    if (w.source) {
+      labels = Object.freeze(new Set([w.source]));
+    }
+    if (typeof w.taintFromArg === 'number') {
+      const src = argValues[w.taintFromArg];
+      if (src && src.labels && src.labels.size > 0) {
+        if (labels.size === 0) {
+          labels = src.labels;
+        } else {
+          const merged = new Set(labels);
+          for (const l of src.labels) merged.add(l);
+          labels = Object.freeze(merged);
+        }
+      }
+      if (src && src.assumptionIds) {
+        for (const id of src.assumptionIds) chainIds.push(id);
+      }
+    }
+    const newVal = D.opaque(chainIds, null, loc, labels);
+    state = writeHeapField(state, targetValue.objId, w.field, newVal);
+  }
+  return state;
+}
+
+// formulaForValue — coerce a Value to its SMT formula. Uses the
+// value's attached `formula` when present, otherwise the
+// concrete-literal folding via `formulaOf`. A special case:
+// Opaque values with an attacker source label but no formula
+// (can happen when a lattice merge lost the formula) get a
+// fresh sym reallocated so symbolic propagation keeps working.
+function formulaForValue(ctx, value, loc) {
+  if (!value) return null;
+  if (value.formula) return value.formula;
+  const concrete = formulaOf(value);
+  if (concrete) return concrete;
+  if (value.kind === D.V.OPAQUE && value.labels && value.labels.size > 0) {
+    for (const lab of value.labels) {
+      const reason = sourceLabelToReason(lab);
+      if (reason) {
+        return allocSourceSym(ctx, lab, loc, lab, 'String');
+      }
+    }
+  }
+  return null;
 }
 
 // --- Sink classification for call sites ----------------------------------

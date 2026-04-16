@@ -15,10 +15,12 @@ primary validation targets:
    `document.write` assignments into safe `createElement` /
    `appendChild` trees. Preserves loops, branches, and
    function boundaries.
-2. **PoC synthesis** — take a taint flow, invoke Z3 with the
+2. **Taint report + PoC synthesis** — group taint flows for a
+   human reader, and for each surviving flow invoke Z3 with the
    accumulated path condition + a sink-specific exploitability
-   constraint, produce a concrete attacker input that triggers
-   the sink.
+   constraint to produce a concrete attacker input that triggers
+   the sink. Sink-specific exploit shapes live in the consumer,
+   not the engine (see D11.1).
 
 The library is integrated into `analyzer/index.html` (Monaco
 editor + sidebar + findings panel). The legacy engine that
@@ -30,8 +32,9 @@ and the `analyzer/` UI is now the only entry point.
 ### D1. TypeDB is pure data with no code
 
 The TypeDB is a plain JavaScript object matching the schema
-documented in `docs/TYPEDB.md`. No functions, no classes, no
-behaviour. The engine applies the TypeDB through a single set
+documented in `src/default-typedb.js` (the default browser DB
+serves as the canonical schema reference). No functions, no
+classes, no behaviour. The engine applies the TypeDB through a single set
 of lookup helpers (`_lookupProp`, `_lookupMethod`,
 `_resolveReturnType`, `_classifySink`). This makes it trivial
 to replace the default DB with a custom one for Node APIs,
@@ -227,14 +230,13 @@ via its public API (`analyze`, `query`). Consumers don't
 reach into the engine internals. The directory contains:
 
 - `dom-convert.js` — innerHTML → createElement rewriter
-- `poc-synth.js` — SMT-based exploit generator
-- `taint-report.js` — human-readable findings
+- `taint-report.js` — human-readable findings + SMT-based PoC
+  witness synthesis for every surviving flow
 - `fetch-trace.js` — HTTP endpoint discovery
 - `csp-derive.js` — CSP policy derivation
 
-Each is 200-500 lines. The first two are primary; the last
-three are ports of the legacy consumers, added after the
-first two are working.
+The first two are primary; the last two are ports of the
+legacy consumers, added after the first two were working.
 
 **Rationale.** Separation of concerns: the engine is generic,
 consumers are domain-specific. A new consumer is a new file,
@@ -403,12 +405,13 @@ the heap at that program point. No magic cap.
 
 ### D15. Assumption catalog is closed
 
-The 15 reason codes defined in `src/assumptions.js` are the
-complete public set. Adding a new code is a minor schema
-bump; removing or repurposing one is a major bump. If a new
-situation arises that doesn't fit any existing code, the
-correct response is to add a new code to the catalog in
-`src/assumptions.js` AND document it in `docs/ASSUMPTIONS.md`
+The 18 reason codes defined in `src/assumptions.js` are the
+complete public set (10 theoretical-floor + 3 environmental +
+2 engineering-gap + 3 performance-shortcut). Adding a new code
+is a minor schema bump; removing or repurposing one is a major
+bump. If a new situation arises that doesn't fit any existing
+code, the correct response is to add a new code to the catalog
+in `src/assumptions.js` AND document it in `docs/ASSUMPTIONS.md`
 in the same commit.
 
 **Rationale.** The catalog is part of the stable public API.
