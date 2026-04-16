@@ -52,72 +52,87 @@ const DEFAULT_TYPE_DB = {
         // Generic Event has no taint-relevant props; subtypes override.
       },
     },
+    // Event types whose source reads carry per-invocation
+    // values get `sourceScope: 'call'`. Two `event.data` reads
+    // in two different `message` handlers MUST receive distinct
+    // SMT symbols — each postMessage delivery is independent.
+    // Without this, Z3 would unsoundly correlate the two.
     MessageEvent: {
       extends: 'Event',
+      sourceScope: 'call',
       props: {
-        data:   { source: 'postMessage' },
-        origin: { source: 'postMessage' },
+        data:   { source: 'postMessage', delivery: 'postMessage:data'   },
+        origin: { source: 'postMessage', delivery: 'postMessage:origin' },
       },
     },
     HashChangeEvent: {
       extends: 'Event',
+      sourceScope: 'call',
       props: {
-        newURL: { source: 'url' },
-        oldURL: { source: 'url' },
+        newURL: { source: 'url', delivery: 'location-href' },
+        oldURL: { source: 'url', delivery: 'location-href' },
       },
     },
     PopStateEvent: {
       extends: 'Event',
+      sourceScope: 'call',
       props: {
-        state: { source: 'url' },
+        state: { source: 'url', delivery: 'history-state' },
       },
     },
     ErrorEvent: {
       extends: 'Event',
+      sourceScope: 'call',
       props: {
-        message:  { source: 'network' },
-        filename: { source: 'url' },
+        message:  { source: 'network', delivery: 'network-response' },
+        filename: { source: 'url',     delivery: 'location-href'     },
       },
     },
     StorageEvent: {
       extends: 'Event',
+      sourceScope: 'call',
       props: {
-        newValue: { source: 'storage' },
-        oldValue: { source: 'storage' },
-        url:      { source: 'url' },
+        newValue: { source: 'storage', delivery: 'localStorage' },
+        oldValue: { source: 'storage', delivery: 'localStorage' },
+        url:      { source: 'url',     delivery: 'location-href' },
       },
     },
     DataTransfer: {
+      sourceScope: 'call',
       props: {
-        files: { source: 'file' },
+        files: { source: 'file', delivery: 'file-drop' },
       },
       methods: {
-        getData: { source: 'dragdrop', returnType: 'String' },
+        getData: { source: 'dragdrop', returnType: 'String', delivery: 'file-drop' },
       },
     },
     DragEvent: {
       extends: 'Event',
+      sourceScope: 'call',
       props: {
         dataTransfer: { readType: 'DataTransfer' },
       },
     },
     ClipboardData: {
+      sourceScope: 'call',
       methods: {
-        getData: { source: 'clipboard', returnType: 'String' },
+        getData: { source: 'clipboard', returnType: 'String', delivery: 'clipboard-paste' },
       },
     },
     ClipboardEvent: {
       extends: 'Event',
+      sourceScope: 'call',
       props: {
         clipboardData: { readType: 'ClipboardData' },
       },
     },
     FileReader: {
       extends: 'EventTarget',
+      sourceScope: 'call',
       props: {
-        result:       { source: 'file' },
-        response:     { source: 'network' },
-        responseText: { source: 'network' },
+        result:       { source: 'file',    delivery: 'file-drop'        },
+        response:     { source: 'network', delivery: 'network-response' },
+        responseText: { source: 'network', delivery: 'network-response' },
       },
     },
     ProgressEvent: {
@@ -138,19 +153,19 @@ const DEFAULT_TYPE_DB = {
       // Location references.
       selfSource: 'url',
       props: {
-        search:   { source: 'url', readType: 'String' },
-        hash:     { source: 'url', readType: 'String' },
-        href:     { source: 'url', readType: 'String', sink: 'navigation' },
-        pathname: { source: 'url', readType: 'String' },
-        host:     { source: 'url', readType: 'String' },
-        hostname: { source: 'url', readType: 'String' },
-        origin:   { source: 'url', readType: 'String' },
-        port:     { source: 'url', readType: 'String' },
-        protocol: { source: 'url', readType: 'String' },
+        search:   { source: 'url', readType: 'String', delivery: 'location-search'   },
+        hash:     { source: 'url', readType: 'String', delivery: 'location-fragment' },
+        href:     { source: 'url', readType: 'String', sink: 'navigation', exploit: 'url-javascript-scheme', delivery: 'location-href' },
+        pathname: { source: 'url', readType: 'String', delivery: 'location-pathname' },
+        host:     { source: 'url', readType: 'String', delivery: 'location-href'     },
+        hostname: { source: 'url', readType: 'String', delivery: 'location-href'     },
+        origin:   { source: 'url', readType: 'String', delivery: 'location-href'     },
+        port:     { source: 'url', readType: 'String', delivery: 'location-href'     },
+        protocol: { source: 'url', readType: 'String', delivery: 'location-href'     },
       },
       methods: {
-        assign:   { args: [{ sink: 'navigation' }] },
-        replace:  { args: [{ sink: 'navigation' }] },
+        assign:   { args: [{ sink: 'navigation', exploit: 'url-javascript-scheme' }] },
+        replace:  { args: [{ sink: 'navigation', exploit: 'url-javascript-scheme' }] },
         reload:   {},
         toString: { source: 'url', returnType: 'String' },
       },
@@ -166,7 +181,7 @@ const DEFAULT_TYPE_DB = {
     },
     Navigation: {
       methods: {
-        navigate: { args: [{ sink: 'navigation' }] },
+        navigate: { args: [{ sink: 'navigation', exploit: 'url-javascript-scheme' }] },
       },
     },
     Storage: {
@@ -175,7 +190,7 @@ const DEFAULT_TYPE_DB = {
       // the legacy TAINT_SOURCES entries for those roots.
       selfSource: 'storage',
       methods: {
-        getItem:    { source: 'storage', returnType: 'String' },
+        getItem:    { source: 'storage', returnType: 'String', delivery: 'localStorage' },
         setItem:    {},
         removeItem: {},
         clear:      {},
@@ -185,11 +200,11 @@ const DEFAULT_TYPE_DB = {
     Document: {
       extends: 'EventTarget',
       props: {
-        URL:         { source: 'url',      readType: 'String' },
-        documentURI: { source: 'url',      readType: 'String' },
-        baseURI:     { source: 'url',      readType: 'String' },
-        cookie:      { source: 'cookie',   readType: 'String' },
-        referrer:    { source: 'referrer', readType: 'String' },
+        URL:         { source: 'url',      readType: 'String', delivery: 'location-href'     },
+        documentURI: { source: 'url',      readType: 'String', delivery: 'location-href'     },
+        baseURI:     { source: 'url',      readType: 'String', delivery: 'location-href'     },
+        cookie:      { source: 'cookie',   readType: 'String', delivery: 'cookie'            },
+        referrer:    { source: 'referrer', readType: 'String', delivery: 'referrer'          },
         domain:      { source: 'referrer', readType: 'String', sink: 'origin' },
         location:    { readType: 'Location' },
         body:        { readType: 'HTMLElement' },
@@ -206,15 +221,18 @@ const DEFAULT_TYPE_DB = {
         getElementsByClassName: { returnType: 'HTMLCollection' },
         querySelector:     { returnType: 'HTMLElement' },
         querySelectorAll:  { returnType: 'NodeList' },
-        write:             { args: [{ sink: 'html' }] },
-        writeln:           { args: [{ sink: 'html' }] },
+        // document.write / writeln: streaming parser DOES execute
+        // script tags in the written chunk — different exec
+        // context from innerHTML.
+        write:   { args: [{ sink: 'html', exploit: 'html-document-write' }] },
+        writeln: { args: [{ sink: 'html', exploit: 'html-document-write' }] },
       },
     },
     Window: {
       extends: 'EventTarget',
       props: {
         location:       { readType: 'Location' },
-        name:           { source: 'window.name', readType: 'String' },
+        name:           { source: 'window.name', readType: 'String', delivery: 'window-name' },
         document:       { readType: 'Document' },
         history:        { readType: 'History' },
         navigation:     { readType: 'Navigation' },
@@ -227,14 +245,14 @@ const DEFAULT_TYPE_DB = {
         frames:         { readType: 'Window' },
       },
       methods: {
-        open: { args: [{ sink: 'navigation', severity: 'medium' }] },
+        open: { args: [{ sink: 'navigation', severity: 'medium', exploit: 'url-javascript-scheme' }] },
         postMessage: {},
         // setTimeout / setInterval: arg 0 is either a string
         // (code sink — unsafe-eval path) OR a callback
         // function. The callback variant needs interprocedural
         // walking so any sink inside the timer body shows up.
-        setTimeout:  { args: [{ sink: 'code' }], callbackArgs: [0] },
-        setInterval: { args: [{ sink: 'code' }], callbackArgs: [0] },
+        setTimeout:  { args: [{ sink: 'code', exploit: 'js-expression' }], callbackArgs: [0] },
+        setInterval: { args: [{ sink: 'code', exploit: 'js-expression' }], callbackArgs: [0] },
         clearTimeout:  {},
         clearInterval: {},
         queueMicrotask: { args: [{}], callbackArgs: [0] },
@@ -266,11 +284,15 @@ const DEFAULT_TYPE_DB = {
     Element: {
       extends: 'Node',
       props: {
-        innerHTML: { sink: 'html' },
-        outerHTML: { sink: 'html' },
+        // innerHTML / outerHTML: HTML5 parser spec says
+        // <script> tags injected here DO NOT execute. We use
+        // the 'html-innerHTML' exploit context whose attempts
+        // are event-handler shapes (img onerror, svg onload).
+        innerHTML: { sink: 'html', exploit: 'html-innerHTML' },
+        outerHTML: { sink: 'html', exploit: 'html-innerHTML' },
       },
       methods: {
-        insertAdjacentHTML: { args: [{}, { sink: 'html' }] },
+        insertAdjacentHTML: { args: [{}, { sink: 'html', exploit: 'html-innerHTML' }] },
         setAttribute: {
           // arg[0] is the attribute name, arg[1] is its value. The
           // per-attr sink classification lives on db.attrSinks so
@@ -299,58 +321,58 @@ const DEFAULT_TYPE_DB = {
     HTMLIFrameElement: {
       extends: 'HTMLElement',
       props: {
-        src:    { sink: 'url' },
-        srcdoc: { sink: 'html' },
+        src:    { sink: 'url',  exploit: 'url-javascript-scheme' },
+        srcdoc: { sink: 'html', exploit: 'html-document-write'   },
       },
     },
     HTMLScriptElement: {
       extends: 'HTMLElement',
       props: {
-        src:         { sink: 'url' },
-        textContent: { sink: 'code' },
-        text:        { sink: 'code' },
-        innerText:   { sink: 'code' },
+        src:         { sink: 'url',  exploit: 'url-script' },
+        textContent: { sink: 'code', exploit: 'js-expression' },
+        text:        { sink: 'code', exploit: 'js-expression' },
+        innerText:   { sink: 'code', exploit: 'js-expression' },
       },
     },
     HTMLEmbedElement: {
       extends: 'HTMLElement',
-      props: { src: { sink: 'url' } },
+      props: { src: { sink: 'url', exploit: 'url-javascript-scheme' } },
     },
     HTMLObjectElement: {
       extends: 'HTMLElement',
-      props: { data: { sink: 'url' } },
+      props: { data: { sink: 'url', exploit: 'url-javascript-scheme' } },
     },
     HTMLFrameElement: {
       extends: 'HTMLElement',
-      props: { src: { sink: 'url' } },
+      props: { src: { sink: 'url', exploit: 'url-javascript-scheme' } },
     },
     HTMLAnchorElement: {
       extends: 'HTMLElement',
-      props: { href: { sink: 'url' } },
+      props: { href: { sink: 'url', exploit: 'url-javascript-scheme' } },
     },
     HTMLAreaElement: {
       extends: 'HTMLElement',
-      props: { href: { sink: 'url' } },
+      props: { href: { sink: 'url', exploit: 'url-javascript-scheme' } },
     },
     HTMLBaseElement: {
       extends: 'HTMLElement',
-      props: { href: { sink: 'url' } },
+      props: { href: { sink: 'url', exploit: 'url-javascript-scheme' } },
     },
     HTMLLinkElement: {
       extends: 'HTMLElement',
-      props: { href: { sink: 'url' } },
+      props: { href: { sink: 'url', exploit: 'url-javascript-scheme' } },
     },
     HTMLFormElement: {
       extends: 'HTMLElement',
-      props: { action: { sink: 'url' } },
+      props: { action: { sink: 'url', exploit: 'url-javascript-scheme' } },
     },
     HTMLInputElement: {
       extends: 'HTMLElement',
-      props: { formAction: { sink: 'url', severity: 'medium' } },
+      props: { formAction: { sink: 'url', severity: 'medium', exploit: 'url-javascript-scheme' } },
     },
     HTMLButtonElement: {
       extends: 'HTMLElement',
-      props: { formAction: { sink: 'url', severity: 'medium' } },
+      props: { formAction: { sink: 'url', severity: 'medium', exploit: 'url-javascript-scheme' } },
     },
     HTMLStyleElement: {
       extends: 'HTMLElement',
@@ -505,11 +527,11 @@ const DEFAULT_TYPE_DB = {
 
     // --- Global callables ---
     GlobalEval: {
-      call: { args: [{ sink: 'code', severity: 'high' }] },
+      call: { args: [{ sink: 'code', severity: 'high', exploit: 'js-expression' }] },
     },
     GlobalFunctionCtor: {
-      construct: { args: [{ sink: 'code', severity: 'high' }, { sink: 'code', severity: 'high' }] },
-      call:      { args: [{ sink: 'code', severity: 'high' }, { sink: 'code', severity: 'high' }] },
+      construct: { args: [{ sink: 'code', severity: 'high', exploit: 'js-expression' }, { sink: 'code', severity: 'high', exploit: 'js-expression' }] },
+      call:      { args: [{ sink: 'code', severity: 'high', exploit: 'js-expression' }, { sink: 'code', severity: 'high', exploit: 'js-expression' }] },
     },
     GlobalSetTimeout: {
       // Arg 0 is either a code-string (sink: 'code') or a
@@ -817,6 +839,73 @@ const DEFAULT_TYPE_DB = {
     loadend:      'ProgressEvent',
     loadstart:    'ProgressEvent',
     progress:     'ProgressEvent',
+  },
+
+  // Exploit shape library, keyed by the `exploit` name declared
+  // on sink descriptors. Each entry carries an ordered list of
+  // `attempts`; a taint-report consumer walks the list building
+  // an SMT predicate per attempt and asks Z3 to solve each
+  // against the flow's pathFormula ∧ valueFormula. First SAT
+  // wins, and the attempt's `payload` is the VALUE that arrives
+  // at the sink when the model is realised.
+  //
+  //   trigger — the SMT predicate shape applied to the flow's
+  //             valueFormula. 'contains' / 'equals' / 'prefixof'.
+  //   payload — the string that must appear at the sink.
+  //
+  // Users who want to swap exploit shapes (custom sandbox, new
+  // canary, etc.) replace this table via `options.typeDB` —
+  // no code change needed.
+  exploits: {
+    // innerHTML / outerHTML / insertAdjacentHTML: HTML5 parsing
+    // deliberately refuses to execute <script> tags injected
+    // through these APIs. Attempts use shapes that DO execute:
+    // event handlers on image / svg / iframe elements.
+    'html-innerHTML': {
+      attempts: [
+        { name: 'img-onerror',    trigger: 'contains', payload: '<img src=x onerror=alert(1)>' },
+        { name: 'svg-onload',     trigger: 'contains', payload: '<svg onload=alert(1)>' },
+        { name: 'iframe-srcdoc',  trigger: 'contains', payload: '<iframe srcdoc="<img src=x onerror=alert(1)>"></iframe>' },
+        { name: 'attr-breakout',  trigger: 'contains', payload: '" onerror="alert(1)' },
+      ],
+    },
+    // document.write / writeln: streaming parser; <script> DOES
+    // execute. Script tag is the cleanest reproducer.
+    'html-document-write': {
+      attempts: [
+        { name: 'script-tag',  trigger: 'contains', payload: '<script>alert(1)</script>' },
+        { name: 'img-onerror', trigger: 'contains', payload: '<img src=x onerror=alert(1)>' },
+      ],
+    },
+    // URL-valued sinks (location.href, iframe.src, anchor.href,
+    // window.open, etc.). Browser executes only when the value
+    // STARTS with `javascript:` — so 'equals' is the tightest
+    // constraint. 'data:text/html,...' is a fallback for frames
+    // that disallow javascript:.
+    'url-javascript-scheme': {
+      attempts: [
+        { name: 'javascript-url', trigger: 'equals', payload: 'javascript:alert(1)' },
+        { name: 'data-html',      trigger: 'equals', payload: 'data:text/html,<script>alert(1)</script>' },
+      ],
+    },
+    // script.src loads external JavaScript. The value must be
+    // a URL serving a script with the desired side effect. For
+    // a PoC we point at a data: URL whose body is the payload.
+    'url-script': {
+      attempts: [
+        { name: 'data-script', trigger: 'equals', payload: 'data:text/javascript,alert(1)' },
+      ],
+    },
+    // eval / new Function / setTimeout(string). Value must be
+    // valid JS. 'equals alert(1)' is the tightest constraint;
+    // secondary 'contains ;alert(1);' handles cases where the
+    // value is embedded inside an existing expression.
+    'js-expression': {
+      attempts: [
+        { name: 'alert-canary',  trigger: 'equals',   payload: 'alert(1)' },
+        { name: 'embedded-semi', trigger: 'contains', payload: ';alert(1);' },
+      ],
+    },
   },
 };
 

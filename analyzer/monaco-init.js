@@ -62,7 +62,7 @@
     var folderFiles = { 'example.html': defaultInput };
     var outputFiles = {};
     var dirHandle = null;
-    var activeFile = null;          // { path: string, view: 'source' | 'converted' }
+    var activeFile = null;          // { path: string, source: 'input' | 'output' }
     var taintResults = null;
     var cspResults = null;
     var fetchResults = null;
@@ -73,6 +73,7 @@
     var customAccept = null;
     var convertAllRunning = false;
     var activeTab = 'taint';
+    var contextUrl = '';  // forwarded to the taint-report consumer's PoC builder
 
     function langFor(name) {
       if (/\.html?$/i.test(name)) return 'html';
@@ -112,9 +113,14 @@
     }
 
     // --- File list rendering --------------------------------------------
-    // Single unified tree. One row per input file. Output files don't
-    // get their own row — they live behind the Source / Converted toggle
-    // on the active file.
+    //
+    // Two sidebar sections:
+    //   * Input Files (editable) — the user's source tree.
+    //   * Output Files (read-only) — dom-convert's rewrite. One
+    //     input HTML can produce its own HTML output PLUS N
+    //     extracted `*.inline.N.js` files, so input↔output isn't
+    //     a 1:1 mapping. Keeping two lists makes the multi-file
+    //     shape visible.
     function findingsForFile(path) {
       if (!taintResults) return 0;
       var n = 0;
@@ -125,10 +131,15 @@
     }
 
     function renderFileList() {
+      renderInputList();
+      renderOutputList();
+    }
+
+    function renderInputList() {
       var container = document.getElementById('fileList');
       var countEl = document.getElementById('fileCount');
       var paths = Object.keys(folderFiles).sort();
-      countEl.textContent = paths.length ? paths.length + ' file' + (paths.length === 1 ? '' : 's') : '';
+      countEl.textContent = paths.length ? String(paths.length) : '';
       if (!paths.length) {
         container.innerHTML = '<div class="empty-hint">No files</div>';
         return;
@@ -137,7 +148,7 @@
       paths.forEach(function (path) {
         var el = document.createElement('div');
         el.className = 'file-item' +
-          (activeFile && activeFile.path === path ? ' active' : '');
+          (activeFile && activeFile.path === path && activeFile.source === 'input' ? ' active' : '');
         var icon = document.createElement('span');
         icon.className = 'icon';
         icon.textContent = iconFor(path);
@@ -150,49 +161,71 @@
         var badge = document.createElement('span');
         badge.className = 'badge';
         var n = findingsForFile(path);
-        var hasOutput = outputFiles[path] != null;
         if (n > 0) {
           badge.classList.add('findings');
           badge.textContent = n + ' issue' + (n === 1 ? '' : 's');
-        } else if (hasOutput) {
-          badge.classList.add('converted');
-          badge.textContent = 'converted';
         } else if (/\.(html?|js)$/i.test(path)) {
           badge.classList.add('clean');
           badge.textContent = 'clean';
-        } else {
-          badge.classList.add('clean');
-          badge.textContent = '';
         }
         if (badge.textContent) el.appendChild(badge);
 
-        el.addEventListener('click', function () { selectFile(path, 'source'); });
+        el.addEventListener('click', function () { selectFile(path, 'input'); });
         container.appendChild(el);
       });
     }
 
-    // --- File selection + Source/Converted toggle -----------------------
-    function selectFile(path, view) {
-      view = view || 'source';
-      activeFile = { path: path, view: view };
-      var content = view === 'converted'
-        ? (outputFiles[path] || '')
-        : (folderFiles[path] || '');
+    function renderOutputList() {
+      var container = document.getElementById('outputList');
+      var countEl = document.getElementById('outputCount');
+      var paths = Object.keys(outputFiles).sort();
+      countEl.textContent = paths.length ? String(paths.length) : '';
+      if (!paths.length) {
+        container.innerHTML = '<div class="empty-hint">Converted files appear here after analysis</div>';
+        return;
+      }
+      container.innerHTML = '';
+      paths.forEach(function (path) {
+        var el = document.createElement('div');
+        el.className = 'file-item' +
+          (activeFile && activeFile.path === path && activeFile.source === 'output' ? ' active' : '');
+        var icon = document.createElement('span');
+        icon.className = 'icon';
+        icon.textContent = iconFor(path);
+        el.appendChild(icon);
+        var name = document.createElement('span');
+        name.className = 'name';
+        name.textContent = path;
+        el.appendChild(name);
+        var badge = document.createElement('span');
+        badge.className = 'badge generated';
+        // A file that exists in both trees was rewritten in
+        // place; one that only exists in output is synthetic
+        // (extracted from a host HTML's inline <script>).
+        badge.textContent = folderFiles[path] != null ? 'converted' : 'generated';
+        el.appendChild(badge);
+        el.addEventListener('click', function () { selectFile(path, 'output'); });
+        container.appendChild(el);
+      });
+    }
+
+    // --- File selection -------------------------------------------------
+    //
+    // `source` disambiguates the same-named path appearing in
+    // both trees. 'input' → editable from folderFiles; 'output'
+    // → read-only from outputFiles.
+    function selectFile(path, source) {
+      source = source || 'input';
+      var map = source === 'output' ? outputFiles : folderFiles;
+      var content = map[path];
+      if (content == null) return;
+      activeFile = { path: path, source: source };
       editor.setValue(content);
       monaco.editor.setModelLanguage(editor.getModel(), langFor(path));
-      editor.updateOptions({ readOnly: view === 'converted' });
+      editor.updateOptions({ readOnly: source === 'output' });
       document.getElementById('editorFilename').textContent =
-        path + (view === 'converted' ? '  (converted)' : '');
-
-      var hasOutput = outputFiles[path] != null;
-      document.getElementById('downloadCurrent').disabled = !hasOutput;
-
-      var btnSrc = document.getElementById('viewOriginal');
-      var btnCvt = document.getElementById('viewConverted');
-      btnSrc.classList.toggle('active', view === 'source');
-      btnCvt.classList.toggle('active', view === 'converted');
-      btnCvt.disabled = !hasOutput;
-
+        (source === 'output' ? '[output] ' : '') + path;
+      document.getElementById('downloadCurrent').disabled = source !== 'output';
       renderFileList();
       updateEditorDecorations();
     }
@@ -203,7 +236,10 @@
       convertAllRunning = true;
       try {
         if (globalThis.__runAllConsumers) {
-          var opts = { accept: currentAcceptSet() };
+          var opts = {
+            accept: currentAcceptSet(),
+            contextUrl: contextUrl || undefined,
+          };
           var all = await globalThis.__runAllConsumers(folderFiles, opts);
           outputFiles         = all.convertedFiles || {};
           taintResults        = all.taint  || { findings: [], summary: { total: 0 } };
@@ -223,15 +259,15 @@
         updateEditorDecorations();
         document.getElementById('downloadAll').disabled = !Object.keys(outputFiles).length;
 
-        // If the active file's converted view was showing but it no
-        // longer has an output, fall back to source.
-        if (activeFile && activeFile.view === 'converted' &&
+        // If the active output file disappeared this cycle,
+        // fall back to the input view for that path.
+        if (activeFile && activeFile.source === 'output' &&
             outputFiles[activeFile.path] == null) {
-          selectFile(activeFile.path, 'source');
-        } else if (activeFile) {
-          // Re-enable the Converted toggle if output appeared.
-          var btnCvt = document.getElementById('viewConverted');
-          btnCvt.disabled = outputFiles[activeFile.path] == null;
+          if (folderFiles[activeFile.path] != null) {
+            selectFile(activeFile.path, 'input');
+          } else {
+            activeFile = null;
+          }
         }
       } finally {
         convertAllRunning = false;
@@ -264,67 +300,6 @@
       document.getElementById('countNetwork').textContent = n;
       document.getElementById('countRejected').textContent = r;
       document.getElementById('countRejected').classList.toggle('high', r > 0);
-    }
-
-    // --- Exploit delivery formatting -----------------------------------
-    //
-    // Turns a finding's `poc` into a reproducer snippet the user
-    // can run. Keyed off the source label (e.g. `url` →
-    // attacker-supplied URL, `postMessage` → postMessage call).
-    // Multi-source flows get one snippet per binding, joined with
-    // newlines.
-    function formatDelivery(sourceLabel, payload) {
-      var json = JSON.stringify(payload);
-      switch (sourceLabel) {
-        case 'url':
-        case 'attacker-input':
-          return '// Deliver as URL — victim visits:\n' +
-                 '// https://target.example/page#' + encodeURIComponent(payload) + '\n' +
-                 '// (or ?q=' + encodeURIComponent(payload) + ')';
-        case 'referrer':
-          return '// Attacker page sets document.referrer to:\n// ' + payload;
-        case 'postMessage':
-          return 'window.postMessage(' + json + ', "*");';
-        case 'persistent-state':
-          return 'localStorage.setItem("key", ' + json + ');\n' +
-                 '// or: document.cookie = "key=" + ' + json + ';';
-        case 'dom-state':
-          return '// Plant in DOM first, e.g.:\n' +
-                 'document.querySelector("#target").textContent = ' + json + ';';
-        case 'ui-interaction':
-          return '// Victim types / pastes / drops:\n// ' + payload;
-        case 'network':
-          return '// Backend responds with:\n// ' + payload;
-        default:
-          return '// ' + (sourceLabel || 'attacker-input') + ' = ' + payload;
-      }
-    }
-
-    function formatExploitDelivery(finding) {
-      var poc = finding.poc;
-      if (!poc || poc.payload == null) return '';
-      var header = '// ' + (finding.severity || '').toUpperCase() + ': ' +
-        finding.sources.join(', ') + ' → ' + finding.sink.prop +
-        (finding.sink.elementTag ? ' on <' + finding.sink.elementTag + '>' : '') +
-        '\n// Attempt: ' + (poc.attempt || 'direct') +
-        (finding.file ? '\n// Site: ' + finding.file +
-          (finding.location && finding.location.line ? ':' + finding.location.line : '') : '') +
-        '\n// Payload: ' + poc.payload + '\n';
-      var bindings = poc.bindings;
-      if (!bindings || Object.keys(bindings).length === 0) {
-        // Single-source direct flow.
-        var label = finding.sources[0] || 'attacker-input';
-        return header + '\n' + formatDelivery(label, poc.payload);
-      }
-      var parts = [header];
-      var keys = Object.keys(bindings);
-      for (var i = 0; i < keys.length; i++) {
-        var k = keys[i];
-        if (k === '__const__') continue;
-        parts.push('\n// Source: ' + k);
-        parts.push(formatDelivery(k, bindings[k]));
-      }
-      return parts.join('\n');
     }
 
     // --- Assumption chips -----------------------------------------------
@@ -376,12 +351,23 @@
         sev.textContent = finding.severity.toUpperCase();
         head.appendChild(sev);
 
-        var flow = document.createElement('span');
-        var sinkLabel = finding.sink.prop +
+        // Build the flow summary from text nodes only — never
+        // innerHTML a sink's elementTag (which arrives as a raw
+        // string like "iframe") or we'll render it as a real
+        // element in our own UI. That was a self-XSS in an
+        // earlier revision.
+        var srcSpan = document.createElement('span');
+        srcSpan.textContent = finding.sources.join(', ');
+        head.appendChild(srcSpan);
+        var arrow = document.createElement('span');
+        arrow.className = 'flow-arrow';
+        arrow.textContent = ' \u2192 ';  // right arrow
+        head.appendChild(arrow);
+        var sinkSpan = document.createElement('span');
+        var sinkText = finding.sink.prop +
           (finding.sink.elementTag ? ' on <' + finding.sink.elementTag + '>' : '');
-        flow.innerHTML = finding.sources.join(', ') +
-          ' <span class="flow-arrow">&rarr;</span> ' + sinkLabel;
-        head.appendChild(flow);
+        sinkSpan.textContent = sinkText;
+        head.appendChild(sinkSpan);
 
         if (finding.poc && finding.poc.verdict) {
           var v = document.createElement('span');
@@ -401,6 +387,7 @@
         el.appendChild(head);
 
         if (finding.poc && finding.poc.payload != null) {
+          // Payload (the value that arrives at the sink).
           var p = document.createElement('div');
           p.className = 'row-payload';
           var lbl = document.createElement('span');
@@ -409,23 +396,61 @@
             (finding.poc.attempt ? ' (' + finding.poc.attempt + ')' : '');
           p.appendChild(lbl);
           p.appendChild(document.createTextNode(finding.poc.payload));
-          var copyBtn = document.createElement('button');
-          copyBtn.className = 'copy-exploit';
-          copyBtn.textContent = 'Copy exploit';
-          copyBtn.addEventListener('click', (function (f) {
-            return function (ev) {
-              ev.stopPropagation();
-              var snippet = formatExploitDelivery(f);
-              navigator.clipboard.writeText(snippet).then(function () {
-                copyBtn.textContent = 'Copied!';
-                setTimeout(function () { copyBtn.textContent = 'Copy exploit'; }, 1200);
-              }, function () {
-                copyBtn.textContent = 'Copy failed';
-              });
-            };
-          })(finding));
-          p.appendChild(copyBtn);
           el.appendChild(p);
+
+          // Reproducer actions: Copy + Show toggle.
+          if (finding.poc.reproducer) {
+            var actions = document.createElement('div');
+            actions.className = 'reproducer-actions';
+            var copyBtn = document.createElement('button');
+            copyBtn.className = 'copy-exploit';
+            copyBtn.textContent = 'Copy PoC';
+            copyBtn.title = 'Copy a runnable JavaScript reproducer to the clipboard';
+            var pre = document.createElement('pre');
+            pre.className = 'reproducer-pre';
+            pre.textContent = finding.poc.reproducer;
+            var showBtn = document.createElement('button');
+            showBtn.className = 'show-reproducer';
+            showBtn.textContent = 'Show PoC';
+            showBtn.addEventListener('click', function (ev) {
+              ev.stopPropagation();
+              var visible = pre.classList.toggle('visible');
+              showBtn.textContent = visible ? 'Hide PoC' : 'Show PoC';
+            });
+            copyBtn.addEventListener('click', (function (repro) {
+              return function (ev) {
+                ev.stopPropagation();
+                navigator.clipboard.writeText(repro).then(function () {
+                  copyBtn.textContent = 'Copied!';
+                  setTimeout(function () { copyBtn.textContent = 'Copy PoC'; }, 1200);
+                }, function () {
+                  copyBtn.textContent = 'Copy failed';
+                });
+              };
+            })(finding.poc.reproducer));
+            actions.appendChild(copyBtn);
+            actions.appendChild(showBtn);
+            el.appendChild(actions);
+            el.appendChild(pre);
+          }
+
+          // Bindings — per-source values Z3 chose. Only shown
+          // when they differ from the payload (i.e. the source
+          // transformed into the payload through some path).
+          if (finding.poc.bindings) {
+            var keys = Object.keys(finding.poc.bindings);
+            var sameAsPayload = keys.length === 1 &&
+              finding.poc.bindings[keys[0]] === finding.poc.payload;
+            if (keys.length > 0 && !sameAsPayload) {
+              var b = document.createElement('div');
+              b.className = 'row-sub';
+              var parts = keys.map(function (k) {
+                return k + ' = ' + JSON.stringify(finding.poc.bindings[k]);
+              });
+              b.textContent = 'attacker sets: ' + parts.join(', ');
+              el.appendChild(b);
+            }
+          }
         } else if (finding.poc && finding.poc.note) {
           var note = document.createElement('div');
           note.className = 'row-sub';
@@ -446,7 +471,7 @@
         (function (fi) {
           el.addEventListener('click', function () {
             if (fi.file && folderFiles[fi.file]) {
-              selectFile(fi.file, 'source');
+              selectFile(fi.file, 'input');
               if (fi.location && fi.location.line) {
                 editor.revealLineInCenter(fi.location.line);
               }
@@ -553,7 +578,7 @@
           (function (lc) {
             el.addEventListener('click', function () {
               if (folderFiles[lc.file]) {
-                selectFile(lc.file, 'source');
+                selectFile(lc.file, 'input');
                 if (lc.line) editor.revealLineInCenter(lc.line);
               }
             });
@@ -602,7 +627,7 @@
         (function (ai) {
           el.addEventListener('click', function () {
             if (ai.location && ai.location.file && folderFiles[ai.location.file]) {
-              selectFile(ai.location.file, 'source');
+              selectFile(ai.location.file, 'input');
               if (ai.location.line) editor.revealLineInCenter(ai.location.line);
             }
           });
@@ -617,9 +642,9 @@
         editorDecorations = editor.deltaDecorations(editorDecorations, []);
         return;
       }
-      if (activeFile.view === 'converted') {
-        // Decorations are keyed to source-file line numbers; the converted
-        // view's line mapping is different, so skip.
+      if (activeFile.source === 'output') {
+        // Decorations are keyed to input-file line numbers; the
+        // converted view's line mapping is different, so skip.
         editorDecorations = editor.deltaDecorations(editorDecorations, []);
         return;
       }
@@ -745,14 +770,18 @@
       })(tabs[ti].dataset.tab));
     }
 
-    // --- View toggle (Source / Converted) -------------------------------
-    document.getElementById('viewOriginal').addEventListener('click', function () {
-      if (activeFile) selectFile(activeFile.path, 'source');
-    });
-    document.getElementById('viewConverted').addEventListener('click', function () {
-      if (activeFile && outputFiles[activeFile.path] != null) {
-        selectFile(activeFile.path, 'converted');
-      }
+    // --- Context URL (PoC target) --------------------------------------
+    var contextUrlInput = document.getElementById('contextUrl');
+    var applyContextBtn = document.getElementById('applyContextUrl');
+    function applyContextUrl() {
+      var v = contextUrlInput.value.trim();
+      if (v === contextUrl) return;
+      contextUrl = v;
+      convertAll();
+    }
+    applyContextBtn.addEventListener('click', applyContextUrl);
+    contextUrlInput.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter') { ev.preventDefault(); applyContextUrl(); }
     });
 
     // --- Open Folder ----------------------------------------------------
@@ -771,7 +800,7 @@
         var first = Object.keys(folderFiles).sort().find(function (n) {
           return /\.html?$/i.test(n);
         });
-        if (first) selectFile(first, 'source');
+        if (first) selectFile(first, 'input');
       } catch (e) {
         if (e.name !== 'AbortError') console.error(e);
       }
@@ -841,7 +870,7 @@
     // --- Auto-reconvert on edit -----------------------------------------
     var reconvertTimer = null;
     editor.onDidChangeModelContent(function () {
-      if (activeFile && activeFile.view === 'source' &&
+      if (activeFile && activeFile.source === 'input' &&
           folderFiles[activeFile.path] !== undefined) {
         folderFiles[activeFile.path] = editor.getValue();
       }
@@ -854,7 +883,7 @@
       if (globalThis.__runAllConsumers) {
         clearInterval(initTimer);
         convertAll();
-        selectFile('example.html', 'source');
+        selectFile('example.html', 'input');
       }
     }, 50);
   });

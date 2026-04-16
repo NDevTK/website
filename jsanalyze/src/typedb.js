@@ -190,6 +190,11 @@ function sinkInfoFromPropDescriptor(desc, propName, elementTag) {
   if (severity === 'safe') return null;
   const out = { type: desc.sink, severity, prop: propName };
   if (elementTag) out.elementTag = elementTag;
+  // `exploit` links this sink to a named entry in
+  // `db.exploits[...]` — the exploit attempts library for
+  // PoC synthesis. Carry it through so the consumer doesn't
+  // need to re-lookup the descriptor.
+  if (desc.exploit) out.exploit = desc.exploit;
   return out;
 }
 

@@ -144,6 +144,7 @@ header .hint { color: #888; font-size: 0.78rem; }
 .sidebar .file-item .badge.unsafe    { background: #e74c3c22; color: #e74c3c; }
 .sidebar .file-item .badge.clean     { background: #2a2e33;   color: #777; }
 .sidebar .file-item .badge.findings  { background: #e74c3c22; color: #e74c3c; }
+.sidebar .file-item .badge.generated { background: #317EFB22; color: #6ea8fe; }
 .sidebar .empty-hint {
   padding: 0.8rem 0.75rem;
   color: #555;
@@ -175,23 +176,6 @@ header .hint { color: #888; font-size: 0.78rem; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.view-toggle {
-  display: inline-flex;
-  border: 1px solid #3a3e44;
-  border-radius: 3px;
-  overflow: hidden;
-}
-.view-toggle button {
-  background: transparent;
-  color: #888;
-  border: 0;
-  padding: 0.15rem 0.55rem;
-  font-size: 0.72rem;
-  cursor: pointer;
-}
-.view-toggle button.active { background: #317EFB; color: #fff; }
-.view-toggle button:disabled { color: #555; cursor: default; }
-
 .editor-container { flex: 1; min-height: 0; }
 
 /* Bottom dock */
@@ -300,8 +284,7 @@ header .hint { color: #888; font-size: 0.78rem; }
   margin-right: 0.35rem;
   font-family: system-ui, sans-serif;
 }
-.copy-exploit {
-  float: right;
+.copy-exploit, .show-reproducer {
   background: #2a2e33;
   color: #aaa;
   border: 1px solid #3a3e44;
@@ -312,7 +295,25 @@ header .hint { color: #888; font-size: 0.78rem; }
   margin-left: 0.4rem;
   font-family: system-ui, sans-serif;
 }
-.copy-exploit:hover { background: #353a41; color: #fff; border-color: #4a4f56; }
+.copy-exploit:hover, .show-reproducer:hover { background: #353a41; color: #fff; border-color: #4a4f56; }
+.reproducer-actions { margin-top: 0.3rem; display: flex; gap: 0.3rem; flex-wrap: wrap; }
+.reproducer-pre {
+  margin-top: 0.3rem;
+  padding: 0.45rem 0.55rem;
+  background: #15181b;
+  border: 1px solid #2a2e33;
+  border-left: 2px solid #2ecc71;
+  border-radius: 2px;
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 0.7rem;
+  color: #d0d4d8;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 240px;
+  overflow-y: auto;
+  display: none;
+}
+.reproducer-pre.visible { display: block; }
 
 .severity {
   font-weight: 600;
@@ -501,6 +502,9 @@ header .hint { color: #888; font-size: 0.78rem; }
     <option value="custom">Custom…</option>
   </select>
   <button id="customAccept" class="secondary" style="display:none;">Choose reasons…</button>
+  <label class="mode-label" for="contextUrl" title="The URL the PoC navigates the victim to. Default https://example.com/.">PoC target:</label>
+  <input id="contextUrl" class="mode-select" type="url" placeholder="https://example.com/" style="width: 200px;" />
+  <button id="applyContextUrl" class="secondary" title="Re-run PoC synthesis against this URL">Apply</button>
   <button id="downloadCurrent" class="secondary" disabled>Download File</button>
   <button id="downloadAll" class="success" disabled>Download All</button>
   <button id="copy" class="secondary">Copy</button>
@@ -529,14 +533,21 @@ header .hint { color: #888; font-size: 0.78rem; }
 
 <div class="main">
 
-  <!-- Left: unified file tree -->
+  <!-- Left: input files + output files -->
   <div class="sidebar">
     <div class="section-header">
-      <span>Files</span>
+      <span>Input Files</span>
       <span id="fileCount" class="count"></span>
     </div>
     <div class="file-list" id="fileList">
       <div class="empty-hint">Open a folder to load files</div>
+    </div>
+    <div class="section-header">
+      <span>Output Files</span>
+      <span id="outputCount" class="count"></span>
+    </div>
+    <div class="file-list" id="outputList">
+      <div class="empty-hint">Converted files appear here after analysis</div>
     </div>
   </div>
 
@@ -545,10 +556,6 @@ header .hint { color: #888; font-size: 0.78rem; }
 
     <div class="editor-bar">
       <span id="editorFilename" class="filename">Open a folder or paste code directly</span>
-      <div class="view-toggle" id="viewToggle">
-        <button id="viewOriginal" class="active">Source</button>
-        <button id="viewConverted" disabled>Converted</button>
-      </div>
     </div>
     <div id="editor" class="editor-container"></div>
 

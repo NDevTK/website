@@ -192,40 +192,70 @@ analyses even when they share some scripts.
 const tr = require('./jsanalyze/consumers/taint-report.js');
 
 const report = await tr.analyze(
-  'var h = location.hash.slice(1); document.body.innerHTML = h;');
+  'var h = location.hash.slice(1); document.body.innerHTML = h;',
+  { contextUrl: 'https://victim.example/page.html' });
 
 for (const flow of report.flows) {
   if (flow.poc && flow.poc.verdict === 'synthesised') {
-    console.log('[' + flow.sink.kind + '] payload:', flow.poc.payload);
-    console.log('  attempt:', flow.poc.attempt);
-    console.log('  bindings:', flow.poc.bindings);
-    // Example:
-    //   [html] payload: <script>alert(1)</script>
-    //     attempt: script-tag
-    //     bindings: { url: '<script>alert(1)</script>' }
+    console.log(flow.poc.reproducer);
+    // (function () {
+    //   // Auto-generated PoC from jsanalyze.
+    //   // Flow: url -> innerHTML (<input>.js:1)
+    //   // Attempt: img-onerror
+    //   // Navigate the victim to the exploit URL:
+    //   window.open("https://victim.example/page.html#<img src=x onerror=alert(1)>");
+    // })();
   }
 }
 ```
 
 `tr.analyze` walks the program (via the engine), then for every
-surviving taint flow conjoins the flow's `pathFormula` with a
-sink-specific exploit constraint on the `valueFormula` and asks
-Z3 for a satisfying model.
+surviving taint flow conjoins the flow's `pathFormula` with an
+exploit constraint on the `valueFormula` and asks Z3 for a
+satisfying model. **All exploit shapes live in the TypeDB as
+pure data** (`typeDB.exploits[...]`): the consumer holds zero
+hardcoded payload strings. Each sink's TypeDB descriptor
+declares an `exploit` code that indexes into the exploits
+table; the table's `attempts` list is tried in order, first
+SAT wins.
 
-**Multiple exploit attempts per sink.** Each sink kind has an
-ordered list of candidate payloads — for `html` the list is
-`<script>`, `<img onerror>`, `<svg onload>`, attribute-breakout,
-style-breakout. The synthesiser tries each in order and returns
-the first that Z3 reports SAT, naming the winning shape in
-`poc.attempt`. Direct attacker-controlled flows with no
-intermediate constraints return the primary payload without a
-solver round-trip.
+**PoC field.** Each `flow.poc` carries:
 
-**Per-source bindings.** `poc.bindings` is a map from source
-label (e.g. `'url'`, `'postMessage'`, `'persistent-state'`) to
-the string Z3 chose for that source. Multi-source flows get one
-binding per source so delivery consumers can format reproducers
-(URL fragments, postMessage calls, storage writes) per source.
+```ts
+{
+  verdict:    'synthesised' | 'trivial' | 'infeasible' | 'unsolvable';
+  payload:    string | null;       // value arriving at the sink
+  attempt:    string | null;       // name of the exploit shape that matched
+  bindings:   { [label]: string }; // what the attacker supplies per source
+  reproducer: string | null;       // runnable JavaScript program
+  note:       string | null;
+}
+```
+
+`reproducer` is a self-contained JavaScript program. Paste into
+a browser console and it opens the victim page at
+`options.contextUrl` (default `https://example.com/`) with the
+URL parts, storage, cookies, postMessages, and other deliveries
+sequenced so the flow fires end-to-end. Multi-source flows get
+one reproducer that wires every source through its declared
+delivery mechanism.
+
+**Source delivery.** Each TypeDB source descriptor declares a
+`delivery` code — `'location-fragment'`, `'postMessage:data'`,
+`'localStorage'`, `'cookie'`, `'referrer'`, `'network-response'`,
+`'file-drop'`, `'clipboard-paste'`, `'history-state'`,
+`'window-name'`. The consumer's default `deliveryEmitters` map
+each to a JS emitter; users can override with
+`options.deliveryEmitters` for custom targets (testing
+harnesses, sandbox deployments, bug bounty PoC format).
+
+**Per-invocation sources.** Event data (`MessageEvent.data`,
+`DragEvent.dataTransfer`, etc.) carries `sourceScope: 'call'` in
+the TypeDB. Two `message` handlers each reading `event.data`
+get INDEPENDENT SMT symbols — so Z3 can solve for distinct
+payloads per handler. Stable sources (`location.*`,
+`localStorage`) keep the default `'page'` scope so two reads
+correlate through one symbol.
 
 **Symbolic operations.** String methods registered with an
 `smtOp` in the TypeDB (`slice`, `substring`, `substr`, `charAt`,
@@ -238,7 +268,8 @@ Unmodelled ops (`trim`, `split`, `toLowerCase`, …) raise an
 drop is visible in strict mode.
 
 **Direct API.** `tr.synthesisePocs(trace, options)` attaches
-PoCs to a pre-built trace without re-analysing.
+PoCs (including `reproducer`) to a pre-built trace without
+re-analysing.
 
 ## Browser integration
 

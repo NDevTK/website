@@ -152,10 +152,14 @@
     var trace = await J.analyze(input, buildAnalyseOptions(options));
     // PoC synthesis lives in the taint-report consumer (D11.1 —
     // exploit shapes are consumer output, not engine knowledge).
-    // Attach witnesses to each flow before the UI reshapes them.
+    // Forward `contextUrl` so the reproducer's `window.open(...)`
+    // targets the right victim page. Defaults are inside the
+    // consumer; we only pass through what the UI set.
     if (J.consumers && J.consumers.taintReport &&
         typeof J.consumers.taintReport.synthesisePocs === 'function') {
-      await J.consumers.taintReport.synthesisePocs(trace, {});
+      await J.consumers.taintReport.synthesisePocs(trace, {
+        contextUrl: options && options.contextUrl,
+      });
     }
     return trace;
   }
@@ -231,21 +235,21 @@
         location: sinkLoc ? { line: sinkLoc.line || 0, col: sinkLoc.col || 0 } : null,
         conditions: conditions,
         assumptions: assumptionsFor(f.assumptionIds, byId),
-        // PoC witness was attached by the taint-report consumer
-        // via analyseAll. Shape:
-        //   { verdict, payload, attempt, bindings, note }
-        // `bindings` is keyed by source label (so the UI can
-        // format per-source delivery snippets for the Copy-
-        // exploit action). `attempt` names which exploit shape
-        // Z3 accepted ('script-tag', 'attr-breakout', 'javascript-url'
-        // etc.). The solver-level `witness` map is dropped on
-        // the wire — consumers only need bindings.
+        // PoC record from the taint-report consumer. Shape:
+        //   { verdict, payload, attempt, bindings, reproducer, note }
+        // `payload` is the value that arrives at the sink.
+        // `bindings` maps each source label to the string the
+        // attacker must supply via that source. `attempt` names
+        // the exploit shape Z3 matched. `reproducer` is
+        // runnable JavaScript — the Copy-exploit button copies
+        // this verbatim.
         poc: f.poc ? {
-          verdict:  f.poc.verdict || null,
-          payload:  f.poc.payload != null ? f.poc.payload : null,
-          attempt:  f.poc.attempt || null,
-          bindings: f.poc.bindings || null,
-          note:     f.poc.note || null,
+          verdict:    f.poc.verdict || null,
+          payload:    f.poc.payload != null ? f.poc.payload : null,
+          attempt:    f.poc.attempt || null,
+          bindings:   f.poc.bindings || null,
+          reproducer: f.poc.reproducer || null,
+          note:       f.poc.note || null,
         } : null,
       });
     }

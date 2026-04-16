@@ -524,72 +524,87 @@ const DEFAULT_TYPE_DB = {
         // Generic Event has no taint-relevant props; subtypes override.
       },
     },
+    // Event types whose source reads carry per-invocation
+    // values get `sourceScope: 'call'`. Two `event.data` reads
+    // in two different `message` handlers MUST receive distinct
+    // SMT symbols — each postMessage delivery is independent.
+    // Without this, Z3 would unsoundly correlate the two.
     MessageEvent: {
       extends: 'Event',
+      sourceScope: 'call',
       props: {
-        data:   { source: 'postMessage' },
-        origin: { source: 'postMessage' },
+        data:   { source: 'postMessage', delivery: 'postMessage:data'   },
+        origin: { source: 'postMessage', delivery: 'postMessage:origin' },
       },
     },
     HashChangeEvent: {
       extends: 'Event',
+      sourceScope: 'call',
       props: {
-        newURL: { source: 'url' },
-        oldURL: { source: 'url' },
+        newURL: { source: 'url', delivery: 'location-href' },
+        oldURL: { source: 'url', delivery: 'location-href' },
       },
     },
     PopStateEvent: {
       extends: 'Event',
+      sourceScope: 'call',
       props: {
-        state: { source: 'url' },
+        state: { source: 'url', delivery: 'history-state' },
       },
     },
     ErrorEvent: {
       extends: 'Event',
+      sourceScope: 'call',
       props: {
-        message:  { source: 'network' },
-        filename: { source: 'url' },
+        message:  { source: 'network', delivery: 'network-response' },
+        filename: { source: 'url',     delivery: 'location-href'     },
       },
     },
     StorageEvent: {
       extends: 'Event',
+      sourceScope: 'call',
       props: {
-        newValue: { source: 'storage' },
-        oldValue: { source: 'storage' },
-        url:      { source: 'url' },
+        newValue: { source: 'storage', delivery: 'localStorage' },
+        oldValue: { source: 'storage', delivery: 'localStorage' },
+        url:      { source: 'url',     delivery: 'location-href' },
       },
     },
     DataTransfer: {
+      sourceScope: 'call',
       props: {
-        files: { source: 'file' },
+        files: { source: 'file', delivery: 'file-drop' },
       },
       methods: {
-        getData: { source: 'dragdrop', returnType: 'String' },
+        getData: { source: 'dragdrop', returnType: 'String', delivery: 'file-drop' },
       },
     },
     DragEvent: {
       extends: 'Event',
+      sourceScope: 'call',
       props: {
         dataTransfer: { readType: 'DataTransfer' },
       },
     },
     ClipboardData: {
+      sourceScope: 'call',
       methods: {
-        getData: { source: 'clipboard', returnType: 'String' },
+        getData: { source: 'clipboard', returnType: 'String', delivery: 'clipboard-paste' },
       },
     },
     ClipboardEvent: {
       extends: 'Event',
+      sourceScope: 'call',
       props: {
         clipboardData: { readType: 'ClipboardData' },
       },
     },
     FileReader: {
       extends: 'EventTarget',
+      sourceScope: 'call',
       props: {
-        result:       { source: 'file' },
-        response:     { source: 'network' },
-        responseText: { source: 'network' },
+        result:       { source: 'file',    delivery: 'file-drop'        },
+        response:     { source: 'network', delivery: 'network-response' },
+        responseText: { source: 'network', delivery: 'network-response' },
       },
     },
     ProgressEvent: {
@@ -610,19 +625,19 @@ const DEFAULT_TYPE_DB = {
       // Location references.
       selfSource: 'url',
       props: {
-        search:   { source: 'url', readType: 'String' },
-        hash:     { source: 'url', readType: 'String' },
-        href:     { source: 'url', readType: 'String', sink: 'navigation' },
-        pathname: { source: 'url', readType: 'String' },
-        host:     { source: 'url', readType: 'String' },
-        hostname: { source: 'url', readType: 'String' },
-        origin:   { source: 'url', readType: 'String' },
-        port:     { source: 'url', readType: 'String' },
-        protocol: { source: 'url', readType: 'String' },
+        search:   { source: 'url', readType: 'String', delivery: 'location-search'   },
+        hash:     { source: 'url', readType: 'String', delivery: 'location-fragment' },
+        href:     { source: 'url', readType: 'String', sink: 'navigation', exploit: 'url-javascript-scheme', delivery: 'location-href' },
+        pathname: { source: 'url', readType: 'String', delivery: 'location-pathname' },
+        host:     { source: 'url', readType: 'String', delivery: 'location-href'     },
+        hostname: { source: 'url', readType: 'String', delivery: 'location-href'     },
+        origin:   { source: 'url', readType: 'String', delivery: 'location-href'     },
+        port:     { source: 'url', readType: 'String', delivery: 'location-href'     },
+        protocol: { source: 'url', readType: 'String', delivery: 'location-href'     },
       },
       methods: {
-        assign:   { args: [{ sink: 'navigation' }] },
-        replace:  { args: [{ sink: 'navigation' }] },
+        assign:   { args: [{ sink: 'navigation', exploit: 'url-javascript-scheme' }] },
+        replace:  { args: [{ sink: 'navigation', exploit: 'url-javascript-scheme' }] },
         reload:   {},
         toString: { source: 'url', returnType: 'String' },
       },
@@ -638,7 +653,7 @@ const DEFAULT_TYPE_DB = {
     },
     Navigation: {
       methods: {
-        navigate: { args: [{ sink: 'navigation' }] },
+        navigate: { args: [{ sink: 'navigation', exploit: 'url-javascript-scheme' }] },
       },
     },
     Storage: {
@@ -647,7 +662,7 @@ const DEFAULT_TYPE_DB = {
       // the legacy TAINT_SOURCES entries for those roots.
       selfSource: 'storage',
       methods: {
-        getItem:    { source: 'storage', returnType: 'String' },
+        getItem:    { source: 'storage', returnType: 'String', delivery: 'localStorage' },
         setItem:    {},
         removeItem: {},
         clear:      {},
@@ -657,11 +672,11 @@ const DEFAULT_TYPE_DB = {
     Document: {
       extends: 'EventTarget',
       props: {
-        URL:         { source: 'url',      readType: 'String' },
-        documentURI: { source: 'url',      readType: 'String' },
-        baseURI:     { source: 'url',      readType: 'String' },
-        cookie:      { source: 'cookie',   readType: 'String' },
-        referrer:    { source: 'referrer', readType: 'String' },
+        URL:         { source: 'url',      readType: 'String', delivery: 'location-href'     },
+        documentURI: { source: 'url',      readType: 'String', delivery: 'location-href'     },
+        baseURI:     { source: 'url',      readType: 'String', delivery: 'location-href'     },
+        cookie:      { source: 'cookie',   readType: 'String', delivery: 'cookie'            },
+        referrer:    { source: 'referrer', readType: 'String', delivery: 'referrer'          },
         domain:      { source: 'referrer', readType: 'String', sink: 'origin' },
         location:    { readType: 'Location' },
         body:        { readType: 'HTMLElement' },
@@ -678,15 +693,18 @@ const DEFAULT_TYPE_DB = {
         getElementsByClassName: { returnType: 'HTMLCollection' },
         querySelector:     { returnType: 'HTMLElement' },
         querySelectorAll:  { returnType: 'NodeList' },
-        write:             { args: [{ sink: 'html' }] },
-        writeln:           { args: [{ sink: 'html' }] },
+        // document.write / writeln: streaming parser DOES execute
+        // script tags in the written chunk — different exec
+        // context from innerHTML.
+        write:   { args: [{ sink: 'html', exploit: 'html-document-write' }] },
+        writeln: { args: [{ sink: 'html', exploit: 'html-document-write' }] },
       },
     },
     Window: {
       extends: 'EventTarget',
       props: {
         location:       { readType: 'Location' },
-        name:           { source: 'window.name', readType: 'String' },
+        name:           { source: 'window.name', readType: 'String', delivery: 'window-name' },
         document:       { readType: 'Document' },
         history:        { readType: 'History' },
         navigation:     { readType: 'Navigation' },
@@ -699,14 +717,14 @@ const DEFAULT_TYPE_DB = {
         frames:         { readType: 'Window' },
       },
       methods: {
-        open: { args: [{ sink: 'navigation', severity: 'medium' }] },
+        open: { args: [{ sink: 'navigation', severity: 'medium', exploit: 'url-javascript-scheme' }] },
         postMessage: {},
         // setTimeout / setInterval: arg 0 is either a string
         // (code sink — unsafe-eval path) OR a callback
         // function. The callback variant needs interprocedural
         // walking so any sink inside the timer body shows up.
-        setTimeout:  { args: [{ sink: 'code' }], callbackArgs: [0] },
-        setInterval: { args: [{ sink: 'code' }], callbackArgs: [0] },
+        setTimeout:  { args: [{ sink: 'code', exploit: 'js-expression' }], callbackArgs: [0] },
+        setInterval: { args: [{ sink: 'code', exploit: 'js-expression' }], callbackArgs: [0] },
         clearTimeout:  {},
         clearInterval: {},
         queueMicrotask: { args: [{}], callbackArgs: [0] },
@@ -738,11 +756,15 @@ const DEFAULT_TYPE_DB = {
     Element: {
       extends: 'Node',
       props: {
-        innerHTML: { sink: 'html' },
-        outerHTML: { sink: 'html' },
+        // innerHTML / outerHTML: HTML5 parser spec says
+        // <script> tags injected here DO NOT execute. We use
+        // the 'html-innerHTML' exploit context whose attempts
+        // are event-handler shapes (img onerror, svg onload).
+        innerHTML: { sink: 'html', exploit: 'html-innerHTML' },
+        outerHTML: { sink: 'html', exploit: 'html-innerHTML' },
       },
       methods: {
-        insertAdjacentHTML: { args: [{}, { sink: 'html' }] },
+        insertAdjacentHTML: { args: [{}, { sink: 'html', exploit: 'html-innerHTML' }] },
         setAttribute: {
           // arg[0] is the attribute name, arg[1] is its value. The
           // per-attr sink classification lives on db.attrSinks so
@@ -771,58 +793,58 @@ const DEFAULT_TYPE_DB = {
     HTMLIFrameElement: {
       extends: 'HTMLElement',
       props: {
-        src:    { sink: 'url' },
-        srcdoc: { sink: 'html' },
+        src:    { sink: 'url',  exploit: 'url-javascript-scheme' },
+        srcdoc: { sink: 'html', exploit: 'html-document-write'   },
       },
     },
     HTMLScriptElement: {
       extends: 'HTMLElement',
       props: {
-        src:         { sink: 'url' },
-        textContent: { sink: 'code' },
-        text:        { sink: 'code' },
-        innerText:   { sink: 'code' },
+        src:         { sink: 'url',  exploit: 'url-script' },
+        textContent: { sink: 'code', exploit: 'js-expression' },
+        text:        { sink: 'code', exploit: 'js-expression' },
+        innerText:   { sink: 'code', exploit: 'js-expression' },
       },
     },
     HTMLEmbedElement: {
       extends: 'HTMLElement',
-      props: { src: { sink: 'url' } },
+      props: { src: { sink: 'url', exploit: 'url-javascript-scheme' } },
     },
     HTMLObjectElement: {
       extends: 'HTMLElement',
-      props: { data: { sink: 'url' } },
+      props: { data: { sink: 'url', exploit: 'url-javascript-scheme' } },
     },
     HTMLFrameElement: {
       extends: 'HTMLElement',
-      props: { src: { sink: 'url' } },
+      props: { src: { sink: 'url', exploit: 'url-javascript-scheme' } },
     },
     HTMLAnchorElement: {
       extends: 'HTMLElement',
-      props: { href: { sink: 'url' } },
+      props: { href: { sink: 'url', exploit: 'url-javascript-scheme' } },
     },
     HTMLAreaElement: {
       extends: 'HTMLElement',
-      props: { href: { sink: 'url' } },
+      props: { href: { sink: 'url', exploit: 'url-javascript-scheme' } },
     },
     HTMLBaseElement: {
       extends: 'HTMLElement',
-      props: { href: { sink: 'url' } },
+      props: { href: { sink: 'url', exploit: 'url-javascript-scheme' } },
     },
     HTMLLinkElement: {
       extends: 'HTMLElement',
-      props: { href: { sink: 'url' } },
+      props: { href: { sink: 'url', exploit: 'url-javascript-scheme' } },
     },
     HTMLFormElement: {
       extends: 'HTMLElement',
-      props: { action: { sink: 'url' } },
+      props: { action: { sink: 'url', exploit: 'url-javascript-scheme' } },
     },
     HTMLInputElement: {
       extends: 'HTMLElement',
-      props: { formAction: { sink: 'url', severity: 'medium' } },
+      props: { formAction: { sink: 'url', severity: 'medium', exploit: 'url-javascript-scheme' } },
     },
     HTMLButtonElement: {
       extends: 'HTMLElement',
-      props: { formAction: { sink: 'url', severity: 'medium' } },
+      props: { formAction: { sink: 'url', severity: 'medium', exploit: 'url-javascript-scheme' } },
     },
     HTMLStyleElement: {
       extends: 'HTMLElement',
@@ -977,11 +999,11 @@ const DEFAULT_TYPE_DB = {
 
     // --- Global callables ---
     GlobalEval: {
-      call: { args: [{ sink: 'code', severity: 'high' }] },
+      call: { args: [{ sink: 'code', severity: 'high', exploit: 'js-expression' }] },
     },
     GlobalFunctionCtor: {
-      construct: { args: [{ sink: 'code', severity: 'high' }, { sink: 'code', severity: 'high' }] },
-      call:      { args: [{ sink: 'code', severity: 'high' }, { sink: 'code', severity: 'high' }] },
+      construct: { args: [{ sink: 'code', severity: 'high', exploit: 'js-expression' }, { sink: 'code', severity: 'high', exploit: 'js-expression' }] },
+      call:      { args: [{ sink: 'code', severity: 'high', exploit: 'js-expression' }, { sink: 'code', severity: 'high', exploit: 'js-expression' }] },
     },
     GlobalSetTimeout: {
       // Arg 0 is either a code-string (sink: 'code') or a
@@ -1289,6 +1311,73 @@ const DEFAULT_TYPE_DB = {
     loadend:      'ProgressEvent',
     loadstart:    'ProgressEvent',
     progress:     'ProgressEvent',
+  },
+
+  // Exploit shape library, keyed by the `exploit` name declared
+  // on sink descriptors. Each entry carries an ordered list of
+  // `attempts`; a taint-report consumer walks the list building
+  // an SMT predicate per attempt and asks Z3 to solve each
+  // against the flow's pathFormula ∧ valueFormula. First SAT
+  // wins, and the attempt's `payload` is the VALUE that arrives
+  // at the sink when the model is realised.
+  //
+  //   trigger — the SMT predicate shape applied to the flow's
+  //             valueFormula. 'contains' / 'equals' / 'prefixof'.
+  //   payload — the string that must appear at the sink.
+  //
+  // Users who want to swap exploit shapes (custom sandbox, new
+  // canary, etc.) replace this table via `options.typeDB` —
+  // no code change needed.
+  exploits: {
+    // innerHTML / outerHTML / insertAdjacentHTML: HTML5 parsing
+    // deliberately refuses to execute <script> tags injected
+    // through these APIs. Attempts use shapes that DO execute:
+    // event handlers on image / svg / iframe elements.
+    'html-innerHTML': {
+      attempts: [
+        { name: 'img-onerror',    trigger: 'contains', payload: '<img src=x onerror=alert(1)>' },
+        { name: 'svg-onload',     trigger: 'contains', payload: '<svg onload=alert(1)>' },
+        { name: 'iframe-srcdoc',  trigger: 'contains', payload: '<iframe srcdoc="<img src=x onerror=alert(1)>"></iframe>' },
+        { name: 'attr-breakout',  trigger: 'contains', payload: '" onerror="alert(1)' },
+      ],
+    },
+    // document.write / writeln: streaming parser; <script> DOES
+    // execute. Script tag is the cleanest reproducer.
+    'html-document-write': {
+      attempts: [
+        { name: 'script-tag',  trigger: 'contains', payload: '<script>alert(1)</script>' },
+        { name: 'img-onerror', trigger: 'contains', payload: '<img src=x onerror=alert(1)>' },
+      ],
+    },
+    // URL-valued sinks (location.href, iframe.src, anchor.href,
+    // window.open, etc.). Browser executes only when the value
+    // STARTS with `javascript:` — so 'equals' is the tightest
+    // constraint. 'data:text/html,...' is a fallback for frames
+    // that disallow javascript:.
+    'url-javascript-scheme': {
+      attempts: [
+        { name: 'javascript-url', trigger: 'equals', payload: 'javascript:alert(1)' },
+        { name: 'data-html',      trigger: 'equals', payload: 'data:text/html,<script>alert(1)</script>' },
+      ],
+    },
+    // script.src loads external JavaScript. The value must be
+    // a URL serving a script with the desired side effect. For
+    // a PoC we point at a data: URL whose body is the payload.
+    'url-script': {
+      attempts: [
+        { name: 'data-script', trigger: 'equals', payload: 'data:text/javascript,alert(1)' },
+      ],
+    },
+    // eval / new Function / setTimeout(string). Value must be
+    // valid JS. 'equals alert(1)' is the tightest constraint;
+    // secondary 'contains ;alert(1);' handles cases where the
+    // value is embedded inside an existing expression.
+    'js-expression': {
+      attempts: [
+        { name: 'alert-canary',  trigger: 'equals',   payload: 'alert(1)' },
+        { name: 'embedded-semi', trigger: 'contains', payload: ';alert(1);' },
+      ],
+    },
   },
 };
 
@@ -13509,19 +13598,61 @@ function getAnalyseFunction() {
 // SHOULD share a sym — that's what makes path-condition
 // correlation work. So the discriminator captures the address,
 // not the call site.
-function allocSourceSym(ctx, label, loc, discriminator, sort) {
+// Labels whose default scope is per-invocation, not per-page.
+// Used only by the formulaForValue fallback path where we don't
+// have the source descriptor on hand (value-formula was lost
+// in a lattice merge). Sources declared with sourceScope='call'
+// in the TypeDB are handled through the normal path.
+const EPHEMERAL_SOURCE_LABELS = new Set([
+  'postMessage', 'file', 'dragdrop', 'clipboard',
+]);
+
+// allocSourceSym — mint or retrieve an SMT symbol for a taint
+// source read.
+//
+// Two source kinds, distinguished by `scope`:
+//
+//   'page'  — stable across the page lifetime. A second read of
+//             `location.hash` in a later statement should
+//             observe the SAME value (the URL doesn't change
+//             mid-handler). Two such reads share the same
+//             symbol so Z3 can correlate them in path
+//             conditions. Key: `label + ':' + discriminator`.
+//
+//   'call'  — ephemeral, tied to a specific invocation. Two
+//             message handlers both reading `event.data` get
+//             DIFFERENT payloads because each postMessage
+//             delivery is a separate event. Keying only by
+//             typeName+propName would unsoundly force the two
+//             symbols to be equal. Solution: include the source
+//             location in the key so each syntactic read site
+//             gets its own symbol. Two reads at the SAME site
+//             (e.g. `event.data` accessed twice in the same
+//             handler body) still share a symbol — that
+//             correlation is within one invocation.
+//
+// Scope is carried by the TypeDB source descriptor's
+// `sourceScope` field and defaulted to `'page'` when absent.
+function allocSourceSym(ctx, label, loc, discriminator, sort, scope) {
   if (!ctx._symCache) ctx._symCache = new Map();
   const disc = discriminator || '';
-  // Address-based key: same source, same address, same sym.
-  // We deliberately ignore the loc.pos so that `location.hash`
-  // read in two different statements still gets the same sym
-  // and downstream branches can correlate them.
-  const key = label + ':' + disc;
+  const s = sort || 'Int';
+  // Per-call scope keys additionally on the instruction's file
+  // + position so each read SITE gets its own symbol across
+  // handler invocations, without spawning a fresh symbol for
+  // every dynamic call (two reads at the same syntactic site
+  // still collide → still correlated, which is the right
+  // behaviour inside one handler body).
+  let key;
+  if (scope === 'call' && loc && (loc.file != null || loc.pos != null)) {
+    key = label + ':' + disc + '@' + (loc.file || '') + ':' + (loc.pos || 0);
+  } else {
+    key = label + ':' + disc;
+  }
   let entry = ctx._symCache.get(key);
   if (entry) return SMT.mkSym(entry.name, entry.sort);
   if (ctx.nextSymId == null) ctx.nextSymId = 1;
   const name = (disc || label) + '_' + (ctx.nextSymId++);
-  const s = sort || 'Int';
   ctx._symCache.set(key, { name, sort: s });
   return SMT.mkSym(name, s);
 }
@@ -13658,6 +13789,13 @@ function emitTaintFlow(ctx, sinkInfo, sinkLoc, value, targetType) {
     sources.push({
       label,
       location: prov[prov.length - 1] || sinkLoc,
+      // `delivery` names the mechanism an attacker uses to
+      // supply a value for this source. Looked up from the
+      // TypeDB by label; used by PoC consumers to emit a
+      // runnable reproducer. Null when no delivery is
+      // declared — the reproducer will fall back to a generic
+      // comment placeholder.
+      delivery: sourceDeliveryForLabel(ctx, label),
     });
   }
   // Flow assumption ids are the union of:
@@ -13705,6 +13843,11 @@ function emitTaintFlow(ctx, sinkInfo, sinkLoc, value, targetType) {
       targetType: targetType || null,
       elementTag: tagName,
       location: sinkLoc,
+      // `exploit` names the attempt library in
+      // `typeDB.exploits[...]` for this sink. Consumers use it
+      // to run sink-appropriate exploit solving without any
+      // hardcoded knowledge about sink kinds.
+      exploit: sinkInfo.exploit || null,
     },
     severity: sinkInfo.severity,
     pathConditions: [],            // legacy human-readable list — unused in B3
@@ -13713,6 +13856,35 @@ function emitTaintFlow(ctx, sinkInfo, sinkLoc, value, targetType) {
     assumptionIds: flowIds,
   };
   ctx.taintFlows.push(flow);
+}
+
+// recordSourceDelivery — called at every source read
+// (GetProp / GetGlobal / resolveCallReturnViaDB) with the
+// SPECIFIC descriptor's delivery code. Stashed on ctx so flow
+// emission can attribute the correct delivery per label.
+//
+// A single label (e.g. 'url') has multiple Location-* deliveries
+// (hash, search, pathname). The last read wins for that label
+// in this analysis — matching the common case where a program
+// reads one URL source and flows it to a sink. Programs that
+// read multiple url sources and combine them into one sink get
+// the delivery of the last-read source; the reproducer covers
+// that case by constructing a URL with whichever part was most
+// recently seen, which is a reasonable (if not perfect) default.
+function recordSourceDelivery(ctx, label, delivery) {
+  if (!ctx || !label || !delivery) return;
+  if (!ctx._deliveryByLabel) ctx._deliveryByLabel = Object.create(null);
+  ctx._deliveryByLabel[label] = delivery;
+}
+
+// sourceDeliveryForLabel — retrieve the delivery recorded at
+// the most recent source read for this label during the
+// current analysis. Returns null when no read carried a
+// declared delivery — the reproducer will fall back to a
+// placeholder comment.
+function sourceDeliveryForLabel(ctx, label) {
+  if (!ctx || !label || !ctx._deliveryByLabel) return null;
+  return ctx._deliveryByLabel[label] || null;
 }
 
 // resolveTagFromType — reverse the TypeDB's tagMap from
@@ -14214,7 +14386,15 @@ function applyGetGlobal(ctx, state, instr) {
       // calls toString on it, but the value at the IR level is
       // not a String yet. Default to Int sort here and let
       // sort upgrades occur naturally on the first comparison.
-      const sym = allocSourceSym(ctx, selfSource, loc, instr.name);
+      // Global roots (e.g. `localStorage`) are page-scoped by
+      // default — two bare reads observe the same object.
+      const scope = typeDesc && typeDesc.sourceScope ? typeDesc.sourceScope : 'page';
+      const sym = allocSourceSym(ctx, selfSource, loc, instr.name, undefined, scope);
+      // Record the delivery declared on the type itself
+      // (e.g. selfSource 'storage' → delivery 'localStorage').
+      if (typeDesc && typeDesc.delivery) {
+        recordSourceDelivery(ctx, selfSource, typeDesc.delivery);
+      }
       const v = D.opaque([assumption.id], typeName, loc, [selfSource]);
       return D.setReg(state, instr.dest, D.withFormula(v, sym));
     }
@@ -14322,17 +14502,38 @@ function propLookupForVariant(ctx, state, obj, instr, loc) {
           merged.add(desc.source);
           resultLabels = Object.freeze(merged);
           chainIds.push(assumption.id);
-          // B2: allocate an SMT symbol for this source read.
-          // The discriminator combines the receiver type and
-          // property name so `location.hash` and `location.search`
-          // get distinct syms; two reads of `location.hash`
-          // anywhere in the program share the same sym (which
-          // is what makes path-condition correlation work). The
-          // sort is derived from `desc.readType` so a String-typed
-          // source produces a String-sorted sym immediately.
+          // Allocate an SMT symbol for this source read. The
+          // discriminator combines the receiver type and prop
+          // name; `location.hash` and `location.search` get
+          // distinct syms. Scope decides whether two reads of
+          // THE SAME property share a sym:
+          //
+          //   'page' (default): YES — `location.hash` is a
+          //     stable per-page value, so correlation is sound.
+          //   'call':           NO — `MessageEvent.data` is
+          //     per-invocation, so each syntactic read site
+          //     gets its own sym (two message handlers reading
+          //     event.data must be independent in Z3 — they
+          //     receive different postMessages).
+          //
+          // The source scope can be declared on the type itself
+          // (`sourceScope` on the type descriptor) or on the
+          // property descriptor. Property-level overrides the
+          // type-level default.
+          const typeDesc = db.types[obj.typeName];
+          const scope = (desc.sourceScope != null ? desc.sourceScope :
+            (typeDesc && typeDesc.sourceScope != null ? typeDesc.sourceScope : 'page'));
           resultFormula = allocSourceSym(ctx, desc.source, loc,
             obj.typeName + '.' + instr.propName,
-            readTypeToSort(desc.readType));
+            readTypeToSort(desc.readType), scope);
+          // Record the delivery declared on this specific
+          // descriptor so flow emission can attribute the
+          // correct delivery mechanism to the source. For
+          // Location.hash this is 'location-fragment'; for
+          // MessageEvent.data it is 'postMessage:data'.
+          if (desc.delivery) {
+            recordSourceDelivery(ctx, desc.source, desc.delivery);
+          }
         }
         // Derived-formula propagation for non-source props (e.g.
         // `.length` on a String). When the prop descriptor names
@@ -16174,7 +16375,15 @@ function formulaForValue(ctx, value, loc) {
     for (const lab of value.labels) {
       const reason = sourceLabelToReason(lab);
       if (reason) {
-        return allocSourceSym(ctx, lab, loc, lab, 'String');
+        // Fix-up allocation for values whose formula was lost
+        // in a lattice merge. Scope lookup: some source labels
+        // are inherently per-invocation (postMessage, file
+        // pick, dragdrop, clipboard). For those, use 'call' so
+        // each recovery site gets its own sym — otherwise we'd
+        // recreate the cross-handler correlation bug at the
+        // fallback path.
+        const scope = EPHEMERAL_SOURCE_LABELS.has(lab) ? 'call' : 'page';
+        return allocSourceSym(ctx, lab, loc, lab, 'String', scope);
       }
     }
   }
@@ -16236,7 +16445,10 @@ function maybeEmitSinkFlowForCall(ctx, instr, thisValue, argValues, loc) {
   if (desc.sink) {
     const severity = desc.severity || TDB.defaultSinkSeverity(desc.sink);
     if (severity !== 'safe') {
-      const sinkInfo = { type: desc.sink, severity, prop: sinkProp };
+      const sinkInfo = {
+        type: desc.sink, severity, prop: sinkProp,
+        exploit: desc.exploit || null,
+      };
       for (const arg of argValues) {
         if (arg && arg.labels && arg.labels.size > 0) {
           emitTaintFlow(ctx, sinkInfo, loc, arg, targetType);
@@ -16257,6 +16469,7 @@ function maybeEmitSinkFlowForCall(ctx, instr, thisValue, argValues, loc) {
         type: argDesc.sink,
         severity,
         prop: sinkProp + '.arg' + i,
+        exploit: argDesc.exploit || null,
       };
       emitTaintFlow(ctx, sinkInfo, loc, arg, targetType);
     }
@@ -16783,6 +16996,11 @@ function sinkInfoFromPropDescriptor(desc, propName, elementTag) {
   if (severity === 'safe') return null;
   const out = { type: desc.sink, severity, prop: propName };
   if (elementTag) out.elementTag = elementTag;
+  // `exploit` links this sink to a named entry in
+  // `db.exploits[...]` — the exploit attempts library for
+  // PoC synthesis. Carry it through so the consumer doesn't
+  // need to re-lookup the descriptor.
+  if (desc.exploit) out.exploit = desc.exploit;
   return out;
 }
 
@@ -20573,39 +20791,40 @@ module.exports = {
   };
 
   __modules["consumers/taint-report.js"] = function (module, exports, require, __id) {
-// taint-report.js — human-friendly taint-flow presentation +
-// PoC witness synthesis.
+// taint-report.js — human-friendly taint-flow presentation and
+// PoC reproducer synthesis.
 //
-// Reads trace.taintFlows and attaches:
+// Reads `trace.taintFlows`, then per flow:
 //
-//   * `poc` — a concrete attacker-input witness for every
-//     surviving flow. Runs the sink-kind exploit constraint
-//     against the flow's pathFormula ∧ valueFormula and calls
-//     Z3.getModel to extract a payload. For flows whose source
-//     value is opaque (the common `location.hash → sink` case
-//     where no symbolic variable exists for the attacker byte),
-//     synthesises a canonical demo payload keyed off the sink
-//     kind — no solver round-trip needed, since the flow is
-//     unconstrained.
+//   * Looks up the attempts library at `typeDB.exploits[sink.exploit]`.
+//     Every payload shape lives in the TypeDB as pure data — the
+//     consumer holds zero hardcoded exploit strings.
 //
-//   * grouping / counts — buckets by source label, sink prop,
-//     severity, and originating file.
+//   * Builds an SMT predicate from each attempt's `trigger`
+//     ('contains' / 'equals' / 'prefixof') applied to the flow's
+//     `valueFormula`, conjoins it with the flow's pathFormula,
+//     and asks Z3 for a model. First SAT wins.
 //
-// PoC synthesis lives here (not in the engine) because exploit
-// shapes are third-party knowledge about XSS / prototype /
-// navigation payloads — exactly the "emit output" work D11.1
-// assigns to consumers. The engine's job stopped when it
-// produced pathFormula + valueFormula.
+//   * Emits a runnable JavaScript program — a PoC — that
+//     orchestrates every source binding through its declared
+//     delivery mechanism (URL construction + navigation for
+//     location-*, postMessage after load for message handlers,
+//     localStorage setItem before navigation, etc.). The PoC is
+//     a string the consumer can paste into a browser console to
+//     demonstrate the flow.
 //
-// Public API:
+// The consumer does NO hardcoded mapping of sink-kind → payload
+// or source-label → delivery. Every choice lives in the TypeDB:
+// swap `options.typeDB` and PoCs come out different.
 //
-//   const tr = require('jsanalyze/consumers/taint-report');
-//   const report = await tr.analyze(input, options?);
-//     // { schemaVersion, flows, grouped, counts, partial, warnings }
-//   const text = tr.render(report, { groupBy: 'source' });
-//   await tr.synthesisePocs(trace, { smtTimeoutMs });
-//     // mutates each flow with `flow.poc = { verdict, payload,
-//     //                                      witness, note }`
+// Options:
+//
+//   contextUrl       — base URL the PoC navigates the victim to.
+//                      Default 'https://example.com/'.
+//   smtTimeoutMs     — per Z3 call.
+//   deliveryEmitters — overrides for per-delivery-code JS
+//                      emitters; consumer-supplied JS that takes
+//                      (value, context) and returns a snippet.
 
 'use strict';
 
@@ -20614,177 +20833,238 @@ const TDB = require('../src/default-typedb.js');
 const SMT = require('../src/smt.js');
 const Z3 = require('../src/z3.js');
 
-// Per-sink exploit attempts. Each sink kind has an ordered list
-// of candidate payloads; when the flow is constrained, the
-// synthesiser tries each attempt against Z3 and keeps the first
-// that comes back SAT. For unconstrained direct flows, the
-// primary (first) attempt is returned verbatim.
-//
-// Multiple attempts matter because a single-shape exploit misses
-// injection contexts that require different breakouts:
-//
-//   html       — primary: a full <script> element. Alternates
-//                cover attribute context (' onerror=…'), style
-//                break-out ('</style>…'), and comment break-out
-//                ('-->…') — in case Z3 needs a specific shape to
-//                satisfy path constraints.
-//   navigation — javascript: URL, then a data:text/html URL as
-//                a fallback for frames that disallow the former.
-//   url        — same as navigation, suitable for iframe src.
-//   code       — an alert(1) canary; no real alternates needed
-//                (the body is free-form JS).
-const EXPLOIT_ATTEMPTS = {
-  html: [
-    { name: 'script-tag',    payload: '<script>alert(1)</script>' },
-    { name: 'img-onerror',   payload: '<img src=x onerror=alert(1)>' },
-    { name: 'svg-onload',    payload: '<svg onload=alert(1)>' },
-    { name: 'attr-breakout', payload: '" onerror="alert(1)' },
-    { name: 'style-breakout', payload: '</style><script>alert(1)</script>' },
-  ],
-  navigation: [
-    { name: 'javascript-url', payload: 'javascript:alert(1)' },
-    { name: 'data-html',      payload: 'data:text/html,<script>alert(1)</script>' },
-  ],
-  url: [
-    { name: 'javascript-url', payload: 'javascript:alert(1)' },
-    { name: 'data-html',      payload: 'data:text/html,<script>alert(1)</script>' },
-  ],
-  code: [
-    { name: 'alert-canary',   payload: 'alert(1)' },
-  ],
+// Trigger predicates: map TypeDB trigger-name → SMT helper.
+// The ONLY hardcoded knowledge in this consumer. These are
+// mathematical primitives of the string theory Z3 implements
+// — no user-facing choices encoded here.
+const TRIGGERS = {
+  contains: (val, payload) => SMT.mkContains(val, SMT.mkConst(payload)),
+  equals:   (val, payload) => SMT.mkCmp('===', val, SMT.mkConst(payload)),
+  prefixof: (val, payload) => SMT.mkPrefixOf(SMT.mkConst(payload), val),
+  suffixof: (val, payload) => SMT.mkSuffixOf(SMT.mkConst(payload), val),
 };
 
-function buildExploitConstraint(val, payload) {
-  return SMT.mkContains(val, SMT.mkConst(payload));
+// Default per-delivery JS emitters. Each takes (value, ctx) —
+// `value` is the string the attacker must supply at this
+// source, `ctx` is the accumulated PoC-build context
+// ({ contextUrl, target, seen, parts, ... }). Emitters may
+// return either:
+//   * a string (inline snippet), or
+//   * { setup, navigate, postload } for staged delivery
+//     (setup runs synchronously, navigate opens the victim,
+//     postload runs after `load` fires on the opened window).
+//
+// Consumers can override by passing `options.deliveryEmitters`;
+// unknown delivery codes fall through to a generic placeholder.
+const DEFAULT_DELIVERY_EMITTERS = {
+  'location-fragment': (value) => ({
+    urlHash: value,
+  }),
+  'location-search': (value) => ({
+    urlSearch: value,
+  }),
+  'location-pathname': (value) => ({
+    urlPath: value,
+  }),
+  'location-href': (value) => ({
+    urlFull: value,
+  }),
+  'postMessage:data': (value) => ({
+    postload: [
+      '  w.postMessage(' + jsRepr(value) + ', "*");',
+    ],
+  }),
+  'postMessage:origin': () => ({
+    // The attacker can't choose origin — it's determined by
+    // where the postMessage call is made from. Emit a note
+    // rather than an inert snippet.
+    note: '// NOTE: the flow requires a specific `event.origin`. ' +
+          'Host the PoC on that origin (or use an iframe/popup ' +
+          'from it) so `window.postMessage(..., "*")` delivers ' +
+          'the expected origin.',
+  }),
+  'localStorage': (value, ctx) => ({
+    setup: [
+      'localStorage.setItem(' + jsRepr(ctx.storageKey || 'key') + ', ' + jsRepr(value) + ');',
+    ],
+  }),
+  'cookie': (value, ctx) => ({
+    setup: [
+      'document.cookie = ' + jsRepr((ctx.cookieKey || 'key') + '=' + value) + ';',
+    ],
+  }),
+  'window-name': (value) => ({
+    // `window.name` survives navigation; set on opener before
+    // calling window.open.
+    preopen: [
+      'w.name = ' + jsRepr(value) + ';',
+    ],
+  }),
+  'referrer': () => ({
+    note: '// NOTE: the flow reads `document.referrer`. Host the ' +
+          'PoC page on the origin you want reported as referrer ' +
+          'and link (<a href>, Location header, etc.) to the ' +
+          'target URL below.',
+  }),
+  'network-response': (value, ctx) => ({
+    note: '// NOTE: the flow requires a specific network response ' +
+          'body. Stand up a service worker or mock server ' +
+          'returning ' + jsRepr(value) + ' for the relevant fetch.',
+  }),
+  'file-drop': (value) => ({
+    note: '// NOTE: the flow reads file/dataTransfer content. ' +
+          'Attacker must lure the victim to drop a file whose ' +
+          'content is:\n//   ' + value.replace(/\n/g, '\n//   '),
+  }),
+  'clipboard-paste': (value) => ({
+    note: '// NOTE: the flow reads clipboard data. Attacker must ' +
+          'lure the victim to paste the following text:\n//   ' +
+          value.replace(/\n/g, '\n//   '),
+  }),
+  'history-state': (value) => ({
+    setup: [
+      'history.pushState(' + jsRepr(value) + ', "");',
+    ],
+  }),
+};
+
+function jsRepr(v) {
+  return JSON.stringify(v);
 }
 
-// Extract the primary payload and per-symbol bindings from a Z3
-// witness map. A witness has one binding per declared symbol in
-// the formula; for PoC purposes we care about the string-sorted
-// ones (those are the attacker-visible source values). The
-// primary payload is picked by the selector, which falls back to
-// the first string binding.
-function extractWitness(witness, primarySelector) {
-  if (!witness) return { payload: null, bindings: {} };
-  const keys = Object.keys(witness);
-  const bindings = {};
-  for (const k of keys) bindings[k] = witness[k];
-  let payload = null;
-  if (primarySelector) payload = primarySelector(bindings);
-  if (payload == null) {
-    for (const k of keys) {
-      if (typeof witness[k] === 'string') { payload = witness[k]; break; }
-    }
+// Map a Z3 witness symbol name back to its source descriptor.
+// Sym names are constructed by `allocSourceSym` as
+// `discriminator + '_' + counter`, where discriminator is
+// typically `typeName + '.' + propName` (e.g. `Location.hash_1`)
+// or the source label itself for ephemeral-fallback syms.
+//
+// To map back, we strip the numeric suffix and try to match
+// against the flow's declared sources. When ambiguous, we fall
+// through to generic naming.
+function resolveSymbolToSource(symName, flow) {
+  if (!symName) return null;
+  const m = symName.match(/^(.*)_\d+$/);
+  const stem = m ? m[1] : symName;
+  const sources = (flow && flow.source) || [];
+  // Exact discriminator match (e.g. `Location.hash` vs source at
+  // Location.hash). Try (typeName.propName) style first.
+  for (const s of sources) {
+    if (stem === s.discriminator) return s;
   }
-  if (payload == null && keys.length > 0) payload = JSON.stringify(bindings);
-  return { payload, bindings };
+  // Match by label (symName stem === label, e.g. ephemeral-
+  // fallback syms whose stem IS the label).
+  for (const s of sources) {
+    if (stem === s.label) return s;
+  }
+  return null;
 }
 
-async function synthesisePocForFlow(flow, timeoutMs) {
+async function synthesisePocForFlow(flow, db, options) {
+  const timeoutMs = options.smtTimeoutMs != null ? options.smtTimeoutMs : 5000;
   const val = flow.valueFormula;
 
-  // Trivial: the value is a concrete source literal. Report
-  // the literal as the payload without touching Z3.
+  // Concrete-literal flow: no solving needed.
   if (val && val.value && typeof val.value.val === 'string') {
     return {
       verdict: 'trivial',
       payload: val.value.val,
-      bindings: { __const__: val.value.val },
-      witness: { __const__: val.value.val },
+      bindings: buildDirectBindings(flow, val.value.val),
       attempt: 'concrete',
+      witness: { __const__: val.value.val },
       note: null,
     };
   }
 
-  const sinkKind = flow.sink && flow.sink.kind;
-  const attempts = EXPLOIT_ATTEMPTS[sinkKind];
+  // Look up exploit attempts from the TypeDB.
+  const exploitName = flow.sink && flow.sink.exploit;
+  const exploitDesc = exploitName && db && db.exploits && db.exploits[exploitName];
+  const attempts = (exploitDesc && exploitDesc.attempts) || null;
 
   if (!attempts || attempts.length === 0) {
     return {
       verdict: 'unsolvable',
       payload: null,
       bindings: {},
+      attempt: null,
       witness: null,
-      note: 'no exploit shape registered for sink kind "' + sinkKind + '"',
+      note: exploitName
+        ? 'no exploit attempts declared for `' + exploitName + '` in typeDB.exploits'
+        : 'sink has no `exploit` tag — TypeDB needs an exploit name to drive PoC synthesis',
     };
   }
 
-  // Direct attacker-controlled flow with no intermediate
-  // constraints: pathFormula is null AND valueFormula is null.
-  // The attacker picks the source bytes directly, so the
-  // primary attempt's payload IS the witness.
+  // Direct attacker-controlled flow (no path / no symbolic
+  // value). The attacker supplies the source bytes directly,
+  // so the first attempt's payload IS the sink-arriving value.
   if (!flow.pathFormula && !val) {
     const primary = attempts[0];
     return {
       verdict: 'synthesised',
       payload: primary.payload,
       bindings: buildDirectBindings(flow, primary.payload),
-      witness: null,
       attempt: primary.name,
-      note: 'direct attacker-controlled flow; set ' +
-        describeSource(flow) + ' to the payload above',
+      witness: null,
+      note: 'direct attacker-controlled flow; attacker-supplied ' +
+        'source value equals the sink-arriving payload',
     };
   }
 
-  // Constrained flow: try each exploit attempt in order.
-  // First one SAT wins. If all UNSAT, report infeasible.
+  // Constrained flow: try each attempt. Conjoin
+  // pathFormula ∧ trigger(valueFormula, payload). First SAT
+  // wins; the attempt's payload is the value arriving at the
+  // sink, Z3's witness is per-source-symbol attacker input.
   const basePath = flow.pathFormula || null;
-  let lastVerdict = 'infeasible';
-  let lastNote = 'path condition + exploit constraint is UNSAT';
+  const notes = [];
   for (const attempt of attempts) {
+    const trig = TRIGGERS[attempt.trigger];
+    if (!trig) {
+      notes.push(attempt.name + ': unknown trigger `' + attempt.trigger + '`');
+      continue;
+    }
     let formula = basePath;
     let exploited = false;
     if (val) {
-      const c = buildExploitConstraint(val, attempt.payload);
+      const c = trig(val, attempt.payload);
       if (c) {
         formula = formula ? SMT.mkAnd(formula, c) : c;
         exploited = true;
       }
     }
     if (!formula) {
-      // No constraint at all — same as direct flow.
       return {
         verdict: 'synthesised',
         payload: attempt.payload,
         bindings: buildDirectBindings(flow, attempt.payload),
-        witness: null,
         attempt: attempt.name,
-        note: 'unconstrained path; set ' + describeSource(flow) +
-          ' to the payload above',
+        witness: null,
+        note: 'path and value are unconstrained; direct delivery',
       };
     }
     const witness = await Z3.getModel(formula, timeoutMs);
     if (witness === null) {
-      lastVerdict = exploited ? 'infeasible' : 'unsolvable';
-      lastNote = exploited
-        ? 'path condition + exploit constraint (' + attempt.name + ') is UNSAT'
-        : 'Z3 returned unknown (timeout or unhandled theory)';
+      notes.push(attempt.name + ': UNSAT');
       continue;
     }
-    const { payload, bindings } = extractWitness(witness);
     return {
-      verdict: exploited ? 'synthesised' : 'no-constraint',
-      payload: payload || attempt.payload,
-      bindings,
-      witness,
+      verdict: 'synthesised',
+      payload: attempt.payload,           // value at the sink
+      bindings: witnessToBindings(witness, flow),
       attempt: attempt.name,
+      witness,
       note: null,
     };
   }
+
   return {
-    verdict: lastVerdict,
+    verdict: 'infeasible',
     payload: null,
     bindings: {},
+    attempt: null,
     witness: null,
-    note: lastNote + ' (tried ' + attempts.length + ' exploit shape' +
-      (attempts.length === 1 ? '' : 's') + ')',
+    note: 'all ' + attempts.length + ' exploit attempts UNSAT: ' + notes.join('; '),
   };
 }
 
-// Produce a "bindings" map for direct attacker-controlled flows,
-// keyed by source label. Makes downstream delivery (see UI's
-// "Copy exploit" button) a 1:1 mapping from source label to the
-// string the attacker should supply.
 function buildDirectBindings(flow, payload) {
   const out = {};
   const sources = flow.source || [];
@@ -20799,33 +21079,167 @@ function buildDirectBindings(flow, payload) {
   return out;
 }
 
-function describeSource(flow) {
-  const sources = flow.source || [];
-  if (sources.length === 0) return 'the attacker-controlled input';
-  const labels = sources.map((s) => s.label).filter(Boolean);
-  if (labels.length === 0) return 'the attacker-controlled input';
-  return '`' + labels.join(' / ') + '`';
+function witnessToBindings(witness, flow) {
+  const bindings = {};
+  if (!witness) return bindings;
+  const sources = flow && flow.source ? flow.source : [];
+  const syms = Object.keys(witness);
+  if (syms.length === 0) return bindings;
+  // If there's one sym and one source, map directly.
+  if (sources.length === 1 && syms.length === 1) {
+    bindings[sources[0].label || 'attacker-input'] = witness[syms[0]];
+    return bindings;
+  }
+  // Otherwise attempt to match sym stem → source label/discriminator.
+  for (const sym of syms) {
+    const matched = resolveSymbolToSource(sym, flow);
+    if (matched) {
+      bindings[matched.label || sym] = witness[sym];
+    } else {
+      bindings[sym] = witness[sym];
+    }
+  }
+  return bindings;
 }
+
+// --- Reproducer emission ---------------------------------------------------
+
+function resolveDelivery(label, flow) {
+  const sources = (flow && flow.source) || [];
+  for (const s of sources) {
+    if (s.label === label && s.delivery) return s.delivery;
+  }
+  return null;
+}
+
+function buildReproducer(flow, pocRecord, db, options) {
+  if (!pocRecord || pocRecord.payload == null) return null;
+  const emitters = Object.assign({}, DEFAULT_DELIVERY_EMITTERS,
+    options.deliveryEmitters || {});
+  const contextUrl = options.contextUrl || 'https://example.com/';
+
+  const setup    = [];
+  const preopen  = [];
+  const postload = [];
+  const notes    = [];
+  let urlHash     = null;
+  let urlSearch   = null;
+  let urlPath     = null;
+  let urlFull     = null;
+
+  for (const label in pocRecord.bindings) {
+    const value = pocRecord.bindings[label];
+    const deliveryCode = resolveDelivery(label, flow);
+    if (!deliveryCode) {
+      notes.push('// delivery unknown for source `' + label +
+        '`: attacker must supply ' + jsRepr(value));
+      continue;
+    }
+    const emit = emitters[deliveryCode];
+    if (!emit) {
+      notes.push('// no emitter for delivery `' + deliveryCode +
+        '` (source `' + label + '`); value = ' + jsRepr(value));
+      continue;
+    }
+    const result = emit(value, { contextUrl });
+    if (typeof result === 'string') {
+      setup.push(result);
+      continue;
+    }
+    if (!result) continue;
+    if (result.urlHash   != null) urlHash   = result.urlHash;
+    if (result.urlSearch != null) urlSearch = result.urlSearch;
+    if (result.urlPath   != null) urlPath   = result.urlPath;
+    if (result.urlFull   != null) urlFull   = result.urlFull;
+    if (result.setup)    for (const s of result.setup)    setup.push(s);
+    if (result.preopen)  for (const s of result.preopen)  preopen.push(s);
+    if (result.postload) for (const s of result.postload) postload.push(s);
+    if (result.note) notes.push(result.note);
+  }
+
+  // Build the victim URL.
+  let url;
+  if (urlFull != null) {
+    url = urlFull;
+  } else {
+    url = contextUrl;
+    if (urlPath) {
+      // Path override: replace the context URL's path.
+      url = url.replace(/\/[^?#]*(?=($|[?#]))/, '/' + urlPath.replace(/^\//, ''));
+    }
+    if (urlSearch) {
+      url += (url.indexOf('?') >= 0 ? '&' : '?') + urlSearch.replace(/^\?/, '');
+    }
+    if (urlHash) {
+      url += '#' + urlHash.replace(/^#/, '');
+    }
+  }
+
+  const body = [];
+  body.push('(function () {');
+  body.push('  // Auto-generated PoC from jsanalyze.');
+  body.push('  // Flow: ' + describeFlow(flow));
+  body.push('  // Attempt: ' + (pocRecord.attempt || 'direct'));
+  if (notes.length) {
+    for (const n of notes) body.push('  ' + n.split('\n').join('\n  '));
+  }
+  if (setup.length) {
+    body.push('  // Synchronous setup (storage / cookies / state):');
+    for (const s of setup) body.push('  ' + s);
+  }
+  const needsOpener = preopen.length > 0 || postload.length > 0;
+  if (needsOpener) {
+    body.push('  var w = window.open(' + jsRepr(url) + ');');
+    if (preopen.length) {
+      for (const s of preopen) body.push(s);
+    }
+    if (postload.length) {
+      body.push('  // Wait for the victim page to load before');
+      body.push('  // delivering post-load inputs (postMessage etc.).');
+      body.push('  w.addEventListener("load", function () {');
+      for (const s of postload) body.push(s);
+      body.push('  });');
+    }
+  } else {
+    body.push('  // Navigate the victim to the exploit URL:');
+    body.push('  window.open(' + jsRepr(url) + ');');
+  }
+  body.push('})();');
+  return body.join('\n');
+}
+
+function describeFlow(flow) {
+  const srcs = (flow.source || []).map(s => s.label).join(', ');
+  const sinkLabel = flow.sink.prop +
+    (flow.sink.elementTag ? ' on <' + flow.sink.elementTag + '>' : '');
+  return srcs + ' -> ' + sinkLabel +
+    (flow.sink.location && flow.sink.location.file
+      ? ' (' + flow.sink.location.file +
+        (flow.sink.location.line ? ':' + flow.sink.location.line : '') + ')'
+      : '');
+}
+
+// --- Public API -----------------------------------------------------------
 
 async function synthesisePocs(trace, options) {
   options = options || {};
-  const timeoutMs = options.smtTimeoutMs != null ? options.smtTimeoutMs : 5000;
+  const db = options.typeDB || TDB;
   if (!trace || !trace.taintFlows || trace.taintFlows.length === 0) {
     return trace;
   }
   for (const flow of trace.taintFlows) {
-    // Per-flow isolation: a Z3 parse error or theory mismatch on
-    // one flow (e.g. the vendored solver not supporting a string
-    // op we emitted) shouldn't take down witness generation for
-    // the other flows. Record the failure as `unsolvable` with
-    // the error note so the UI can surface it.
     try {
-      flow.poc = await synthesisePocForFlow(flow, timeoutMs);
+      const rec = await synthesisePocForFlow(flow, db, options);
+      rec.reproducer = buildReproducer(flow, rec, db, options);
+      flow.poc = rec;
     } catch (err) {
       flow.poc = {
         verdict: 'unsolvable',
         payload: null,
+        bindings: {},
+        attempt: null,
         witness: null,
+        reproducer: null,
         note: 'synthesis threw: ' +
           (err && err.message ? err.message : String(err)),
       };
@@ -20914,18 +21328,7 @@ function render(report, opts) {
         const loc = f.sink && f.sink.location;
         const poc = f.poc && f.poc.payload != null ? '  payload: ' + f.poc.payload : '';
         lines.push('    ' + (loc ? loc.file + ':' + loc.line : '?') +
-          '  →  ' + ((f.sink && f.sink.prop) || '?') + poc);
-      }
-    }
-  } else if (groupBy === 'sink') {
-    for (const sink of Object.keys(report.grouped.bySink).sort()) {
-      lines.push('');
-      lines.push('  sink: ' + sink + ' (' + report.grouped.bySink[sink].length + ')');
-      for (const f of report.grouped.bySink[sink]) {
-        const loc = f.sink && f.sink.location;
-        const srcs = (f.source || []).map(s => s.label).join('+');
-        lines.push('    ' + (loc ? loc.file + ':' + loc.line : '?') +
-          '  from ' + srcs);
+          '  ->  ' + ((f.sink && f.sink.prop) || '?') + poc);
       }
     }
   }
@@ -20936,6 +21339,7 @@ module.exports = {
   analyze: analyzeReport,
   render,
   synthesisePocs,
+  buildReproducer,
 };
 
   };

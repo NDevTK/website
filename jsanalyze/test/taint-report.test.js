@@ -10,7 +10,7 @@ const { assert, assertEqual } = require('./run.js');
 
 const tests = [
   {
-    name: 'taint-report: direct location.hash → innerHTML synthesises a demo html payload',
+    name: 'taint-report: direct location.hash → innerHTML synthesises an executing html payload',
     fn: async () => {
       const report = await tr.analyze(
         'document.body.innerHTML = location.hash;');
@@ -19,7 +19,14 @@ const tests = [
       assert(flow, 'html-sink flow present');
       assert(flow.poc, 'flow has poc');
       assertEqual(flow.poc.verdict, 'synthesised');
-      assertEqual(flow.poc.payload, '<script>alert(1)</script>');
+      // innerHTML does NOT execute <script> tags per HTML5
+      // spec; the primary exploit for this context is an
+      // event-handler payload.
+      assertEqual(flow.poc.payload, '<img src=x onerror=alert(1)>');
+      // Reproducer is JavaScript that navigates the victim.
+      assert(typeof flow.poc.reproducer === 'string' &&
+        flow.poc.reproducer.indexOf('window.open') >= 0,
+        'reproducer is runnable JS that navigates the victim');
     },
   },
   {
@@ -88,16 +95,21 @@ const tests = [
       const flow = report.flows.find(f => f.sink && f.sink.kind === 'html');
       assert(flow, 'html flow present for slice-stripped hash');
       assert(flow.poc, 'flow has poc');
-      // Either Z3 finds a symbolic witness that contains the demo,
-      // or the fallback direct-flow demo payload fires. Both are
-      // valid "synthesised" outcomes; we reject `no-constraint`
-      // / `unsolvable` because Phase A-2 should have given the
-      // flow a valueFormula.
       assert(flow.poc.verdict === 'synthesised' || flow.poc.verdict === 'trivial',
         'expected synthesised/trivial, got ' + flow.poc.verdict +
         ' (' + (flow.poc.note || '') + ')');
-      assert(flow.poc.payload && flow.poc.payload.indexOf('<script>') >= 0,
-        'payload contains <script>, got: ' + flow.poc.payload);
+      // Payload is the VALUE AT THE SINK (an executing shape)
+      // — not the source-supplied bytes. For innerHTML that's
+      // an event-handler payload.
+      assert(flow.poc.payload && flow.poc.payload.indexOf('onerror') >= 0,
+        'payload contains onerror, got: ' + flow.poc.payload);
+      // bindings maps each attacker-controlled source to the
+      // bytes the attacker must supply (witness-derived for
+      // constrained flows).
+      assert(flow.poc.bindings && Object.keys(flow.poc.bindings).length > 0,
+        'bindings populated');
+      assert(typeof flow.poc.reproducer === 'string',
+        'runnable reproducer present');
     },
   },
   {
@@ -122,6 +134,74 @@ const tests = [
       assert(flow.poc.verdict === 'synthesised' || flow.poc.verdict === 'trivial',
         'expected synthesised, got ' + flow.poc.verdict +
         ' (' + (flow.poc.note || '') + ')');
+    },
+  },
+  {
+    name: 'taint-report: PoC reproducer is runnable JavaScript targeting options.contextUrl',
+    fn: async () => {
+      const report = await tr.analyze(
+        'document.body.innerHTML = location.hash;',
+        { contextUrl: 'https://victim.example/page.html' });
+      const flow = report.flows.find(f => f.sink && f.sink.kind === 'html');
+      assert(flow, 'html flow present');
+      assert(flow.poc.reproducer, 'reproducer present');
+      const repro = flow.poc.reproducer;
+      // Reproducer includes the user-supplied contextUrl.
+      assert(repro.indexOf('https://victim.example/page.html') >= 0,
+        'reproducer targets contextUrl');
+      // The executing payload appears in the URL (fragment).
+      assert(repro.indexOf('onerror=alert(1)') >= 0,
+        'reproducer URL carries the executing payload');
+      // Valid JS — this parses without throwing.
+      new Function(repro);
+    },
+  },
+  {
+    name: 'taint-report: eval(postMessage.data) emits postMessage delivery in reproducer',
+    fn: async () => {
+      const report = await tr.analyze(
+        'window.addEventListener("message", function(ev){ eval(ev.data); });',
+        { contextUrl: 'https://target.example/' });
+      const flow = report.flows.find(f => f.sink && f.sink.kind === 'code');
+      assert(flow, 'code flow present');
+      assert(flow.poc.reproducer, 'reproducer present');
+      const repro = flow.poc.reproducer;
+      // Delivery for postMessage sources is window.open + postload
+      // postMessage on the load event.
+      assert(repro.indexOf('window.open') >= 0,
+        'reproducer opens the victim window');
+      assert(repro.indexOf('.postMessage(') >= 0,
+        'reproducer delivers a postMessage');
+      assert(repro.indexOf('alert(1)') >= 0,
+        'reproducer payload is alert(1)');
+      // Parse-valid.
+      new Function(repro);
+    },
+  },
+  {
+    name: 'taint-report: two message handlers emit two independent flows with per-invocation symbols',
+    fn: async () => {
+      const trace = await tr.analyze(
+        'window.addEventListener("message", function(a){ eval(a.data); });\n' +
+        'window.addEventListener("message", function(b){ location.href = b.data; });\n'
+      );
+      const flows = trace.flows;
+      const codeFlow = flows.find(f => f.sink && f.sink.kind === 'code');
+      const navFlow  = flows.find(f => f.sink && f.sink.kind === 'navigation');
+      assert(codeFlow && navFlow, 'both flows present (code + navigation)');
+      // Per-invocation symbols: each handler's `event.data`
+      // read gets its own sym, so the two flows' value
+      // formulas (if any) reference distinct variables.
+      if (codeFlow.valueFormula && navFlow.valueFormula) {
+        const codeSorts = Object.keys(codeFlow.valueFormula.sorts || {});
+        const navSorts  = Object.keys(navFlow.valueFormula.sorts || {});
+        // Symbols in each formula's sort table shouldn't
+        // overlap when both are per-invocation.
+        const shared = codeSorts.filter(s => navSorts.indexOf(s) >= 0);
+        assert(shared.length === 0,
+          'per-invocation symbols must not overlap between handlers; shared: ' +
+          shared.join(','));
+      }
     },
   },
 ];

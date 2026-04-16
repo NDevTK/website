@@ -1,36 +1,37 @@
-// taint-report.js — human-friendly taint-flow presentation +
-// PoC witness synthesis.
+// taint-report.js — human-friendly taint-flow presentation and
+// PoC reproducer synthesis.
 //
-// Reads trace.taintFlows and attaches:
+// Reads `trace.taintFlows`, then per flow:
 //
-//   * `poc` — a concrete attacker-input witness for every
-//     surviving flow. Runs the sink-kind exploit constraint
-//     against the flow's pathFormula ∧ valueFormula and calls
-//     Z3.getModel to extract a payload. For flows whose source
-//     value is opaque (the common `location.hash → sink` case
-//     where no symbolic variable exists for the attacker byte),
-//     synthesises a canonical demo payload keyed off the sink
-//     kind — no solver round-trip needed, since the flow is
-//     unconstrained.
+//   * Looks up the attempts library at `typeDB.exploits[sink.exploit]`.
+//     Every payload shape lives in the TypeDB as pure data — the
+//     consumer holds zero hardcoded exploit strings.
 //
-//   * grouping / counts — buckets by source label, sink prop,
-//     severity, and originating file.
+//   * Builds an SMT predicate from each attempt's `trigger`
+//     ('contains' / 'equals' / 'prefixof') applied to the flow's
+//     `valueFormula`, conjoins it with the flow's pathFormula,
+//     and asks Z3 for a model. First SAT wins.
 //
-// PoC synthesis lives here (not in the engine) because exploit
-// shapes are third-party knowledge about XSS / prototype /
-// navigation payloads — exactly the "emit output" work D11.1
-// assigns to consumers. The engine's job stopped when it
-// produced pathFormula + valueFormula.
+//   * Emits a runnable JavaScript program — a PoC — that
+//     orchestrates every source binding through its declared
+//     delivery mechanism (URL construction + navigation for
+//     location-*, postMessage after load for message handlers,
+//     localStorage setItem before navigation, etc.). The PoC is
+//     a string the consumer can paste into a browser console to
+//     demonstrate the flow.
 //
-// Public API:
+// The consumer does NO hardcoded mapping of sink-kind → payload
+// or source-label → delivery. Every choice lives in the TypeDB:
+// swap `options.typeDB` and PoCs come out different.
 //
-//   const tr = require('jsanalyze/consumers/taint-report');
-//   const report = await tr.analyze(input, options?);
-//     // { schemaVersion, flows, grouped, counts, partial, warnings }
-//   const text = tr.render(report, { groupBy: 'source' });
-//   await tr.synthesisePocs(trace, { smtTimeoutMs });
-//     // mutates each flow with `flow.poc = { verdict, payload,
-//     //                                      witness, note }`
+// Options:
+//
+//   contextUrl       — base URL the PoC navigates the victim to.
+//                      Default 'https://example.com/'.
+//   smtTimeoutMs     — per Z3 call.
+//   deliveryEmitters — overrides for per-delivery-code JS
+//                      emitters; consumer-supplied JS that takes
+//                      (value, context) and returns a snippet.
 
 'use strict';
 
@@ -39,177 +40,238 @@ const TDB = require('../src/default-typedb.js');
 const SMT = require('../src/smt.js');
 const Z3 = require('../src/z3.js');
 
-// Per-sink exploit attempts. Each sink kind has an ordered list
-// of candidate payloads; when the flow is constrained, the
-// synthesiser tries each attempt against Z3 and keeps the first
-// that comes back SAT. For unconstrained direct flows, the
-// primary (first) attempt is returned verbatim.
-//
-// Multiple attempts matter because a single-shape exploit misses
-// injection contexts that require different breakouts:
-//
-//   html       — primary: a full <script> element. Alternates
-//                cover attribute context (' onerror=…'), style
-//                break-out ('</style>…'), and comment break-out
-//                ('-->…') — in case Z3 needs a specific shape to
-//                satisfy path constraints.
-//   navigation — javascript: URL, then a data:text/html URL as
-//                a fallback for frames that disallow the former.
-//   url        — same as navigation, suitable for iframe src.
-//   code       — an alert(1) canary; no real alternates needed
-//                (the body is free-form JS).
-const EXPLOIT_ATTEMPTS = {
-  html: [
-    { name: 'script-tag',    payload: '<script>alert(1)</script>' },
-    { name: 'img-onerror',   payload: '<img src=x onerror=alert(1)>' },
-    { name: 'svg-onload',    payload: '<svg onload=alert(1)>' },
-    { name: 'attr-breakout', payload: '" onerror="alert(1)' },
-    { name: 'style-breakout', payload: '</style><script>alert(1)</script>' },
-  ],
-  navigation: [
-    { name: 'javascript-url', payload: 'javascript:alert(1)' },
-    { name: 'data-html',      payload: 'data:text/html,<script>alert(1)</script>' },
-  ],
-  url: [
-    { name: 'javascript-url', payload: 'javascript:alert(1)' },
-    { name: 'data-html',      payload: 'data:text/html,<script>alert(1)</script>' },
-  ],
-  code: [
-    { name: 'alert-canary',   payload: 'alert(1)' },
-  ],
+// Trigger predicates: map TypeDB trigger-name → SMT helper.
+// The ONLY hardcoded knowledge in this consumer. These are
+// mathematical primitives of the string theory Z3 implements
+// — no user-facing choices encoded here.
+const TRIGGERS = {
+  contains: (val, payload) => SMT.mkContains(val, SMT.mkConst(payload)),
+  equals:   (val, payload) => SMT.mkCmp('===', val, SMT.mkConst(payload)),
+  prefixof: (val, payload) => SMT.mkPrefixOf(SMT.mkConst(payload), val),
+  suffixof: (val, payload) => SMT.mkSuffixOf(SMT.mkConst(payload), val),
 };
 
-function buildExploitConstraint(val, payload) {
-  return SMT.mkContains(val, SMT.mkConst(payload));
+// Default per-delivery JS emitters. Each takes (value, ctx) —
+// `value` is the string the attacker must supply at this
+// source, `ctx` is the accumulated PoC-build context
+// ({ contextUrl, target, seen, parts, ... }). Emitters may
+// return either:
+//   * a string (inline snippet), or
+//   * { setup, navigate, postload } for staged delivery
+//     (setup runs synchronously, navigate opens the victim,
+//     postload runs after `load` fires on the opened window).
+//
+// Consumers can override by passing `options.deliveryEmitters`;
+// unknown delivery codes fall through to a generic placeholder.
+const DEFAULT_DELIVERY_EMITTERS = {
+  'location-fragment': (value) => ({
+    urlHash: value,
+  }),
+  'location-search': (value) => ({
+    urlSearch: value,
+  }),
+  'location-pathname': (value) => ({
+    urlPath: value,
+  }),
+  'location-href': (value) => ({
+    urlFull: value,
+  }),
+  'postMessage:data': (value) => ({
+    postload: [
+      '  w.postMessage(' + jsRepr(value) + ', "*");',
+    ],
+  }),
+  'postMessage:origin': () => ({
+    // The attacker can't choose origin — it's determined by
+    // where the postMessage call is made from. Emit a note
+    // rather than an inert snippet.
+    note: '// NOTE: the flow requires a specific `event.origin`. ' +
+          'Host the PoC on that origin (or use an iframe/popup ' +
+          'from it) so `window.postMessage(..., "*")` delivers ' +
+          'the expected origin.',
+  }),
+  'localStorage': (value, ctx) => ({
+    setup: [
+      'localStorage.setItem(' + jsRepr(ctx.storageKey || 'key') + ', ' + jsRepr(value) + ');',
+    ],
+  }),
+  'cookie': (value, ctx) => ({
+    setup: [
+      'document.cookie = ' + jsRepr((ctx.cookieKey || 'key') + '=' + value) + ';',
+    ],
+  }),
+  'window-name': (value) => ({
+    // `window.name` survives navigation; set on opener before
+    // calling window.open.
+    preopen: [
+      'w.name = ' + jsRepr(value) + ';',
+    ],
+  }),
+  'referrer': () => ({
+    note: '// NOTE: the flow reads `document.referrer`. Host the ' +
+          'PoC page on the origin you want reported as referrer ' +
+          'and link (<a href>, Location header, etc.) to the ' +
+          'target URL below.',
+  }),
+  'network-response': (value, ctx) => ({
+    note: '// NOTE: the flow requires a specific network response ' +
+          'body. Stand up a service worker or mock server ' +
+          'returning ' + jsRepr(value) + ' for the relevant fetch.',
+  }),
+  'file-drop': (value) => ({
+    note: '// NOTE: the flow reads file/dataTransfer content. ' +
+          'Attacker must lure the victim to drop a file whose ' +
+          'content is:\n//   ' + value.replace(/\n/g, '\n//   '),
+  }),
+  'clipboard-paste': (value) => ({
+    note: '// NOTE: the flow reads clipboard data. Attacker must ' +
+          'lure the victim to paste the following text:\n//   ' +
+          value.replace(/\n/g, '\n//   '),
+  }),
+  'history-state': (value) => ({
+    setup: [
+      'history.pushState(' + jsRepr(value) + ', "");',
+    ],
+  }),
+};
+
+function jsRepr(v) {
+  return JSON.stringify(v);
 }
 
-// Extract the primary payload and per-symbol bindings from a Z3
-// witness map. A witness has one binding per declared symbol in
-// the formula; for PoC purposes we care about the string-sorted
-// ones (those are the attacker-visible source values). The
-// primary payload is picked by the selector, which falls back to
-// the first string binding.
-function extractWitness(witness, primarySelector) {
-  if (!witness) return { payload: null, bindings: {} };
-  const keys = Object.keys(witness);
-  const bindings = {};
-  for (const k of keys) bindings[k] = witness[k];
-  let payload = null;
-  if (primarySelector) payload = primarySelector(bindings);
-  if (payload == null) {
-    for (const k of keys) {
-      if (typeof witness[k] === 'string') { payload = witness[k]; break; }
-    }
+// Map a Z3 witness symbol name back to its source descriptor.
+// Sym names are constructed by `allocSourceSym` as
+// `discriminator + '_' + counter`, where discriminator is
+// typically `typeName + '.' + propName` (e.g. `Location.hash_1`)
+// or the source label itself for ephemeral-fallback syms.
+//
+// To map back, we strip the numeric suffix and try to match
+// against the flow's declared sources. When ambiguous, we fall
+// through to generic naming.
+function resolveSymbolToSource(symName, flow) {
+  if (!symName) return null;
+  const m = symName.match(/^(.*)_\d+$/);
+  const stem = m ? m[1] : symName;
+  const sources = (flow && flow.source) || [];
+  // Exact discriminator match (e.g. `Location.hash` vs source at
+  // Location.hash). Try (typeName.propName) style first.
+  for (const s of sources) {
+    if (stem === s.discriminator) return s;
   }
-  if (payload == null && keys.length > 0) payload = JSON.stringify(bindings);
-  return { payload, bindings };
+  // Match by label (symName stem === label, e.g. ephemeral-
+  // fallback syms whose stem IS the label).
+  for (const s of sources) {
+    if (stem === s.label) return s;
+  }
+  return null;
 }
 
-async function synthesisePocForFlow(flow, timeoutMs) {
+async function synthesisePocForFlow(flow, db, options) {
+  const timeoutMs = options.smtTimeoutMs != null ? options.smtTimeoutMs : 5000;
   const val = flow.valueFormula;
 
-  // Trivial: the value is a concrete source literal. Report
-  // the literal as the payload without touching Z3.
+  // Concrete-literal flow: no solving needed.
   if (val && val.value && typeof val.value.val === 'string') {
     return {
       verdict: 'trivial',
       payload: val.value.val,
-      bindings: { __const__: val.value.val },
-      witness: { __const__: val.value.val },
+      bindings: buildDirectBindings(flow, val.value.val),
       attempt: 'concrete',
+      witness: { __const__: val.value.val },
       note: null,
     };
   }
 
-  const sinkKind = flow.sink && flow.sink.kind;
-  const attempts = EXPLOIT_ATTEMPTS[sinkKind];
+  // Look up exploit attempts from the TypeDB.
+  const exploitName = flow.sink && flow.sink.exploit;
+  const exploitDesc = exploitName && db && db.exploits && db.exploits[exploitName];
+  const attempts = (exploitDesc && exploitDesc.attempts) || null;
 
   if (!attempts || attempts.length === 0) {
     return {
       verdict: 'unsolvable',
       payload: null,
       bindings: {},
+      attempt: null,
       witness: null,
-      note: 'no exploit shape registered for sink kind "' + sinkKind + '"',
+      note: exploitName
+        ? 'no exploit attempts declared for `' + exploitName + '` in typeDB.exploits'
+        : 'sink has no `exploit` tag — TypeDB needs an exploit name to drive PoC synthesis',
     };
   }
 
-  // Direct attacker-controlled flow with no intermediate
-  // constraints: pathFormula is null AND valueFormula is null.
-  // The attacker picks the source bytes directly, so the
-  // primary attempt's payload IS the witness.
+  // Direct attacker-controlled flow (no path / no symbolic
+  // value). The attacker supplies the source bytes directly,
+  // so the first attempt's payload IS the sink-arriving value.
   if (!flow.pathFormula && !val) {
     const primary = attempts[0];
     return {
       verdict: 'synthesised',
       payload: primary.payload,
       bindings: buildDirectBindings(flow, primary.payload),
-      witness: null,
       attempt: primary.name,
-      note: 'direct attacker-controlled flow; set ' +
-        describeSource(flow) + ' to the payload above',
+      witness: null,
+      note: 'direct attacker-controlled flow; attacker-supplied ' +
+        'source value equals the sink-arriving payload',
     };
   }
 
-  // Constrained flow: try each exploit attempt in order.
-  // First one SAT wins. If all UNSAT, report infeasible.
+  // Constrained flow: try each attempt. Conjoin
+  // pathFormula ∧ trigger(valueFormula, payload). First SAT
+  // wins; the attempt's payload is the value arriving at the
+  // sink, Z3's witness is per-source-symbol attacker input.
   const basePath = flow.pathFormula || null;
-  let lastVerdict = 'infeasible';
-  let lastNote = 'path condition + exploit constraint is UNSAT';
+  const notes = [];
   for (const attempt of attempts) {
+    const trig = TRIGGERS[attempt.trigger];
+    if (!trig) {
+      notes.push(attempt.name + ': unknown trigger `' + attempt.trigger + '`');
+      continue;
+    }
     let formula = basePath;
     let exploited = false;
     if (val) {
-      const c = buildExploitConstraint(val, attempt.payload);
+      const c = trig(val, attempt.payload);
       if (c) {
         formula = formula ? SMT.mkAnd(formula, c) : c;
         exploited = true;
       }
     }
     if (!formula) {
-      // No constraint at all — same as direct flow.
       return {
         verdict: 'synthesised',
         payload: attempt.payload,
         bindings: buildDirectBindings(flow, attempt.payload),
-        witness: null,
         attempt: attempt.name,
-        note: 'unconstrained path; set ' + describeSource(flow) +
-          ' to the payload above',
+        witness: null,
+        note: 'path and value are unconstrained; direct delivery',
       };
     }
     const witness = await Z3.getModel(formula, timeoutMs);
     if (witness === null) {
-      lastVerdict = exploited ? 'infeasible' : 'unsolvable';
-      lastNote = exploited
-        ? 'path condition + exploit constraint (' + attempt.name + ') is UNSAT'
-        : 'Z3 returned unknown (timeout or unhandled theory)';
+      notes.push(attempt.name + ': UNSAT');
       continue;
     }
-    const { payload, bindings } = extractWitness(witness);
     return {
-      verdict: exploited ? 'synthesised' : 'no-constraint',
-      payload: payload || attempt.payload,
-      bindings,
-      witness,
+      verdict: 'synthesised',
+      payload: attempt.payload,           // value at the sink
+      bindings: witnessToBindings(witness, flow),
       attempt: attempt.name,
+      witness,
       note: null,
     };
   }
+
   return {
-    verdict: lastVerdict,
+    verdict: 'infeasible',
     payload: null,
     bindings: {},
+    attempt: null,
     witness: null,
-    note: lastNote + ' (tried ' + attempts.length + ' exploit shape' +
-      (attempts.length === 1 ? '' : 's') + ')',
+    note: 'all ' + attempts.length + ' exploit attempts UNSAT: ' + notes.join('; '),
   };
 }
 
-// Produce a "bindings" map for direct attacker-controlled flows,
-// keyed by source label. Makes downstream delivery (see UI's
-// "Copy exploit" button) a 1:1 mapping from source label to the
-// string the attacker should supply.
 function buildDirectBindings(flow, payload) {
   const out = {};
   const sources = flow.source || [];
@@ -224,33 +286,167 @@ function buildDirectBindings(flow, payload) {
   return out;
 }
 
-function describeSource(flow) {
-  const sources = flow.source || [];
-  if (sources.length === 0) return 'the attacker-controlled input';
-  const labels = sources.map((s) => s.label).filter(Boolean);
-  if (labels.length === 0) return 'the attacker-controlled input';
-  return '`' + labels.join(' / ') + '`';
+function witnessToBindings(witness, flow) {
+  const bindings = {};
+  if (!witness) return bindings;
+  const sources = flow && flow.source ? flow.source : [];
+  const syms = Object.keys(witness);
+  if (syms.length === 0) return bindings;
+  // If there's one sym and one source, map directly.
+  if (sources.length === 1 && syms.length === 1) {
+    bindings[sources[0].label || 'attacker-input'] = witness[syms[0]];
+    return bindings;
+  }
+  // Otherwise attempt to match sym stem → source label/discriminator.
+  for (const sym of syms) {
+    const matched = resolveSymbolToSource(sym, flow);
+    if (matched) {
+      bindings[matched.label || sym] = witness[sym];
+    } else {
+      bindings[sym] = witness[sym];
+    }
+  }
+  return bindings;
 }
+
+// --- Reproducer emission ---------------------------------------------------
+
+function resolveDelivery(label, flow) {
+  const sources = (flow && flow.source) || [];
+  for (const s of sources) {
+    if (s.label === label && s.delivery) return s.delivery;
+  }
+  return null;
+}
+
+function buildReproducer(flow, pocRecord, db, options) {
+  if (!pocRecord || pocRecord.payload == null) return null;
+  const emitters = Object.assign({}, DEFAULT_DELIVERY_EMITTERS,
+    options.deliveryEmitters || {});
+  const contextUrl = options.contextUrl || 'https://example.com/';
+
+  const setup    = [];
+  const preopen  = [];
+  const postload = [];
+  const notes    = [];
+  let urlHash     = null;
+  let urlSearch   = null;
+  let urlPath     = null;
+  let urlFull     = null;
+
+  for (const label in pocRecord.bindings) {
+    const value = pocRecord.bindings[label];
+    const deliveryCode = resolveDelivery(label, flow);
+    if (!deliveryCode) {
+      notes.push('// delivery unknown for source `' + label +
+        '`: attacker must supply ' + jsRepr(value));
+      continue;
+    }
+    const emit = emitters[deliveryCode];
+    if (!emit) {
+      notes.push('// no emitter for delivery `' + deliveryCode +
+        '` (source `' + label + '`); value = ' + jsRepr(value));
+      continue;
+    }
+    const result = emit(value, { contextUrl });
+    if (typeof result === 'string') {
+      setup.push(result);
+      continue;
+    }
+    if (!result) continue;
+    if (result.urlHash   != null) urlHash   = result.urlHash;
+    if (result.urlSearch != null) urlSearch = result.urlSearch;
+    if (result.urlPath   != null) urlPath   = result.urlPath;
+    if (result.urlFull   != null) urlFull   = result.urlFull;
+    if (result.setup)    for (const s of result.setup)    setup.push(s);
+    if (result.preopen)  for (const s of result.preopen)  preopen.push(s);
+    if (result.postload) for (const s of result.postload) postload.push(s);
+    if (result.note) notes.push(result.note);
+  }
+
+  // Build the victim URL.
+  let url;
+  if (urlFull != null) {
+    url = urlFull;
+  } else {
+    url = contextUrl;
+    if (urlPath) {
+      // Path override: replace the context URL's path.
+      url = url.replace(/\/[^?#]*(?=($|[?#]))/, '/' + urlPath.replace(/^\//, ''));
+    }
+    if (urlSearch) {
+      url += (url.indexOf('?') >= 0 ? '&' : '?') + urlSearch.replace(/^\?/, '');
+    }
+    if (urlHash) {
+      url += '#' + urlHash.replace(/^#/, '');
+    }
+  }
+
+  const body = [];
+  body.push('(function () {');
+  body.push('  // Auto-generated PoC from jsanalyze.');
+  body.push('  // Flow: ' + describeFlow(flow));
+  body.push('  // Attempt: ' + (pocRecord.attempt || 'direct'));
+  if (notes.length) {
+    for (const n of notes) body.push('  ' + n.split('\n').join('\n  '));
+  }
+  if (setup.length) {
+    body.push('  // Synchronous setup (storage / cookies / state):');
+    for (const s of setup) body.push('  ' + s);
+  }
+  const needsOpener = preopen.length > 0 || postload.length > 0;
+  if (needsOpener) {
+    body.push('  var w = window.open(' + jsRepr(url) + ');');
+    if (preopen.length) {
+      for (const s of preopen) body.push(s);
+    }
+    if (postload.length) {
+      body.push('  // Wait for the victim page to load before');
+      body.push('  // delivering post-load inputs (postMessage etc.).');
+      body.push('  w.addEventListener("load", function () {');
+      for (const s of postload) body.push(s);
+      body.push('  });');
+    }
+  } else {
+    body.push('  // Navigate the victim to the exploit URL:');
+    body.push('  window.open(' + jsRepr(url) + ');');
+  }
+  body.push('})();');
+  return body.join('\n');
+}
+
+function describeFlow(flow) {
+  const srcs = (flow.source || []).map(s => s.label).join(', ');
+  const sinkLabel = flow.sink.prop +
+    (flow.sink.elementTag ? ' on <' + flow.sink.elementTag + '>' : '');
+  return srcs + ' -> ' + sinkLabel +
+    (flow.sink.location && flow.sink.location.file
+      ? ' (' + flow.sink.location.file +
+        (flow.sink.location.line ? ':' + flow.sink.location.line : '') + ')'
+      : '');
+}
+
+// --- Public API -----------------------------------------------------------
 
 async function synthesisePocs(trace, options) {
   options = options || {};
-  const timeoutMs = options.smtTimeoutMs != null ? options.smtTimeoutMs : 5000;
+  const db = options.typeDB || TDB;
   if (!trace || !trace.taintFlows || trace.taintFlows.length === 0) {
     return trace;
   }
   for (const flow of trace.taintFlows) {
-    // Per-flow isolation: a Z3 parse error or theory mismatch on
-    // one flow (e.g. the vendored solver not supporting a string
-    // op we emitted) shouldn't take down witness generation for
-    // the other flows. Record the failure as `unsolvable` with
-    // the error note so the UI can surface it.
     try {
-      flow.poc = await synthesisePocForFlow(flow, timeoutMs);
+      const rec = await synthesisePocForFlow(flow, db, options);
+      rec.reproducer = buildReproducer(flow, rec, db, options);
+      flow.poc = rec;
     } catch (err) {
       flow.poc = {
         verdict: 'unsolvable',
         payload: null,
+        bindings: {},
+        attempt: null,
         witness: null,
+        reproducer: null,
         note: 'synthesis threw: ' +
           (err && err.message ? err.message : String(err)),
       };
@@ -339,18 +535,7 @@ function render(report, opts) {
         const loc = f.sink && f.sink.location;
         const poc = f.poc && f.poc.payload != null ? '  payload: ' + f.poc.payload : '';
         lines.push('    ' + (loc ? loc.file + ':' + loc.line : '?') +
-          '  →  ' + ((f.sink && f.sink.prop) || '?') + poc);
-      }
-    }
-  } else if (groupBy === 'sink') {
-    for (const sink of Object.keys(report.grouped.bySink).sort()) {
-      lines.push('');
-      lines.push('  sink: ' + sink + ' (' + report.grouped.bySink[sink].length + ')');
-      for (const f of report.grouped.bySink[sink]) {
-        const loc = f.sink && f.sink.location;
-        const srcs = (f.source || []).map(s => s.label).join('+');
-        lines.push('    ' + (loc ? loc.file + ':' + loc.line : '?') +
-          '  from ' + srcs);
+          '  ->  ' + ((f.sink && f.sink.prop) || '?') + poc);
       }
     }
   }
@@ -361,4 +546,5 @@ module.exports = {
   analyze: analyzeReport,
   render,
   synthesisePocs,
+  buildReproducer,
 };

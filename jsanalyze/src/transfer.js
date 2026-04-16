@@ -47,19 +47,61 @@ function getAnalyseFunction() {
 // SHOULD share a sym — that's what makes path-condition
 // correlation work. So the discriminator captures the address,
 // not the call site.
-function allocSourceSym(ctx, label, loc, discriminator, sort) {
+// Labels whose default scope is per-invocation, not per-page.
+// Used only by the formulaForValue fallback path where we don't
+// have the source descriptor on hand (value-formula was lost
+// in a lattice merge). Sources declared with sourceScope='call'
+// in the TypeDB are handled through the normal path.
+const EPHEMERAL_SOURCE_LABELS = new Set([
+  'postMessage', 'file', 'dragdrop', 'clipboard',
+]);
+
+// allocSourceSym — mint or retrieve an SMT symbol for a taint
+// source read.
+//
+// Two source kinds, distinguished by `scope`:
+//
+//   'page'  — stable across the page lifetime. A second read of
+//             `location.hash` in a later statement should
+//             observe the SAME value (the URL doesn't change
+//             mid-handler). Two such reads share the same
+//             symbol so Z3 can correlate them in path
+//             conditions. Key: `label + ':' + discriminator`.
+//
+//   'call'  — ephemeral, tied to a specific invocation. Two
+//             message handlers both reading `event.data` get
+//             DIFFERENT payloads because each postMessage
+//             delivery is a separate event. Keying only by
+//             typeName+propName would unsoundly force the two
+//             symbols to be equal. Solution: include the source
+//             location in the key so each syntactic read site
+//             gets its own symbol. Two reads at the SAME site
+//             (e.g. `event.data` accessed twice in the same
+//             handler body) still share a symbol — that
+//             correlation is within one invocation.
+//
+// Scope is carried by the TypeDB source descriptor's
+// `sourceScope` field and defaulted to `'page'` when absent.
+function allocSourceSym(ctx, label, loc, discriminator, sort, scope) {
   if (!ctx._symCache) ctx._symCache = new Map();
   const disc = discriminator || '';
-  // Address-based key: same source, same address, same sym.
-  // We deliberately ignore the loc.pos so that `location.hash`
-  // read in two different statements still gets the same sym
-  // and downstream branches can correlate them.
-  const key = label + ':' + disc;
+  const s = sort || 'Int';
+  // Per-call scope keys additionally on the instruction's file
+  // + position so each read SITE gets its own symbol across
+  // handler invocations, without spawning a fresh symbol for
+  // every dynamic call (two reads at the same syntactic site
+  // still collide → still correlated, which is the right
+  // behaviour inside one handler body).
+  let key;
+  if (scope === 'call' && loc && (loc.file != null || loc.pos != null)) {
+    key = label + ':' + disc + '@' + (loc.file || '') + ':' + (loc.pos || 0);
+  } else {
+    key = label + ':' + disc;
+  }
   let entry = ctx._symCache.get(key);
   if (entry) return SMT.mkSym(entry.name, entry.sort);
   if (ctx.nextSymId == null) ctx.nextSymId = 1;
   const name = (disc || label) + '_' + (ctx.nextSymId++);
-  const s = sort || 'Int';
   ctx._symCache.set(key, { name, sort: s });
   return SMT.mkSym(name, s);
 }
@@ -196,6 +238,13 @@ function emitTaintFlow(ctx, sinkInfo, sinkLoc, value, targetType) {
     sources.push({
       label,
       location: prov[prov.length - 1] || sinkLoc,
+      // `delivery` names the mechanism an attacker uses to
+      // supply a value for this source. Looked up from the
+      // TypeDB by label; used by PoC consumers to emit a
+      // runnable reproducer. Null when no delivery is
+      // declared — the reproducer will fall back to a generic
+      // comment placeholder.
+      delivery: sourceDeliveryForLabel(ctx, label),
     });
   }
   // Flow assumption ids are the union of:
@@ -243,6 +292,11 @@ function emitTaintFlow(ctx, sinkInfo, sinkLoc, value, targetType) {
       targetType: targetType || null,
       elementTag: tagName,
       location: sinkLoc,
+      // `exploit` names the attempt library in
+      // `typeDB.exploits[...]` for this sink. Consumers use it
+      // to run sink-appropriate exploit solving without any
+      // hardcoded knowledge about sink kinds.
+      exploit: sinkInfo.exploit || null,
     },
     severity: sinkInfo.severity,
     pathConditions: [],            // legacy human-readable list — unused in B3
@@ -251,6 +305,35 @@ function emitTaintFlow(ctx, sinkInfo, sinkLoc, value, targetType) {
     assumptionIds: flowIds,
   };
   ctx.taintFlows.push(flow);
+}
+
+// recordSourceDelivery — called at every source read
+// (GetProp / GetGlobal / resolveCallReturnViaDB) with the
+// SPECIFIC descriptor's delivery code. Stashed on ctx so flow
+// emission can attribute the correct delivery per label.
+//
+// A single label (e.g. 'url') has multiple Location-* deliveries
+// (hash, search, pathname). The last read wins for that label
+// in this analysis — matching the common case where a program
+// reads one URL source and flows it to a sink. Programs that
+// read multiple url sources and combine them into one sink get
+// the delivery of the last-read source; the reproducer covers
+// that case by constructing a URL with whichever part was most
+// recently seen, which is a reasonable (if not perfect) default.
+function recordSourceDelivery(ctx, label, delivery) {
+  if (!ctx || !label || !delivery) return;
+  if (!ctx._deliveryByLabel) ctx._deliveryByLabel = Object.create(null);
+  ctx._deliveryByLabel[label] = delivery;
+}
+
+// sourceDeliveryForLabel — retrieve the delivery recorded at
+// the most recent source read for this label during the
+// current analysis. Returns null when no read carried a
+// declared delivery — the reproducer will fall back to a
+// placeholder comment.
+function sourceDeliveryForLabel(ctx, label) {
+  if (!ctx || !label || !ctx._deliveryByLabel) return null;
+  return ctx._deliveryByLabel[label] || null;
 }
 
 // resolveTagFromType — reverse the TypeDB's tagMap from
@@ -752,7 +835,15 @@ function applyGetGlobal(ctx, state, instr) {
       // calls toString on it, but the value at the IR level is
       // not a String yet. Default to Int sort here and let
       // sort upgrades occur naturally on the first comparison.
-      const sym = allocSourceSym(ctx, selfSource, loc, instr.name);
+      // Global roots (e.g. `localStorage`) are page-scoped by
+      // default — two bare reads observe the same object.
+      const scope = typeDesc && typeDesc.sourceScope ? typeDesc.sourceScope : 'page';
+      const sym = allocSourceSym(ctx, selfSource, loc, instr.name, undefined, scope);
+      // Record the delivery declared on the type itself
+      // (e.g. selfSource 'storage' → delivery 'localStorage').
+      if (typeDesc && typeDesc.delivery) {
+        recordSourceDelivery(ctx, selfSource, typeDesc.delivery);
+      }
       const v = D.opaque([assumption.id], typeName, loc, [selfSource]);
       return D.setReg(state, instr.dest, D.withFormula(v, sym));
     }
@@ -860,17 +951,38 @@ function propLookupForVariant(ctx, state, obj, instr, loc) {
           merged.add(desc.source);
           resultLabels = Object.freeze(merged);
           chainIds.push(assumption.id);
-          // B2: allocate an SMT symbol for this source read.
-          // The discriminator combines the receiver type and
-          // property name so `location.hash` and `location.search`
-          // get distinct syms; two reads of `location.hash`
-          // anywhere in the program share the same sym (which
-          // is what makes path-condition correlation work). The
-          // sort is derived from `desc.readType` so a String-typed
-          // source produces a String-sorted sym immediately.
+          // Allocate an SMT symbol for this source read. The
+          // discriminator combines the receiver type and prop
+          // name; `location.hash` and `location.search` get
+          // distinct syms. Scope decides whether two reads of
+          // THE SAME property share a sym:
+          //
+          //   'page' (default): YES — `location.hash` is a
+          //     stable per-page value, so correlation is sound.
+          //   'call':           NO — `MessageEvent.data` is
+          //     per-invocation, so each syntactic read site
+          //     gets its own sym (two message handlers reading
+          //     event.data must be independent in Z3 — they
+          //     receive different postMessages).
+          //
+          // The source scope can be declared on the type itself
+          // (`sourceScope` on the type descriptor) or on the
+          // property descriptor. Property-level overrides the
+          // type-level default.
+          const typeDesc = db.types[obj.typeName];
+          const scope = (desc.sourceScope != null ? desc.sourceScope :
+            (typeDesc && typeDesc.sourceScope != null ? typeDesc.sourceScope : 'page'));
           resultFormula = allocSourceSym(ctx, desc.source, loc,
             obj.typeName + '.' + instr.propName,
-            readTypeToSort(desc.readType));
+            readTypeToSort(desc.readType), scope);
+          // Record the delivery declared on this specific
+          // descriptor so flow emission can attribute the
+          // correct delivery mechanism to the source. For
+          // Location.hash this is 'location-fragment'; for
+          // MessageEvent.data it is 'postMessage:data'.
+          if (desc.delivery) {
+            recordSourceDelivery(ctx, desc.source, desc.delivery);
+          }
         }
         // Derived-formula propagation for non-source props (e.g.
         // `.length` on a String). When the prop descriptor names
@@ -2712,7 +2824,15 @@ function formulaForValue(ctx, value, loc) {
     for (const lab of value.labels) {
       const reason = sourceLabelToReason(lab);
       if (reason) {
-        return allocSourceSym(ctx, lab, loc, lab, 'String');
+        // Fix-up allocation for values whose formula was lost
+        // in a lattice merge. Scope lookup: some source labels
+        // are inherently per-invocation (postMessage, file
+        // pick, dragdrop, clipboard). For those, use 'call' so
+        // each recovery site gets its own sym — otherwise we'd
+        // recreate the cross-handler correlation bug at the
+        // fallback path.
+        const scope = EPHEMERAL_SOURCE_LABELS.has(lab) ? 'call' : 'page';
+        return allocSourceSym(ctx, lab, loc, lab, 'String', scope);
       }
     }
   }
@@ -2774,7 +2894,10 @@ function maybeEmitSinkFlowForCall(ctx, instr, thisValue, argValues, loc) {
   if (desc.sink) {
     const severity = desc.severity || TDB.defaultSinkSeverity(desc.sink);
     if (severity !== 'safe') {
-      const sinkInfo = { type: desc.sink, severity, prop: sinkProp };
+      const sinkInfo = {
+        type: desc.sink, severity, prop: sinkProp,
+        exploit: desc.exploit || null,
+      };
       for (const arg of argValues) {
         if (arg && arg.labels && arg.labels.size > 0) {
           emitTaintFlow(ctx, sinkInfo, loc, arg, targetType);
@@ -2795,6 +2918,7 @@ function maybeEmitSinkFlowForCall(ctx, instr, thisValue, argValues, loc) {
         type: argDesc.sink,
         severity,
         prop: sinkProp + '.arg' + i,
+        exploit: argDesc.exploit || null,
       };
       emitTaintFlow(ctx, sinkInfo, loc, arg, targetType);
     }
