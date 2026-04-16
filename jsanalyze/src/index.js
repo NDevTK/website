@@ -66,6 +66,7 @@ const HTML = require('./html.js');
 const HtmlTemplates = require('./html-templates.js');
 const DEFAULT_TYPEDB = require('./default-typedb.js');
 const query = require('./query.js');
+const { walkRegisteredCallback } = require('./transfer.js');
 
 // analyze(input, options) → Promise<Trace>
 //
@@ -164,6 +165,16 @@ async function analyze(input, options) {
     rejectedAssumptions: [],
     warnings: [],
     partial: false,
+    // Symbolic-object schema: for every SMT source symbol that
+    // had property reads during the walk, we record its child
+    // symbols keyed by the parent symbol's name. This lets the
+    // taint-report consumer reconstruct object shapes from a
+    // Z3 witness — a flat witness of
+    //   { 'ev.data_1.action' = 'run', 'ev.data_1.payload' = 'alert(1)' }
+    // rebuilds as the object {action: 'run', payload: 'alert(1)'}
+    // that the reproducer passes to postMessage. Structure:
+    //   { [parentSymName]: [{ name: childSymName, prop: string }] }
+    sourceSchema: Object.create(null),
   };
 
   // Extract inline <script> content from HTML files so the
@@ -407,11 +418,115 @@ async function analyze(input, options) {
     // dual-visibility rule as above — warning + soundness
     // assumption.
     try {
+      // Pass 0: module top. During this walk, every callback
+      // registration (addEventListener, .then, setTimeout-
+      // with-function, etc.) records a CallbackRegistration on
+      // ctx._registeredCallbacks — but walkCallback no longer
+      // WALKS the callback here. The fixpoint loop below walks
+      // every registered callback repeatedly against the
+      // accumulated post-top heap until the global state stops
+      // changing.
       result = await analyseFunction(module, module.top, initialState, ctx);
+
+      // Pass 1..N: whole-program fixpoint. Every registered
+      // callback re-walks with the current persistedState; its
+      // exit state joins in on the first pass, then WIDENS on
+      // every subsequent pass. The loop terminates when no
+      // callback's walk adds new state (fixpoint reached).
+      //
+      // Termination is STRUCTURAL, not capped by a magic
+      // iteration count:
+      //
+      //   * On iteration 1 we pure-join each callback's exit
+      //     into persistedState — standard abstract-interpretation
+      //     gathering step.
+      //   * On iteration 2+ we widen instead of joining.
+      //     src/domain.js's `widen` operator satisfies the
+      //     widening-theorem contract: chains under widen have
+      //     FINITE HEIGHT (interval bounds fold to ±∞ in one
+      //     step; OneOf unions cap structurally via the domain's
+      //     lattice, not a numeric cap; object shapes saturate
+      //     to opaque).
+      //   * Therefore the chain persisted_1 ⊑ persisted_2 ⊑ ...
+      //     stabilises in a bounded number of steps bounded by
+      //     the lattice height — a STRUCTURAL property of the
+      //     program, not a tuned constant.
+      //
+      // When the fixpoint widens at all, we raise a single
+      // LOOP_WIDENING assumption so consumers running with
+      // exact mode (accept set without loop-widening) see that
+      // precision was traded for termination. The details
+      // string names the fixpoint loop so it's distinguishable
+      // from in-function loop widening.
+      //
+      // State channels covered by this loop: addEventListener /
+      // onclick / timers / rAF / MutationObserver /
+      // BroadcastChannel / service worker message / Promise
+      // .then/.catch/.finally / module-level globals / closure-
+      // captured state / class instance state / exported
+      // entry points.
+      //
+      // Not covered: DOM as a state channel (opaque with a
+      // 'dom-state' label today) and symbolic heap values
+      // (path conditions carrying preconditions across
+      // handlers). Both are additive improvements.
+      let persistedState = result.exitState;
+      const callbacks = ctx._registeredCallbacks || [];
+      if (callbacks.length > 0 && persistedState) {
+        let iter = 0;
+        let fixpointWidened = false;
+        while (true) {
+          iter++;
+          let iterChanged = false;
+          const applyWiden = iter > 1;
+          for (const cb of callbacks) {
+            let cbResult = null;
+            try {
+              cbResult = await walkRegisteredCallback(ctx, cb, persistedState);
+            } catch (cbErr) {
+              trace.warnings.push({
+                severity: 'error',
+                message: 'callback fixpoint walk error: ' + cbErr.message,
+                file: filename,
+                stack: cbErr.stack,
+              });
+              assumptions.raise(
+                REASONS.UNIMPLEMENTED,
+                'callback walk failure: ' + cbErr.message,
+                cb.registrationLoc || { file: filename, line: 0, col: 0, pos: 0 },
+                { severity: SEVERITIES.SOUNDNESS }
+              );
+              continue;
+            }
+            if (!cbResult || !cbResult.exitState) continue;
+            const merged = applyWiden
+              ? D.widenStates(persistedState, cbResult.exitState)
+              : D.joinStates(persistedState, cbResult.exitState);
+            if (!D.stateLeq(merged, persistedState)) {
+              persistedState = merged;
+              iterChanged = true;
+              if (applyWiden) fixpointWidened = true;
+            }
+          }
+          if (!iterChanged) break;
+        }
+        if (fixpointWidened) {
+          // One assumption per fixpoint run. Consumers in exact
+          // mode (accept set excluding 'loop-widening') will see
+          // this as a rejected assumption and know the whole-
+          // program cross-handler analysis traded precision for
+          // termination.
+          assumptions.raise(
+            REASONS.LOOP_WIDENING,
+            'whole-program fixpoint over registered callbacks widened ' +
+            'to guarantee termination; per-iteration lattice growth ' +
+            'was collapsed structurally via the domain widening operator',
+            { file: filename, line: 0, col: 0, pos: 0 }
+          );
+        }
+        result = Object.assign({}, result, { exitState: persistedState });
+      }
     } catch (e) {
-      // Verbose-logging diagnostic (no behavior change): log
-      // the actual walker error to the browser console so the
-      // user can see WHY the worklist gave up on this file.
       console.error('[jsanalyze] worklist error in', filename, e && (e.stack || e.message), e);
       trace.partial = true;
       trace.warnings.push({
@@ -475,6 +590,24 @@ async function analyze(input, options) {
       trace.taintFlows.push(flow);
       if (watchers && typeof watchers.onFinding === 'function') {
         watchers.onFinding(flow);
+      }
+    }
+
+    // Merge this file's symbolic-object schema into the
+    // trace-level map so consumers can reconstruct objects
+    // from witnesses across the whole analysis.
+    if (ctx._symChildren) {
+      for (const parent in ctx._symChildren) {
+        if (!trace.sourceSchema[parent]) {
+          trace.sourceSchema[parent] = [];
+        }
+        const seen = new Set(trace.sourceSchema[parent].map(c => c.name));
+        for (const c of ctx._symChildren[parent]) {
+          if (!seen.has(c.name)) {
+            trace.sourceSchema[parent].push(c);
+            seen.add(c.name);
+          }
+        }
       }
     }
 

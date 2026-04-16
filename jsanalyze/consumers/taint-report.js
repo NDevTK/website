@@ -77,6 +77,11 @@ const DEFAULT_DELIVERY_EMITTERS = {
     urlFull: value,
   }),
   'postMessage:data': (value) => ({
+    // `value` may be a string OR an object (when the flow's
+    // path references multiple fields of `ev.data`). postMessage
+    // natively accepts any structured-clone-able value, so we
+    // pass it verbatim via JSON.stringify — no field-by-field
+    // serialisation needed.
     postload: [
       '  w.postMessage(' + jsRepr(value) + ', "*");',
     ],
@@ -119,14 +124,29 @@ const DEFAULT_DELIVERY_EMITTERS = {
           'returning ' + jsRepr(value) + ' for the relevant fetch.',
   }),
   'file-drop': (value) => ({
-    note: '// NOTE: the flow reads file/dataTransfer content. ' +
-          'Attacker must lure the victim to drop a file whose ' +
-          'content is:\n//   ' + value.replace(/\n/g, '\n//   '),
+    // UI-interaction: self-XSS. The victim cooperates by
+    // dropping a file. Build a lure page that instructs + auto-
+    // fills on click (still requires user cooperation, which
+    // is what `ui-interaction` means in the assumption model).
+    selfXssLure: {
+      kind: 'file-drop',
+      value: typeof value === 'string' ? value : JSON.stringify(value),
+      instruction: 'Drop a file whose content is the value shown.',
+    },
   }),
   'clipboard-paste': (value) => ({
-    note: '// NOTE: the flow reads clipboard data. Attacker must ' +
-          'lure the victim to paste the following text:\n//   ' +
-          value.replace(/\n/g, '\n//   '),
+    selfXssLure: {
+      kind: 'clipboard-paste',
+      value: typeof value === 'string' ? value : JSON.stringify(value),
+      instruction: 'Paste the following text into the target field.',
+    },
+  }),
+  'ui-form-input': (value) => ({
+    selfXssLure: {
+      kind: 'form-input',
+      value: typeof value === 'string' ? value : JSON.stringify(value),
+      instruction: 'Type the value shown into the target field.',
+    },
   }),
   'history-state': (value) => ({
     setup: [
@@ -166,7 +186,7 @@ function resolveSymbolToSource(symName, flow) {
   return null;
 }
 
-async function synthesisePocForFlow(flow, db, options) {
+async function synthesisePocForFlow(flow, db, options, sourceSchema) {
   const timeoutMs = options.smtTimeoutMs != null ? options.smtTimeoutMs : 5000;
   const val = flow.valueFormula;
 
@@ -255,7 +275,7 @@ async function synthesisePocForFlow(flow, db, options) {
     return {
       verdict: 'synthesised',
       payload: attempt.payload,           // value at the sink
-      bindings: witnessToBindings(witness, flow),
+      bindings: witnessToBindings(witness, flow, sourceSchema),
       attempt: attempt.name,
       witness,
       note: null,
@@ -286,24 +306,72 @@ function buildDirectBindings(flow, payload) {
   return out;
 }
 
-function witnessToBindings(witness, flow) {
-  const bindings = {};
-  if (!witness) return bindings;
-  const sources = flow && flow.source ? flow.source : [];
-  const syms = Object.keys(witness);
-  if (syms.length === 0) return bindings;
-  // If there's one sym and one source, map directly.
-  if (sources.length === 1 && syms.length === 1) {
-    bindings[sources[0].label || 'attacker-input'] = witness[syms[0]];
-    return bindings;
+// Group a Z3 witness by its source-schema parents. Given a
+// witness like { 'ev.data_1.action_2': 'run',
+// 'ev.data_1.payload_3': 'alert(1)' } and a sourceSchema
+// mapping 'ev.data_1' → [{name: '*.action_2', prop: 'action'},
+// {name: '*.payload_3', prop: 'payload'}], produce an
+// assembled object { action: 'run', payload: 'alert(1)' } per
+// parent. Returns:
+//
+//   { [parentSymName]: { object: {...}, label: '...' } }
+//
+// Parents that have no children in the schema (ordinary flat
+// symbols like location.hash) map to { scalar: value }.
+function groupWitnessByParent(witness, flow, schema) {
+  if (!witness) return {};
+  schema = schema || {};
+  const groups = {};
+  // Reverse-index: childSymName → parentSymName.
+  const childToParent = Object.create(null);
+  for (const parent in schema) {
+    for (const c of schema[parent]) {
+      childToParent[c.name] = { parent, prop: c.prop };
+    }
   }
-  // Otherwise attempt to match sym stem → source label/discriminator.
-  for (const sym of syms) {
-    const matched = resolveSymbolToSource(sym, flow);
-    if (matched) {
-      bindings[matched.label || sym] = witness[sym];
+  for (const sym of Object.keys(witness)) {
+    const pc = childToParent[sym];
+    if (pc) {
+      if (!groups[pc.parent]) groups[pc.parent] = { object: {} };
+      groups[pc.parent].object[pc.prop] = witness[sym];
     } else {
-      bindings[sym] = witness[sym];
+      // Top-level sym — flat scalar (e.g. location.hash_1).
+      groups[sym] = { scalar: witness[sym] };
+    }
+  }
+  // Attach per-group source label by looking up flow.source —
+  // heuristic: map by label whose parent-sym stem matches the
+  // typeName.propName discriminator ('MessageEvent.data_1'
+  // matches label 'postMessage' via the flow.source list).
+  const sources = (flow && flow.source) || [];
+  for (const parent in groups) {
+    const g = groups[parent];
+    // Strip trailing `_N` counter from the sym name to get the
+    // discriminator.
+    const m = parent.match(/^(.*)_\d+$/);
+    const stem = m ? m[1] : parent;
+    let found = null;
+    for (const s of sources) {
+      if (s.discriminator === stem || s.label === stem) { found = s; break; }
+    }
+    g.label    = found ? found.label    : (sources.length === 1 ? sources[0].label    : null);
+    g.delivery = found ? found.delivery : (sources.length === 1 ? sources[0].delivery : null);
+  }
+  return groups;
+}
+
+function witnessToBindings(witness, flow, schema) {
+  const groups = groupWitnessByParent(witness, flow, schema);
+  const bindings = {};
+  for (const parent in groups) {
+    const g = groups[parent];
+    const key = g.label || parent;
+    if (g.object) {
+      // Multi-child group — the attacker must supply this
+      // whole object at the source.
+      bindings[key] = g.object;
+    } else {
+      bindings[key] = g.scalar;
     }
   }
   return bindings;
@@ -329,6 +397,7 @@ function buildReproducer(flow, pocRecord, db, options) {
   const preopen  = [];
   const postload = [];
   const notes    = [];
+  const lures    = [];
   let urlHash     = null;
   let urlSearch   = null;
   let urlPath     = null;
@@ -362,6 +431,22 @@ function buildReproducer(flow, pocRecord, db, options) {
     if (result.preopen)  for (const s of result.preopen)  preopen.push(s);
     if (result.postload) for (const s of result.postload) postload.push(s);
     if (result.note) notes.push(result.note);
+    if (result.selfXssLure) lures.push(Object.assign({ label }, result.selfXssLure));
+  }
+
+  // Self-XSS lure block. When one or more sources require user
+  // cooperation (file drop, paste, form typing), emit a
+  // self-contained lure that opens the victim page, builds a
+  // floating instruction panel on the attacker window, and
+  // tells the victim exactly what to type/paste/drop. The PoC
+  // is still end-to-end runnable — the human cooperator IS the
+  // `ui-interaction` assumption.
+  if (lures.length > 0) {
+    setup.push('// === Self-XSS lure (requires user cooperation) ===');
+    setup.push('var __lure = document.createElement("div");');
+    setup.push('__lure.style.cssText = "position:fixed;top:12px;right:12px;z-index:2147483647;background:#1d2024;color:#eee;padding:12px 14px;border:1px solid #e74c3c;border-radius:4px;font:13px/1.4 system-ui;max-width:360px;box-shadow:0 4px 12px rgba(0,0,0,.5)";');
+    setup.push('__lure.innerHTML = ' + jsRepr(renderLureHtml(lures)) + ';');
+    setup.push('document.body.appendChild(__lure);');
   }
 
   // Build the victim URL.
@@ -415,6 +500,31 @@ function buildReproducer(flow, pocRecord, db, options) {
   return body.join('\n');
 }
 
+// Render the self-XSS instruction panel HTML as a static
+// string (escaped for safe innerHTML; this is our own UI, the
+// payload is in a <pre> so it renders as text). Each lure
+// carries `instruction` + `value` + `kind` (file-drop /
+// clipboard-paste / form-input).
+function renderLureHtml(lures) {
+  function esc(s) {
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+  const rows = lures.map(function (l) {
+    return '<div style="margin-top:8px"><b>' + esc(l.instruction) +
+      '</b><br><pre style="background:#15181b;padding:6px 8px;margin:4px 0 0;border-radius:3px;font:11px/1.3 ui-monospace;white-space:pre-wrap;word-break:break-all">' +
+      esc(l.value) +
+      '</pre><small style="color:#888">source: ' + esc(l.label) +
+      '  kind: ' + esc(l.kind) + '</small></div>';
+  }).join('');
+  return '<b>jsanalyze self-XSS PoC</b>' +
+    '<div style="color:#aaa;margin-top:4px">This flow needs user cooperation to fire (the <code>ui-interaction</code> assumption). Follow the steps below on the victim page.</div>' +
+    rows;
+}
+
 function describeFlow(flow) {
   const srcs = (flow.source || []).map(s => s.label).join(', ');
   const sinkLabel = flow.sink.prop +
@@ -434,9 +544,10 @@ async function synthesisePocs(trace, options) {
   if (!trace || !trace.taintFlows || trace.taintFlows.length === 0) {
     return trace;
   }
+  const schema = trace.sourceSchema || {};
   for (const flow of trace.taintFlows) {
     try {
-      const rec = await synthesisePocForFlow(flow, db, options);
+      const rec = await synthesisePocForFlow(flow, db, options, schema);
       rec.reproducer = buildReproducer(flow, rec, db, options);
       flow.poc = rec;
     } catch (err) {

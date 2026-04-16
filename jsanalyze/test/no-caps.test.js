@@ -52,17 +52,39 @@ const tests = [
     },
   },
   {
+    name: 'whole-program fixpoint has no magic iteration / widen-threshold constants',
+    fn: () => {
+      const src = fs.readFileSync(path.join(SRC_DIR, 'index.js'), 'utf8');
+      // Guards D14 for the fixpoint driver. No MAX_ITER /
+      // MAX_ITERATIONS / WIDEN_AT / similar caps — widening is
+      // the structural termination mechanism.
+      assert(!/\bMAX_ITER(ATIONS)?\b/.test(src),
+        'MAX_ITER found — fixpoint iteration cap reintroduced (violates D14)');
+      assert(!/\bWIDEN_AT\b/.test(src),
+        'WIDEN_AT found — widening-threshold constant reintroduced (violates D14)');
+      assert(!/iter\s*<\s*\d+\s*&&/.test(src),
+        'numeric iteration bound found on fixpoint loop (violates D14)');
+    },
+  },
+  {
     name: 'only boundary catches exist in engine src',
     fn: () => {
-      // Allowed: index.js has exactly 2 try/catch (parse boundary, walk boundary).
+      // Allowed: index.js has exactly 3 try/catch — one for the
+      // parse boundary, one for the module-top walk boundary,
+      // and one per-callback inside the whole-program fixpoint
+      // loop. The third one is required because a single
+      // callback's walk error mustn't abort the fixpoint over
+      // the others (the driver iterates over a set of
+      // registered callbacks; failing to continue would turn
+      // one bad callback into a whole-file analysis failure).
       // Everywhere else: none.
       for (const f of fs.readdirSync(SRC_DIR)) {
         if (!f.endsWith('.js')) continue;
         const src = fs.readFileSync(path.join(SRC_DIR, f), 'utf8');
         const matches = src.match(/\bcatch\s*\(/g) || [];
         if (f === 'index.js') {
-          assertEqual(matches.length, 2,
-            'index.js must have exactly 2 boundary catches, found ' + matches.length);
+          assertEqual(matches.length, 3,
+            'index.js must have exactly 3 boundary catches, found ' + matches.length);
         } else {
           assertEqual(matches.length, 0,
             f + ' must have zero catch clauses, found ' + matches.length);

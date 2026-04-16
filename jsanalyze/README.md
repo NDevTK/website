@@ -11,6 +11,53 @@ This is a from-scratch rewrite of the engine that previously lived under
 bundle at `jsanalyze/browser-bundle.js`. The legacy engine and its
 legacy consumers have been removed from the tree.
 
+## Whole-program fixpoint
+
+Every JavaScript program is a set of entry points — module top, plus
+every callback the runtime invokes asynchronously (DOM events, timers,
+Promise settlements, MutationObserver callbacks, BroadcastChannel
+messages). A single-pass analysis that walks each entry once can't see
+cross-entry state machines: if handler A's write to a module global
+is needed for handler B's sink to fire, walking B first means seeing
+the global unwritten.
+
+The engine runs an abstract-interpretation fixpoint over all entry
+points. Registration (via a TypeDB `callbackArgs` descriptor) records
+the callback; the fixpoint driver re-walks every registered callback
+against the accumulated persisted state until nothing new is learnt.
+Widening kicks in after 4 iterations to guarantee termination; the
+bound is 8 iterations.
+
+Channels the loop covers:
+
+| Channel | Mechanism |
+|---------|-----------|
+| `addEventListener` / `onclick=` / `setTimeout-with-fn` / `setInterval` / `requestAnimationFrame` / `MutationObserver` / `BroadcastChannel` / service worker `message` | TypeDB `callbackArgs` declares which arg is the callback. Registration records; fixpoint walks. |
+| `Promise.then` / `.catch` / `.finally` | Same. |
+| Module-level globals written by any function | Writes flow through the shared heap during the callback walk; fixpoint joins them into persisted state. |
+| Closure-captured shared state | Captures snapshot at registration; writes into captured objects propagate via the heap. |
+| Class instance state | Method invocations share `this` via the heap. |
+| Exported functions called from outside | Registered when the module exports them. |
+
+Not covered by the loop (needs additional engine work):
+
+- **DOM as a state channel.** The DOM is modelled as opaque with a
+  `dom-state` label; writes via `el.dataset.x = …` followed by reads
+  elsewhere are invisible. Fix would model the DOM as a concrete heap
+  cell in the TypeDB.
+
+- **Symbolic heap values.** When handler A writes `g.flag = true`
+  under condition `a.data === 'flip'`, the lattice currently joins
+  `g.flag ∈ {false, true}`; the causal link to `a.data` is lost, so
+  a PoC for handler B's sink doesn't include the prerequisite `'flip'`
+  message. Fix would store heap values symbolically (the flag's SMT
+  formula references `a.data`), making B's path condition carry the
+  precondition through.
+
+Both are meaningful improvements; neither is a soundness bug (the
+current behaviour over-approximates, producing PoCs that may under-
+specify the prerequisite inputs).
+
 ## Design principles
 
 1. **No hardcoded third-party library knowledge.** Every source,

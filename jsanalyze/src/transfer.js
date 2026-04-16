@@ -86,15 +86,18 @@ function allocSourceSym(ctx, label, loc, discriminator, sort, scope) {
   if (!ctx._symCache) ctx._symCache = new Map();
   const disc = discriminator || '';
   const s = sort || 'Int';
-  // Per-call scope keys additionally on the instruction's file
-  // + position so each read SITE gets its own symbol across
-  // handler invocations, without spawning a fresh symbol for
-  // every dynamic call (two reads at the same syntactic site
-  // still collide → still correlated, which is the right
-  // behaviour inside one handler body).
+  // Per-call scope keys on the CONTAINING FUNCTION ID (set by
+  // worklist.analyseFunction). Two reads of `event.data` at
+  // different positions inside ONE handler body share a sym
+  // (they observe the same MessageEvent per invocation). Two
+  // reads in two DIFFERENT handlers get distinct syms because
+  // the runtime delivers independent events to each. When we
+  // have no function context (e.g. a synthetic read outside
+  // any walk), fall back to the page-scoped key so the
+  // allocation still behaves soundly.
   let key;
-  if (scope === 'call' && loc && (loc.file != null || loc.pos != null)) {
-    key = label + ':' + disc + '@' + (loc.file || '') + ':' + (loc.pos || 0);
+  if (scope === 'call' && ctx._currentFnId != null) {
+    key = label + ':' + disc + '@fn:' + ctx._currentFnId;
   } else {
     key = label + ':' + disc;
   }
@@ -245,6 +248,13 @@ function emitTaintFlow(ctx, sinkInfo, sinkLoc, value, targetType) {
       // declared — the reproducer will fall back to a generic
       // comment placeholder.
       delivery: sourceDeliveryForLabel(ctx, label),
+      // `handlerContext` is { event, registrationSite,
+      // calleeName } when this source was read inside a
+      // callback registered via an API with callbackArgs
+      // (addEventListener, setTimeout+string, etc.). Null for
+      // top-level reads. The PoC consumer uses this to
+      // sequence deliveries across handlers.
+      handlerContext: ctx._currentHandlerContext || null,
     });
   }
   // Flow assumption ids are the union of:
@@ -334,6 +344,71 @@ function recordSourceDelivery(ctx, label, delivery) {
 function sourceDeliveryForLabel(ctx, label) {
   if (!ctx || !label || !ctx._deliveryByLabel) return null;
   return ctx._deliveryByLabel[label] || null;
+}
+
+// allocChildSym — symbolic model for opaque-object field reads.
+//
+// Given a parent sym name (e.g. `MessageEvent.data_1`), a
+// property name (`action`), and the parent's scope, return a
+// fresh flat SMT symbol that represents the field. The parent-
+// child relationship is recorded on ctx so the PoC consumer
+// can reconstruct the object shape from the Z3 witness (a
+// witness with children `ev.data_1.action = "run"` and
+// `ev.data_1.payload = "alert(1)"` rebuilds as the object
+// `{action: "run", payload: "alert(1)"}`).
+//
+// Scope propagates through: a field of a 'call'-scoped source
+// is itself 'call'-scoped. The compound discriminator keeps
+// MessageEvent.data.action distinct from
+// MessageEvent.data.payload across sites.
+function allocChildSym(ctx, fullName, parentName, prop, scope) {
+  if (!ctx._symCache) ctx._symCache = new Map();
+  const key = 'child:' + parentName + '::' + prop +
+    (scope === 'call' ? ':call' : '');
+  let entry = ctx._symCache.get(key);
+  if (entry) return SMT.mkSym(entry.name, entry.sort);
+  if (ctx.nextSymId == null) ctx.nextSymId = 1;
+  const name = fullName + '_' + (ctx.nextSymId++);
+  const sort = 'String';
+  ctx._symCache.set(key, { name, sort });
+  recordSymChild(ctx, parentName, name, prop);
+  return SMT.mkSym(name, sort);
+}
+
+// recordSymChild — stash the (parent → [{name, prop}]) map on
+// ctx so it can be projected onto the trace and consumed by
+// the taint-report's reproducer builder. This is the wiring
+// that lets a flat Z3 witness be regrouped into the nested
+// object the attacker must deliver.
+function recordSymChild(ctx, parentName, childName, prop) {
+  if (!ctx._symChildren) ctx._symChildren = Object.create(null);
+  if (!ctx._symChildren[parentName]) ctx._symChildren[parentName] = [];
+  const list = ctx._symChildren[parentName];
+  // Dedup per (parent, prop) — two reads of the same field at
+  // the same program point produce one child entry.
+  for (const c of list) {
+    if (c.prop === prop && c.name === childName) return;
+  }
+  list.push({ name: childName, prop });
+}
+
+// parentScopeFromSym — recover the scope of a sym previously
+// allocated by allocSourceSym so child-sym allocation inherits
+// it. Scope is stored implicitly in the cache entry via the
+// key shape (see allocSourceSym). We scan the cache entries
+// to find a match; `_symCache` is small so the O(n) cost is
+// fine per-read.
+function parentScopeFromSym(ctx, symName) {
+  if (!ctx._symCache) return 'page';
+  for (const [key, entry] of ctx._symCache) {
+    if (entry.name === symName) {
+      // 'page' keys are `label:disc`; 'call' keys are
+      // `label:disc@fn:<id>`.
+      if (key.indexOf('@fn:') >= 0) return 'call';
+      return 'page';
+    }
+  }
+  return 'page';
 }
 
 // resolveTagFromType — reverse the TypeDB's tagMap from
@@ -1017,12 +1092,36 @@ function propLookupForVariant(ctx, state, obj, instr, loc) {
         return resultFormula ? D.withFormula(v, resultFormula) : v;
       }
     }
-    // No TypeDB info → propagate the receiver's opaqueness.
-    // Precision note: if the receiver had a formula, we drop it
-    // here because we don't know what the unmodeled property
-    // returns. Raise unsolvable-math so the loss is visible to
-    // consumers running with strict accept sets.
+    // No TypeDB info. If the receiver has a source formula AND
+    // a source label, model this as a symbolic object-field
+    // read: mint a CHILD SMT symbol representing the specific
+    // property. Path conditions like `ev.data.action === 'run'`
+    // and exploits like `ev.data.payload === 'alert(1)'` become
+    // directly solvable; Z3's witness supplies each field's
+    // value, and the PoC consumer reconstructs the object
+    // shape from the parent-child relation recorded on ctx.
+    //
+    // This is the right model for opaque attacker-controlled
+    // objects (postMessage payloads, storage values, network
+    // responses). The parent sym's scope (page vs call) is
+    // inherited by the child — two message handlers' children
+    // of `ev.data.foo` stay independent.
+    //
+    // When the receiver has a formula but NO source label
+    // (e.g. a typed-object value that happens to carry an SMT
+    // sym from some other op), we fall back to the
+    // unsolvable-math announcement — we don't know enough to
+    // reason about its shape.
     const chainIds = obj.assumptionIds ? obj.assumptionIds.slice() : [];
+    if (obj.formula && obj.formula.symName &&
+        obj.labels && obj.labels.size > 0) {
+      const parentName = obj.formula.symName;
+      const scope = parentScopeFromSym(ctx, parentName);
+      const childName = parentName + '.' + instr.propName;
+      const childSym = allocChildSym(ctx, childName, parentName, instr.propName, scope);
+      const v = D.opaque(chainIds, null, loc, obj.labels);
+      return D.withFormula(v, childSym);
+    }
     if (obj.formula) {
       const a = ctx.assumptions.raise(
         REASONS.UNSOLVABLE_MATH,
@@ -1565,16 +1664,27 @@ async function walkCallbackArgs(ctx, state, instr, thisValue, argValues, loc) {
   // bare opaque first-param and every event-data access
   // loses its source label.
   let firstParamType = null;
+  let eventName = null;
   if (typeof desc.callbackEventNameArg === 'number' && db.eventMap) {
     const evNameVal = argValues[desc.callbackEventNameArg];
     if (evNameVal && evNameVal.kind === D.V.CONCRETE &&
         typeof evNameVal.value === 'string') {
-      const mapped = db.eventMap[evNameVal.value];
+      eventName = evNameVal.value;
+      const mapped = db.eventMap[eventName];
       if (mapped && db.types && db.types[mapped]) {
         firstParamType = mapped;
       }
     }
   }
+
+  // Track the calling context so source reads inside the
+  // callback know which handler / event registered them. The
+  // PoC consumer uses this to emit the right delivery
+  // (postMessage for message handlers, form-input for input
+  // handlers, etc.) and to order multi-handler sequences.
+  const handlerContext = eventName
+    ? { event: eventName, registrationSite: loc, calleeName: instr.methodName || instr.calleeName || null }
+    : null;
 
   for (const idx of desc.callbackArgs) {
     if (typeof idx !== 'number') continue;
@@ -1589,29 +1699,46 @@ async function walkCallbackArgs(ctx, state, instr, thisValue, argValues, loc) {
     if (cbValue.kind === D.V.DISJUNCT && Array.isArray(cbValue.variants)) {
       for (const v of cbValue.variants) {
         if (v && v.kind === D.V.CLOSURE && v.functionId) {
-          await walkCallback(ctx, state, v, loc, firstParamType);
+          await walkCallback(ctx, state, v, loc, firstParamType, handlerContext);
         }
       }
       continue;
     }
     if (fnId == null) continue;
-    await walkCallback(ctx, state, cbValue, loc, firstParamType);
+    await walkCallback(ctx, state, cbValue, loc, firstParamType, handlerContext);
   }
 }
 
-// walkCallback — walk a single closure's body as a synthetic
-// call site. Matches the applyCall walking path but with
-// empty args (the runtime will supply them later). Captures
-// are threaded from the closure's snapshot so variables the
-// callback closes over are visible inside.
-async function walkCallback(ctx, state, closureValue, loc, firstParamType) {
+// walkCallback — REGISTRATION ONLY (post-fixpoint redesign).
+//
+// Records the callback on `ctx._registeredCallbacks` so the
+// whole-program fixpoint driver (src/index.js) can re-walk it
+// against the accumulated post-top heap. The callback's
+// captures are snapshotted at registration time (outer-scope
+// values resolved via getReg); the fixpoint driver rebuilds the
+// callback's init state per iteration using these snapshots +
+// the current persisted heap + opaque placeholders for each
+// param.
+//
+// Why registration-only:
+//
+// Before this redesign, walkCallback walked the callback once
+// at its registration site, with the heap as of that statement.
+// That couldn't capture state-machine semantics — if handler A
+// was registered BEFORE handler B but A's writes to a shared
+// global were needed for B's sink to fire, B's walk wouldn't
+// see them. The fixpoint driver walks every registered
+// callback REPEATEDLY until the persisted heap stabilises,
+// modelling the event loop correctly: any ordering, any number
+// of invocations.
+async function walkCallback(ctx, state, closureValue, loc, firstParamType, handlerContext) {
   const calleeFn = ctx.module.functions.find(f => f.id === closureValue.functionId);
   if (!calleeFn || !calleeFn.cfg) return;
 
-  // Recursion guard per D7 (body + args fingerprint).
-  let calleeInit = D.createStateSharingHeap(state);
-  // Thread captures.
+  // Snapshot captures (resolve outerReg against the current
+  // outer state; fall back to the closure's frozen value).
   const closureCaptures = closureValue.captures || [];
+  const resolvedCaptures = [];
   for (const c of closureCaptures) {
     if (!c || c.innerReg == null) continue;
     let val = null;
@@ -1620,51 +1747,104 @@ async function walkCallback(ctx, state, closureValue, loc, firstParamType) {
       if (live && live.kind !== D.V.BOTTOM) val = live;
     }
     if (!val && c.value && c.value.kind !== D.V.BOTTOM) val = c.value;
-    if (val) calleeInit = D.setReg(calleeInit, c.innerReg, val);
+    if (val) resolvedCaptures.push({ innerReg: c.innerReg, value: val });
   }
-  // Bind each param to an Opaque value. The callback's
-  // params receive runtime data we can't predict statically
-  // (the event object for addEventListener, no args for
-  // setTimeout, etc.) — Opaque is the sound floor. When the
-  // caller supplied a `firstParamType` (e.g. MessageEvent
-  // derived from the eventMap lookup for
-  // addEventListener('message', h)), we type the first
-  // parameter so its property reads flow through the
-  // TypeDB's source classifier — `msg.data` on a
-  // MessageEvent produces a postMessage-tainted value.
-  const params = calleeFn.params || [];
+
+  // De-dupe: two syntactic registrations of the same closure
+  // in the same place are one runtime listener. We key on
+  // (fn.id, registration loc.pos); a second registration at a
+  // different site IS a different listener (bound later via
+  // `addEventListener` again), which needs its own fixpoint
+  // entry.
+  if (!ctx._registeredCallbacks) ctx._registeredCallbacks = [];
+  const key = (calleeFn.id || 0) + '@' +
+    (loc && loc.file ? loc.file : '') + ':' +
+    (loc && loc.pos != null ? loc.pos : 0);
+  if (!ctx._registeredCallbackKeys) ctx._registeredCallbackKeys = new Set();
+  if (ctx._registeredCallbackKeys.has(key)) return;
+  ctx._registeredCallbackKeys.add(key);
+
+  ctx._registeredCallbacks.push({
+    fn: calleeFn,
+    resolvedCaptures,
+    firstParamType,
+    handlerContext,
+    registrationLoc: loc,
+    // Carry the outer path so fixpoint re-walks inherit the
+    // path condition that was live at registration time.
+    registrationPath: ctx.currentPath || null,
+  });
+}
+
+// buildCallbackInitState — helper used by the fixpoint driver
+// to construct a fresh init state for a registered callback
+// against the currently-persisted heap. The persistedState
+// provides the heap + assumption chain; this helper adds the
+// callback's captures and opaque placeholder params.
+//
+// Note: one UI_INTERACTION assumption is raised per param the
+// FIRST time this helper runs for a given callback (tracked
+// via ctx._calledParamAssumptions so iterations don't spam
+// the assumption list with duplicates).
+function buildCallbackInitState(ctx, cb, persistedState) {
+  let init = D.createStateSharingHeap(persistedState);
+  for (const rc of cb.resolvedCaptures) {
+    init = D.setReg(init, rc.innerReg, rc.value);
+  }
+  const params = cb.fn.params || [];
+  if (!ctx._calledParamAssumptions) ctx._calledParamAssumptions = new Set();
   for (let pi = 0; pi < params.length; pi++) {
     const paramReg = params[pi];
-    const typeName = (pi === 0 && firstParamType) ? firstParamType : null;
-    const a = ctx.assumptions.raise(
-      REASONS.UI_INTERACTION,
-      'callback argument is supplied by the runtime — walking with an Opaque placeholder' +
-        (typeName ? ' typed as ' + typeName : ''),
-      loc
-    );
-    calleeInit = D.setReg(calleeInit, paramReg,
-      D.opaque([a.id], typeName, loc));
+    const typeName = (pi === 0 && cb.firstParamType) ? cb.firstParamType : null;
+    const paramKey = cb.fn.id + ':' + paramReg;
+    let aId;
+    if (!ctx._calledParamAssumptions.has(paramKey)) {
+      const a = ctx.assumptions.raise(
+        REASONS.UI_INTERACTION,
+        'callback argument is supplied by the runtime — walking with an Opaque placeholder' +
+          (typeName ? ' typed as ' + typeName : ''),
+        cb.registrationLoc
+      );
+      aId = a.id;
+      ctx._calledParamAssumptions.add(paramKey);
+      ctx._calledParamAssumptionIds = ctx._calledParamAssumptionIds || Object.create(null);
+      ctx._calledParamAssumptionIds[paramKey] = aId;
+    } else {
+      aId = (ctx._calledParamAssumptionIds && ctx._calledParamAssumptionIds[paramKey]) || null;
+    }
+    init = D.setReg(init, paramReg,
+      D.opaque(aId != null ? [aId] : [], typeName, cb.registrationLoc));
   }
-  // Seed the callback's path with the caller's current path
-  // so sinks inside inherit the caller-side reachability.
-  const callerPath = ctx.currentPath || null;
-  if (callerPath) calleeInit = D.withPath(calleeInit, callerPath);
+  if (cb.registrationPath) init = D.withPath(init, cb.registrationPath);
+  return init;
+}
 
-  const fp = buildArgsFingerprint(calleeFn, calleeInit, closureCaptures, null);
-  const frame = { funcId: calleeFn.id, argsFp: fp };
-  if (D.callStackContains(state, frame)) return;
-  calleeInit = D.pushCallStack(calleeInit, frame);
+// walkRegisteredCallback — walks one registered callback against
+// a supplied persisted state, returning the callback's exit
+// state (or null when recursion-guarded). Used by the fixpoint
+// driver to iterate callbacks with the growing persisted heap.
+async function walkRegisteredCallback(ctx, cb, persistedState) {
+  if (!cb.fn || !cb.fn.cfg) return null;
+  let init = buildCallbackInitState(ctx, cb, persistedState);
+  const fp = buildArgsFingerprint(cb.fn, init, cb.fn.captures || [], null);
+  const frame = { funcId: cb.fn.id, argsFp: fp };
+  if (D.callStackContains(init, frame)) return null;
+  init = D.pushCallStack(init, frame);
 
   const savedPath = ctx.currentPath;
   const savedBlockId = ctx.currentBlockId;
   const savedThis = ctx._currentThisValue;
+  const savedHandlerCtx = ctx._currentHandlerContext;
+  if (cb.handlerContext) ctx._currentHandlerContext = cb.handlerContext;
   try {
     const analyse = getAnalyseFunction();
-    await analyse(ctx.module, calleeFn, calleeInit, ctx);
+    const result = await analyse(ctx.module, cb.fn, init, ctx);
+    return result;
   } finally {
     ctx.currentPath = savedPath;
     ctx.currentBlockId = savedBlockId;
     ctx._currentThisValue = savedThis;
+    ctx._currentHandlerContext = savedHandlerCtx;
   }
 }
 
@@ -3248,4 +3428,5 @@ module.exports = {
   applyInstruction,
   computeBinOp,
   evalJsBinOp,
+  walkRegisteredCallback,
 };

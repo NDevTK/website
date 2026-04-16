@@ -195,13 +195,78 @@ const tests = [
       if (codeFlow.valueFormula && navFlow.valueFormula) {
         const codeSorts = Object.keys(codeFlow.valueFormula.sorts || {});
         const navSorts  = Object.keys(navFlow.valueFormula.sorts || {});
-        // Symbols in each formula's sort table shouldn't
-        // overlap when both are per-invocation.
         const shared = codeSorts.filter(s => navSorts.indexOf(s) >= 0);
         assert(shared.length === 0,
           'per-invocation symbols must not overlap between handlers; shared: ' +
           shared.join(','));
       }
+    },
+  },
+  {
+    name: 'taint-report: symbolic object reversing — path condition on ev.data.action solves ev.data.payload',
+    fn: async () => {
+      const trace = await tr.analyze(
+        'window.addEventListener("message", function(ev){ ' +
+        '  if (ev.data.action === "run") { eval(ev.data.payload); }' +
+        '});'
+      );
+      const flow = trace.flows.find(f => f.sink && f.sink.kind === 'code');
+      assert(flow, 'code flow present');
+      assert(flow.pathFormula && /action/.test(flow.pathFormula.expr),
+        'path formula references ev.data.action');
+      assert(flow.valueFormula && /payload/.test(flow.valueFormula.expr),
+        'value formula is ev.data.payload');
+      assertEqual(flow.poc.verdict, 'synthesised');
+      // Bindings should be an OBJECT, not a string — Z3 solved
+      // both action and payload simultaneously.
+      const b = flow.poc.bindings.postMessage;
+      assert(b && typeof b === 'object',
+        'postMessage binding is an object; got ' + typeof b);
+      assertEqual(b.action,  'run');
+      assertEqual(b.payload, 'alert(1)');
+      // Reproducer passes the whole object to postMessage.
+      assert(flow.poc.reproducer.indexOf('postMessage({') >= 0,
+        'reproducer passes an object to postMessage');
+      new Function(flow.poc.reproducer);  // parse-valid
+    },
+  },
+  {
+    name: 'taint-report: handler context attaches to flow.source entries',
+    fn: async () => {
+      const trace = await tr.analyze(
+        'window.addEventListener("message", function(ev){ eval(ev.data); });'
+      );
+      const flow = trace.flows.find(f => f.sink && f.sink.kind === 'code');
+      assert(flow, 'flow present');
+      const src = flow.source[0];
+      assert(src.handlerContext, 'handlerContext attached to source');
+      assertEqual(src.handlerContext.event, 'message');
+      assertEqual(src.handlerContext.calleeName, 'addEventListener');
+    },
+  },
+  {
+    name: 'fixpoint: cross-handler state machine makes sink reachable',
+    fn: async () => {
+      // Handler A writes a global flag under a specific input.
+      // Handler B reads the flag and guards a sink. Without the
+      // whole-program fixpoint, B's walk sees the flag as false
+      // (A's writes aren't visible) and the sink is concluded
+      // unreachable. With the fixpoint, A's writes propagate
+      // into B's pre-walk heap and the sink becomes reachable.
+      const trace = await tr.analyze(
+        'var state = {active:false};' +
+        'window.addEventListener("message", function(a) {' +
+        '  if (a.data === "flip") state.active = true;' +
+        '});' +
+        'window.addEventListener("message", function(b) {' +
+        '  if (state.active && b.data.code) eval(b.data.code);' +
+        '});'
+      );
+      const flow = trace.flows.find(f => f.sink && f.sink.kind === 'code');
+      assert(flow, 'eval flow emitted — fixpoint propagated cross-handler state');
+      assert(flow.poc && flow.poc.verdict === 'synthesised',
+        'flow synthesises a PoC, not infeasible; got ' +
+        (flow.poc && flow.poc.verdict));
     },
   },
 ];

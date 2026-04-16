@@ -274,6 +274,20 @@ function joinVariantList(list) {
 
 async function analyseFunction(module, fn, initialState, ctx) {
   const cfg = fn.cfg;
+  // Track the currently-walking function so transfer.js can
+  // key 'call' scope on the containing handler. Save/restore
+  // around the whole walk so recursive / interprocedural calls
+  // restore the outer function's id on return.
+  const _savedFnId = ctx._currentFnId;
+  ctx._currentFnId = fn.id;
+  try {
+    return await _analyseFunctionBody(module, fn, cfg, initialState, ctx);
+  } finally {
+    ctx._currentFnId = _savedFnId;
+  }
+}
+
+async function _analyseFunctionBody(module, fn, cfg, initialState, ctx) {
 
   // Per-block in-state: each block holds a list of variants
   // merged from its predecessors. Equivalent shapes collapse;
