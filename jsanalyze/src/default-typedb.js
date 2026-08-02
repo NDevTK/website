@@ -490,9 +490,20 @@ const DEFAULT_TYPE_DB = {
     // don't expose the resolved value's type the same way.
     Promise: {
       methods: {
-        then:    { args: [{ usesReceiverInnerType: true }, {}] },
-        catch:   { args: [{}] },
-        finally: { args: [{}] },
+        // `.then(onFulfilled, onRejected)` — BOTH arguments are
+        // callbacks the runtime invokes, so the engine has to
+        // walk them or every `fetch(u).then(r => …)` body goes
+        // unanalysed. `callbackResolvesReceiver` additionally
+        // says the first parameter receives the promise's
+        // resolution value, which is how taint reaches the
+        // handler at all.
+        then:    {
+          args: [{ usesReceiverInnerType: true }, {}],
+          callbackArgs: [0, 1],
+          callbackResolvesReceiver: true,
+        },
+        catch:   { args: [{}], callbackArgs: [0] },
+        finally: { args: [{}], callbackArgs: [0] },
       },
     },
     // ArrayBuffer / Object placeholder types.

@@ -83,11 +83,22 @@ before the payload.
    code, large call graphs, and arbitrary expressions never blow the
    JavaScript call stack.
 
-3. **Proper AST parser.** Source is parsed via
-   [acorn](https://github.com/acornjs/acorn) (vendored under
-   `vendor/`). Every construct in the ECMAScript spec is a node
-   kind the analyser can pattern-match on. No ad-hoc tokenizer, no
-   brace-matching heuristic.
+3. **Proper AST parser.** Lexing is
+   [acorn](https://github.com/acornjs/acorn)'s tokenizer (vendored
+   under `vendor/`); the parser on top of it is our own, because
+   acorn's is recursive descent and principle 2 requires an
+   iterative one. The output is an ESTree AST, so every construct
+   is a node kind the analyser pattern-matches on — no ad-hoc
+   tokenizer, no brace-matching heuristic.
+
+   The trade-off is that grammar coverage is ours to maintain, and
+   a gap in it fails SILENTLY: a construct the parser skips takes
+   the sinks inside it along, and a construct it cannot parse at
+   all abandons the whole file. Both look exactly like a clean
+   result. `test/construct-coverage.test.js` is the guard —
+   every construct carries a known flow to a sink, so a
+   regression shows up as a failing test rather than as a missing
+   finding.
 
 4. **SSA intermediate representation.** The AST is lowered to a
    typed SSA form with a control-flow graph of basic blocks. Every
@@ -385,11 +396,29 @@ Run `node jsanalyze/test/run.js` to see the current pass count
 - `csp-derive.js`   — CSP directive derivation.
 
 **Engine features:** SSA IR, interprocedural worklist fixpoint,
-B4 per-path state correlation, C3 k-CFA summary cache,
-classes / closures / destructuring / arrow functions / template
-literals / switch / try/catch, callbacks via
-`addEventListener` / `setTimeout` / `setInterval`, Z3 Layer 5
-branch refutation, Z3 post-pass refutation, multi-file projects.
+B4 per-path state correlation, C3 k-CFA summary cache, Z3
+Layer 5 branch refutation, Z3 post-pass refutation, multi-file
+projects.
+
+**Language coverage** (each row is a case in
+`test/construct-coverage.test.js`): every loop form including
+for-of / for-in and labelled break; classes with fields, private
+and static members, `extends`, and class expressions; getters and
+setters, invoked on property read and write so a sink inside an
+accessor body is found; destructuring with defaults and
+string keys; async functions, async arrows, `await`, and
+`.then` / `.catch` callbacks with the promise's resolution value
+bound to the handler's parameter; generators (bodies walked —
+values are not tracked through `next()`); tagged templates;
+the comma operator; optional chaining and nullish operators;
+spread and rest; try/catch/finally; switch.
+
+**Known gaps**, all of which fail loudly rather than silently:
+a generator's yielded values are not observable through
+`.next().value`; a `.then` chain does not carry the callback's
+RETURN value into the next link (each callback body is still
+walked); and `for-of` trip counts are widened rather than
+unrolled, like every other loop.
 
 See `docs/DESIGN-DECISIONS.md` for the full architectural
 rationale.

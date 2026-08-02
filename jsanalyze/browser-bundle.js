@@ -962,9 +962,20 @@ const DEFAULT_TYPE_DB = {
     // don't expose the resolved value's type the same way.
     Promise: {
       methods: {
-        then:    { args: [{ usesReceiverInnerType: true }, {}] },
-        catch:   { args: [{}] },
-        finally: { args: [{}] },
+        // `.then(onFulfilled, onRejected)` — BOTH arguments are
+        // callbacks the runtime invokes, so the engine has to
+        // walk them or every `fetch(u).then(r => …)` body goes
+        // unanalysed. `callbackResolvesReceiver` additionally
+        // says the first parameter receives the promise's
+        // resolution value, which is how taint reaches the
+        // handler at all.
+        then:    {
+          args: [{ usesReceiverInnerType: true }, {}],
+          callbackArgs: [0, 1],
+          callbackResolvesReceiver: true,
+        },
+        catch:   { args: [{}], callbackArgs: [0] },
+        finally: { args: [{}], callbackArgs: [0] },
       },
     },
     // ArrayBuffer / Object placeholder types.
@@ -7136,6 +7147,8 @@ function lowerStatement(ctx, node) {
     case 'WhileStatement':     return beginWhile(ctx, node, loc);
     case 'DoWhileStatement':   return beginDoWhile(ctx, node, loc);
     case 'ForStatement':       return beginFor(ctx, node, loc);
+    case 'ForOfStatement':
+    case 'ForInStatement':     return beginForInOf(ctx, node, loc);
     case 'BreakStatement':     return lowerBreak(ctx, node, loc);
     case 'ContinueStatement':  return lowerContinue(ctx, node, loc);
     case 'TryStatement':       return beginTry(ctx, node, loc);
@@ -7642,6 +7655,170 @@ function beginWhile(ctx, node, loc) {
   ctx._work.push({ kind: 'lower_stmt', node: node.body });
 }
 
+// beginForInOf — lower `for (LEFT of RIGHT) BODY` and
+// `for (LEFT in RIGHT) BODY`.
+//
+// The parser used to skip both forms entirely, which dropped the
+// loop body — and every sink inside it — with a single
+// `unimplemented` marker standing in for the whole statement.
+// `for (const el of container.children) el.innerHTML = untrusted`
+// simply did not exist as far as the analysis was concerned.
+//
+// The CFG is the same may-execute shape the other loops use:
+//
+//   pred → header (branch on an unknown trip count)
+//   header → body → header        (back edge)
+//   header → exit
+//
+// so the body runs zero-or-more times and the worklist widens at
+// the header exactly as it does for `while`.
+//
+// What LEFT binds to differs:
+//
+//   for-of — the ELEMENT. We emit a GetIndex with an unknown key,
+//            which `applyGetIndex` resolves by joining every field
+//            of the iterable's heap cell. For `[a, b]` that is
+//            `a ⊔ b`: precisely the set of values the loop can
+//            bind, without unrolling.
+//   for-in — the KEY. Property names are strings the analysis
+//            doesn't enumerate, so the binding is opaque. Bodies
+//            that then read `obj[k]` still resolve through the
+//            same join, so the common shape stays precise.
+//
+// The trip count is deliberately unknown rather than derived from
+// the iterable's length: matching the rest of the engine, loops
+// are analysed by widening rather than unrolling.
+function beginForInOf(ctx, node, loc) {
+  const isOf = node.type === 'ForOfStatement';
+  const predBlock = ctx.currentBlock;
+
+  // Evaluate the iterable ONCE, in the pred block.
+  const iterReg = lowerExpression(ctx, node.right);
+
+  // Names assigned in the body need header phis, as do bare
+  // (non-declaring) loop targets — `for (x of xs)` reassigns `x`
+  // on every iteration.
+  const loopDefs = new Set();
+  collectAssignedNames([node.body], loopDefs);
+  const bareTarget = node.left && node.left.type === 'Identifier'
+    ? node.left.name : null;
+  if (bareTarget) loopDefs.add(bareTarget);
+
+  const headerBlock = createBlock(ctx.module);
+  ctx.blocks.set(headerBlock.id, headerBlock);
+  addEdge(ctx.currentBlock, headerBlock);
+
+  const bodyBlock = createBlock(ctx.module);
+  ctx.blocks.set(bodyBlock.id, bodyBlock);
+  addEdge(headerBlock, bodyBlock);
+
+  const exitBlock = createBlock(ctx.module);
+  ctx.blocks.set(exitBlock.id, exitBlock);
+  addEdge(headerBlock, exitBlock);
+
+  emit(ctx.module, ctx.currentBlock, {
+    op: OP.JUMP, target: headerBlock.id,
+  }, loc);
+  const predExitBlock = ctx.currentBlock;
+
+  const phis = [];
+  for (const name of loopDefs) {
+    const currentReg = lookupName(ctx.scope, name);
+    if (currentReg == null) continue;
+    const destReg = newRegister(ctx.module);
+    const phiInstr = {
+      op: OP.PHI,
+      dest: destReg,
+      incoming: [{ pred: predExitBlock.id, value: currentReg }],
+    };
+    emit(ctx.module, headerBlock, phiInstr, loc);
+    updateName(ctx.scope, name, destReg);
+    phis.push({ name, destReg, instr: phiInstr });
+  }
+
+  // Header: branch on whether another element remains.
+  ctx.currentBlock = headerBlock;
+  const condReg = newRegister(ctx.module);
+  emit(ctx.module, headerBlock, {
+    op: OP.OPAQUE,
+    dest: condReg,
+    reason: REASONS.UNIMPLEMENTED,
+    details: 'for-' + (isOf ? 'of' : 'in') +
+      ' trip count is not derived from the iterable; the body is ' +
+      'analysed as may-execute, so the loop is entered and exited ' +
+      'without a bound',
+    affects: null,
+  }, loc);
+  emit(ctx.module, headerBlock, {
+    op: OP.BRANCH,
+    cond: condReg,
+    trueTarget: bodyBlock.id,
+    falseTarget: exitBlock.id,
+  }, loc);
+
+  // Body: bind LEFT, then lower the user's body into the same block.
+  ctx.currentBlock = bodyBlock;
+  const keyReg = newRegister(ctx.module);
+  emit(ctx.module, bodyBlock, {
+    op: OP.OPAQUE,
+    dest: keyReg,
+    reason: REASONS.UNIMPLEMENTED,
+    details: isOf
+      ? 'for-of element position is not tracked per iteration'
+      : 'for-in enumerates property names the analysis does not list',
+    affects: null,
+  }, loc);
+
+  let boundReg;
+  if (isOf) {
+    boundReg = newRegister(ctx.module);
+    emit(ctx.module, bodyBlock, {
+      op: OP.GET_INDEX, dest: boundReg, object: iterReg, key: keyReg,
+    }, loc);
+  } else {
+    boundReg = keyReg;
+  }
+  bindForTarget(ctx, node.left, boundReg, loc);
+
+  if (!ctx._loopStack) ctx._loopStack = [];
+  ctx._loopStack.push({
+    headerBlock,
+    bodyBlock,
+    exitBlock,
+    continueTarget: headerBlock,
+    phis,
+  });
+
+  ctx._work.push({ kind: 'finish_loop_body', loc });
+  ctx._work.push({ kind: 'after_stmt' });
+  ctx._work.push({ kind: 'lower_stmt', node: node.body });
+}
+
+// bindForTarget — bind a for-in / for-of loop target to the
+// register holding this iteration's value. The declaring form
+// (`for (const x of …)`) introduces a binding; the bare form
+// (`for (x of …)`) assigns to whatever `x` already names, and
+// destructuring targets (`for (const {a} of …)`) go through the
+// same path as a variable declarator.
+function bindForTarget(ctx, left, valueReg, loc) {
+  if (!left) return;
+  if (left.type === 'VariableDeclaration') {
+    const declKind = left.kind || 'var';
+    const bindingKind = declKind === 'let' ? BIND.LET
+      : declKind === 'const' ? BIND.CONST
+      : BIND.VAR;
+    const decl = left.declarations && left.declarations[0];
+    if (decl) bindDestructuringTarget(ctx, decl.id, valueReg, bindingKind, loc);
+    return;
+  }
+  if (left.type === 'Identifier') {
+    updateName(ctx.scope, left.name, valueReg);
+    return;
+  }
+  // ObjectPattern / ArrayPattern in the bare form.
+  bindDestructuringTarget(ctx, left, valueReg, BIND.VAR, loc);
+}
+
 function beginDoWhile(ctx, node, loc) {
   const predBlock = ctx.currentBlock;
 
@@ -7966,11 +8143,16 @@ function finishDoWhileCondStep(ctx, task) {
   }, task.loc);
   addEdge(loop.condBlock, loop.bodyBlock);
 
-  // Body-exit phi incomings (via condBlock's back edge).
+  // Body-exit phi incomings (via condBlock's back edge). The
+  // register live at condBlock is also what survives into the
+  // exit block, since a do-while can only leave through the
+  // test — remember it for the rebinding at the bottom.
+  const bodyExitRegs = new Map();
   for (const phi of loop.phis) {
     const finalReg = lookupName(ctx.scope, phi.name);
     if (finalReg != null) {
       phi.instr.incoming.push({ pred: loop.condBlock.id, value: finalReg });
+      bodyExitRegs.set(phi.name, finalReg);
     }
   }
   // `continue` in do-while jumps to condBlock (the continueTarget),
@@ -8017,7 +8199,18 @@ function finishDoWhileCondStep(ctx, task) {
   }
   if (!loop.breakSources || loop.breakSources.length === 0) {
     for (const phi of loop.phis) {
-      updateName(ctx.scope, phi.name, phi.destReg);
+      // A do-while body ALWAYS runs, and the only way out is
+      // through the test — so after the loop a name holds what
+      // the body last assigned, not the loop-entry phi. Binding
+      // to `phi.destReg` here is what made
+      //   var h = ""; do { h = location.hash; } while (c);
+      // read back as "" and silently drop the flow. `while` and
+      // `for` differ: they exit from the header, where the phi
+      // IS the live value.
+      const live = bodyExitRegs.has(phi.name)
+        ? bodyExitRegs.get(phi.name)
+        : phi.destReg;
+      updateName(ctx.scope, phi.name, live);
     }
   }
 
@@ -9781,6 +9974,32 @@ function lowerExpressionIter(ctx, root) {
         results.push(newReg);
         break;
       }
+      case 'emit_yield': {
+        // Drop the operand's register — it has been evaluated —
+        // and produce the opaque resumption value.
+        results.pop();
+        const dest = newRegister(ctx.module);
+        emit(ctx.module, ctx.currentBlock, {
+          op: OP.OPAQUE, dest,
+          reason: REASONS.UNIMPLEMENTED,
+          details: 'value of a `yield` expression is supplied by the ' +
+            'generator\'s consumer via next(), which is not modelled',
+          affects: null,
+        }, task.loc);
+        results.push(dest);
+        break;
+      }
+      case 'emit_sequence': {
+        // Every operand has been lowered and left a register on
+        // the stack. The comma operator's value is the last one;
+        // the earlier registers stay exactly where they are (the
+        // instructions that produced their side effects are
+        // already emitted), we just discard the values.
+        const last = results.pop();
+        for (let i = 1; i < task.count; i++) results.pop();
+        results.push(last);
+        break;
+      }
       case 'emit_unimplemented_expr': {
         const dest = newRegister(ctx.module);
         emit(ctx.module, ctx.currentBlock, {
@@ -10057,6 +10276,45 @@ function visitNode(ctx, node, tasks, results) {
         details: 'UpdateExpression on unrecognised target', loc });
       return;
     }
+    case 'YieldExpression': {
+      // Evaluate the operand for its side effects and sinks;
+      // the yield expression's own value comes from whatever
+      // the consumer passes to `next()`, which is outside the
+      // analysed program.
+      if (node.argument) {
+        tasks.push({ kind: 'emit_yield', loc });
+        tasks.push({ kind: 'visit', node: node.argument });
+      } else {
+        tasks.push({ kind: 'emit_unimplemented_expr',
+          details: 'yield with no operand: resumption value is supplied by the generator\'s consumer',
+          loc });
+      }
+      return;
+    }
+    case 'SequenceExpression': {
+      // The comma operator: evaluate every operand left to right
+      // for its side effects, and take the LAST one's value as
+      // the result. Falling through to `unimplemented` meant
+      // `var h = (0, location.hash)` — and, more importantly,
+      // every minified bundle's comma-chained statements — lost
+      // both the side effects and the value.
+      //
+      // The visit stack pops in reverse, so pushing the operands
+      // back-to-front evaluates them front-to-back. Each visit
+      // leaves its register on the operand stack;
+      // `emit_sequence` drops all but the last.
+      const exprs = node.expressions || [];
+      if (exprs.length === 0) {
+        tasks.push({ kind: 'emit_unimplemented_expr',
+          details: 'empty SequenceExpression', loc });
+        return;
+      }
+      tasks.push({ kind: 'emit_sequence', count: exprs.length, loc });
+      for (let i = exprs.length - 1; i >= 0; i--) {
+        tasks.push({ kind: 'visit', node: exprs[i] });
+      }
+      return;
+    }
     case 'MemberExpression': {
       if (node.computed) {
         tasks.push({ kind: 'emit_member_index', loc });
@@ -10226,6 +10484,33 @@ function visitNode(ctx, node, tasks, results) {
         tasks.push({ kind: 'visit', node: node.arguments[i] });
       }
       tasks.push({ kind: 'visit', node: node.callee });
+      return;
+    }
+    case 'ClassExpression': {
+      // `var C = class { … }`. The class desugaring already
+      // knows how to build the constructor and its members —
+      // it just needed somewhere to hand the resulting register
+      // back to the expression stack. Without this case the
+      // node fell through to `unimplemented` and the class
+      // (methods, fields, accessors and all) evaluated to an
+      // opaque value.
+      const savedSlot = ctx._classExprResult;
+      ctx._classExprResult = -1;          // non-null: "please report"
+      lowerClassDeclaration(ctx, node, loc);
+      const reg = ctx._classExprResult;
+      ctx._classExprResult = savedSlot;
+      if (reg != null && reg !== -1) {
+        results.push(reg);
+      } else {
+        const dest = newRegister(ctx.module);
+        emit(ctx.module, ctx.currentBlock, {
+          op: OP.OPAQUE, dest,
+          reason: REASONS.UNIMPLEMENTED,
+          details: 'class expression produced no constructor register',
+          affects: null,
+        }, loc);
+        results.push(dest);
+      }
       return;
     }
     case 'FunctionExpression':
@@ -10876,6 +11161,24 @@ function mkForStatement(init, test, update, body, startTok) {
   };
 }
 
+// `for (LEFT of RIGHT) BODY` / `for (LEFT in RIGHT) BODY`.
+// `left` is a VariableDeclaration (the declaring form) or an
+// arbitrary assignment target (the bare form).
+function mkForInOfStatement(isOf, left, right, body, startTok) {
+  return {
+    type: isOf ? 'ForOfStatement' : 'ForInStatement',
+    left,
+    right,
+    body,
+    await: false,
+    loc: startTok && startTok.loc && body && body.loc
+      ? { start: startTok.loc.start, end: body.loc.end }
+      : null,
+    start: startTok ? startTok.start : 0,
+    end:   body ? body.end : 0,
+  };
+}
+
 function mkTryStatement(block, handler, finalizer, startTok) {
   return {
     type: 'TryStatement',
@@ -11116,17 +11419,88 @@ function parseOperand(lexer) {
   // Phase-4 expansion: the "primary" that the Pratt loop consumes
   // is actually: prefixUnary* primary postfix*
   const prefixes = [];
+  // Pending `new` operators, outermost first. Each claims the
+  // next argument list the postfix loop encounters; any left
+  // over at the end are argument-less `new X`.
+  const pendingNew = [];
+  // Set when the prefix scan consumed `new.target`, which is a
+  // primary in its own right rather than an operator.
+  let metaPrimary = null;
   while (true) {
     const t = lexer.peek();
     if (!t) break;
-    // Unary `new` — prefix form; treat specially because it
-    // captures the following call expression as its arguments.
+    // `new` — NOT a plain prefix operator. Per the grammar,
+    // `new MemberExpression Arguments` binds to the member
+    // expression up to and INCLUDING the first argument list,
+    // and the postfix chain then continues on the result:
+    // `new C().v` is `(new C()).v`, not `new (C().v)`.
+    //
+    // Deferring it to the prefix-unwind loop below got that
+    // backwards, so `new C().v` built a NewExpression over the
+    // member read — which called C() as a plain function, left
+    // `this` unbound, and silently dropped every flow through a
+    // freshly constructed object. We instead count pending
+    // `new`s here and let the postfix loop claim the first
+    // argument list for each.
     if (t.type.label === 'new') {
-      prefixes.push({ kind: 'new', tok: t });
+      lexer.advance();
+      // `new.target` — a meta-property, not a construction. It
+      // IS the primary, so record it and stop peeling prefixes;
+      // the postfix loop then runs on it as usual.
+      const afterNew = lexer.peek();
+      if (afterNew && afterNew.type.label === '.') {
+        lexer.advance();
+        const metaTok = lexer.peek();
+        if (metaTok && metaTok.type.label === 'name') lexer.advance();
+        // Inside a constructor it is the constructor, elsewhere
+        // undefined. Neither is a taint source, so an ordinary
+        // identifier read is the whole story.
+        metaPrimary = mkIdentifier('new.target', t);
+        break;
+      }
+      pendingNew.push({ tok: t });
+      continue;
+    }
+    // `await expr`. The awaited value IS the promise's
+    // resolution value, and this engine models an async
+    // function's return as that value directly, so `await` is
+    // the identity here. Left as a bare identifier it detached
+    // its operand from the expression entirely.
+    if (t.type.label === 'name' && t.value === 'await' &&
+        isYieldOperandStart(lexer)) {
       lexer.advance();
       continue;
     }
-    if (UNARY_PREFIX.has(t.type.label) || UNARY_PREFIX.has(t.value)) {
+    // `yield expr` / `yield* expr` inside a generator. The
+    // tokenizer hands `yield` back as a plain name, so without
+    // this it read as an identifier and the operand became a
+    // separate, disconnected expression — the yielded value's
+    // side effects and sinks went unanalysed.
+    //
+    // We evaluate the operand (that is where the sinks are) and
+    // give the yield expression itself an opaque value, because
+    // what `yield` evaluates to is whatever the CONSUMER passes
+    // back into `next()` — not the operand.
+    if (t.type.label === 'name' && t.value === 'yield' && isYieldOperandStart(lexer)) {
+      lexer.advance();
+      if (lexer.peek() && lexer.peek().type.label === '*') lexer.advance();
+      prefixes.push({ kind: 'yield', tok: t });
+      continue;
+    }
+    // The value check below is what recognises operators the
+    // tokenizer reports under a generic label (`!` and `~` come
+    // through as `prefix`, `-` and `+` as `+/-`, `typeof` as a
+    // keyword). It must NOT apply to literals: a string whose
+    // CONTENTS happen to spell an operator is not an operator.
+    // Without that exclusion `op === '+'`, `case '+':`,
+    // `x === 'typeof'` and `f('!')` were all parse errors — and
+    // a parse error costs the whole file, which is why most of
+    // this repo's own sources were unreadable to the analyzer.
+    const isLiteralToken =
+      t.type.label === 'string' || t.type.label === 'num' ||
+      t.type.label === 'regexp' || t.type.label === 'template';
+    if (!isLiteralToken &&
+        (UNARY_PREFIX.has(t.type.label) || UNARY_PREFIX.has(t.value))) {
       const op = t.type.label === 'name' ? t.value : (t.value || t.type.label);
       // acorn reports +/- with label "+/-" and value "+" or "-".
       const realOp = (op === '+/-') ? t.value : op;
@@ -11144,7 +11518,7 @@ function parseOperand(lexer) {
     break;
   }
 
-  let base = parsePrimary(lexer);
+  let base = metaPrimary || parsePrimary(lexer);
 
   // Postfix suffix loop: `.prop`, `[expr]`, `(args)`.
   while (true) {
@@ -11190,13 +11564,44 @@ function parseOperand(lexer) {
             args.push(parseExpression(lexer));
           }
           const n = lexer.peek();
-          if (n.type.label === ',') { lexer.advance(); continue; }
+          // Trailing comma: `f(a, b,)` is legal and is what
+          // every formatter emits on multi-line calls. Looping
+          // straight back tried to parse `)` as an argument and
+          // failed the whole file.
+          if (n.type.label === ',') {
+            lexer.advance();
+            if (lexer.peek() && lexer.peek().type.label === ')') break;
+            continue;
+          }
           break;
         }
       }
       const closeTok = lexer.peek();
       expect(lexer, ')');
-      base = mkCall(base, args, closeTok ? closeTok.end : base.end);
+      // An argument list directly after a pending `new` is that
+      // `new`'s arguments — the innermost pending one, so
+      // `new new C()()` nests correctly. Everything after the
+      // resulting NewExpression is an ordinary postfix chain.
+      const claimed = pendingNew.length > 0 ? pendingNew.pop() : null;
+      base = claimed
+        ? mkNew(base, args, claimed.tok.start, closeTok ? closeTok.end : base.end)
+        : mkCall(base, args, closeTok ? closeTok.end : base.end);
+      continue;
+    }
+    // Tagged template: `tag`a${x}b``. Per the spec this CALLS
+    // `tag` with the strings array first and one argument per
+    // interpolation. Treating it as an unparsed primary lost the
+    // call entirely, so a tag that forwards its arguments to a
+    // sink — the shape every html`` / sanitize`` helper uses —
+    // was invisible.
+    if (label === '`') {
+      const tpl = parseTemplateLiteral(lexer);
+      const strings = mkArrayExpression(
+        (tpl.quasis || []).map(q => mkLiteral(
+          q.value ? q.value.cooked : '',
+          JSON.stringify(q.value ? q.value.cooked : ''), t)),
+        t, t);
+      base = mkCall(base, [strings].concat(tpl.expressions || []), tpl.end);
       continue;
     }
     // Postfix ++ / --. Binds tighter than any binary operator, so
@@ -11241,7 +11646,11 @@ function parseOperand(lexer) {
             } else {
               args.push(parseExpression(lexer));
             }
-            if (lexer.peek().type.label === ',') { lexer.advance(); continue; }
+            if (lexer.peek().type.label === ',') {
+              lexer.advance();
+              if (lexer.peek() && lexer.peek().type.label === ')') break;
+              continue;
+            }
             break;
           }
         }
@@ -11264,6 +11673,13 @@ function parseOperand(lexer) {
     break;
   }
 
+  // Any `new` the postfix loop didn't hand an argument list to
+  // is the argument-less form, `new Date`.
+  while (pendingNew.length > 0) {
+    const p = pendingNew.pop();
+    base = mkNew(base, [], p.tok.start, base.end);
+  }
+
   // Apply prefix operators in reverse (innermost first).
   while (prefixes.length > 0) {
     const p = prefixes.pop();
@@ -11271,15 +11687,8 @@ function parseOperand(lexer) {
       base = mkUnary(p.op, base, true, p.tok);
     } else if (p.kind === 'update_prefix') {
       base = mkUpdate(p.op, base, true, p.tok);
-    } else if (p.kind === 'new') {
-      // `new X(args)`: if the base is already a CallExpression,
-      // convert it in place to NewExpression; otherwise it's
-      // `new X` with no args.
-      if (base.type === 'CallExpression') {
-        base = mkNew(base.callee, base.arguments, p.tok.start, base.end);
-      } else {
-        base = mkNew(base, [], p.tok.start, base.end);
-      }
+    } else if (p.kind === 'yield') {
+      base = mkYieldExpression(base, p.tok);
     }
   }
 
@@ -11374,7 +11783,12 @@ function parseObjectExpression(lexer) {
         throw parseError(lexer, 'unexpected token after `' + kindName + '` in object literal');
       }
     }
-    if (t.type.label === 'name') {
+    // Property keys may be reserved words: `{ extends: 'X' }`,
+    // `{ default: 1 }`, `{ class: 2 }`, `{ in: 3 }` are all
+    // legal and common (the engine's own TypeDB uses
+    // `extends:`). Accepting only `name` tokens rejected the
+    // whole object literal — and with it the whole file.
+    if (t.type.label === 'name' || t.type.keyword) {
       lexer.advance();
       // `name: value`
       if (lexer.peek() && lexer.peek().type.label === ':') {
@@ -11831,6 +12245,103 @@ function mkAssignmentPattern(left, right) {
   };
 }
 
+// `yield x`. Modelled as an expression that EVALUATES its
+// operand (so the operand's reads and sinks are analysed) but
+// whose own value is supplied by the generator's consumer.
+function mkYieldExpression(argument, tok) {
+  return {
+    type: 'YieldExpression',
+    argument,
+    delegate: false,
+    loc: tok && tok.loc && argument && argument.loc
+      ? { start: tok.loc.start, end: argument.loc.end }
+      : null,
+    start: tok ? tok.start : 0,
+    end:   argument ? argument.end : (tok ? tok.end : 0),
+  };
+}
+
+// True when `async` here introduces a function rather than
+// being an ordinary identifier named `async`.
+//
+// `async function` is unambiguous. The arrow forms are not:
+// `async (1)` is a CALL to a function named `async`, while
+// `async (a) => …` is an async arrow, and the two only diverge
+// at the `=>` after the closing paren. One token of lookahead
+// cannot see that far, so we run a throwaway tokenizer over the
+// remaining source and skip balanced parens. Tokenizing (rather
+// than scanning characters) is what keeps a `)` inside a string,
+// comment or regex from being miscounted.
+function isAsyncFunctionStart(lexer) {
+  const n = lexer.peek2();
+  if (!n) return false;
+  if (n.type.label === 'function') return true;
+  if (n.type.label !== '(' && n.type.label !== 'name') return false;
+  return arrowFollows(lexer.source, n.start);
+}
+
+// Scan from `offset` — positioned at either `(` or a parameter
+// name — and report whether the parameter list is followed by
+// `=>`.
+//
+// No error handling here on purpose: a lexical error in the
+// remaining source is a real error the main tokenizer will hit
+// moments later, and swallowing it would turn a broken file
+// into a silently mis-parsed one. It propagates to the
+// parseModule boundary like any other lexical failure.
+function arrowFollows(source, offset) {
+  if (typeof source !== 'string') return false;
+  const iter = getAcorn().tokenizer(source.slice(offset), {
+    ecmaVersion: 'latest', allowHashBang: true,
+  });
+  let depth = 0;
+  let seen = 0;
+  // Parameter lists are small. The bound stops a pathological
+  // file from turning one lookahead into a whole-file scan.
+  const LIMIT = 4096;
+  while (seen++ < LIMIT) {
+    const tok = iter.getToken();
+    const l = tok.type.label;
+    if (l === 'eof') return false;
+    if (l === '(') { depth++; continue; }
+    if (l === ')') {
+      depth--;
+      if (depth === 0) return iter.getToken().type.label === '=>';
+      if (depth < 0) return false;
+      continue;
+    }
+    // Bare single-parameter form: `async x => …`. Exactly one
+    // identifier may precede the arrow.
+    if (depth === 0) {
+      if (l === '=>') return true;
+      if (seen === 1 && l === 'name') continue;
+      return false;
+    }
+  }
+  return false;
+}
+
+// True when the token after `yield` can begin an operand. A
+// bare `yield` (`yield;`, `yield)`, `yield}`) has none, and a
+// variable actually NAMED `yield` in sloppy-mode code must keep
+// working as an identifier.
+function isYieldOperandStart(lexer) {
+  const n = lexer.peek2();
+  if (!n) return false;
+  const l = n.type.label;
+  if (l === ';' || l === ')' || l === '}' || l === ']' || l === ',' ||
+      l === 'eof' || l === ':') return false;
+  // An operator following `yield` means `yield` was the operand:
+  // `yield + 1` is ambiguous in theory but `yield` as a variable
+  // is what sloppy-mode code means by it.
+  // `yield.x`, `yield = 1`, `yield++` — `yield` is the operand
+  // itself. `yield [a, b]` and `yield (x)` are yields of an
+  // array / parenthesised expression, which is what generator
+  // code actually writes.
+  if (l === '=' || l === '.' || l === '++/--') return false;
+  return true;
+}
+
 function mkSequenceExpression(expressions) {
   const first = expressions[0];
   const last = expressions[expressions.length - 1];
@@ -11894,6 +12405,26 @@ function parsePrimary(lexer) {
     lexer.advance();
     return mkLiteral(null, 'null', t);
   }
+  if (label === 'name' && t.value === 'async' && isAsyncFunctionStart(lexer)) {
+    // `async function …`, `async (…) => …`, `async x => …`.
+    //
+    // `async` was consumed as a plain identifier, so
+    // `var f = async () => …` parsed as THREE statements
+    // (`async;`, `() => …;`, …) and `(async () => {…})()` — the
+    // async IIFE, one of the most common shapes in modern web
+    // code — was a hard parse error that failed the whole file.
+    //
+    // The asynchrony itself needs no special handling: `await`
+    // is modelled as the identity below, and an async
+    // function's return value IS its resolution value.
+    lexer.advance();
+    const node = parsePrimary(lexer);
+    if (node && (node.type === 'FunctionExpression' ||
+                 node.type === 'ArrowFunctionExpression')) {
+      node.async = true;
+    }
+    return node;
+  }
   if (label === 'name') {
     // Single-identifier arrow-function shortcut: `x => body`.
     // Peek two tokens ahead; if the next non-name token is
@@ -11926,6 +12457,9 @@ function parsePrimary(lexer) {
     // like a FunctionDeclaration for IR-lowering purposes but
     // doesn't bind its name in the enclosing scope.
     lexer.advance();
+    // `function*` — generator expression. Parsed as an ordinary
+    // function so the body is walked; see the statement form.
+    if (lexer.peek() && lexer.peek().type.label === '*') lexer.advance();
     let id = null;
     if (lexer.peek() && lexer.peek().type.label === 'name') {
       const idTok = lexer.advance();
@@ -11965,6 +12499,10 @@ function parsePrimary(lexer) {
     const items = [parseExpression(lexer)];
     while (lexer.peek() && lexer.peek().type.label === ',') {
       lexer.advance();
+      // Trailing comma before `)`. Only legal when this turns
+      // out to be an arrow parameter list, and harmless to
+      // accept either way.
+      if (lexer.peek() && lexer.peek().type.label === ')') break;
       items.push(parseExpression(lexer));
     }
     expect(lexer, ')');
@@ -12025,6 +12563,29 @@ function parsePrimary(lexer) {
   // to opaque because their semantics are tag-specific.
   if (label === '`') {
     return parseTemplateLiteral(lexer);
+  }
+  // Class expression: `var C = class [Name] [extends P] { … }`.
+  // Without this the `class` keyword fell through to the
+  // unknown-primary handler, which skipped the balanced `{ … }`
+  // — so the member bodies were never parsed, and the
+  // assignment silently produced an opaque.
+  if (label === 'class') {
+    lexer.advance();
+    let id = null;
+    const nameTok = lexer.peek();
+    if (nameTok && nameTok.type.label === 'name') {
+      lexer.advance();
+      id = mkIdentifier(nameTok.value, nameTok);
+    }
+    let superClass = null;
+    if (lexer.peek() && lexer.peek().type.label === 'extends') {
+      lexer.advance();
+      superClass = parseExpression(lexer);
+    }
+    const body = parseClassBody(lexer);
+    const node = mkClassDeclaration(id, superClass, body, t);
+    node.type = 'ClassExpression';
+    return node;
   }
   // Unknown primary. Emit an UnimplementedExpression marker so
   // the IR builder can raise an explicit `unimplemented`
@@ -12405,6 +12966,9 @@ function parseStatement(lexer) {
       case 'finish_for':
         finishFor(task, outputs);
         break;
+      case 'finish_for_in_of':
+        finishForInOf(task, outputs);
+        break;
       case 'finish_try_body':
         finishTryBody(lexer, task, tasks, outputs);
         break;
@@ -12499,8 +13063,31 @@ function beginStatement(lexer, tasks, outputs) {
     outputs.push(mkReturnStatement(arg, t, null));
     return;
   }
+  if (label === 'name' && t.value === 'async' &&
+      lexer.peek2() && lexer.peek2().type.label === 'function') {
+    // `async function f() { … }` in statement position. The
+    // async marker is kept on the node: an async function's
+    // return value is its promise's RESOLUTION value, which is
+    // what `.then(cb)` hands the callback.
+    lexer.advance();
+    beginStatement(lexer, tasks, outputs);
+    for (let i = tasks.length - 1; i >= 0; i--) {
+      if (tasks[i].kind === 'finish_func_decl') { tasks[i].isAsync = true; break; }
+    }
+    return;
+  }
   if (label === 'function') {
     lexer.advance();
+    // `function*` — a generator. The `*` was an unconditional
+    // parse error, which failed the ENTIRE file: one generator
+    // anywhere and every sink in that file disappeared. We parse
+    // it as an ordinary function so the body is walked; `yield`
+    // is handled below.
+    let isGenerator = false;
+    if (lexer.peek() && lexer.peek().type.label === '*') {
+      lexer.advance();
+      isGenerator = true;
+    }
     const nameTok = lexer.peek();
     let id = null;
     if (nameTok && nameTok.type.label === 'name') {
@@ -12510,7 +13097,7 @@ function beginStatement(lexer, tasks, outputs) {
     expect(lexer, '(');
     const params = parseParamList(lexer);
     expect(lexer, ')');
-    tasks.push({ kind: 'finish_func_decl', startTok: t, id, params });
+    tasks.push({ kind: 'finish_func_decl', startTok: t, id, params, isGenerator });
     tasks.push({ kind: 'parse_stmt' });
     return;
   }
@@ -12535,6 +13122,16 @@ function beginStatement(lexer, tasks, outputs) {
   // --- for / for-in / for-of loop ---
   if (label === 'for') {
     lexer.advance();
+    // `for await (… of …)` — async iteration. The `await` only
+    // affects WHEN each value arrives, not which values the loop
+    // sees, so it is dropped and the loop lowers like any other
+    // for-of. Rejecting it failed the whole file, which is how
+    // `for await (const entry of dirHandle.values())` erased
+    // every finding in the analyzer's own UI source.
+    if (lexer.peek() && lexer.peek().type.label === 'name' &&
+        lexer.peek().value === 'await') {
+      lexer.advance();
+    }
     expect(lexer, '(');
     // Parse the init slot. It may be:
     //   * empty (just `;`)
@@ -12560,15 +13157,23 @@ function beginStatement(lexer, tasks, outputs) {
     } else {
       init = parseExpression(lexer);
     }
-    // TODO: for-in / for-of detection. For now we assume `;`-style
-    // C loop and raise unimplemented if the next token is `in` or
-    // `of`.
+    // for-in / for-of. Either keyword follows the loop's binding
+    // target rather than a `;`, so we branch here on what the
+    // lexer actually produced.
+    //
+    // `init` is currently either a VariableDeclaration (whose
+    // single declarator IS the binding target) or an expression
+    // (an assignment target, `for (x of xs)`). Both shapes go
+    // straight into the ESTree node; the IR builder handles them.
     const afterInit = lexer.peek();
     if (afterInit && (afterInit.type.label === 'in' ||
         (afterInit.type.label === 'name' && afterInit.value === 'of'))) {
-      // for-in / for-of. Skip to end of statement — not yet supported.
-      const endTok = skipToNextStatementBoundary(lexer);
-      outputs.push(mkUnimplementedStatement('for-' + afterInit.value, t, endTok));
+      const isOf = afterInit.type.label !== 'in';
+      lexer.advance();
+      const right = parseExpression(lexer);
+      expect(lexer, ')');
+      tasks.push({ kind: 'finish_for_in_of', startTok: t, left: init, right, isOf });
+      tasks.push({ kind: 'parse_stmt' });
       return;
     }
     expect(lexer, ';');
@@ -12804,6 +13409,8 @@ function parseParamList(lexer) {
     }
     if (lexer.peek() && lexer.peek().type.label === ',') {
       lexer.advance();
+      // Trailing comma in a parameter list: `function f(a, b,)`.
+      if (lexer.peek() && lexer.peek().type.label === ')') break;
       continue;
     }
     break;
@@ -12862,11 +13469,15 @@ function parseObjectPattern(lexer) {
     }
     // Property: key [: value] [= default]
     const keyTok = lexer.peek();
-    if (keyTok.type.label !== 'name') {
+    // Keys may be identifiers, string literals or numbers:
+    // `{ "a-b": x }` and `{ 0: x }` are both legal patterns.
+    if (keyTok.type.label !== 'name' && keyTok.type.label !== 'string' &&
+        keyTok.type.label !== 'num') {
       throw parseError(lexer, 'expected property name in destructuring pattern');
     }
     lexer.advance();
-    const key = mkIdentifier(keyTok.value, keyTok);
+    const keyName = String(keyTok.value);
+    const key = mkIdentifier(keyName, keyTok);
     let value;
     let shorthand;
     if (lexer.peek() && lexer.peek().type.label === ':') {
@@ -12874,11 +13485,15 @@ function parseObjectPattern(lexer) {
       value = parseBindingTarget(lexer);
       shorthand = false;
     } else {
-      value = mkIdentifier(keyTok.value, keyTok);
+      value = mkIdentifier(keyName, keyTok);
       shorthand = true;
     }
-    // Default value: `key = default` (in shorthand only legal)
-    if (lexer.peek() && lexer.peek().type.label === '=' && shorthand) {
+    // Default value. Legal in BOTH forms — `{v = d}` and
+    // `{v: alias = d}`. Restricting it to the shorthand form
+    // left the `=` unconsumed, so the next loop turn read `=`
+    // as a property name and the whole statement failed to
+    // parse; every sink in the file went with it.
+    if (lexer.peek() && lexer.peek().type.label === '=') {
       lexer.advance();
       const def = parseExpression(lexer);
       value = mkAssignmentPattern(value, def);
@@ -13205,12 +13820,19 @@ function parseVarDeclarationsInFor(lexer, kind, kindTok, outputs) {
   outputs.push(mkVariableDeclaration(kind, decls, kindTok));
 }
 
+function finishForInOf(task, outputs) {
+  const body = outputs.pop();
+  outputs.push(mkForInOfStatement(
+    task.isOf, task.left, task.right, body, task.startTok));
+}
+
 function finishFuncDecl(task, outputs) {
   const body = outputs.pop();
   if (!body || body.type !== 'BlockStatement') {
     throw new Error('parse: function body must be a block statement');
   }
-  outputs.push(mkFunctionDeclaration(task.id, task.params, body, false, false, task.startTok));
+  outputs.push(mkFunctionDeclaration(task.id, task.params, body,
+    !!task.isAsync, !!task.isGenerator, task.startTok));
 }
 
 // --- Location helper (public) -----------------------------------------
@@ -14196,6 +14818,149 @@ function domCellKey(kind, typeName, memberName, argStrings, receiverCell) {
   return null;
 }
 
+// --- Accessor properties (get / set) --------------------------------------
+//
+// The parser stores `get v() {…}` / `set v(x) {…}` on the object
+// (or the class instance) under the mangled keys `__get_v__` /
+// `__set_v__`, so the accessor body survives as a closure in the
+// heap. Nothing ever invoked it, though: a getter is only ever
+// called through a property READ, and property reads went
+// straight to the field table.
+//
+// The consequence was total silence. `o.v` returned `undefined`
+// instead of whatever the getter computes, so taint through an
+// accessor vanished — and worse, a sink written INSIDE a getter
+// body was never walked at all, because the engine only walks
+// functions it sees called. `get v() { el.innerHTML = untrusted }`
+// produced no finding and no assumption.
+//
+// So a property read now looks for the accessor first and calls
+// it, and a property write calls the setter with the assigned
+// value. Both go through `invokeAccessor`, which is the ordinary
+// interprocedural walk minus the parts that only make sense for
+// a syntactic call site (spread/rest expansion, the summary
+// cache, TypeDB descriptor resolution).
+const GETTER_PREFIX = '__get_';
+const SETTER_PREFIX = '__set_';
+const ACCESSOR_SUFFIX = '__';
+
+// Find the accessor closure for `prop` on a receiver, or null.
+// An own data property of the same name wins: a class that
+// assigns `this.v = …` in its constructor has shadowed the
+// prototype accessor, which is what JS does too.
+function accessorClosure(state, obj, prefix, prop) {
+  if (!obj || obj.kind !== D.V.OBJECT || !prop) return null;
+  const cell = D.overlayGet(state.heap, obj.objId);
+  if (!cell || !cell.fields) return null;
+  if (cell.fields[prop] !== undefined) return null;
+  const fn = cell.fields[prefix + prop + ACCESSOR_SUFFIX];
+  if (!fn) return null;
+  if (fn.kind === D.V.CLOSURE && fn.functionId) return fn;
+  if (fn.kind === D.V.DISJUNCT) {
+    for (const v of fn.variants) {
+      if (v && v.kind === D.V.CLOSURE && v.functionId) return v;
+    }
+  }
+  return null;
+}
+
+// invokeAccessor — walk an accessor body and return its value.
+//
+// Returns `{ state, value }`: the state carries any heap writes
+// the accessor performed (a setter's whole purpose), and `value`
+// is the join of the closure's return registers.
+//
+// Recursion is guarded the same way ordinary calls are — a
+// getter that reads its own property would otherwise walk
+// forever. On a guarded re-entry we return an opaque value that
+// keeps the receiver's labels, which is the sound answer.
+async function invokeAccessor(ctx, state, closureValue, thisValue, args, loc) {
+  const fn = ctx.module.functions.find(f => f.id === closureValue.functionId);
+  if (!fn || !fn.cfg) return { state, value: null };
+
+  let init = D.createStateSharingHeap(state);
+  if (ctx.currentPath) init = D.withPath(init, ctx.currentPath);
+
+  // Captures, resolved against the caller's live state first so
+  // the accessor sees current values, then the definition-time
+  // snapshot for closures that have escaped their defining
+  // frame.
+  for (const c of closureValue.captures || []) {
+    if (!c || c.innerReg == null) continue;
+    let val = null;
+    if (c.outerReg != null) {
+      const live = D.getReg(state, c.outerReg);
+      if (live && live.kind !== D.V.BOTTOM) val = live;
+    }
+    if (!val && c.value && c.value.kind !== D.V.BOTTOM) val = c.value;
+    if (val) init = D.setReg(init, c.innerReg, val);
+  }
+
+  const params = fn.params || [];
+  for (let i = 0; i < params.length; i++) {
+    const v = args[i] || D.concrete(undefined, undefined, loc);
+    init = D.setReg(init, params[i], v);
+  }
+
+  const frame = { funcId: fn.id, argsFp: 'accessor' };
+  if (D.callStackContains(init, frame)) {
+    const a = ctx.assumptions.raise(
+      REASONS.UNIMPLEMENTED,
+      'recursive accessor invocation on `' + (fn.name || fn.id) +
+        '` — result conservatively inherits the receiver\'s labels',
+      loc
+    );
+    return {
+      state,
+      value: D.opaque([a.id], null, loc, thisValue && thisValue.labels),
+    };
+  }
+  init = D.pushCallStack(init, frame);
+
+  const savedPath = ctx.currentPath;
+  const savedBlockId = ctx.currentBlockId;
+  const savedThis = ctx._currentThisValue;
+  let result = null;
+  if (thisValue) ctx._currentThisValue = thisValue;
+  try {
+    const analyse = getAnalyseFunction();
+    result = await analyse(ctx.module, fn, init, ctx);
+  } finally {
+    ctx.currentPath = savedPath;
+    ctx.currentBlockId = savedBlockId;
+    ctx._currentThisValue = savedThis;
+  }
+
+  let outState = state;
+  if (result && result.exitState) {
+    const exitHeap = result.exitState.heap;
+    if (!isEmptyOverlayOver(exitHeap, state.heap)) {
+      outState = D.withHeap(state, exitHeap);
+    }
+  }
+
+  let value = null;
+  if (fn.returns && fn.returns.length > 0 && result && result.exitState) {
+    for (const retReg of fn.returns) {
+      const v = D.getReg(result.exitState, retReg);
+      if (v) value = value ? D.join(value, v) : v;
+    }
+  }
+  return { state: outState, value };
+}
+
+// iteratedElementType — the type a typed iterable yields when
+// indexed or iterated, declared as `iteratesType` on the
+// TypeDB's type descriptor (NodeList → HTMLElement,
+// HTMLCollection → HTMLElement, FileList → File). Returns null
+// for anything that doesn't declare one, which leaves the read
+// untyped exactly as before.
+function iteratedElementType(ctx, typeName) {
+  if (!typeName || !ctx.typeDB || !ctx.typeDB.types) return null;
+  const desc = ctx.typeDB.types[typeName];
+  return (desc && desc.iteratesType) || null;
+}
+
 // domStateField — resolve the cell field a `domStateRead` /
 // `domStateWrite` descriptor addresses, e.g. `attr:data-token`
 // for `setAttribute("data-token", v)`. Returns null when the key
@@ -15106,11 +15871,40 @@ function applyGetArgs(ctx, state, instr) {
 // downstream `el.src = ...` write sees both the iframe variant
 // (sink) and the anchor variant (no `src` property).
 
-function applyGetProp(ctx, state, instr) {
+async function applyGetProp(ctx, state, instr) {
   const loc = instrLoc(ctx, instr);
   const obj = D.getReg(state, instr.object);
   if (!obj) {
     return D.setReg(state, instr.dest, D.top(loc));
+  }
+  // Accessor path: only taken when some receiver variant
+  // actually has a getter for this name, so the plain
+  // data-property path below is bit-for-bit what it always was.
+  const variants = D.disjunctVariants(obj);
+  let hasAccessor = false;
+  for (const v of variants) {
+    if (accessorClosure(state, v, GETTER_PREFIX, instr.propName)) {
+      hasAccessor = true;
+      break;
+    }
+  }
+  if (hasAccessor) {
+    let joined = null;
+    let newState = state;
+    for (const variant of variants) {
+      const getter = accessorClosure(newState, variant, GETTER_PREFIX, instr.propName);
+      let v;
+      if (getter) {
+        const r = await invokeAccessor(ctx, newState, getter, variant, [], loc);
+        newState = r.state;
+        v = r.value || D.concrete(undefined, undefined, loc);
+      } else {
+        v = propLookupForVariant(ctx, newState, variant, instr, loc);
+      }
+      if (!v || v.kind === D.V.BOTTOM) continue;
+      joined = joined ? D.join(joined, v) : v;
+    }
+    return D.setReg(newState, instr.dest, joined || D.bottom());
   }
   const result = D.disjunctMap(obj, (variant) =>
     propLookupForVariant(ctx, state, variant, instr, loc));
@@ -15338,9 +16132,37 @@ function highestNumericKey(fields) {
   return hi;
 }
 
+// applyGetIndex — `obj[key]`. Fans out over Disjunct receivers
+// the same way applyGetProp does, then joins the per-variant
+// results.
+//
+// The fan-out is not cosmetic. An imprecise read over an array
+// joins EVERY field, and an array cell holds `length` alongside
+// its elements — so `arr[k]` with an unknown key yields
+// Disjunct(element, number). Without fanning out, a second read
+// on that value (`arr[j][k]`, or any nested container walked by
+// a for-of) hit the "unresolved target" fallback and dropped the
+// taint entirely.
 function applyGetIndex(ctx, state, instr) {
   const loc = instrLoc(ctx, instr);
   const obj = D.getReg(state, instr.object);
+  if (obj && obj.kind === D.V.DISJUNCT) {
+    let joined = null;
+    let newState = state;
+    for (const variant of obj.variants) {
+      newState = indexLookupForVariant(ctx, newState, variant, instr, loc);
+      const v = D.getReg(newState, instr.dest);
+      joined = joined ? D.join(joined, v) : v;
+    }
+    return D.setReg(newState, instr.dest, joined);
+  }
+  return indexLookupForVariant(ctx, state, obj, instr, loc);
+}
+
+// Resolve a computed index read against a single (non-disjunct)
+// receiver. Writes the result into `instr.dest` and returns the
+// new state, so the caller can join across variants.
+function indexLookupForVariant(ctx, state, obj, instr, loc) {
   const key = D.getReg(state, instr.key);
 
   // Case 1: concrete heap object, concrete scalar key.
@@ -15487,8 +16309,17 @@ function applyGetIndex(ctx, state, instr) {
     // read-out value. The old code built a fresh opaque and
     // dropped labels, which lost taint across `obj[k]` reads
     // when the receiver itself was tainted.
+    //
+    // Typed iterables carry their element type in the TypeDB's
+    // `iteratesType`. Indexing (or iterating, which lowers to
+    // the same read) a NodeList yields an HTMLElement, so
+    // `for (const a of document.querySelectorAll("a")) a.href = x`
+    // classifies the write as a navigation sink. Without the
+    // element type the read produced a type-less opaque and no
+    // sink lookup was possible.
+    const elemType = iteratedElementType(ctx, obj.typeName);
     return D.setReg(state, instr.dest,
-      D.opaque(obj.assumptionIds, null, loc, obj.labels));
+      D.opaque(obj.assumptionIds, elemType, loc, obj.labels));
   }
 
   // Computed index whose target object or key couldn't be
@@ -15506,10 +16337,21 @@ function applyGetIndex(ctx, state, instr) {
 
 // --- SetProp / SetIndex -------------------------------------------------
 
-function applySetProp(ctx, state, instr) {
+async function applySetProp(ctx, state, instr) {
   const loc = instrLoc(ctx, instr);
   const obj = D.getReg(state, instr.object);
   const val = D.getReg(state, instr.value);
+  // Setter path: `o.v = x` where `v` is an accessor runs the
+  // setter body with `x` bound to its parameter, so a sink
+  // inside the setter fires and any `this.…` the setter writes
+  // lands in the heap. As with getters, this only diverges from
+  // the plain field-write path when a setter actually exists.
+  for (const variant of D.disjunctVariants(obj)) {
+    const setter = accessorClosure(state, variant, SETTER_PREFIX, instr.propName);
+    if (!setter) continue;
+    const r = await invokeAccessor(ctx, state, setter, variant, [val], loc);
+    state = r.state;
+  }
   // D11.1 completeness gate: any syntactic innerHTML /
   // outerHTML / insertAdjacentHTML write the walker actually
   // executed — regardless of whether the receiver resolved
@@ -15844,6 +16686,42 @@ async function walkCallbackArgs(ctx, state, instr, thisValue, argValues, loc) {
     ? { event: eventName, registrationSite: loc, calleeName: instr.methodName || instr.calleeName || null }
     : null;
 
+  // Promise resolution. `p.then(cb)` hands `cb` the value `p`
+  // settled with, so the callback's first parameter must carry
+  // the receiver's taint rather than being a blank opaque —
+  // otherwise `fetch(u).then(r => …)` walks the handler but
+  // sees nothing flow into it.
+  //
+  // Two shapes, both TypeDB-declared:
+  //
+  //   * The receiver came from an analysed async function, so
+  //     its return value IS the resolution value and we pass it
+  //     through directly.
+  //   * The receiver is a declared Promise with an `innerType`
+  //     (fetch → Promise<Response>), so the parameter takes that
+  //     type and its property reads resolve through the TypeDB.
+  let firstParamValue = null;
+  if (desc.callbackResolvesReceiver && thisValue) {
+    // An analysed async function's promise carries the exact
+    // value its body returned — prefer that over any declared
+    // type, since it is the real thing with its real labels.
+    if (thisValue.resolutionValue) {
+      firstParamValue = thisValue.resolutionValue;
+      if (!firstParamType && firstParamValue.typeName) {
+        firstParamType = firstParamValue.typeName;
+      }
+    }
+    const inner = firstParamValue ? null : (thisValue.innerType || null);
+    if (inner && db.types && db.types[inner]) {
+      firstParamType = inner;
+      firstParamValue = D.opaque(thisValue.assumptionIds || [], inner, loc,
+        thisValue.labels);
+    } else if (!firstParamValue && thisValue.kind !== D.V.BOTTOM) {
+      firstParamValue = thisValue;
+      if (!firstParamType && thisValue.typeName) firstParamType = thisValue.typeName;
+    }
+  }
+
   for (const idx of desc.callbackArgs) {
     if (typeof idx !== 'number') continue;
     const cbValue = argValues[idx];
@@ -15857,13 +16735,15 @@ async function walkCallbackArgs(ctx, state, instr, thisValue, argValues, loc) {
     if (cbValue.kind === D.V.DISJUNCT && Array.isArray(cbValue.variants)) {
       for (const v of cbValue.variants) {
         if (v && v.kind === D.V.CLOSURE && v.functionId) {
-          await walkCallback(ctx, state, v, loc, firstParamType, handlerContext);
+          await walkCallback(ctx, state, v, loc, firstParamType, handlerContext,
+            firstParamValue);
         }
       }
       continue;
     }
     if (fnId == null) continue;
-    await walkCallback(ctx, state, cbValue, loc, firstParamType, handlerContext);
+    await walkCallback(ctx, state, cbValue, loc, firstParamType, handlerContext,
+      firstParamValue);
   }
 }
 
@@ -15889,7 +16769,8 @@ async function walkCallbackArgs(ctx, state, instr, thisValue, argValues, loc) {
 // callback REPEATEDLY until the persisted heap stabilises,
 // modelling the event loop correctly: any ordering, any number
 // of invocations.
-async function walkCallback(ctx, state, closureValue, loc, firstParamType, handlerContext) {
+async function walkCallback(ctx, state, closureValue, loc, firstParamType, handlerContext,
+                            firstParamValue) {
   const calleeFn = ctx.module.functions.find(f => f.id === closureValue.functionId);
   if (!calleeFn || !calleeFn.cfg) return;
 
@@ -15926,6 +16807,7 @@ async function walkCallback(ctx, state, closureValue, loc, firstParamType, handl
     fn: calleeFn,
     resolvedCaptures,
     firstParamType,
+    firstParamValue: firstParamValue || null,
     handlerContext,
     registrationLoc: loc,
     // Carry the outer path so fixpoint re-walks inherit the
@@ -15969,6 +16851,13 @@ function buildCallbackInitState(ctx, cb, persistedState) {
       ctx._calledParamAssumptionIds[paramKey] = aId;
     } else {
       aId = (ctx._calledParamAssumptionIds && ctx._calledParamAssumptionIds[paramKey]) || null;
+    }
+    // A known resolution value (see walkCallbackArgs) replaces
+    // the opaque placeholder for the first parameter, so taint
+    // carried by the promise reaches the handler body.
+    if (pi === 0 && cb.firstParamValue) {
+      init = D.setReg(init, paramReg, cb.firstParamValue);
+      continue;
     }
     init = D.setReg(init, paramReg,
       D.opaque(aId != null ? [aId] : [], typeName, cb.registrationLoc));
@@ -16757,6 +17646,17 @@ async function applyCall(ctx, state, instr) {
         }
       }
     }
+    // An async function returns a Promise, and what `.then(cb)`
+    // hands `cb` is the RESOLUTION value — the thing the body
+    // returned. We keep both: the value is typed `Promise` so
+    // `.then` resolves through the TypeDB, and `resolutionValue`
+    // carries what the body produced so walkCallbackArgs can
+    // bind it to the handler's parameter.
+    if (calleeFn.isAsync && returnValue) {
+      returnValue = Object.freeze(Object.assign({}, D.opaque(
+        returnValue.assumptionIds || [], 'Promise', loc, returnValue.labels),
+        { resolutionValue: returnValue }));
+    }
     if (!returnValue) {
       returnValue = D.concrete(undefined, undefined, loc);
     }
@@ -17059,6 +17959,15 @@ function resolveCallReturnViaDB(ctx, state, instr, thisValue, argValues, loc) {
   }
 
   let result = D.opaque(chainIds, returnType, loc, resultLabels);
+
+  // Parametric containers: remember the declared `innerType`
+  // (Promise<Response>, Array<T>) on the value so `.then(cb)`
+  // can type the callback's parameter. Without it the promise
+  // is just an opaque tagged `Promise` and its payload type is
+  // lost at the first call boundary.
+  if (desc.innerType) {
+    result = Object.freeze(Object.assign({}, result, { innerType: desc.innerType }));
+  }
 
   // DOM identity: a query whose arguments pin down which element
   // it returns (`getElementById("out")`) yields a value tagged

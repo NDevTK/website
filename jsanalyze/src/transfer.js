@@ -186,6 +186,149 @@ function domCellKey(kind, typeName, memberName, argStrings, receiverCell) {
   return null;
 }
 
+// --- Accessor properties (get / set) --------------------------------------
+//
+// The parser stores `get v() {…}` / `set v(x) {…}` on the object
+// (or the class instance) under the mangled keys `__get_v__` /
+// `__set_v__`, so the accessor body survives as a closure in the
+// heap. Nothing ever invoked it, though: a getter is only ever
+// called through a property READ, and property reads went
+// straight to the field table.
+//
+// The consequence was total silence. `o.v` returned `undefined`
+// instead of whatever the getter computes, so taint through an
+// accessor vanished — and worse, a sink written INSIDE a getter
+// body was never walked at all, because the engine only walks
+// functions it sees called. `get v() { el.innerHTML = untrusted }`
+// produced no finding and no assumption.
+//
+// So a property read now looks for the accessor first and calls
+// it, and a property write calls the setter with the assigned
+// value. Both go through `invokeAccessor`, which is the ordinary
+// interprocedural walk minus the parts that only make sense for
+// a syntactic call site (spread/rest expansion, the summary
+// cache, TypeDB descriptor resolution).
+const GETTER_PREFIX = '__get_';
+const SETTER_PREFIX = '__set_';
+const ACCESSOR_SUFFIX = '__';
+
+// Find the accessor closure for `prop` on a receiver, or null.
+// An own data property of the same name wins: a class that
+// assigns `this.v = …` in its constructor has shadowed the
+// prototype accessor, which is what JS does too.
+function accessorClosure(state, obj, prefix, prop) {
+  if (!obj || obj.kind !== D.V.OBJECT || !prop) return null;
+  const cell = D.overlayGet(state.heap, obj.objId);
+  if (!cell || !cell.fields) return null;
+  if (cell.fields[prop] !== undefined) return null;
+  const fn = cell.fields[prefix + prop + ACCESSOR_SUFFIX];
+  if (!fn) return null;
+  if (fn.kind === D.V.CLOSURE && fn.functionId) return fn;
+  if (fn.kind === D.V.DISJUNCT) {
+    for (const v of fn.variants) {
+      if (v && v.kind === D.V.CLOSURE && v.functionId) return v;
+    }
+  }
+  return null;
+}
+
+// invokeAccessor — walk an accessor body and return its value.
+//
+// Returns `{ state, value }`: the state carries any heap writes
+// the accessor performed (a setter's whole purpose), and `value`
+// is the join of the closure's return registers.
+//
+// Recursion is guarded the same way ordinary calls are — a
+// getter that reads its own property would otherwise walk
+// forever. On a guarded re-entry we return an opaque value that
+// keeps the receiver's labels, which is the sound answer.
+async function invokeAccessor(ctx, state, closureValue, thisValue, args, loc) {
+  const fn = ctx.module.functions.find(f => f.id === closureValue.functionId);
+  if (!fn || !fn.cfg) return { state, value: null };
+
+  let init = D.createStateSharingHeap(state);
+  if (ctx.currentPath) init = D.withPath(init, ctx.currentPath);
+
+  // Captures, resolved against the caller's live state first so
+  // the accessor sees current values, then the definition-time
+  // snapshot for closures that have escaped their defining
+  // frame.
+  for (const c of closureValue.captures || []) {
+    if (!c || c.innerReg == null) continue;
+    let val = null;
+    if (c.outerReg != null) {
+      const live = D.getReg(state, c.outerReg);
+      if (live && live.kind !== D.V.BOTTOM) val = live;
+    }
+    if (!val && c.value && c.value.kind !== D.V.BOTTOM) val = c.value;
+    if (val) init = D.setReg(init, c.innerReg, val);
+  }
+
+  const params = fn.params || [];
+  for (let i = 0; i < params.length; i++) {
+    const v = args[i] || D.concrete(undefined, undefined, loc);
+    init = D.setReg(init, params[i], v);
+  }
+
+  const frame = { funcId: fn.id, argsFp: 'accessor' };
+  if (D.callStackContains(init, frame)) {
+    const a = ctx.assumptions.raise(
+      REASONS.UNIMPLEMENTED,
+      'recursive accessor invocation on `' + (fn.name || fn.id) +
+        '` — result conservatively inherits the receiver\'s labels',
+      loc
+    );
+    return {
+      state,
+      value: D.opaque([a.id], null, loc, thisValue && thisValue.labels),
+    };
+  }
+  init = D.pushCallStack(init, frame);
+
+  const savedPath = ctx.currentPath;
+  const savedBlockId = ctx.currentBlockId;
+  const savedThis = ctx._currentThisValue;
+  let result = null;
+  if (thisValue) ctx._currentThisValue = thisValue;
+  try {
+    const analyse = getAnalyseFunction();
+    result = await analyse(ctx.module, fn, init, ctx);
+  } finally {
+    ctx.currentPath = savedPath;
+    ctx.currentBlockId = savedBlockId;
+    ctx._currentThisValue = savedThis;
+  }
+
+  let outState = state;
+  if (result && result.exitState) {
+    const exitHeap = result.exitState.heap;
+    if (!isEmptyOverlayOver(exitHeap, state.heap)) {
+      outState = D.withHeap(state, exitHeap);
+    }
+  }
+
+  let value = null;
+  if (fn.returns && fn.returns.length > 0 && result && result.exitState) {
+    for (const retReg of fn.returns) {
+      const v = D.getReg(result.exitState, retReg);
+      if (v) value = value ? D.join(value, v) : v;
+    }
+  }
+  return { state: outState, value };
+}
+
+// iteratedElementType — the type a typed iterable yields when
+// indexed or iterated, declared as `iteratesType` on the
+// TypeDB's type descriptor (NodeList → HTMLElement,
+// HTMLCollection → HTMLElement, FileList → File). Returns null
+// for anything that doesn't declare one, which leaves the read
+// untyped exactly as before.
+function iteratedElementType(ctx, typeName) {
+  if (!typeName || !ctx.typeDB || !ctx.typeDB.types) return null;
+  const desc = ctx.typeDB.types[typeName];
+  return (desc && desc.iteratesType) || null;
+}
+
 // domStateField — resolve the cell field a `domStateRead` /
 // `domStateWrite` descriptor addresses, e.g. `attr:data-token`
 // for `setAttribute("data-token", v)`. Returns null when the key
@@ -1096,11 +1239,40 @@ function applyGetArgs(ctx, state, instr) {
 // downstream `el.src = ...` write sees both the iframe variant
 // (sink) and the anchor variant (no `src` property).
 
-function applyGetProp(ctx, state, instr) {
+async function applyGetProp(ctx, state, instr) {
   const loc = instrLoc(ctx, instr);
   const obj = D.getReg(state, instr.object);
   if (!obj) {
     return D.setReg(state, instr.dest, D.top(loc));
+  }
+  // Accessor path: only taken when some receiver variant
+  // actually has a getter for this name, so the plain
+  // data-property path below is bit-for-bit what it always was.
+  const variants = D.disjunctVariants(obj);
+  let hasAccessor = false;
+  for (const v of variants) {
+    if (accessorClosure(state, v, GETTER_PREFIX, instr.propName)) {
+      hasAccessor = true;
+      break;
+    }
+  }
+  if (hasAccessor) {
+    let joined = null;
+    let newState = state;
+    for (const variant of variants) {
+      const getter = accessorClosure(newState, variant, GETTER_PREFIX, instr.propName);
+      let v;
+      if (getter) {
+        const r = await invokeAccessor(ctx, newState, getter, variant, [], loc);
+        newState = r.state;
+        v = r.value || D.concrete(undefined, undefined, loc);
+      } else {
+        v = propLookupForVariant(ctx, newState, variant, instr, loc);
+      }
+      if (!v || v.kind === D.V.BOTTOM) continue;
+      joined = joined ? D.join(joined, v) : v;
+    }
+    return D.setReg(newState, instr.dest, joined || D.bottom());
   }
   const result = D.disjunctMap(obj, (variant) =>
     propLookupForVariant(ctx, state, variant, instr, loc));
@@ -1328,9 +1500,37 @@ function highestNumericKey(fields) {
   return hi;
 }
 
+// applyGetIndex — `obj[key]`. Fans out over Disjunct receivers
+// the same way applyGetProp does, then joins the per-variant
+// results.
+//
+// The fan-out is not cosmetic. An imprecise read over an array
+// joins EVERY field, and an array cell holds `length` alongside
+// its elements — so `arr[k]` with an unknown key yields
+// Disjunct(element, number). Without fanning out, a second read
+// on that value (`arr[j][k]`, or any nested container walked by
+// a for-of) hit the "unresolved target" fallback and dropped the
+// taint entirely.
 function applyGetIndex(ctx, state, instr) {
   const loc = instrLoc(ctx, instr);
   const obj = D.getReg(state, instr.object);
+  if (obj && obj.kind === D.V.DISJUNCT) {
+    let joined = null;
+    let newState = state;
+    for (const variant of obj.variants) {
+      newState = indexLookupForVariant(ctx, newState, variant, instr, loc);
+      const v = D.getReg(newState, instr.dest);
+      joined = joined ? D.join(joined, v) : v;
+    }
+    return D.setReg(newState, instr.dest, joined);
+  }
+  return indexLookupForVariant(ctx, state, obj, instr, loc);
+}
+
+// Resolve a computed index read against a single (non-disjunct)
+// receiver. Writes the result into `instr.dest` and returns the
+// new state, so the caller can join across variants.
+function indexLookupForVariant(ctx, state, obj, instr, loc) {
   const key = D.getReg(state, instr.key);
 
   // Case 1: concrete heap object, concrete scalar key.
@@ -1477,8 +1677,17 @@ function applyGetIndex(ctx, state, instr) {
     // read-out value. The old code built a fresh opaque and
     // dropped labels, which lost taint across `obj[k]` reads
     // when the receiver itself was tainted.
+    //
+    // Typed iterables carry their element type in the TypeDB's
+    // `iteratesType`. Indexing (or iterating, which lowers to
+    // the same read) a NodeList yields an HTMLElement, so
+    // `for (const a of document.querySelectorAll("a")) a.href = x`
+    // classifies the write as a navigation sink. Without the
+    // element type the read produced a type-less opaque and no
+    // sink lookup was possible.
+    const elemType = iteratedElementType(ctx, obj.typeName);
     return D.setReg(state, instr.dest,
-      D.opaque(obj.assumptionIds, null, loc, obj.labels));
+      D.opaque(obj.assumptionIds, elemType, loc, obj.labels));
   }
 
   // Computed index whose target object or key couldn't be
@@ -1496,10 +1705,21 @@ function applyGetIndex(ctx, state, instr) {
 
 // --- SetProp / SetIndex -------------------------------------------------
 
-function applySetProp(ctx, state, instr) {
+async function applySetProp(ctx, state, instr) {
   const loc = instrLoc(ctx, instr);
   const obj = D.getReg(state, instr.object);
   const val = D.getReg(state, instr.value);
+  // Setter path: `o.v = x` where `v` is an accessor runs the
+  // setter body with `x` bound to its parameter, so a sink
+  // inside the setter fires and any `this.…` the setter writes
+  // lands in the heap. As with getters, this only diverges from
+  // the plain field-write path when a setter actually exists.
+  for (const variant of D.disjunctVariants(obj)) {
+    const setter = accessorClosure(state, variant, SETTER_PREFIX, instr.propName);
+    if (!setter) continue;
+    const r = await invokeAccessor(ctx, state, setter, variant, [val], loc);
+    state = r.state;
+  }
   // D11.1 completeness gate: any syntactic innerHTML /
   // outerHTML / insertAdjacentHTML write the walker actually
   // executed — regardless of whether the receiver resolved
@@ -1834,6 +2054,42 @@ async function walkCallbackArgs(ctx, state, instr, thisValue, argValues, loc) {
     ? { event: eventName, registrationSite: loc, calleeName: instr.methodName || instr.calleeName || null }
     : null;
 
+  // Promise resolution. `p.then(cb)` hands `cb` the value `p`
+  // settled with, so the callback's first parameter must carry
+  // the receiver's taint rather than being a blank opaque —
+  // otherwise `fetch(u).then(r => …)` walks the handler but
+  // sees nothing flow into it.
+  //
+  // Two shapes, both TypeDB-declared:
+  //
+  //   * The receiver came from an analysed async function, so
+  //     its return value IS the resolution value and we pass it
+  //     through directly.
+  //   * The receiver is a declared Promise with an `innerType`
+  //     (fetch → Promise<Response>), so the parameter takes that
+  //     type and its property reads resolve through the TypeDB.
+  let firstParamValue = null;
+  if (desc.callbackResolvesReceiver && thisValue) {
+    // An analysed async function's promise carries the exact
+    // value its body returned — prefer that over any declared
+    // type, since it is the real thing with its real labels.
+    if (thisValue.resolutionValue) {
+      firstParamValue = thisValue.resolutionValue;
+      if (!firstParamType && firstParamValue.typeName) {
+        firstParamType = firstParamValue.typeName;
+      }
+    }
+    const inner = firstParamValue ? null : (thisValue.innerType || null);
+    if (inner && db.types && db.types[inner]) {
+      firstParamType = inner;
+      firstParamValue = D.opaque(thisValue.assumptionIds || [], inner, loc,
+        thisValue.labels);
+    } else if (!firstParamValue && thisValue.kind !== D.V.BOTTOM) {
+      firstParamValue = thisValue;
+      if (!firstParamType && thisValue.typeName) firstParamType = thisValue.typeName;
+    }
+  }
+
   for (const idx of desc.callbackArgs) {
     if (typeof idx !== 'number') continue;
     const cbValue = argValues[idx];
@@ -1847,13 +2103,15 @@ async function walkCallbackArgs(ctx, state, instr, thisValue, argValues, loc) {
     if (cbValue.kind === D.V.DISJUNCT && Array.isArray(cbValue.variants)) {
       for (const v of cbValue.variants) {
         if (v && v.kind === D.V.CLOSURE && v.functionId) {
-          await walkCallback(ctx, state, v, loc, firstParamType, handlerContext);
+          await walkCallback(ctx, state, v, loc, firstParamType, handlerContext,
+            firstParamValue);
         }
       }
       continue;
     }
     if (fnId == null) continue;
-    await walkCallback(ctx, state, cbValue, loc, firstParamType, handlerContext);
+    await walkCallback(ctx, state, cbValue, loc, firstParamType, handlerContext,
+      firstParamValue);
   }
 }
 
@@ -1879,7 +2137,8 @@ async function walkCallbackArgs(ctx, state, instr, thisValue, argValues, loc) {
 // callback REPEATEDLY until the persisted heap stabilises,
 // modelling the event loop correctly: any ordering, any number
 // of invocations.
-async function walkCallback(ctx, state, closureValue, loc, firstParamType, handlerContext) {
+async function walkCallback(ctx, state, closureValue, loc, firstParamType, handlerContext,
+                            firstParamValue) {
   const calleeFn = ctx.module.functions.find(f => f.id === closureValue.functionId);
   if (!calleeFn || !calleeFn.cfg) return;
 
@@ -1916,6 +2175,7 @@ async function walkCallback(ctx, state, closureValue, loc, firstParamType, handl
     fn: calleeFn,
     resolvedCaptures,
     firstParamType,
+    firstParamValue: firstParamValue || null,
     handlerContext,
     registrationLoc: loc,
     // Carry the outer path so fixpoint re-walks inherit the
@@ -1959,6 +2219,13 @@ function buildCallbackInitState(ctx, cb, persistedState) {
       ctx._calledParamAssumptionIds[paramKey] = aId;
     } else {
       aId = (ctx._calledParamAssumptionIds && ctx._calledParamAssumptionIds[paramKey]) || null;
+    }
+    // A known resolution value (see walkCallbackArgs) replaces
+    // the opaque placeholder for the first parameter, so taint
+    // carried by the promise reaches the handler body.
+    if (pi === 0 && cb.firstParamValue) {
+      init = D.setReg(init, paramReg, cb.firstParamValue);
+      continue;
     }
     init = D.setReg(init, paramReg,
       D.opaque(aId != null ? [aId] : [], typeName, cb.registrationLoc));
@@ -2747,6 +3014,17 @@ async function applyCall(ctx, state, instr) {
         }
       }
     }
+    // An async function returns a Promise, and what `.then(cb)`
+    // hands `cb` is the RESOLUTION value — the thing the body
+    // returned. We keep both: the value is typed `Promise` so
+    // `.then` resolves through the TypeDB, and `resolutionValue`
+    // carries what the body produced so walkCallbackArgs can
+    // bind it to the handler's parameter.
+    if (calleeFn.isAsync && returnValue) {
+      returnValue = Object.freeze(Object.assign({}, D.opaque(
+        returnValue.assumptionIds || [], 'Promise', loc, returnValue.labels),
+        { resolutionValue: returnValue }));
+    }
     if (!returnValue) {
       returnValue = D.concrete(undefined, undefined, loc);
     }
@@ -3049,6 +3327,15 @@ function resolveCallReturnViaDB(ctx, state, instr, thisValue, argValues, loc) {
   }
 
   let result = D.opaque(chainIds, returnType, loc, resultLabels);
+
+  // Parametric containers: remember the declared `innerType`
+  // (Promise<Response>, Array<T>) on the value so `.then(cb)`
+  // can type the callback's parameter. Without it the promise
+  // is just an opaque tagged `Promise` and its payload type is
+  // lost at the first call boundary.
+  if (desc.innerType) {
+    result = Object.freeze(Object.assign({}, result, { innerType: desc.innerType }));
+  }
 
   // DOM identity: a query whose arguments pin down which element
   // it returns (`getElementById("out")`) yields a value tagged

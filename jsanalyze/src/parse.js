@@ -307,6 +307,24 @@ function mkForStatement(init, test, update, body, startTok) {
   };
 }
 
+// `for (LEFT of RIGHT) BODY` / `for (LEFT in RIGHT) BODY`.
+// `left` is a VariableDeclaration (the declaring form) or an
+// arbitrary assignment target (the bare form).
+function mkForInOfStatement(isOf, left, right, body, startTok) {
+  return {
+    type: isOf ? 'ForOfStatement' : 'ForInStatement',
+    left,
+    right,
+    body,
+    await: false,
+    loc: startTok && startTok.loc && body && body.loc
+      ? { start: startTok.loc.start, end: body.loc.end }
+      : null,
+    start: startTok ? startTok.start : 0,
+    end:   body ? body.end : 0,
+  };
+}
+
 function mkTryStatement(block, handler, finalizer, startTok) {
   return {
     type: 'TryStatement',
@@ -547,17 +565,88 @@ function parseOperand(lexer) {
   // Phase-4 expansion: the "primary" that the Pratt loop consumes
   // is actually: prefixUnary* primary postfix*
   const prefixes = [];
+  // Pending `new` operators, outermost first. Each claims the
+  // next argument list the postfix loop encounters; any left
+  // over at the end are argument-less `new X`.
+  const pendingNew = [];
+  // Set when the prefix scan consumed `new.target`, which is a
+  // primary in its own right rather than an operator.
+  let metaPrimary = null;
   while (true) {
     const t = lexer.peek();
     if (!t) break;
-    // Unary `new` — prefix form; treat specially because it
-    // captures the following call expression as its arguments.
+    // `new` — NOT a plain prefix operator. Per the grammar,
+    // `new MemberExpression Arguments` binds to the member
+    // expression up to and INCLUDING the first argument list,
+    // and the postfix chain then continues on the result:
+    // `new C().v` is `(new C()).v`, not `new (C().v)`.
+    //
+    // Deferring it to the prefix-unwind loop below got that
+    // backwards, so `new C().v` built a NewExpression over the
+    // member read — which called C() as a plain function, left
+    // `this` unbound, and silently dropped every flow through a
+    // freshly constructed object. We instead count pending
+    // `new`s here and let the postfix loop claim the first
+    // argument list for each.
     if (t.type.label === 'new') {
-      prefixes.push({ kind: 'new', tok: t });
+      lexer.advance();
+      // `new.target` — a meta-property, not a construction. It
+      // IS the primary, so record it and stop peeling prefixes;
+      // the postfix loop then runs on it as usual.
+      const afterNew = lexer.peek();
+      if (afterNew && afterNew.type.label === '.') {
+        lexer.advance();
+        const metaTok = lexer.peek();
+        if (metaTok && metaTok.type.label === 'name') lexer.advance();
+        // Inside a constructor it is the constructor, elsewhere
+        // undefined. Neither is a taint source, so an ordinary
+        // identifier read is the whole story.
+        metaPrimary = mkIdentifier('new.target', t);
+        break;
+      }
+      pendingNew.push({ tok: t });
+      continue;
+    }
+    // `await expr`. The awaited value IS the promise's
+    // resolution value, and this engine models an async
+    // function's return as that value directly, so `await` is
+    // the identity here. Left as a bare identifier it detached
+    // its operand from the expression entirely.
+    if (t.type.label === 'name' && t.value === 'await' &&
+        isYieldOperandStart(lexer)) {
       lexer.advance();
       continue;
     }
-    if (UNARY_PREFIX.has(t.type.label) || UNARY_PREFIX.has(t.value)) {
+    // `yield expr` / `yield* expr` inside a generator. The
+    // tokenizer hands `yield` back as a plain name, so without
+    // this it read as an identifier and the operand became a
+    // separate, disconnected expression — the yielded value's
+    // side effects and sinks went unanalysed.
+    //
+    // We evaluate the operand (that is where the sinks are) and
+    // give the yield expression itself an opaque value, because
+    // what `yield` evaluates to is whatever the CONSUMER passes
+    // back into `next()` — not the operand.
+    if (t.type.label === 'name' && t.value === 'yield' && isYieldOperandStart(lexer)) {
+      lexer.advance();
+      if (lexer.peek() && lexer.peek().type.label === '*') lexer.advance();
+      prefixes.push({ kind: 'yield', tok: t });
+      continue;
+    }
+    // The value check below is what recognises operators the
+    // tokenizer reports under a generic label (`!` and `~` come
+    // through as `prefix`, `-` and `+` as `+/-`, `typeof` as a
+    // keyword). It must NOT apply to literals: a string whose
+    // CONTENTS happen to spell an operator is not an operator.
+    // Without that exclusion `op === '+'`, `case '+':`,
+    // `x === 'typeof'` and `f('!')` were all parse errors — and
+    // a parse error costs the whole file, which is why most of
+    // this repo's own sources were unreadable to the analyzer.
+    const isLiteralToken =
+      t.type.label === 'string' || t.type.label === 'num' ||
+      t.type.label === 'regexp' || t.type.label === 'template';
+    if (!isLiteralToken &&
+        (UNARY_PREFIX.has(t.type.label) || UNARY_PREFIX.has(t.value))) {
       const op = t.type.label === 'name' ? t.value : (t.value || t.type.label);
       // acorn reports +/- with label "+/-" and value "+" or "-".
       const realOp = (op === '+/-') ? t.value : op;
@@ -575,7 +664,7 @@ function parseOperand(lexer) {
     break;
   }
 
-  let base = parsePrimary(lexer);
+  let base = metaPrimary || parsePrimary(lexer);
 
   // Postfix suffix loop: `.prop`, `[expr]`, `(args)`.
   while (true) {
@@ -621,13 +710,44 @@ function parseOperand(lexer) {
             args.push(parseExpression(lexer));
           }
           const n = lexer.peek();
-          if (n.type.label === ',') { lexer.advance(); continue; }
+          // Trailing comma: `f(a, b,)` is legal and is what
+          // every formatter emits on multi-line calls. Looping
+          // straight back tried to parse `)` as an argument and
+          // failed the whole file.
+          if (n.type.label === ',') {
+            lexer.advance();
+            if (lexer.peek() && lexer.peek().type.label === ')') break;
+            continue;
+          }
           break;
         }
       }
       const closeTok = lexer.peek();
       expect(lexer, ')');
-      base = mkCall(base, args, closeTok ? closeTok.end : base.end);
+      // An argument list directly after a pending `new` is that
+      // `new`'s arguments — the innermost pending one, so
+      // `new new C()()` nests correctly. Everything after the
+      // resulting NewExpression is an ordinary postfix chain.
+      const claimed = pendingNew.length > 0 ? pendingNew.pop() : null;
+      base = claimed
+        ? mkNew(base, args, claimed.tok.start, closeTok ? closeTok.end : base.end)
+        : mkCall(base, args, closeTok ? closeTok.end : base.end);
+      continue;
+    }
+    // Tagged template: `tag`a${x}b``. Per the spec this CALLS
+    // `tag` with the strings array first and one argument per
+    // interpolation. Treating it as an unparsed primary lost the
+    // call entirely, so a tag that forwards its arguments to a
+    // sink — the shape every html`` / sanitize`` helper uses —
+    // was invisible.
+    if (label === '`') {
+      const tpl = parseTemplateLiteral(lexer);
+      const strings = mkArrayExpression(
+        (tpl.quasis || []).map(q => mkLiteral(
+          q.value ? q.value.cooked : '',
+          JSON.stringify(q.value ? q.value.cooked : ''), t)),
+        t, t);
+      base = mkCall(base, [strings].concat(tpl.expressions || []), tpl.end);
       continue;
     }
     // Postfix ++ / --. Binds tighter than any binary operator, so
@@ -672,7 +792,11 @@ function parseOperand(lexer) {
             } else {
               args.push(parseExpression(lexer));
             }
-            if (lexer.peek().type.label === ',') { lexer.advance(); continue; }
+            if (lexer.peek().type.label === ',') {
+              lexer.advance();
+              if (lexer.peek() && lexer.peek().type.label === ')') break;
+              continue;
+            }
             break;
           }
         }
@@ -695,6 +819,13 @@ function parseOperand(lexer) {
     break;
   }
 
+  // Any `new` the postfix loop didn't hand an argument list to
+  // is the argument-less form, `new Date`.
+  while (pendingNew.length > 0) {
+    const p = pendingNew.pop();
+    base = mkNew(base, [], p.tok.start, base.end);
+  }
+
   // Apply prefix operators in reverse (innermost first).
   while (prefixes.length > 0) {
     const p = prefixes.pop();
@@ -702,15 +833,8 @@ function parseOperand(lexer) {
       base = mkUnary(p.op, base, true, p.tok);
     } else if (p.kind === 'update_prefix') {
       base = mkUpdate(p.op, base, true, p.tok);
-    } else if (p.kind === 'new') {
-      // `new X(args)`: if the base is already a CallExpression,
-      // convert it in place to NewExpression; otherwise it's
-      // `new X` with no args.
-      if (base.type === 'CallExpression') {
-        base = mkNew(base.callee, base.arguments, p.tok.start, base.end);
-      } else {
-        base = mkNew(base, [], p.tok.start, base.end);
-      }
+    } else if (p.kind === 'yield') {
+      base = mkYieldExpression(base, p.tok);
     }
   }
 
@@ -805,7 +929,12 @@ function parseObjectExpression(lexer) {
         throw parseError(lexer, 'unexpected token after `' + kindName + '` in object literal');
       }
     }
-    if (t.type.label === 'name') {
+    // Property keys may be reserved words: `{ extends: 'X' }`,
+    // `{ default: 1 }`, `{ class: 2 }`, `{ in: 3 }` are all
+    // legal and common (the engine's own TypeDB uses
+    // `extends:`). Accepting only `name` tokens rejected the
+    // whole object literal — and with it the whole file.
+    if (t.type.label === 'name' || t.type.keyword) {
       lexer.advance();
       // `name: value`
       if (lexer.peek() && lexer.peek().type.label === ':') {
@@ -1262,6 +1391,103 @@ function mkAssignmentPattern(left, right) {
   };
 }
 
+// `yield x`. Modelled as an expression that EVALUATES its
+// operand (so the operand's reads and sinks are analysed) but
+// whose own value is supplied by the generator's consumer.
+function mkYieldExpression(argument, tok) {
+  return {
+    type: 'YieldExpression',
+    argument,
+    delegate: false,
+    loc: tok && tok.loc && argument && argument.loc
+      ? { start: tok.loc.start, end: argument.loc.end }
+      : null,
+    start: tok ? tok.start : 0,
+    end:   argument ? argument.end : (tok ? tok.end : 0),
+  };
+}
+
+// True when `async` here introduces a function rather than
+// being an ordinary identifier named `async`.
+//
+// `async function` is unambiguous. The arrow forms are not:
+// `async (1)` is a CALL to a function named `async`, while
+// `async (a) => …` is an async arrow, and the two only diverge
+// at the `=>` after the closing paren. One token of lookahead
+// cannot see that far, so we run a throwaway tokenizer over the
+// remaining source and skip balanced parens. Tokenizing (rather
+// than scanning characters) is what keeps a `)` inside a string,
+// comment or regex from being miscounted.
+function isAsyncFunctionStart(lexer) {
+  const n = lexer.peek2();
+  if (!n) return false;
+  if (n.type.label === 'function') return true;
+  if (n.type.label !== '(' && n.type.label !== 'name') return false;
+  return arrowFollows(lexer.source, n.start);
+}
+
+// Scan from `offset` — positioned at either `(` or a parameter
+// name — and report whether the parameter list is followed by
+// `=>`.
+//
+// No error handling here on purpose: a lexical error in the
+// remaining source is a real error the main tokenizer will hit
+// moments later, and swallowing it would turn a broken file
+// into a silently mis-parsed one. It propagates to the
+// parseModule boundary like any other lexical failure.
+function arrowFollows(source, offset) {
+  if (typeof source !== 'string') return false;
+  const iter = getAcorn().tokenizer(source.slice(offset), {
+    ecmaVersion: 'latest', allowHashBang: true,
+  });
+  let depth = 0;
+  let seen = 0;
+  // Parameter lists are small. The bound stops a pathological
+  // file from turning one lookahead into a whole-file scan.
+  const LIMIT = 4096;
+  while (seen++ < LIMIT) {
+    const tok = iter.getToken();
+    const l = tok.type.label;
+    if (l === 'eof') return false;
+    if (l === '(') { depth++; continue; }
+    if (l === ')') {
+      depth--;
+      if (depth === 0) return iter.getToken().type.label === '=>';
+      if (depth < 0) return false;
+      continue;
+    }
+    // Bare single-parameter form: `async x => …`. Exactly one
+    // identifier may precede the arrow.
+    if (depth === 0) {
+      if (l === '=>') return true;
+      if (seen === 1 && l === 'name') continue;
+      return false;
+    }
+  }
+  return false;
+}
+
+// True when the token after `yield` can begin an operand. A
+// bare `yield` (`yield;`, `yield)`, `yield}`) has none, and a
+// variable actually NAMED `yield` in sloppy-mode code must keep
+// working as an identifier.
+function isYieldOperandStart(lexer) {
+  const n = lexer.peek2();
+  if (!n) return false;
+  const l = n.type.label;
+  if (l === ';' || l === ')' || l === '}' || l === ']' || l === ',' ||
+      l === 'eof' || l === ':') return false;
+  // An operator following `yield` means `yield` was the operand:
+  // `yield + 1` is ambiguous in theory but `yield` as a variable
+  // is what sloppy-mode code means by it.
+  // `yield.x`, `yield = 1`, `yield++` — `yield` is the operand
+  // itself. `yield [a, b]` and `yield (x)` are yields of an
+  // array / parenthesised expression, which is what generator
+  // code actually writes.
+  if (l === '=' || l === '.' || l === '++/--') return false;
+  return true;
+}
+
 function mkSequenceExpression(expressions) {
   const first = expressions[0];
   const last = expressions[expressions.length - 1];
@@ -1325,6 +1551,26 @@ function parsePrimary(lexer) {
     lexer.advance();
     return mkLiteral(null, 'null', t);
   }
+  if (label === 'name' && t.value === 'async' && isAsyncFunctionStart(lexer)) {
+    // `async function …`, `async (…) => …`, `async x => …`.
+    //
+    // `async` was consumed as a plain identifier, so
+    // `var f = async () => …` parsed as THREE statements
+    // (`async;`, `() => …;`, …) and `(async () => {…})()` — the
+    // async IIFE, one of the most common shapes in modern web
+    // code — was a hard parse error that failed the whole file.
+    //
+    // The asynchrony itself needs no special handling: `await`
+    // is modelled as the identity below, and an async
+    // function's return value IS its resolution value.
+    lexer.advance();
+    const node = parsePrimary(lexer);
+    if (node && (node.type === 'FunctionExpression' ||
+                 node.type === 'ArrowFunctionExpression')) {
+      node.async = true;
+    }
+    return node;
+  }
   if (label === 'name') {
     // Single-identifier arrow-function shortcut: `x => body`.
     // Peek two tokens ahead; if the next non-name token is
@@ -1357,6 +1603,9 @@ function parsePrimary(lexer) {
     // like a FunctionDeclaration for IR-lowering purposes but
     // doesn't bind its name in the enclosing scope.
     lexer.advance();
+    // `function*` — generator expression. Parsed as an ordinary
+    // function so the body is walked; see the statement form.
+    if (lexer.peek() && lexer.peek().type.label === '*') lexer.advance();
     let id = null;
     if (lexer.peek() && lexer.peek().type.label === 'name') {
       const idTok = lexer.advance();
@@ -1396,6 +1645,10 @@ function parsePrimary(lexer) {
     const items = [parseExpression(lexer)];
     while (lexer.peek() && lexer.peek().type.label === ',') {
       lexer.advance();
+      // Trailing comma before `)`. Only legal when this turns
+      // out to be an arrow parameter list, and harmless to
+      // accept either way.
+      if (lexer.peek() && lexer.peek().type.label === ')') break;
       items.push(parseExpression(lexer));
     }
     expect(lexer, ')');
@@ -1456,6 +1709,29 @@ function parsePrimary(lexer) {
   // to opaque because their semantics are tag-specific.
   if (label === '`') {
     return parseTemplateLiteral(lexer);
+  }
+  // Class expression: `var C = class [Name] [extends P] { … }`.
+  // Without this the `class` keyword fell through to the
+  // unknown-primary handler, which skipped the balanced `{ … }`
+  // — so the member bodies were never parsed, and the
+  // assignment silently produced an opaque.
+  if (label === 'class') {
+    lexer.advance();
+    let id = null;
+    const nameTok = lexer.peek();
+    if (nameTok && nameTok.type.label === 'name') {
+      lexer.advance();
+      id = mkIdentifier(nameTok.value, nameTok);
+    }
+    let superClass = null;
+    if (lexer.peek() && lexer.peek().type.label === 'extends') {
+      lexer.advance();
+      superClass = parseExpression(lexer);
+    }
+    const body = parseClassBody(lexer);
+    const node = mkClassDeclaration(id, superClass, body, t);
+    node.type = 'ClassExpression';
+    return node;
   }
   // Unknown primary. Emit an UnimplementedExpression marker so
   // the IR builder can raise an explicit `unimplemented`
@@ -1836,6 +2112,9 @@ function parseStatement(lexer) {
       case 'finish_for':
         finishFor(task, outputs);
         break;
+      case 'finish_for_in_of':
+        finishForInOf(task, outputs);
+        break;
       case 'finish_try_body':
         finishTryBody(lexer, task, tasks, outputs);
         break;
@@ -1930,8 +2209,31 @@ function beginStatement(lexer, tasks, outputs) {
     outputs.push(mkReturnStatement(arg, t, null));
     return;
   }
+  if (label === 'name' && t.value === 'async' &&
+      lexer.peek2() && lexer.peek2().type.label === 'function') {
+    // `async function f() { … }` in statement position. The
+    // async marker is kept on the node: an async function's
+    // return value is its promise's RESOLUTION value, which is
+    // what `.then(cb)` hands the callback.
+    lexer.advance();
+    beginStatement(lexer, tasks, outputs);
+    for (let i = tasks.length - 1; i >= 0; i--) {
+      if (tasks[i].kind === 'finish_func_decl') { tasks[i].isAsync = true; break; }
+    }
+    return;
+  }
   if (label === 'function') {
     lexer.advance();
+    // `function*` — a generator. The `*` was an unconditional
+    // parse error, which failed the ENTIRE file: one generator
+    // anywhere and every sink in that file disappeared. We parse
+    // it as an ordinary function so the body is walked; `yield`
+    // is handled below.
+    let isGenerator = false;
+    if (lexer.peek() && lexer.peek().type.label === '*') {
+      lexer.advance();
+      isGenerator = true;
+    }
     const nameTok = lexer.peek();
     let id = null;
     if (nameTok && nameTok.type.label === 'name') {
@@ -1941,7 +2243,7 @@ function beginStatement(lexer, tasks, outputs) {
     expect(lexer, '(');
     const params = parseParamList(lexer);
     expect(lexer, ')');
-    tasks.push({ kind: 'finish_func_decl', startTok: t, id, params });
+    tasks.push({ kind: 'finish_func_decl', startTok: t, id, params, isGenerator });
     tasks.push({ kind: 'parse_stmt' });
     return;
   }
@@ -1966,6 +2268,16 @@ function beginStatement(lexer, tasks, outputs) {
   // --- for / for-in / for-of loop ---
   if (label === 'for') {
     lexer.advance();
+    // `for await (… of …)` — async iteration. The `await` only
+    // affects WHEN each value arrives, not which values the loop
+    // sees, so it is dropped and the loop lowers like any other
+    // for-of. Rejecting it failed the whole file, which is how
+    // `for await (const entry of dirHandle.values())` erased
+    // every finding in the analyzer's own UI source.
+    if (lexer.peek() && lexer.peek().type.label === 'name' &&
+        lexer.peek().value === 'await') {
+      lexer.advance();
+    }
     expect(lexer, '(');
     // Parse the init slot. It may be:
     //   * empty (just `;`)
@@ -1991,15 +2303,23 @@ function beginStatement(lexer, tasks, outputs) {
     } else {
       init = parseExpression(lexer);
     }
-    // TODO: for-in / for-of detection. For now we assume `;`-style
-    // C loop and raise unimplemented if the next token is `in` or
-    // `of`.
+    // for-in / for-of. Either keyword follows the loop's binding
+    // target rather than a `;`, so we branch here on what the
+    // lexer actually produced.
+    //
+    // `init` is currently either a VariableDeclaration (whose
+    // single declarator IS the binding target) or an expression
+    // (an assignment target, `for (x of xs)`). Both shapes go
+    // straight into the ESTree node; the IR builder handles them.
     const afterInit = lexer.peek();
     if (afterInit && (afterInit.type.label === 'in' ||
         (afterInit.type.label === 'name' && afterInit.value === 'of'))) {
-      // for-in / for-of. Skip to end of statement — not yet supported.
-      const endTok = skipToNextStatementBoundary(lexer);
-      outputs.push(mkUnimplementedStatement('for-' + afterInit.value, t, endTok));
+      const isOf = afterInit.type.label !== 'in';
+      lexer.advance();
+      const right = parseExpression(lexer);
+      expect(lexer, ')');
+      tasks.push({ kind: 'finish_for_in_of', startTok: t, left: init, right, isOf });
+      tasks.push({ kind: 'parse_stmt' });
       return;
     }
     expect(lexer, ';');
@@ -2235,6 +2555,8 @@ function parseParamList(lexer) {
     }
     if (lexer.peek() && lexer.peek().type.label === ',') {
       lexer.advance();
+      // Trailing comma in a parameter list: `function f(a, b,)`.
+      if (lexer.peek() && lexer.peek().type.label === ')') break;
       continue;
     }
     break;
@@ -2293,11 +2615,15 @@ function parseObjectPattern(lexer) {
     }
     // Property: key [: value] [= default]
     const keyTok = lexer.peek();
-    if (keyTok.type.label !== 'name') {
+    // Keys may be identifiers, string literals or numbers:
+    // `{ "a-b": x }` and `{ 0: x }` are both legal patterns.
+    if (keyTok.type.label !== 'name' && keyTok.type.label !== 'string' &&
+        keyTok.type.label !== 'num') {
       throw parseError(lexer, 'expected property name in destructuring pattern');
     }
     lexer.advance();
-    const key = mkIdentifier(keyTok.value, keyTok);
+    const keyName = String(keyTok.value);
+    const key = mkIdentifier(keyName, keyTok);
     let value;
     let shorthand;
     if (lexer.peek() && lexer.peek().type.label === ':') {
@@ -2305,11 +2631,15 @@ function parseObjectPattern(lexer) {
       value = parseBindingTarget(lexer);
       shorthand = false;
     } else {
-      value = mkIdentifier(keyTok.value, keyTok);
+      value = mkIdentifier(keyName, keyTok);
       shorthand = true;
     }
-    // Default value: `key = default` (in shorthand only legal)
-    if (lexer.peek() && lexer.peek().type.label === '=' && shorthand) {
+    // Default value. Legal in BOTH forms — `{v = d}` and
+    // `{v: alias = d}`. Restricting it to the shorthand form
+    // left the `=` unconsumed, so the next loop turn read `=`
+    // as a property name and the whole statement failed to
+    // parse; every sink in the file went with it.
+    if (lexer.peek() && lexer.peek().type.label === '=') {
       lexer.advance();
       const def = parseExpression(lexer);
       value = mkAssignmentPattern(value, def);
@@ -2636,12 +2966,19 @@ function parseVarDeclarationsInFor(lexer, kind, kindTok, outputs) {
   outputs.push(mkVariableDeclaration(kind, decls, kindTok));
 }
 
+function finishForInOf(task, outputs) {
+  const body = outputs.pop();
+  outputs.push(mkForInOfStatement(
+    task.isOf, task.left, task.right, body, task.startTok));
+}
+
 function finishFuncDecl(task, outputs) {
   const body = outputs.pop();
   if (!body || body.type !== 'BlockStatement') {
     throw new Error('parse: function body must be a block statement');
   }
-  outputs.push(mkFunctionDeclaration(task.id, task.params, body, false, false, task.startTok));
+  outputs.push(mkFunctionDeclaration(task.id, task.params, body,
+    !!task.isAsync, !!task.isGenerator, task.startTok));
 }
 
 // --- Location helper (public) -----------------------------------------
