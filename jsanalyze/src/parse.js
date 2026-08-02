@@ -690,7 +690,7 @@ function parseOperand(lexer) {
     }
     if (label === '[') {
       lexer.advance();
-      const keyExpr = parseExpression(lexer);
+      const keyExpr = withInAllowed(() => parseExpression(lexer));
       expect(lexer, ']');
       base = mkMember(base, keyExpr, true);
       continue;
@@ -707,7 +707,7 @@ function parseOperand(lexer) {
             const inner = parseExpression(lexer);
             args.push(mkSpreadElement(inner, spreadTok));
           } else {
-            args.push(parseExpression(lexer));
+            args.push(withInAllowed(() => parseExpression(lexer)));
           }
           const n = lexer.peek();
           // Trailing comma: `f(a, b,)` is legal and is what
@@ -774,7 +774,7 @@ function parseOperand(lexer) {
       if (!after) throw parseError(lexer, 'unexpected end after `?.`');
       if (after.type.label === '[') {
         lexer.advance();
-        const keyExpr = parseExpression(lexer);
+        const keyExpr = withInAllowed(() => parseExpression(lexer));
         expect(lexer, ']');
         base = mkMember(base, keyExpr, true);
         base.optional = true;
@@ -790,7 +790,7 @@ function parseOperand(lexer) {
               const inner = parseExpression(lexer);
               args.push(mkSpreadElement(inner, spreadTok));
             } else {
-              args.push(parseExpression(lexer));
+              args.push(withInAllowed(() => parseExpression(lexer)));
             }
             if (lexer.peek().type.label === ',') {
               lexer.advance();
@@ -843,6 +843,59 @@ function parseOperand(lexer) {
 
 // A primary expression: literal, identifier, `this`, or a
 // parenthesised expression.
+// toBindingPattern — reinterpret an expression parsed under the
+// parenthesised cover grammar as a binding pattern, so
+// `({a: x = 1, ...rest}) => …` yields real ObjectPattern /
+// AssignmentPattern / RestElement nodes.
+//
+// Rewrites node types in place, driven by an explicit work stack
+// rather than recursion: a pattern can nest arbitrarily deep
+// (`([[[[x]]]]) => 0`), and nothing in this parser is allowed to
+// grow the JavaScript call stack with the input.
+function toBindingPattern(node) {
+  const stack = [node];
+  while (stack.length > 0) {
+    const n = stack.pop();
+    if (!n || typeof n !== 'object') continue;
+    if (n.type === 'ArrayExpression') {
+      n.type = 'ArrayPattern';
+      for (const el of n.elements || []) if (el) stack.push(el);
+      continue;
+    }
+    if (n.type === 'ObjectExpression') {
+      n.type = 'ObjectPattern';
+      for (const pr of n.properties || []) {
+        if (!pr) continue;
+        if (pr.type === 'SpreadElement') { stack.push(pr); continue; }
+        if (pr.value) stack.push(pr.value);
+      }
+      continue;
+    }
+    if (n.type === 'SpreadElement') {
+      n.type = 'RestElement';
+      if (n.argument) stack.push(n.argument);
+      continue;
+    }
+    if (n.type === 'RestElement') {
+      if (n.argument) stack.push(n.argument);
+      continue;
+    }
+    // `(a = 1) => …`: an assignment in parameter position is a
+    // default value. Only the target side is a pattern.
+    if (n.type === 'AssignmentExpression' && n.operator === '=') {
+      n.type = 'AssignmentPattern';
+      if (n.left) stack.push(n.left);
+      continue;
+    }
+    if (n.type === 'AssignmentPattern') {
+      if (n.left) stack.push(n.left);
+      continue;
+    }
+    // Identifier / MemberExpression need no rewriting.
+  }
+  return node;
+}
+
 // parseArrowBody — `=>` has already been consumed. Parses the
 // arrow body (block or expression) and returns an
 // ArrowFunctionExpression node with the provided params.
@@ -875,10 +928,21 @@ function parseObjectExpression(lexer) {
     // Computed key: `[expr] : value`
     if (t.type.label === '[') {
       lexer.advance();
-      const keyExpr = parseExpression(lexer);
+      const keyExpr = withInAllowed(() => parseExpression(lexer));
       expect(lexer, ']');
+      // Method shorthand with a computed key: `{ [k]() { … } }`.
+      if (lexer.peek() && lexer.peek().type.label === '(') {
+        lexer.advance();
+        const params = parseParamList(lexer);
+        expect(lexer, ')');
+        const body = parseStatement(lexer);
+        const fnExpr = mkFunctionExpression(null, params, body, false, false, t);
+        properties.push(mkProperty(keyExpr, fnExpr, 'init', false, true, true, t));
+        if (lexer.peek() && lexer.peek().type.label === ',') lexer.advance();
+        continue;
+      }
       expect(lexer, ':');
-      const value = parseExpression(lexer);
+      const value = withInAllowed(() => parseExpression(lexer));
       properties.push(mkProperty(keyExpr, value, 'init', false, true, false, t));
       if (lexer.peek() && lexer.peek().type.label === ',') lexer.advance();
       continue;
@@ -887,11 +951,68 @@ function parseObjectExpression(lexer) {
     if (t.type.label === 'string' || t.type.label === 'num') {
       lexer.advance();
       const key = mkLiteral(t.value, JSON.stringify(t.value), t);
+      // Method shorthand with a literal key: `{ "a/b.ts"() { … } }`.
+      // Bundlers emit module maps in exactly this shape, so
+      // requiring a `:` here failed the whole bundle.
+      if (lexer.peek() && lexer.peek().type.label === '(') {
+        lexer.advance();
+        const params = parseParamList(lexer);
+        expect(lexer, ')');
+        const body = parseStatement(lexer);
+        const fnExpr = mkFunctionExpression(null, params, body, false, false, t);
+        properties.push(mkProperty(key, fnExpr, 'init', false, false, true, t));
+        if (lexer.peek() && lexer.peek().type.label === ',') lexer.advance();
+        continue;
+      }
       expect(lexer, ':');
       const value = parseExpression(lexer);
       properties.push(mkProperty(key, value, 'init', false, false, false, t));
       if (lexer.peek() && lexer.peek().type.label === ',') lexer.advance();
       continue;
+    }
+    // Generator method shorthand: `{ *gen() { … } }`. The `*`
+    // was an unrecognised token, which failed the object
+    // literal and with it the file.
+    if (t.type.label === '*') {
+      lexer.advance();
+      const nameTok = lexer.peek();
+      // `{ *[Symbol.iterator]() { … } }` — computed generator key.
+      if (nameTok && nameTok.type.label === '[') {
+        lexer.advance();
+        const keyExpr = withInAllowed(() => parseExpression(lexer));
+        expect(lexer, ']');
+        expect(lexer, '(');
+        const params = parseParamList(lexer);
+        expect(lexer, ')');
+        const body = parseStatement(lexer);
+        const fnExpr = mkFunctionExpression(null, params, body, false, true, nameTok);
+        properties.push(mkProperty(keyExpr, fnExpr, 'init', false, true, true, nameTok));
+        if (lexer.peek() && lexer.peek().type.label === ',') lexer.advance();
+        continue;
+      }
+      if (nameTok && (nameTok.type.label === 'name' || nameTok.type.keyword ||
+                      nameTok.type.label === 'string' || nameTok.type.label === 'num')) {
+        lexer.advance();
+        expect(lexer, '(');
+        const params = parseParamList(lexer);
+        expect(lexer, ')');
+        const body = parseStatement(lexer);
+        const fnExpr = mkFunctionExpression(null, params, body, false, true, nameTok);
+        properties.push(mkProperty(mkIdentifier(String(nameTok.value), nameTok),
+          fnExpr, 'init', false, false, true, nameTok));
+        if (lexer.peek() && lexer.peek().type.label === ',') lexer.advance();
+        continue;
+      }
+      throw parseError(lexer, 'expected a method name after `*` in object literal');
+    }
+    // `async` method shorthand: `{ async m() { … } }`. Only when
+    // a method actually follows — `{ async: 1 }` is a plain key.
+    if (t.type.label === 'name' && t.value === 'async') {
+      const n2 = lexer.peek2();
+      if (n2 && (n2.type.label === 'name' || n2.type.keyword || n2.type.label === '*')) {
+        lexer.advance();
+        continue;   // re-enter: the method (or `*method`) is next
+      }
     }
     // Name key. `get` / `set` act as getter/setter modifiers
     // when followed by another name (the property they cover)
@@ -1114,8 +1235,35 @@ function parseClassMember(lexer) {
     }
   }
   // Method or field (possibly private).
+  // Computed member name: `[Symbol.iterator]() { … }`. The key
+  // is an expression, so it has no stable name to store the
+  // method under; we key it on the source text of the
+  // expression, which is enough to keep the body walked.
+  if (lexer.peek() && lexer.peek().type.label === '[') {
+    const openTok = lexer.advance();
+    const keyExpr = parseExpression(lexer);
+    expect(lexer, ']');
+    expect(lexer, '(');
+    const params = parseParamList(lexer);
+    expect(lexer, ')');
+    const body = parseStatement(lexer);
+    const label = '[' + (keyExpr && keyExpr.type === 'Identifier'
+      ? keyExpr.name : 'computed') + ']';
+    return mkMethodDefinition(
+      mkIdentifier(label, openTok),
+      mkFunctionExpression(null, params, body, false, false, openTok),
+      'method', isStatic, openTok);
+  }
   const memberTok = lexer.peek();
-  if (memberTok.type.label !== 'name' && memberTok.type.label !== 'privateId') {
+  // Reserved words are legal member names — `delete(t) {}`,
+  // `new()`, `class` — and d3 ships exactly that. Skipping the
+  // token desynchronised the class body and lost every member
+  // after it.
+  if (memberTok.type.label !== 'name' &&
+      memberTok.type.label !== 'privateId' &&
+      memberTok.type.label !== 'string' &&
+      memberTok.type.label !== 'num' &&
+      !memberTok.type.keyword) {
     lexer.advance();
     return null;
   }
@@ -1642,25 +1790,40 @@ function parsePrimary(lexer) {
       }
       throw parseError(lexer, '`()` is not a valid expression');
     }
-    const items = [parseExpression(lexer)];
-    while (lexer.peek() && lexer.peek().type.label === ',') {
-      lexer.advance();
-      // Trailing comma before `)`. Only legal when this turns
-      // out to be an arrow parameter list, and harmless to
-      // accept either way.
-      if (lexer.peek() && lexer.peek().type.label === ')') break;
-      items.push(parseExpression(lexer));
+    // `( … )` is a cover grammar: until we see whether `=>`
+    // follows, the contents could be a parenthesised expression
+    // OR an arrow parameter list. We parse permissively — rest
+    // elements included — and reinterpret afterwards.
+    //
+    // Requiring every item to be a plain Identifier rejected
+    // `({a, b}) => …`, `([x]) => …` and `(a, ...rest) => …`.
+    // Destructured and rest parameters are the normal way modern
+    // and bundled code writes callbacks.
+    const items = [];
+    while (true) {
+      if (lexer.peek() && lexer.peek().type.label === '...') {
+        const restTok = lexer.advance();
+        items.push(mkRestElement(parseBindingTarget(lexer), restTok));
+      } else {
+        items.push(withInAllowed(() => parseExpression(lexer)));
+      }
+      if (lexer.peek() && lexer.peek().type.label === ',') {
+        lexer.advance();
+        // Trailing comma before `)`, legal in a parameter list.
+        if (lexer.peek() && lexer.peek().type.label === ')') break;
+        continue;
+      }
+      break;
     }
     expect(lexer, ')');
     if (lexer.peek() && lexer.peek().type.label === '=>') {
       lexer.advance();
-      const params = items.map(e => {
-        if (e.type !== 'Identifier') {
-          throw new Error('arrow parameter must be an identifier (got ' + e.type + ')');
-        }
-        return e;
-      });
-      return parseArrowBody(lexer, params, t);
+      return parseArrowBody(lexer, items.map(toBindingPattern), t);
+    }
+    for (const it of items) {
+      if (it.type === 'RestElement') {
+        throw parseError(lexer, 'rest element outside a parameter list');
+      }
     }
     // Paren-expression. If multiple items, wrap as
     // SequenceExpression (the comma operator).
@@ -1857,7 +2020,10 @@ const RIGHT_ASSOC = new Set(['**']);
 function tokenAsBinOp(t) {
   if (!t) return null;
   const label = t.type.label;
-  if (label === 'in') return 'in';
+  // `for (c in a)`: inside the init slot `in` is not an operator,
+  // it is the loop keyword. Swallowing it here parsed the header
+  // as `for (<c in a>` and then demanded a `;`.
+  if (label === 'in') return noIn ? null : 'in';
   if (label === 'instanceof') return 'instanceof';
   // Binary operators acorn tags with the symbol itself as the label,
   // but for `+`, `-`, `<`, etc. the label is a precedence tag like
@@ -1881,8 +2047,51 @@ const ASSIGN_OPS = new Set([
 // parseOperand, each layer iterative. The `assignment stack`
 // handles right-associativity of chained assignments without
 // recursion.
+// parseExpression — AssignmentExpression. Commas are NOT
+// consumed here, because in most positions a comma is a
+// separator (call arguments, array elements, declarator lists)
+// rather than the comma operator.
 function parseExpression(lexer) {
   return parseAssignment(lexer);
+}
+
+// parseCommaExpression — the grammar's `Expression`: one or more
+// assignment expressions joined by the comma OPERATOR. This is
+// what belongs inside `if (…)`, `while (…)`, a `for` header's
+// slots, and after `return` / `throw`.
+//
+// Using the assignment-level parser in those positions rejected
+// `if (a = f(), a !== X)` and `while (n = next(), n)` — shapes a
+// minifier produces from any multi-statement branch, and the
+// reason lodash, Vue and Angular could not be read at all.
+function parseCommaExpression(lexer) {
+  const first = parseAssignment(lexer);
+  if (!lexer.peek() || lexer.peek().type.label !== ',') return first;
+  const items = [first];
+  while (lexer.peek() && lexer.peek().type.label === ',') {
+    lexer.advance();
+    items.push(parseAssignment(lexer));
+  }
+  return mkSequenceExpression(items);
+}
+
+// The `for` header's init slot forbids the `in` operator, so
+// that `for (c in a)` reads as a for-in loop rather than as a
+// C-style loop whose init is the relational expression `c in a`.
+// The flag is scoped to the init slot and cleared inside any
+// bracketing, matching the grammar's [In] parameter.
+let noIn = false;
+
+function withNoIn(fn) {
+  const saved = noIn;
+  noIn = true;
+  try { return fn(); } finally { noIn = saved; }
+}
+
+function withInAllowed(fn) {
+  const saved = noIn;
+  noIn = false;
+  try { return fn(); } finally { noIn = saved; }
 }
 
 // parseAssignment: handles assignments and ternary conditionals
@@ -1910,6 +2119,10 @@ function parseExpression(lexer) {
 // growing the JS call stack.
 function parseAssignment(lexer) {
   const frames = [];  // stack of pending contexts
+  // How many `ternary-test` frames are on the stack. Counted
+  // rather than searched so a long chain of nested ternaries
+  // stays linear.
+  let pendingTests = 0;
 
   // Read the first expression.
   let value = parseBinary(lexer);
@@ -1929,16 +2142,35 @@ function parseAssignment(lexer) {
       // Start of ternary.
       if (label === '?') {
         frames.push({ kind: 'ternary-test', test: value });
+        pendingTests++;
         lexer.advance();
         value = parseBinary(lexer);
         continue;
       }
-      // `:` terminating a ternary-test frame's consequent. We pop
-      // the test frame, remember its test + the consequent we just
-      // produced, and push a ternary-alt frame so unwinding can
-      // build the ConditionalExpression.
-      if (label === ':' && frames.length > 0 && frames[frames.length - 1].kind === 'ternary-test') {
+      // `:` terminating a ternary-test frame's consequent.
+      //
+      // The pending test is not necessarily on TOP of the stack:
+      // in `a ? b ? 1 : 2 : 3` the inner ternary completes first
+      // and leaves a `ternary-alt` frame sitting above the outer
+      // `ternary-test`. Requiring the test to be on top made that
+      // shape — which minifiers emit constantly, since a nested
+      // ternary is how they encode if/else-if — a parse error, and
+      // a parse error costs the whole file. So we REDUCE completed
+      // frames into `value` until the pending test surfaces, then
+      // shift, which is the ordinary shift-reduce step done with
+      // an explicit stack rather than recursion.
+      if (label === ':' && pendingTests > 0) {
+        while (frames.length > 0 &&
+               frames[frames.length - 1].kind !== 'ternary-test') {
+          const top = frames.pop();
+          if (top.kind === 'assign') {
+            value = mkAssign(top.op, top.lhs, value);
+          } else if (top.kind === 'ternary-alt') {
+            value = mkConditional(top.test, top.consequent, value);
+          }
+        }
         const testFrame = frames.pop();
+        pendingTests--;
         frames.push({ kind: 'ternary-alt', test: testFrame.test, consequent: value });
         lexer.advance();
         value = parseBinary(lexer);
@@ -2087,6 +2319,15 @@ function isLetDeclarationStart(lexer) {
 function parseStatement(lexer) {
   const tasks = [{ kind: 'parse_stmt' }];
   const outputs = [];
+  // The `for` header's no-in restriction covers the header
+  // EXPRESSION only. A function body written inside that header
+  // — `for (var f = function () { if ("x" in o) …; }; …)`, and
+  // minified code does this — is ordinary statement context
+  // where `in` is an operator again. Without this reset the
+  // restriction leaked into the body and rejected the operator.
+  const savedNoIn = noIn;
+  noIn = false;
+  try {
 
   while (tasks.length > 0) {
     const task = tasks.pop();
@@ -2148,6 +2389,9 @@ function parseStatement(lexer) {
     throw parseError(lexer, 'internal: statement parser left ' + outputs.length + ' outputs');
   }
   return outputs[0];
+  } finally {
+    noIn = savedNoIn;
+  }
 }
 
 // --- Statement dispatch ----------------------------------------------
@@ -2190,7 +2434,7 @@ function beginStatement(lexer, tasks, outputs) {
   if (label === 'if') {
     lexer.advance();
     expect(lexer, '(');
-    const test = parseExpression(lexer);
+    const test = parseCommaExpression(lexer);
     expect(lexer, ')');
     tasks.push({ kind: 'finish_if', startTok: t, test });
     tasks.push({ kind: 'parse_stmt' });
@@ -2204,7 +2448,7 @@ function beginStatement(lexer, tasks, outputs) {
       outputs.push(mkReturnStatement(null, t, n));
       return;
     }
-    const arg = parseExpression(lexer);
+    const arg = parseCommaExpression(lexer);
     if (lexer.peek() && lexer.peek().type.label === ';') lexer.advance();
     outputs.push(mkReturnStatement(arg, t, null));
     return;
@@ -2252,7 +2496,7 @@ function beginStatement(lexer, tasks, outputs) {
   if (label === 'while') {
     lexer.advance();
     expect(lexer, '(');
-    const test = parseExpression(lexer);
+    const test = parseCommaExpression(lexer);
     expect(lexer, ')');
     tasks.push({ kind: 'finish_while', startTok: t, test });
     tasks.push({ kind: 'parse_stmt' });
@@ -2301,7 +2545,12 @@ function beginStatement(lexer, tasks, outputs) {
       parseVarDeclarationsInFor(lexer, kind, initTok, declBuf);
       init = declBuf[0] || null;
     } else {
-      init = parseExpression(lexer);
+      // No-in restriction: `for (c in a)` must leave `in` for
+      // the header to consume. Without it the expression parser
+      // ate `c in a` as a relational expression and the header
+      // then demanded a `;`, so every bare-identifier for-in —
+      // `for (c in obj)`, the shape minifiers emit — failed.
+      init = withNoIn(() => parseCommaExpression(lexer));
     }
     // for-in / for-of. Either keyword follows the loop's binding
     // target rather than a `;`, so we branch here on what the
@@ -2316,7 +2565,10 @@ function beginStatement(lexer, tasks, outputs) {
         (afterInit.type.label === 'name' && afterInit.value === 'of'))) {
       const isOf = afterInit.type.label !== 'in';
       lexer.advance();
-      const right = parseExpression(lexer);
+      // The iterated expression is comma-level: minifiers write
+      // `for (d in b = b || {}, a)` to fold a preceding statement
+      // into the header.
+      const right = parseCommaExpression(lexer);
       expect(lexer, ')');
       tasks.push({ kind: 'finish_for_in_of', startTok: t, left: init, right, isOf });
       tasks.push({ kind: 'parse_stmt' });
@@ -2325,12 +2577,12 @@ function beginStatement(lexer, tasks, outputs) {
     expect(lexer, ';');
     let test = null;
     if (lexer.peek() && lexer.peek().type.label !== ';') {
-      test = parseExpression(lexer);
+      test = parseCommaExpression(lexer);
     }
     expect(lexer, ';');
     let update = null;
     if (lexer.peek() && lexer.peek().type.label !== ')') {
-      update = parseExpression(lexer);
+      update = parseCommaExpression(lexer);
     }
     expect(lexer, ')');
     tasks.push({ kind: 'finish_for', startTok: t, init, test, update });
@@ -2385,7 +2637,7 @@ function beginStatement(lexer, tasks, outputs) {
   if (label === 'switch') {
     lexer.advance();
     expect(lexer, '(');
-    const disc = parseExpression(lexer);
+    const disc = parseCommaExpression(lexer);
     expect(lexer, ')');
     expect(lexer, '{');
     const cases = [];
@@ -2429,7 +2681,7 @@ function beginStatement(lexer, tasks, outputs) {
   // --- throw ---
   if (label === 'throw') {
     lexer.advance();
-    const arg = parseExpression(lexer);
+    const arg = parseCommaExpression(lexer);
     if (lexer.peek() && lexer.peek().type.label === ';') lexer.advance();
     outputs.push(mkThrowStatement(arg, t));
     return;
@@ -2465,7 +2717,11 @@ function beginStatement(lexer, tasks, outputs) {
   // propagates errors; unknown primaries become
   // UnimplementedExpression markers inside parsePrimary rather
   // than via exception-and-recover here.
-  const expr = parseExpression(lexer);
+  // Comma-level: a minifier folds a run of statements into one
+  // `a(), b(), c();`. Stopping at the first comma left the rest
+  // of the line unconsumed and the parse derailed — this is what
+  // `do t%2&&(r+=n), t=f(t/2); while (t)` tripped over.
+  const expr = parseCommaExpression(lexer);
   if (lexer.peek() && lexer.peek().type.label === ';') lexer.advance();
   outputs.push(mkExpressionStatement(expr));
 }
@@ -2617,8 +2873,10 @@ function parseObjectPattern(lexer) {
     const keyTok = lexer.peek();
     // Keys may be identifiers, string literals or numbers:
     // `{ "a-b": x }` and `{ 0: x }` are both legal patterns.
+    // Reserved words are legal keys here too: Vue destructures
+    // `const { mixins, extends: r } = t`.
     if (keyTok.type.label !== 'name' && keyTok.type.label !== 'string' &&
-        keyTok.type.label !== 'num') {
+        keyTok.type.label !== 'num' && !keyTok.type.keyword) {
       throw parseError(lexer, 'expected property name in destructuring pattern');
     }
     lexer.advance();
@@ -2750,7 +3008,7 @@ function finishDoWhile(lexer, task, tasks, outputs) {
   // Now expect `while (test);`.
   expect(lexer, 'while');
   expect(lexer, '(');
-  const test = parseExpression(lexer);
+  const test = parseCommaExpression(lexer);
   expect(lexer, ')');
   if (lexer.peek() && lexer.peek().type.label === ';') lexer.advance();
   outputs.push(mkDoWhileStatement(body, test, task.startTok));
@@ -2880,7 +3138,7 @@ function parseSwitchCase(lexer) {
   let test = null;
   if (startTok.type.label === 'case') {
     lexer.advance();
-    test = parseExpression(lexer);
+    test = parseCommaExpression(lexer);
   } else if (startTok.type.label === 'default') {
     lexer.advance();
   } else {
@@ -2954,7 +3212,9 @@ function parseVarDeclarationsInFor(lexer, kind, kindTok, outputs) {
     const next = lexer.peek();
     if (next && next.type.label === '=') {
       lexer.advance();
-      init = parseExpression(lexer);
+      // Declarator initialisers in a `for` header carry the same
+      // no-in restriction as the bare-expression form.
+      init = withNoIn(() => parseExpression(lexer));
     }
     decls.push(mkVariableDeclarator(target, init));
     if (lexer.peek() && lexer.peek().type.label === ',') {

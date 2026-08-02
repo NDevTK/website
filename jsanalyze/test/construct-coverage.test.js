@@ -170,6 +170,39 @@ const MUST_PARSE = {
   'for await':             'for await (const x of y) { f(x); }',
   'yield array':           'function* g(){ yield [1, 2]; }',
   'yield parenthesised':   'function* g(){ yield (1); }',
+
+  // Shapes taken from production bundles (React, jQuery, lodash,
+  // Vue, Angular, d3, moment, three.js, Babel, TypeScript,
+  // Monaco). Every one of them failed, and each failure cost the
+  // whole bundle. Minifiers and bundlers emit these constantly;
+  // hand-written source almost never does, which is why they
+  // stayed invisible until the parser was run over real code.
+  'nested ternary consequent': 'var x = a ? b ? 1 : 2 : 3;',
+  'ternary chain deep':        'var x = a?b?c?1:2:3:4;',
+  'sequence in if':            'if (a = f(), a !== X) { g(); }',
+  'sequence in while':         'while (a = f(), a) { g(); }',
+  'sequence statement':        'a(), b(), c();',
+  'do-while comma body':       'do t = f(t), g(t); while (t);',
+  'for-in bare identifier':    'for (c in a) { f(c); }',
+  'for-in member target':      'for (o.p in a) { f(); }',
+  'for-in comma right':        'for (n in o = f(o), o) { g(n); }',
+  'no-in in for init':         'for (var i = ("x" in o); i; ) break;',
+  'no-in inside call':         'for (var i = f("x" in o); i; ) break;',
+  'no-in in nested body':      'for (var f = function(){ if ("x" in o) g(); }; 0; ) break;',
+  'arrow object pattern':      'var f = ({a, b}) => a;',
+  'arrow array pattern':       'var f = ([x, y]) => x;',
+  'arrow rest param':          'var f = (a, ...rest) => a;',
+  'arrow nested pattern':      'var f = ({a: x = 1, ...r}) => x;',
+  'arrow deep pattern':        'var f = ([[[[x]]]]) => x;',
+  'class keyword method':      'class C { delete(t){ return t; } new(){ return 1; } }',
+  'class computed method':     'class C { [Symbol.iterator](){ return 1; } }',
+  'object literal key method': 'var o = { "src/a.ts"(){ return 1; } };',
+  'object computed method':    'var o = { [k](){ return 1; } };',
+  'object generator method':   'var o = { *g(){ yield 1; } };',
+  'object computed generator': 'var o = { *[Symbol.iterator](){ yield 1; } };',
+  'object async method':       'var o = { async m(){ return 1; } };',
+  'async as plain key':        'var o = { async: 1, get: 2, set: 3 };',
+  'pattern keyword key':       'var {mixins: n, extends: r} = t;',
 };
 
 function makeFlowTest(name, src, expectFlow) {
