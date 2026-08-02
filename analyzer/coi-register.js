@@ -7,15 +7,36 @@
 // off the analyzer pipeline.
 //
 // First load:  SW is registered but not yet controlling the page.
-//              We set a session-storage flag and reload once; the
-//              reload enters SW-controlled territory and SAB
-//              becomes available on `window.crossOriginIsolated`.
+//              Once it IS controlling, we reload once; the reload's
+//              navigation goes through the SW, which adds the COOP +
+//              COEP headers, and SAB becomes available on
+//              `window.crossOriginIsolated`.
 // Next loads:  SW is already controlling, crossOriginIsolated is
 //              true, nothing happens.
 //
-// The session-storage flag prevents reload loops in environments
-// where the SW fails to enable isolation (e.g. Safari, which
-// doesn't yet support `credentialless` COEP mode).
+// Reloading only once the SW controls this page is the whole
+// subtlety here. `register()` resolves as soon as the registration
+// EXISTS — the worker may still be installing, and `clients.claim()`
+// in its activate handler has certainly not run yet. Reloading at
+// that moment is a race: the second navigation is served without
+// the SW about a quarter of the time, the page is not isolated,
+// and the reload guard below then makes that permanent for the
+// session — Z3 silently unavailable for the rest of the visit.
+//
+// So we wait for two things instead of guessing:
+//
+//   * `navigator.serviceWorker.ready` — resolves when a worker is
+//     ACTIVE for this scope.
+//   * a controller — `ready` does not imply the current page is
+//     controlled, because a page loaded before activation stays
+//     uncontrolled until `clients.claim()` takes effect. That
+//     hand-over fires `controllerchange`, so we wait for it when
+//     the controller isn't already there.
+//
+// The session-storage flag remains as the anti-loop backstop for
+// environments where the SW controls the page but the browser
+// still won't isolate it (Safari, which doesn't support the
+// `credentialless` COEP mode).
 
 (function () {
   'use strict';
@@ -35,23 +56,41 @@
     return;
   }
 
-  navigator.serviceWorker.register('coi-serviceworker.js').then(function () {
-    if (!window.crossOriginIsolated) {
-      // The SW is installed but isn't controlling this page yet.
-      // A single reload hands control over and enables SAB. The
-      // session-storage guard prevents a reload loop if the
-      // browser doesn't honour our headers (Safari today).
-      if (!sessionStorage.getItem('__coiReloaded')) {
-        sessionStorage.setItem('__coiReloaded', '1');
-        window.location.reload();
-      } else {
-        // Reload already attempted and still not isolated — give
-        // up quietly. jsanalyze's _initZ3 will surface a clear
-        // error when the walker next hits an SMT-reachable path.
-        console.warn('coi-serviceworker: page is not cross-origin isolated after reload; Z3 will be unavailable.');
-      }
+  // Reload once, now that the SW is in a position to serve the
+  // navigation. Guarded so a browser that ignores the headers
+  // can't put us in a reload loop.
+  function reloadUnderServiceWorker() {
+    if (window.crossOriginIsolated) return;
+    if (sessionStorage.getItem('__coiReloaded')) {
+      // Already reloaded under SW control and still not isolated —
+      // the browser doesn't honour the headers. Give up quietly;
+      // jsanalyze's _initZ3 surfaces a clear error when the walker
+      // next hits an SMT-reachable path.
+      console.warn('coi-serviceworker: page is controlled by the service worker but ' +
+        'still not cross-origin isolated; Z3 will be unavailable.');
+      return;
     }
-  }).catch(function (e) {
-    console.error('coi-serviceworker: registration failed', e);
-  });
+    sessionStorage.setItem('__coiReloaded', '1');
+    window.location.reload();
+  }
+
+  navigator.serviceWorker.register('coi-serviceworker.js')
+    .then(function () {
+      // Wait for an ACTIVE worker before considering a reload.
+      return navigator.serviceWorker.ready;
+    })
+    .then(function () {
+      if (navigator.serviceWorker.controller) {
+        reloadUnderServiceWorker();
+        return;
+      }
+      // Active but not yet controlling this page. The worker's
+      // activate handler calls clients.claim(), which hands
+      // control over asynchronously and fires controllerchange.
+      navigator.serviceWorker.addEventListener(
+        'controllerchange', reloadUnderServiceWorker, { once: true });
+    })
+    .catch(function (e) {
+      console.error('coi-serviceworker: registration failed', e);
+    });
 })();

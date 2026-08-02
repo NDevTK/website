@@ -175,6 +175,20 @@ async function analyze(input, options) {
     // that the reproducer passes to postMessage. Structure:
     //   { [parentSymName]: [{ name: childSymName, prop: string }] }
     sourceSchema: Object.create(null),
+    // Provenance for every SMT symbol minted during the walk:
+    //
+    //   { [symName]: { name, label, delivery, discriminator,
+    //                  typeName, prop, scope, parent, fnId,
+    //                  handlerContext, location } }
+    //
+    // A Z3 witness is a flat symbol → value map, and a path
+    // condition can name symbols that the flow's own sources do
+    // not cover — cross-handler guards put another handler's
+    // input into the formula (see domain.gatherStates). This
+    // table is how a consumer turns such a symbol back into
+    // "deliver this value via postMessage to the message
+    // handler registered at line N".
+    symbolTable: Object.create(null),
   };
 
   // Extract inline <script> content from HTML files so the
@@ -344,11 +358,12 @@ async function analyze(input, options) {
     // summary cache before this file's walk. Different call
     // sites will then walk the callee independently, getting
     // full context sensitivity at the cost of redoing work.
-    // The per-call gate inside transfer.applyCall also
-    // checks ctx.accept.has('summary-reused'); clearing here
-    // is a belt-and-suspenders step so stale cache entries
-    // from a prior permissive analyse() don't accidentally
-    // get reused.
+    // The per-call gate inside transfer.applyCall stops this
+    // walk from WRITING or reading summaries; clearing here is
+    // what discards entries a PREVIOUS permissive analyse()
+    // left on the shared module objects. Both are needed: the
+    // gate alone would leave stale entries in place for the
+    // next permissive run to pick up.
     if (!accept.has(REASONS.SUMMARY_REUSED)) {
       for (const fn of module.functions) {
         if (fn._summaryCache) fn._summaryCache = new Map();
@@ -499,9 +514,14 @@ async function analyze(input, options) {
               continue;
             }
             if (!cbResult || !cbResult.exitState) continue;
+            // Gather, not plain join: heap cells the callback
+            // constrained symbolically keep their formula so a
+            // later handler's guard on that cell carries the
+            // prerequisite into its path condition. See
+            // domain.gatherStates for why that is sound here.
             const merged = applyWiden
-              ? D.widenStates(persistedState, cbResult.exitState)
-              : D.joinStates(persistedState, cbResult.exitState);
+              ? D.gatherWidenStates(persistedState, cbResult.exitState)
+              : D.gatherStates(persistedState, cbResult.exitState);
             if (!D.stateLeq(merged, persistedState)) {
               persistedState = merged;
               iterChanged = true;
@@ -590,6 +610,19 @@ async function analyze(input, options) {
       trace.taintFlows.push(flow);
       if (watchers && typeof watchers.onFinding === 'function') {
         watchers.onFinding(flow);
+      }
+    }
+
+    // Merge this file's symbol provenance into the trace-level
+    // table. Symbol names are unique per analysis (allocated
+    // from ctx.nextSymId), so entries never collide across
+    // files; first writer wins if one ever did.
+    if (ctx._symbolTable) {
+      for (const name in ctx._symbolTable) {
+        if (trace.symbolTable[name]) continue;
+        const entry = Object.assign({}, ctx._symbolTable[name]);
+        entry.location = remapLocation(entry.location, inlineOrigin);
+        trace.symbolTable[name] = entry;
       }
     }
 
@@ -802,7 +835,10 @@ async function analyze(input, options) {
     }
   }
 
-  // Verbose-logging diagnostic: trace exit summary so the
+  // Surface every contained failure on the console too. A
+  // partial trace is easy to miss in a consumer that only reads
+  // `taintFlows`, and "no findings because the walk died" must
+  // not look like "no findings".
   if (trace.warnings.length > 0) {
     for (const w of trace.warnings) {
       console.error('[jsanalyze] trace warning:', w.severity, w.message,

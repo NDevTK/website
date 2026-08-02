@@ -22,6 +22,37 @@
 //            'clipboard'
 //   sinks:   'html', 'code', 'url', 'navigation', 'css', 'text'
 //
+// DOM identity (`domIdentity`)
+// ---------------------------
+// The DOM is a state channel: analyzed code writes
+// `el.dataset.token = x` in one handler and reads it back in
+// another. To follow that, the engine needs to know when two
+// evaluations denote the SAME element. That is a per-API fact,
+// so it lives here as data rather than in the engine:
+//
+//   domIdentity: 'arg:N'    — the call denotes a stable element
+//                             keyed by the concrete value of
+//                             argument N (`getElementById("out")`).
+//                             A non-constant argument yields no
+//                             identity.
+//   domIdentity: 'singleton'— the property denotes one element
+//                             per document (`document.body`).
+//   domIdentity: 'derived'  — the property is a sub-object of its
+//                             receiver (`el.dataset`), so its
+//                             identity is the receiver's identity
+//                             plus the property name. Requires the
+//                             receiver to have an identity.
+//
+// Named accessors over that state are declared with
+// `domStateRead` / `domStateWrite`, which name the argument
+// holding the key and (for writes) the value:
+//
+//   domStateWrite: { nameArg: 0, valueArg: 1, prefix: 'attr:' }
+//   domStateRead:  { nameArg: 0, prefix: 'attr:' }
+//
+// The `prefix` keeps namespaces apart, so `setAttribute("id", v)`
+// cannot be confused with a write to the `id` property.
+//
 // Inheritance: every HTMLxElement extends HTMLElement which
 // extends Element which extends EventTarget. String methods
 // live on String. Event subtypes extend Event. Promise.then /
@@ -207,8 +238,9 @@ const DEFAULT_TYPE_DB = {
         referrer:    { source: 'referrer', readType: 'String', delivery: 'referrer'          },
         domain:      { source: 'referrer', readType: 'String', sink: 'origin' },
         location:    { readType: 'Location' },
-        body:        { readType: 'HTMLElement' },
-        documentElement: { readType: 'HTMLElement' },
+        body:        { readType: 'HTMLElement', domIdentity: 'singleton' },
+        documentElement: { readType: 'HTMLElement', domIdentity: 'singleton' },
+        head:        { readType: 'HTMLElement', domIdentity: 'singleton' },
       },
       methods: {
         createElement: {
@@ -216,10 +248,10 @@ const DEFAULT_TYPE_DB = {
         },
         createTextNode:    { returnType: 'Node' },
         createDocumentFragment: { returnType: 'DocumentFragment' },
-        getElementById:    { returnType: 'HTMLElement' },
+        getElementById:    { returnType: 'HTMLElement', domIdentity: 'arg:0' },
         getElementsByTagName: { returnType: 'HTMLCollection' },
         getElementsByClassName: { returnType: 'HTMLCollection' },
-        querySelector:     { returnType: 'HTMLElement' },
+        querySelector:     { returnType: 'HTMLElement', domIdentity: 'arg:0' },
         querySelectorAll:  { returnType: 'NodeList' },
         // document.write / writeln: streaming parser DOES execute
         // script tags in the written chunk — different exec
@@ -290,6 +322,12 @@ const DEFAULT_TYPE_DB = {
         // are event-handler shapes (img onerror, svg onload).
         innerHTML: { sink: 'html', exploit: 'html-innerHTML' },
         outerHTML: { sink: 'html', exploit: 'html-innerHTML' },
+        // `dataset` is the canonical DOM state channel: code
+        // stashes a value on an element in one handler and reads
+        // it back in another. Its identity is derived from the
+        // element's, so `getElementById("o").dataset` denotes the
+        // same map on every evaluation.
+        dataset: { readType: 'DOMStringMap', domIdentity: 'derived' },
       },
       methods: {
         insertAdjacentHTML: { args: [{}, { sink: 'html', exploit: 'html-innerHTML' }] },
@@ -302,13 +340,21 @@ const DEFAULT_TYPE_DB = {
           // wired to db.attrSinks at DB finalisation time below,
           // so there's one source of truth.
           args: [{ sinkIfArgEquals: { arg: 1, values: null } }, {}],
+          domStateWrite: { nameArg: 0, valueArg: 1, prefix: 'attr:' },
         },
         removeAttribute: { args: [{}] },
-        getAttribute:    { args: [{}], returnType: 'String' },
+        getAttribute:    {
+          args: [{}], returnType: 'String',
+          // Attributes are DOM state: a value written by
+          // analyzed code via setAttribute is read back here
+          // exactly, instead of degrading to an opaque
+          // `dom-state` read.
+          domStateRead: { nameArg: 0, prefix: 'attr:' },
+        },
         // DOM queries on an element return NodeList /
         // HTMLCollection — same typed-iterable semantics as
         // the Document-level equivalents.
-        querySelector:     { returnType: 'HTMLElement' },
+        querySelector:     { returnType: 'HTMLElement', domIdentity: 'arg:0' },
         querySelectorAll:  { returnType: 'NodeList' },
         getElementsByTagName:   { returnType: 'HTMLCollection' },
         getElementsByClassName: { returnType: 'HTMLCollection' },
@@ -317,6 +363,11 @@ const DEFAULT_TYPE_DB = {
         getBoundingClientRect: {},
       },
     },
+    // Element.dataset's map. It declares no properties: every
+    // key is user-chosen, so reads resolve through the element's
+    // DOM cell (a value analyzed code wrote) or fall back to the
+    // opaque `dom-state` read.
+    DOMStringMap: { selfSource: null },
     HTMLElement: { extends: 'Element' },
     HTMLIFrameElement: {
       extends: 'HTMLElement',

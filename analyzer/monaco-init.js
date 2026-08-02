@@ -68,6 +68,12 @@
     var fetchResults = null;
     var rejectedAssumptions = [];
     var allAssumptions = [];
+    // Set when the engine could not complete the walk (parse
+    // error, worklist error, Z3 unavailable). Rendered as a
+    // banner above the findings so an incomplete run is never
+    // mistaken for a clean one.
+    var analysisPartial = false;
+    var analysisWarnings = [];
     var editorDecorations = [];
     var analysisMode = 'precise';
     var customAccept = null;
@@ -247,6 +253,8 @@
           fetchResults        = all.fetches || [];
           rejectedAssumptions = all.rejectedAssumptions || [];
           allAssumptions      = all.allAssumptions || [];
+          analysisPartial     = !!all.partial;
+          analysisWarnings    = all.warnings || [];
         } else {
           outputFiles = {};
         }
@@ -330,13 +338,52 @@
     }
 
     // --- Taint panel ----------------------------------------------------
+    // Banner for an incomplete analysis. Built from text nodes
+    // (warning messages quote source the user supplied, so they
+    // must never reach innerHTML).
+    function buildPartialBanner() {
+      if (!analysisPartial) return null;
+      var box = document.createElement('div');
+      box.className = 'row';
+      box.style.cssText = 'border-left: 3px solid #e67e22; background: #2a2018;';
+      var head = document.createElement('div');
+      head.className = 'row-head';
+      var sev = document.createElement('span');
+      sev.className = 'severity high';
+      sev.style.background = '#e67e22';
+      sev.textContent = 'INCOMPLETE';
+      head.appendChild(sev);
+      head.appendChild(document.createTextNode(
+        ' analysis did not finish — results below are not a clean bill of health'));
+      box.appendChild(head);
+      for (var i = 0; i < analysisWarnings.length; i++) {
+        var w = analysisWarnings[i];
+        var line = document.createElement('div');
+        line.className = 'row-sub';
+        line.textContent = (w.file ? w.file + ': ' : '') + (w.message || '');
+        box.appendChild(line);
+      }
+      return box;
+    }
+
     function renderTaint() {
       var container = document.getElementById('panelTaint');
+      var banner = buildPartialBanner();
       if (!taintResults || !taintResults.findings.length) {
-        container.innerHTML = '<div class="empty-hint" style="padding: 0.8rem 0.9rem; color: #555; font-style: italic;">No security issues found</div>';
+        container.innerHTML = '';
+        if (banner) {
+          container.appendChild(banner);
+          return;
+        }
+        var hint = document.createElement('div');
+        hint.className = 'empty-hint';
+        hint.style.cssText = 'padding: 0.8rem 0.9rem; color: #555; font-style: italic;';
+        hint.textContent = 'No security issues found';
+        container.appendChild(hint);
         return;
       }
       container.innerHTML = '';
+      if (banner) container.appendChild(banner);
       var f = taintResults.findings;
       for (var i = 0; i < f.length; i++) {
         var finding = f[i];
@@ -450,6 +497,24 @@
               b.textContent = 'attacker sets: ' + parts.join(', ');
               el.appendChild(b);
             }
+          }
+
+          // Prerequisites — inputs a DIFFERENT handler has to
+          // receive before this sink is reachable at all. Worth
+          // its own line: without it the finding reads as
+          // directly reachable when it is really behind a
+          // cross-handler state machine.
+          var pre = finding.poc.prerequisites || [];
+          for (var pi = 0; pi < pre.length; pi++) {
+            var pr = pre[pi];
+            var prEl = document.createElement('div');
+            prEl.className = 'row-sub';
+            var where = pr.handlerContext && pr.handlerContext.event
+              ? ' the ' + pr.handlerContext.event + ' handler'
+              : ' another handler';
+            prEl.textContent = 'first,' + where + ' must receive ' +
+              pr.label + ' = ' + JSON.stringify(pr.value);
+            el.appendChild(prEl);
           }
         } else if (finding.poc && finding.poc.note) {
           var note = document.createElement('div');

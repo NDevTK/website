@@ -194,6 +194,41 @@ type Trace = {
   // Every assumption raised during analysis.
   assumptions: Assumption[];
 
+  // For every SMT source symbol that had property reads, its
+  // child symbols keyed by the parent symbol's name. Lets a
+  // consumer rebuild the object an attacker must deliver from
+  // a flat Z3 witness:
+  //   { 'ev.data_1.action': 'run', 'ev.data_1.payload': 'x' }
+  // becomes { action: 'run', payload: 'x' }.
+  sourceSchema: {
+    [parentSymName: string]: Array<{ name: string; prop: string }>;
+  };
+
+  // Provenance for every SMT symbol minted during the walk.
+  //
+  // A Z3 witness is a flat symbol -> value map, and a path
+  // condition can name symbols the flow's own sources do not
+  // cover: a guard on state another handler wrote pulls that
+  // handler's input into the formula. This table is how a
+  // consumer turns such a symbol back into "deliver this value
+  // via postMessage to the handler registered at line N" — it is
+  // what `flow.poc.prerequisites` is built from.
+  symbolTable: {
+    [symName: string]: {
+      name: string;
+      label: string | null;          // taint source label
+      delivery: string | null;       // TypeDB delivery code
+      discriminator: string | null;  // e.g. 'MessageEvent.data'
+      typeName?: string | null;
+      prop?: string | null;
+      scope: 'page' | 'call';
+      parent?: string;               // set on child (field) symbols
+      fnId: string | null;           // IR function that read it
+      handlerContext: object | null; // { event, registrationSite, calleeName }
+      location: Location | null;
+    };
+  };
+
   // Partial-walk notices (analysis errors, timeouts, parser
   // recovery points).
   warnings: Warning[];
@@ -554,6 +589,26 @@ type MethodDescriptor = {
     source?: string;        // label to attach to the new value
     taintFromArg?: number;  // copy labels from this argument
   }>;
+
+  // DOM identity — when two evaluations of this access path
+  // denote the SAME element, so writes through one are visible
+  // to reads through the other. Elements reached through a path
+  // with no `domIdentity` (or whose key argument isn't a
+  // compile-time string) stay untracked: the write raises
+  // `heap-escape` and the read stays opaque, as before.
+  //
+  //   'arg:N'     — keyed by the concrete value of argument N
+  //                 (`getElementById("out")`).
+  //   'singleton' — one element per document (`document.body`).
+  //   'derived'   — a sub-object of the receiver (`el.dataset`);
+  //                 identity is the receiver's plus this name.
+  domIdentity?: `arg:${number}` | 'singleton' | 'derived';
+
+  // Named accessors over that state. `prefix` namespaces the
+  // stored key so `setAttribute("id", v)` cannot collide with a
+  // write to the `id` property.
+  domStateWrite?: { nameArg: number; valueArg: number; prefix?: string };
+  domStateRead?:  { nameArg: number; prefix?: string };
 };
 ```
 

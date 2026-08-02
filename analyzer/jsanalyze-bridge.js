@@ -24,7 +24,18 @@
 //     accept:  string[],                    // echo of the accept set used
 //     allAssumptions: Assumption[],         // every assumption raised
 //     rejectedAssumptions: Assumption[],    // ones outside the accept set
+//     partial: boolean,                     // analysis did not complete
+//     warnings: Warning[],                  // why, one entry per failure
 //   }
+//
+// `partial` / `warnings` matter more than they look. The engine
+// contains each file's parse and walk errors so one bad file
+// can't sink a multi-file run, which means a run that failed
+// outright still returns a well-formed trace with zero findings.
+// Passed through unchanged that is indistinguishable from a
+// clean bill of health — the single worst thing a security tool
+// can report. The UI reads these two fields to say "analysis
+// incomplete" instead of "no issues found".
 //
 // `options.accept`, when passed, is forwarded to every engine
 // call (analyze + each consumer) so the UI's assumption-
@@ -72,23 +83,6 @@
       return J.consumers.domConvert.convertJsFile(jsContent, trace, name);
     },
   };
-
-  // --- HTML inline-script helper ------------------------------------
-  //
-  // The new engine auto-extracts <script> blocks from HTML
-  // inputs into synthetic `<base>.inline.N.js` files. The UI
-  // wants to map those back to the originating HTML file so
-  // click-to-navigate goes to what the user sees in the
-  // sidebar.
-  function resolveOriginatingFile(f, files) {
-    if (!f) return null;
-    var m = f.match(/^(.+)\.inline\.\d+\.js$/);
-    if (!m) return f;
-    var base = m[1];
-    if (files && files[base + '.html'] != null) return base + '.html';
-    if (files && files[base + '.htm']  != null) return base + '.htm';
-    return f;
-  }
 
   // --- Analysis options ----------------------------------------------
   //
@@ -197,7 +191,7 @@
   // schema. Each finding carries its own `assumptions: Assumption[]`
   // so the UI can render "what the engine had to assume" next to
   // each sink.
-  function taintFindingsFromTrace(trace, files) {
+  function taintFindingsFromTrace(trace) {
     var findings = [];
     var byId = buildAssumptionIndex(trace);
     var flows = (trace && trace.taintFlows) || [];
@@ -212,15 +206,10 @@
       if (f.pathFormula && f.pathFormula.expr) {
         conditions.push(f.pathFormula.expr);
       }
-      // The engine now remaps inline-script filenames back
-      // to their originating HTML at trace projection time,
-      // so sinkLoc.file is already 'example.html' rather
-      // than 'example.inline.0.js'. We still route through
-      // resolveOriginatingFile for belt-and-suspenders
-      // compatibility with callers that hand us a trace
-      // built by an older engine build.
-      var originatingFile = resolveOriginatingFile(
-        sinkLoc ? sinkLoc.file : null, files);
+      // The engine remaps inline-script filenames back to their
+      // originating HTML at trace projection time, so this is
+      // already 'example.html' rather than 'example.inline.0.js'.
+      var originatingFile = sinkLoc ? sinkLoc.file : null;
       findings.push({
         id: f.id,
         sources: sources,
@@ -248,6 +237,12 @@
           payload:    f.poc.payload != null ? f.poc.payload : null,
           attempt:    f.poc.attempt || null,
           bindings:   f.poc.bindings || null,
+          // Inputs another handler must receive before this flow
+          // can fire. Shown next to the finding because a
+          // reviewer reading "eval(ev.data.code)" needs to know
+          // the sink is behind a state machine, not directly
+          // reachable.
+          prerequisites: f.poc.prerequisites || [],
           reproducer: f.poc.reproducer || null,
           note:       f.poc.note || null,
         } : null,
@@ -266,7 +261,7 @@
   // leave it pointing at the shared trace path.
   globalThis.__traceTaint = async function (files, options) {
     var trace = await analyseAll(files, options);
-    return taintFindingsFromTrace(trace, files);
+    return taintFindingsFromTrace(trace);
   };
 
   // --- Unified runner --------------------------------------------------
@@ -306,11 +301,14 @@
         accept:  options.accept || null,
         allAssumptions: [],
         rejectedAssumptions: [],
+        partial: true,
+        warnings: [{ severity: 'error', message: 'analysis failed: ' +
+          (e && e.message ? e.message : String(e)) }],
         error:   e && e.message,
       };
     }
 
-    var taint  = taintFindingsFromTrace(trace, files);
+    var taint  = taintFindingsFromTrace(trace);
     var csp    = null;
     var fetches = [];
     // Each consumer is independent — a failure in one shouldn't
@@ -335,6 +333,11 @@
       accept:  options.accept || null,
       allAssumptions:      trace.assumptions || [],
       rejectedAssumptions: trace.rejectedAssumptions || [],
+      // Contained per-file failures. Zero findings from a
+      // partial run is not a clean result and must not render
+      // as one.
+      partial:  !!trace.partial,
+      warnings: trace.warnings || [],
     };
   };
 

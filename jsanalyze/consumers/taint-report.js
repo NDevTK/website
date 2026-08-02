@@ -159,34 +159,7 @@ function jsRepr(v) {
   return JSON.stringify(v);
 }
 
-// Map a Z3 witness symbol name back to its source descriptor.
-// Sym names are constructed by `allocSourceSym` as
-// `discriminator + '_' + counter`, where discriminator is
-// typically `typeName + '.' + propName` (e.g. `Location.hash_1`)
-// or the source label itself for ephemeral-fallback syms.
-//
-// To map back, we strip the numeric suffix and try to match
-// against the flow's declared sources. When ambiguous, we fall
-// through to generic naming.
-function resolveSymbolToSource(symName, flow) {
-  if (!symName) return null;
-  const m = symName.match(/^(.*)_\d+$/);
-  const stem = m ? m[1] : symName;
-  const sources = (flow && flow.source) || [];
-  // Exact discriminator match (e.g. `Location.hash` vs source at
-  // Location.hash). Try (typeName.propName) style first.
-  for (const s of sources) {
-    if (stem === s.discriminator) return s;
-  }
-  // Match by label (symName stem === label, e.g. ephemeral-
-  // fallback syms whose stem IS the label).
-  for (const s of sources) {
-    if (stem === s.label) return s;
-  }
-  return null;
-}
-
-async function synthesisePocForFlow(flow, db, options, sourceSchema) {
+async function synthesisePocForFlow(flow, db, options, sourceSchema, symbolTable) {
   const timeoutMs = options.smtTimeoutMs != null ? options.smtTimeoutMs : 5000;
   const val = flow.valueFormula;
 
@@ -196,6 +169,7 @@ async function synthesisePocForFlow(flow, db, options, sourceSchema) {
       verdict: 'trivial',
       payload: val.value.val,
       bindings: buildDirectBindings(flow, val.value.val),
+      prerequisites: [],
       attempt: 'concrete',
       witness: { __const__: val.value.val },
       note: null,
@@ -212,6 +186,7 @@ async function synthesisePocForFlow(flow, db, options, sourceSchema) {
       verdict: 'unsolvable',
       payload: null,
       bindings: {},
+      prerequisites: [],
       attempt: null,
       witness: null,
       note: exploitName
@@ -229,6 +204,7 @@ async function synthesisePocForFlow(flow, db, options, sourceSchema) {
       verdict: 'synthesised',
       payload: primary.payload,
       bindings: buildDirectBindings(flow, primary.payload),
+      prerequisites: [],
       attempt: primary.name,
       witness: null,
       note: 'direct attacker-controlled flow; attacker-supplied ' +
@@ -262,6 +238,7 @@ async function synthesisePocForFlow(flow, db, options, sourceSchema) {
         verdict: 'synthesised',
         payload: attempt.payload,
         bindings: buildDirectBindings(flow, attempt.payload),
+        prerequisites: [],
         attempt: attempt.name,
         witness: null,
         note: 'path and value are unconstrained; direct delivery',
@@ -272,10 +249,12 @@ async function synthesisePocForFlow(flow, db, options, sourceSchema) {
       notes.push(attempt.name + ': UNSAT');
       continue;
     }
+    const split = witnessToBindings(witness, flow, sourceSchema, symbolTable);
     return {
       verdict: 'synthesised',
       payload: attempt.payload,           // value at the sink
-      bindings: witnessToBindings(witness, flow, sourceSchema),
+      bindings: split.bindings,
+      prerequisites: split.prerequisites,
       attempt: attempt.name,
       witness,
       note: null,
@@ -286,6 +265,7 @@ async function synthesisePocForFlow(flow, db, options, sourceSchema) {
     verdict: 'infeasible',
     payload: null,
     bindings: {},
+    prerequisites: [],
     attempt: null,
     witness: null,
     note: 'all ' + attempts.length + ' exploit attempts UNSAT: ' + notes.join('; '),
@@ -318,9 +298,10 @@ function buildDirectBindings(flow, payload) {
 //
 // Parents that have no children in the schema (ordinary flat
 // symbols like location.hash) map to { scalar: value }.
-function groupWitnessByParent(witness, flow, schema) {
+function groupWitnessByParent(witness, flow, schema, symbolTable) {
   if (!witness) return {};
   schema = schema || {};
+  symbolTable = symbolTable || {};
   const groups = {};
   // Reverse-index: childSymName → parentSymName.
   const childToParent = Object.create(null);
@@ -329,52 +310,114 @@ function groupWitnessByParent(witness, flow, schema) {
       childToParent[c.name] = { parent, prop: c.prop };
     }
   }
+  // `members` tracks every witness symbol that fed a group so
+  // the own-vs-prerequisite classification below can consult
+  // the symbol table for each of them.
   for (const sym of Object.keys(witness)) {
     const pc = childToParent[sym];
     if (pc) {
-      if (!groups[pc.parent]) groups[pc.parent] = { object: {} };
+      if (!groups[pc.parent]) groups[pc.parent] = { object: {}, members: [] };
       groups[pc.parent].object[pc.prop] = witness[sym];
+      groups[pc.parent].members.push(sym);
     } else {
       // Top-level sym — flat scalar (e.g. location.hash_1).
-      groups[sym] = { scalar: witness[sym] };
+      groups[sym] = { scalar: witness[sym], members: [sym] };
     }
   }
-  // Attach per-group source label by looking up flow.source —
-  // heuristic: map by label whose parent-sym stem matches the
-  // typeName.propName discriminator ('MessageEvent.data_1'
-  // matches label 'postMessage' via the flow.source list).
+  // Attach per-group source label + delivery. The symbol table
+  // is authoritative — it records what the engine actually read
+  // at the site that minted the symbol. `flow.source` is the
+  // fallback for traces produced before the table existed.
   const sources = (flow && flow.source) || [];
   for (const parent in groups) {
     const g = groups[parent];
-    // Strip trailing `_N` counter from the sym name to get the
-    // discriminator.
-    const m = parent.match(/^(.*)_\d+$/);
-    const stem = m ? m[1] : parent;
-    let found = null;
-    for (const s of sources) {
-      if (s.discriminator === stem || s.label === stem) { found = s; break; }
+    const meta = symbolTable[parent] ||
+      symbolTable[g.members.length === 1 ? g.members[0] : parent] || null;
+    if (meta && (meta.label || meta.delivery)) {
+      g.label    = meta.label    || null;
+      g.delivery = meta.delivery || null;
+    } else {
+      // Strip trailing `_N` counter from the sym name to get the
+      // discriminator.
+      const m = parent.match(/^(.*)_\d+$/);
+      const stem = m ? m[1] : parent;
+      let found = null;
+      for (const s of sources) {
+        if (s.discriminator === stem || s.label === stem) { found = s; break; }
+      }
+      g.label    = found ? found.label    : (sources.length === 1 ? sources[0].label    : null);
+      g.delivery = found ? found.delivery : (sources.length === 1 ? sources[0].delivery : null);
     }
-    g.label    = found ? found.label    : (sources.length === 1 ? sources[0].label    : null);
-    g.delivery = found ? found.delivery : (sources.length === 1 ? sources[0].delivery : null);
+    g.own = groupIsOwn(g, parent, flow, symbolTable);
   }
   return groups;
 }
 
-function witnessToBindings(witness, flow, schema) {
-  const groups = groupWitnessByParent(witness, flow, schema);
+// A witness group belongs to the flow itself when its value
+// reaches the sink, or when it was read inside the same
+// function the sink sits in. Anything else is a PREREQUISITE:
+// an input some other handler must receive before the guard on
+// the shared state it writes will let this flow fire.
+//
+// Both tests matter. The symbol may reach the sink without
+// appearing in the value (a same-handler path guard like
+// `if (ev.data.action === "run") eval(ev.data.payload)` puts
+// `action` in the path only), and it may be same-handler
+// without being in the value at all.
+function groupIsOwn(group, parent, flow, symbolTable) {
+  const valueSorts = (flow && flow.valueFormula && flow.valueFormula.sorts) || null;
+  if (valueSorts) {
+    for (const sym of group.members) {
+      if (sym in valueSorts) return true;
+    }
+    if (parent in valueSorts) return true;
+  }
+  const sinkFnId = flow && flow.sink && flow.sink.fnId;
+  if (sinkFnId == null) return true;   // no attribution — keep old behaviour
+  for (const sym of group.members) {
+    const meta = symbolTable[sym];
+    // A symbol the table doesn't know about can't be attributed
+    // to another handler, so it stays with the flow.
+    if (!meta || meta.fnId == null) return true;
+    if (meta.fnId === sinkFnId) return true;
+  }
+  return false;
+}
+
+function groupValue(g) {
+  return g.object ? g.object : g.scalar;
+}
+
+// Split a witness into the flow's own source bindings and the
+// prerequisite deliveries other handlers need first.
+//
+//   bindings:      { [sourceLabel]: value }        (unchanged shape)
+//   prerequisites: [{ label, delivery, value, symbol, handlerContext }]
+//
+// Prerequisites are a list rather than a map because two of them
+// can share a label — two `message` handlers both read
+// `event.data`, and collapsing them onto one `postMessage` key
+// would silently drop one of the messages the exploit needs.
+function witnessToBindings(witness, flow, schema, symbolTable) {
+  const groups = groupWitnessByParent(witness, flow, schema, symbolTable);
   const bindings = {};
+  const prerequisites = [];
   for (const parent in groups) {
     const g = groups[parent];
-    const key = g.label || parent;
-    if (g.object) {
-      // Multi-child group — the attacker must supply this
-      // whole object at the source.
-      bindings[key] = g.object;
-    } else {
-      bindings[key] = g.scalar;
+    if (g.own) {
+      bindings[g.label || parent] = groupValue(g);
+      continue;
     }
+    const meta = (symbolTable && symbolTable[parent]) || null;
+    prerequisites.push({
+      label:    g.label || parent,
+      delivery: g.delivery || null,
+      value:    groupValue(g),
+      symbol:   parent,
+      handlerContext: meta ? meta.handlerContext || null : null,
+    });
   }
-  return bindings;
+  return { bindings, prerequisites };
 }
 
 // --- Reproducer emission ---------------------------------------------------
@@ -403,26 +446,26 @@ function buildReproducer(flow, pocRecord, db, options) {
   let urlPath     = null;
   let urlFull     = null;
 
-  for (const label in pocRecord.bindings) {
-    const value = pocRecord.bindings[label];
-    const deliveryCode = resolveDelivery(label, flow);
+  // One delivery. Returns nothing; everything lands in the
+  // accumulators above.
+  function deliver(label, value, deliveryCode) {
     if (!deliveryCode) {
       notes.push('// delivery unknown for source `' + label +
         '`: attacker must supply ' + jsRepr(value));
-      continue;
+      return;
     }
     const emit = emitters[deliveryCode];
     if (!emit) {
       notes.push('// no emitter for delivery `' + deliveryCode +
         '` (source `' + label + '`); value = ' + jsRepr(value));
-      continue;
+      return;
     }
     const result = emit(value, { contextUrl });
     if (typeof result === 'string') {
       setup.push(result);
-      continue;
+      return;
     }
-    if (!result) continue;
+    if (!result) return;
     if (result.urlHash   != null) urlHash   = result.urlHash;
     if (result.urlSearch != null) urlSearch = result.urlSearch;
     if (result.urlPath   != null) urlPath   = result.urlPath;
@@ -432,6 +475,26 @@ function buildReproducer(flow, pocRecord, db, options) {
     if (result.postload) for (const s of result.postload) postload.push(s);
     if (result.note) notes.push(result.note);
     if (result.selfXssLure) lures.push(Object.assign({ label }, result.selfXssLure));
+  }
+
+  // Prerequisites FIRST. These are inputs another handler must
+  // receive before the guard on the state it writes lets this
+  // flow fire, so their snippets have to precede the payload in
+  // every stage they share (postMessage ordering in particular).
+  const prereqs = pocRecord.prerequisites || [];
+  for (const p of prereqs) {
+    const where = p.handlerContext && p.handlerContext.event
+      ? ' (the `' + p.handlerContext.event + '` handler at ' +
+        describeSite(p.handlerContext.registrationSite) + ')'
+      : '';
+    notes.push('// PREREQUISITE: source `' + p.label + '`' + where +
+      ' must receive ' + jsRepr(p.value) +
+      ' first — it sets the shared state this flow is guarded on.');
+    deliver(p.label, p.value, p.delivery);
+  }
+
+  for (const label in pocRecord.bindings) {
+    deliver(label, pocRecord.bindings[label], resolveDelivery(label, flow));
   }
 
   // Self-XSS lure block. When one or more sources require user
@@ -525,6 +588,11 @@ function renderLureHtml(lures) {
     rows;
 }
 
+function describeSite(loc) {
+  if (!loc || !loc.file) return 'an unknown site';
+  return loc.file + (loc.line ? ':' + loc.line : '');
+}
+
 function describeFlow(flow) {
   const srcs = (flow.source || []).map(s => s.label).join(', ');
   const sinkLabel = flow.sink.prop +
@@ -545,9 +613,10 @@ async function synthesisePocs(trace, options) {
     return trace;
   }
   const schema = trace.sourceSchema || {};
+  const symbolTable = trace.symbolTable || {};
   for (const flow of trace.taintFlows) {
     try {
-      const rec = await synthesisePocForFlow(flow, db, options, schema);
+      const rec = await synthesisePocForFlow(flow, db, options, schema, symbolTable);
       rec.reproducer = buildReproducer(flow, rec, db, options);
       flow.poc = rec;
     } catch (err) {
@@ -555,6 +624,7 @@ async function synthesisePocs(trace, options) {
         verdict: 'unsolvable',
         payload: null,
         bindings: {},
+        prerequisites: [],
         attempt: null,
         witness: null,
         reproducer: null,

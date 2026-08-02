@@ -614,8 +614,11 @@ async function _analyseFunctionBody(module, fn, cfg, initialState, ctx) {
         break;
       }
       case OP.THROW: {
-        // TODO: route to enclosing catch. For now, uncaught throws
-        // terminate analysis of the path.
+        // A THROW terminator means the IR builder found no
+        // enclosing handler — a `throw` inside a try lowers to a
+        // Jump to its handler block instead, see ir.js's
+        // catchStack. So the exception leaves the function and
+        // this path has no successor. Nothing to enqueue.
         break;
       }
       case OP.SWITCH: {
@@ -884,8 +887,9 @@ function computeReversePostorder(cfg) {
 // predecessor variant's state, writing the phi dest registers
 // into the outgoing state. Called at terminator time so each
 // enqueued successor variant carries its own correlated phi
-// values. After baking, `resolvePhis` at the target block is
-// effectively a no-op (it sees the dest regs already bound).
+// values. Phi resolution therefore happens exactly once, on the
+// predecessor side of the edge — the block body skips PHI
+// instructions entirely.
 //
 // The phi's `incoming` list is keyed by predecessor block id;
 // we pick the entry whose `pred` matches `fromBlock` and read
@@ -913,83 +917,6 @@ function bakePhis(targetBlock, predState, fromBlock) {
     if (selected != null) {
       state = D.setReg(state, instr.dest, selected);
     }
-  }
-  return state;
-}
-
-// Resolve any Phi instructions at the start of `block` by
-// picking the appropriate source register from the predecessor
-// the incoming variant arrived from.
-//
-// Multi-variant semantics: each variant carries `_fromBlock`
-// identifying the predecessor whose terminator enqueued it.
-// The phi picks the value written in THAT predecessor's
-// out-state — NOT the pointwise join across all predecessors
-// — so cross-register correlation through the join point is
-// preserved. After `if (c) { x=1; y="a"; } else { x=2; y="b"; }`,
-// a variant arriving from the true-branch predecessor resolves
-// its phis to { x=1, y="a" }, and a variant from the false-
-// branch predecessor resolves to { x=2, y="b" } — two distinct
-// variants at the join block. A later `if (x === 1)` can then
-// refine away one of them entirely, eliminating spurious sink
-// flows that would fire under the pointwise-joined y = oneOf.
-//
-// Per-predecessor precision: when multiple variants from the
-// SAME predecessor contributed, we pointwise-join only those
-// (they represent distinct paths ALREADY separated by earlier
-// splits, and joining them here corresponds to the single
-// source-level write at the predecessor's terminator).
-//
-// Fallback: if `_fromBlock` is null or unknown (initial entry
-// state, or a variant whose origin got lost through an
-// intermediate collapse), join across every predecessor's
-// out-states. This stays sound — it's the old pointwise join.
-function resolvePhis(block, inState, variantOutStates) {
-  const from = inState._fromBlock;
-  let state = inState;
-  for (const instr of block.instructions) {
-    if (instr.op !== OP.PHI) break;
-    let merged = D.bottom();
-    if (from != null) {
-      // Find the incoming whose pred matches the variant's
-      // arrival block.
-      let matched = false;
-      for (const { pred, value } of instr.incoming) {
-        if (pred !== from) continue;
-        matched = true;
-        const predList = variantOutStates.get(pred);
-        if (!predList) continue;
-        for (const predOut of predList) {
-          if (!predOut) continue;
-          const v = D.getReg(predOut, value);
-          merged = D.join(merged, v);
-        }
-      }
-      if (!matched) {
-        // No incoming matched our _fromBlock — fall back to
-        // the pointwise join so the phi still has a value.
-        for (const { pred, value } of instr.incoming) {
-          const predList = variantOutStates.get(pred);
-          if (!predList) continue;
-          for (const predOut of predList) {
-            if (!predOut) continue;
-            const v = D.getReg(predOut, value);
-            merged = D.join(merged, v);
-          }
-        }
-      }
-    } else {
-      for (const { pred, value } of instr.incoming) {
-        const predList = variantOutStates.get(pred);
-        if (!predList) continue;
-        for (const predOut of predList) {
-          if (!predOut) continue;
-          const v = D.getReg(predOut, value);
-          merged = D.join(merged, v);
-        }
-      }
-    }
-    state = D.setReg(state, instr.dest, merged);
   }
   return state;
 }

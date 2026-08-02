@@ -503,6 +503,66 @@ function mkToUpper(s) {
   };
 }
 
+// mkIte(cond, thenF, elseF) — SMT-LIB `ite`. This is the
+// symbolic-heap primitive: when two paths write different
+// values into the same heap cell, the merged cell's formula is
+// `ite(pathOfA, valueOnA, valueOnB)`, which keeps the causal
+// link between the branch that performed the write and the
+// value a later read observes.
+//
+// Folding rules, in order:
+//
+//   * concrete condition        → the taken branch verbatim.
+//   * identical branches        → that branch (the condition is
+//                                 irrelevant).
+//   * (true, false) branches    → the condition itself. This is
+//                                 the boolean-flag case
+//                                 (`g.ready = true` under P) and
+//                                 it collapses the ite entirely.
+//   * (false, true) branches    → the negated condition.
+//
+// Sorts must agree across the branches: mixing a String branch
+// with an Int branch has no SMT-LIB typing, so the result is
+// flagged `incompatible` and the solver layer treats it as
+// satisfiable (sound: we lose precision, never soundness).
+function mkIte(cond, thenF, elseF) {
+  if (!cond || !thenF || !elseF) return null;
+  if (cond.value && cond.value.kind === 'bool') {
+    return cond.value.val ? thenF : elseF;
+  }
+  if (thenF === elseF || thenF.expr === elseF.expr) return thenF;
+  if (thenF.value && thenF.value.kind === 'bool' &&
+      elseF.value && elseF.value.kind === 'bool') {
+    if (thenF.value.val === true && elseF.value.val === false) {
+      return cond.isBool ? cond : { ...cond, expr: toBool(cond), isBool: true };
+    }
+    if (thenF.value.val === false && elseF.value.val === true) {
+      return mkNot(cond);
+    }
+  }
+  const bothBool   = !!(thenF.isBool && elseF.isBool);
+  const bothString = isStringSide(thenF) && isStringSide(elseF);
+  const sorts = mergeSorts(mergeSorts(cond.sorts, thenF.sorts), elseF.sorts);
+  // A branch that is a bare sym adopts the other branch's sort
+  // so `ite(P, |sym|, "lit")` declares |sym| as String rather
+  // than leaving it Int and tripping a Z3 sort mismatch.
+  if (thenF.symName && isStringSide(elseF)) sorts[thenF.symName] = 'String';
+  if (elseF.symName && isStringSide(thenF)) sorts[elseF.symName] = 'String';
+  const out = {
+    expr: '(ite ' + toBool(cond) + ' ' + thenF.expr + ' ' + elseF.expr + ')',
+    sorts,
+    isBool: bothBool,
+  };
+  if (bothString) out.stringResult = true;
+  const mixedSorts = (isStringSide(thenF) !== isStringSide(elseF)) ||
+    (thenF.isBool !== elseF.isBool);
+  if (cond.incompatible || thenF.incompatible || elseF.incompatible ||
+      sorts.__conflict || mixedSorts) {
+    out.incompatible = true;
+  }
+  return out;
+}
+
 // mkArith(op, l, r) — integer arithmetic. Supports +, -, *, div, mod.
 // Operands must both be Int-sorted; sym×String → incompatible.
 function mkArith(op, l, r) {
@@ -560,7 +620,7 @@ module.exports = {
   mkSym, mkConst, mkNot, mkAnd, mkOr, mkCmp,
   mkConcat, mkLength, mkContains, mkPrefixOf, mkSuffixOf, mkSubstr,
   mkAt, mkIndexOf, mkReplace, mkReplaceAll, mkToLower, mkToUpper,
-  mkArith,
+  mkArith, mkIte,
   hasSym, emitDeclarations,
   // Internals exposed for tests
   _internals: { quoteName, quoteString, mergeSorts, toBool, isStringSide },

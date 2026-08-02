@@ -82,7 +82,31 @@ const EPHEMERAL_SOURCE_LABELS = new Set([
 //
 // Scope is carried by the TypeDB source descriptor's
 // `sourceScope` field and defaulted to `'page'` when absent.
-function allocSourceSym(ctx, label, loc, discriminator, sort, scope) {
+// recordSymbol — note in `ctx._symbolTable` where an SMT symbol
+// came from: which taint source, which delivery mechanism, and
+// which handler was executing when it was minted.
+//
+// Consumers need this because a Z3 witness is a flat map of
+// symbol names, and a witness can name symbols the flow's own
+// sources do NOT cover. A guard on cross-handler state (see
+// domain.gatherStates) puts another handler's input into the
+// path condition, so the solved model tells the attacker to
+// deliver TWO messages — but only the symbol table says which
+// mechanism delivers which one. Recording it here keeps exploit
+// shaping in the consumer (D11.1) while the engine supplies the
+// facts.
+function recordSymbol(ctx, name, meta) {
+  if (!ctx || !name) return;
+  if (!ctx._symbolTable) ctx._symbolTable = Object.create(null);
+  if (ctx._symbolTable[name]) return;
+  ctx._symbolTable[name] = Object.assign({
+    name,
+    fnId: ctx._currentFnId != null ? ctx._currentFnId : null,
+    handlerContext: ctx._currentHandlerContext || null,
+  }, meta || {});
+}
+
+function allocSourceSym(ctx, label, loc, discriminator, sort, scope, meta) {
   if (!ctx._symCache) ctx._symCache = new Map();
   const disc = discriminator || '';
   const s = sort || 'Int';
@@ -106,7 +130,83 @@ function allocSourceSym(ctx, label, loc, discriminator, sort, scope) {
   if (ctx.nextSymId == null) ctx.nextSymId = 1;
   const name = (disc || label) + '_' + (ctx.nextSymId++);
   ctx._symCache.set(key, { name, sort: s });
+  recordSymbol(ctx, name, Object.assign({
+    label, discriminator: disc || label, scope: scope || 'page',
+    location: loc,
+  }, meta || {}));
   return SMT.mkSym(name, s);
+}
+
+// --- DOM as a state channel ----------------------------------------------
+//
+// The DOM is shared mutable state between handlers, exactly like
+// a module global — `el.dataset.token = x` in one handler and
+// `eval(el.dataset.token)` in another is a real flow. Modelling
+// every element as an unwritable Opaque made that flow invisible:
+// the write raised `heap-escape` and the read came back as a
+// content-free `dom-state` value.
+//
+// An element's CONTENT is genuinely unknowable, but its IDENTITY
+// usually is not: `document.getElementById("out")` denotes the
+// same element on every evaluation. So each element reached
+// through an access path the TypeDB marks with `domIdentity`
+// gets a stable heap cell keyed by that path. Writes land in the
+// cell; reads consult it first and fall back to the opaque
+// `dom-state` read for anything analyzed code did not write.
+//
+// Cell keys are strings in their own namespace (`dom:` prefix)
+// so they cannot collide with the numeric object ids
+// `applyAlloc` mints.
+//
+// What this does NOT claim: that the analyzed program is the
+// only writer. A key the program never wrote still reads back
+// opaque with the `dom-state` label, which is the same answer as
+// before. Tracking only ADDS the writes we can prove.
+const DOM_CELL_PREFIX = 'dom:';
+
+// domCellKey — build the cell key for a `domIdentity` descriptor.
+// Returns null when the identity cannot be pinned down (e.g. a
+// computed selector), which leaves the element untracked.
+function domCellKey(kind, typeName, memberName, argStrings, receiverCell) {
+  if (!kind) return null;
+  if (kind === 'singleton') {
+    return DOM_CELL_PREFIX + typeName + '.' + memberName;
+  }
+  if (kind === 'derived') {
+    if (!receiverCell) return null;
+    return receiverCell + '.' + memberName;
+  }
+  if (typeof kind === 'string' && kind.indexOf('arg:') === 0) {
+    const idx = Number(kind.slice(4));
+    if (Number.isNaN(idx)) return null;
+    const key = argStrings && argStrings[idx];
+    if (typeof key !== 'string') return null;
+    return DOM_CELL_PREFIX + memberName + '(' + key + ')';
+  }
+  return null;
+}
+
+// domStateField — resolve the cell field a `domStateRead` /
+// `domStateWrite` descriptor addresses, e.g. `attr:data-token`
+// for `setAttribute("data-token", v)`. Returns null when the key
+// argument isn't a compile-time string, which leaves the access
+// untracked.
+function domStateField(accessor, argStrings) {
+  if (!accessor) return null;
+  const name = argStrings && argStrings[accessor.nameArg];
+  if (typeof name !== 'string') return null;
+  return (accessor.prefix || '') + name;
+}
+
+// Read a field previously written into a DOM cell by analyzed
+// code. Returns null when the cell or the field is absent, which
+// sends the caller to its normal opaque-read path.
+function domCellRead(state, cellId, field) {
+  if (!cellId) return null;
+  const cell = D.overlayGet(state.heap, cellId);
+  if (!cell || !cell.fields) return null;
+  const v = cell.fields[field];
+  return v || null;
 }
 
 // Map a TypeDB readType string to the SMT sort used for the
@@ -307,6 +407,12 @@ function emitTaintFlow(ctx, sinkInfo, sinkLoc, value, targetType) {
       // to run sink-appropriate exploit solving without any
       // hardcoded knowledge about sink kinds.
       exploit: sinkInfo.exploit || null,
+      // IR function the sink sits in. Paired with
+      // `trace.symbolTable[sym].fnId`, this is how a consumer
+      // tells the flow's OWN inputs from inputs another handler
+      // must receive first for the guard on shared state to
+      // hold (see domain.gatherStates).
+      fnId: ctx._currentFnId != null ? ctx._currentFnId : null,
     },
     severity: sinkInfo.severity,
     pathConditions: [],            // legacy human-readable list — unused in B3
@@ -361,7 +467,7 @@ function sourceDeliveryForLabel(ctx, label) {
 // is itself 'call'-scoped. The compound discriminator keeps
 // MessageEvent.data.action distinct from
 // MessageEvent.data.payload across sites.
-function allocChildSym(ctx, fullName, parentName, prop, scope) {
+function allocChildSym(ctx, fullName, parentName, prop, scope, meta) {
   if (!ctx._symCache) ctx._symCache = new Map();
   const key = 'child:' + parentName + '::' + prop +
     (scope === 'call' ? ':call' : '');
@@ -372,6 +478,16 @@ function allocChildSym(ctx, fullName, parentName, prop, scope) {
   const sort = 'String';
   ctx._symCache.set(key, { name, sort });
   recordSymChild(ctx, parentName, name, prop);
+  const parentMeta = (ctx._symbolTable && ctx._symbolTable[parentName]) || null;
+  recordSymbol(ctx, name, Object.assign({
+    label:      parentMeta ? parentMeta.label : null,
+    delivery:   parentMeta ? parentMeta.delivery : null,
+    discriminator: parentMeta ? parentMeta.discriminator : null,
+    scope:      scope || 'page',
+    parent:     parentName,
+    prop,
+    location:   parentMeta ? parentMeta.location : null,
+  }, meta || {}));
   return SMT.mkSym(name, sort);
 }
 
@@ -913,7 +1029,9 @@ function applyGetGlobal(ctx, state, instr) {
       // Global roots (e.g. `localStorage`) are page-scoped by
       // default — two bare reads observe the same object.
       const scope = typeDesc && typeDesc.sourceScope ? typeDesc.sourceScope : 'page';
-      const sym = allocSourceSym(ctx, selfSource, loc, instr.name, undefined, scope);
+      const sym = allocSourceSym(ctx, selfSource, loc, instr.name, undefined, scope,
+        { delivery: (typeDesc && typeDesc.delivery) || null,
+          typeName, prop: null });
       // Record the delivery declared on the type itself
       // (e.g. selfSource 'storage' → delivery 'localStorage').
       if (typeDesc && typeDesc.delivery) {
@@ -1002,9 +1120,28 @@ function propLookupForVariant(ctx, state, obj, instr, loc) {
   }
   if (obj.kind === D.V.OPAQUE) {
     const db = ctx.typeDB;
+    // DOM state channel: a value analyzed code wrote through
+    // this same access path wins over the opaque read. The
+    // stored value carries its own labels and formula, so taint
+    // and symbolic reasoning flow through the DOM unbroken.
+    const tracked = domCellRead(state, obj.domCell, instr.propName);
+    if (tracked) return tracked;
     if (db && obj.typeName) {
       const desc = TDB.lookupProp(db, obj.typeName, instr.propName);
       if (desc) {
+        // A sub-object of a tracked element (`el.dataset`) is
+        // itself tracked, keyed by the receiver's cell plus the
+        // property name.
+        const derivedCell = desc.domIdentity
+          ? domCellKey(desc.domIdentity, obj.typeName, instr.propName,
+              null, obj.domCell)
+          : null;
+        if (derivedCell) {
+          return D.withDomCell(
+            D.opaque(obj.assumptionIds || [], desc.readType || null, loc,
+              obj.labels),
+            derivedCell);
+        }
         const resultType = desc.readType || null;
         const existingLabels = obj.labels || D.EMPTY_LABELS;
         let resultLabels = existingLabels;
@@ -1049,7 +1186,9 @@ function propLookupForVariant(ctx, state, obj, instr, loc) {
             (typeDesc && typeDesc.sourceScope != null ? typeDesc.sourceScope : 'page'));
           resultFormula = allocSourceSym(ctx, desc.source, loc,
             obj.typeName + '.' + instr.propName,
-            readTypeToSort(desc.readType), scope);
+            readTypeToSort(desc.readType), scope,
+            { delivery: desc.delivery || null,
+              typeName: obj.typeName, prop: instr.propName });
           // Record the delivery declared on this specific
           // descriptor so flow emission can attribute the
           // correct delivery mechanism to the source. For
@@ -1403,12 +1542,21 @@ function applySetProp(ctx, state, instr) {
       newState = writeHeapField(newState, variant.objId, instr.propName, val);
       any = true;
     } else if (variant && variant.kind === D.V.OPAQUE) {
-      ctx.assumptions.raise(
-        REASONS.HEAP_ESCAPE,
-        'property write on opaque object — mutation not tracked',
-        loc,
-        { affects: instr.propName, chain: variant.assumptionIds }
-      );
+      if (variant.domCell) {
+        // Tracked DOM element: the write goes into its cell, so a
+        // later read through the same access path — in this
+        // handler or another one — observes the written value
+        // instead of an opaque `dom-state` read.
+        newState = writeHeapField(newState, variant.domCell, instr.propName, val);
+        any = true;
+      } else {
+        ctx.assumptions.raise(
+          REASONS.HEAP_ESCAPE,
+          'property write on opaque object — mutation not tracked',
+          loc,
+          { affects: instr.propName, chain: variant.assumptionIds }
+        );
+      }
     }
   }
   return newState;
@@ -2649,7 +2797,7 @@ async function applyCall(ctx, state, instr) {
     const perVariantResults = [];
     const perVariantDescs = [];
     for (const thisVariant of thisValue.variants) {
-      const r = resolveCallReturnViaDB(ctx, instr, thisVariant, argValues, loc);
+      const r = resolveCallReturnViaDB(ctx, state, instr, thisVariant, argValues, loc);
       if (r) {
         perVariantResults.push(r.value);
         perVariantDescs.push(r.desc);
@@ -2669,7 +2817,7 @@ async function applyCall(ctx, state, instr) {
       }
     }
   } else {
-    const r = resolveCallReturnViaDB(ctx, instr, thisValue, argValues, loc);
+    const r = resolveCallReturnViaDB(ctx, state, instr, thisValue, argValues, loc);
     if (r) {
       tdbResult = r.value;
       tdbDesc = r.desc;
@@ -2814,7 +2962,7 @@ function applySmtCallOp(op, recv, args) {
 // return type name, any propagated labels, and (when the TypeDB
 // descriptor carries an `smtOp` the engine can translate) an
 // SMT formula derived from the receiver and argument formulas.
-function resolveCallReturnViaDB(ctx, instr, thisValue, argValues, loc) {
+function resolveCallReturnViaDB(ctx, state, instr, thisValue, argValues, loc) {
   const db = ctx.typeDB;
   if (!db) return null;
 
@@ -2837,6 +2985,20 @@ function resolveCallReturnViaDB(ctx, instr, thisValue, argValues, loc) {
     return null;
   });
   const returnType = TDB.resolveReturnType(desc, argStrings);
+
+  // Named DOM-state accessor (`el.getAttribute("data-x")`): when
+  // analyzed code wrote that key through the matching writer, the
+  // call returns exactly what was written — labels, formula and
+  // all — rather than an opaque `dom-state` read.
+  if (desc.domStateRead && thisValue) {
+    const field = domStateField(desc.domStateRead, argStrings);
+    if (field) {
+      for (const variant of D.disjunctVariants(thisValue)) {
+        const tracked = domCellRead(state, variant.domCell, field);
+        if (tracked) return { value: tracked, desc: desc, chainIds: [] };
+      }
+    }
+  }
 
   // Compute the labels that propagate to the return value.
   // Default: no propagation (function call narrows taint).
@@ -2887,6 +3049,19 @@ function resolveCallReturnViaDB(ctx, instr, thisValue, argValues, loc) {
   }
 
   let result = D.opaque(chainIds, returnType, loc, resultLabels);
+
+  // DOM identity: a query whose arguments pin down which element
+  // it returns (`getElementById("out")`) yields a value tagged
+  // with that element's stable cell, so writes through it are
+  // visible to later reads through the same path.
+  if (desc.domIdentity) {
+    const cell = domCellKey(desc.domIdentity,
+      (thisValue && thisValue.typeName) || instr.calleeName || '',
+      instr.methodName || instr.calleeName || '',
+      argStrings,
+      thisValue && thisValue.domCell);
+    if (cell) result = D.withDomCell(result, cell);
+  }
 
   // SMT formula propagation. When the TypeDB descriptor names an
   // `smtOp` the engine can translate AND the receiver / args
@@ -2950,7 +3125,24 @@ function resolveCallReturnViaDB(ctx, instr, thisValue, argValues, loc) {
 // updates the target heap cell to reflect the labels that
 // flowed in.
 function applyCallWrites(ctx, state, thisValue, argValues, desc, loc) {
-  if (!desc || !desc.writes || desc.writes.length === 0) return state;
+  if (!desc) return state;
+  // Named DOM-state writer (`el.setAttribute("data-x", v)`).
+  // Stores the written value under the accessor's field so the
+  // matching reader hands it back with its taint intact.
+  if (desc.domStateWrite && thisValue) {
+    const argStrings = argValues.map(v =>
+      (v && v.kind === D.V.CONCRETE && typeof v.value === 'string') ? v.value : null);
+    const field = domStateField(desc.domStateWrite, argStrings);
+    const written = argValues[desc.domStateWrite.valueArg];
+    if (field && written) {
+      for (const variant of D.disjunctVariants(thisValue)) {
+        if (variant.domCell) {
+          state = writeHeapField(state, variant.domCell, field, written);
+        }
+      }
+    }
+  }
+  if (!desc.writes || desc.writes.length === 0) return state;
   for (const w of desc.writes) {
     // Resolve target Value: 'self' → thisValue, 'arg:N' → argValues[N].
     let targetValue = null;
@@ -3012,7 +3204,8 @@ function formulaForValue(ctx, value, loc) {
         // recreate the cross-handler correlation bug at the
         // fallback path.
         const scope = EPHEMERAL_SOURCE_LABELS.has(lab) ? 'call' : 'page';
-        return allocSourceSym(ctx, lab, loc, lab, 'String', scope);
+        return allocSourceSym(ctx, lab, loc, lab, 'String', scope,
+          { delivery: sourceDeliveryForLabel(ctx, lab) });
       }
     }
   }
