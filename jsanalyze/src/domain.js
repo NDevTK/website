@@ -232,6 +232,33 @@ function withAssumptionIds(value, ids) {
 
 const EMPTY_IDS = Object.freeze([]);
 
+// --- DOM cells ----------------------------------------------------------
+//
+// A DOM element is an Opaque value: the analyzer cannot read the
+// live tree, so its content is unknowable. But its IDENTITY often
+// is knowable — `document.getElementById("out")` denotes the same
+// element every time it is evaluated. `withDomCell` tags such a
+// value with a stable heap-cell id derived from the access path
+// (see transfer.domCellKey), which turns the DOM into a tracked
+// state channel: a write through one access path is visible to a
+// read through the same path, in a later statement or a different
+// event handler.
+//
+// The tag does NOT change the value's lattice position. It is a
+// pointer to a heap cell holding the fields analyzed code wrote;
+// anything not written there stays as opaque as before.
+function withDomCell(value, cellId) {
+  if (!value || !cellId || value.kind === V.BOTTOM) return value;
+  if (value.domCell === cellId) return value;
+  if (value.kind === V.DISJUNCT) {
+    return disjunct(value.variants.map(v => withDomCell(v, cellId)),
+      value.provenance);
+  }
+  const base = Object.assign({}, value);
+  base.domCell = cellId;
+  return Object.freeze(base);
+}
+
 // Read a Value's formula. Falls back to a const formula for
 // concrete primitives so callers don't need to special-case.
 // Returns null only when the value has no symbolic representation
@@ -1150,7 +1177,14 @@ function join(a, b) {
     const ids = aIds.slice();
     for (const i of bIds) if (!seen.has(i)) { seen.add(i); ids.push(i); }
     const tn = a.typeName || b.typeName || null;
-    return opaque(ids, tn, mergeProvenance(a, b), mergedLabels);
+    const merged = opaque(ids, tn, mergeProvenance(a, b), mergedLabels);
+    // Two values reached through the SAME access path denote the
+    // same element, so the merge keeps the DOM cell. Different
+    // paths join to an untracked element — sound, just less
+    // precise.
+    return (a.domCell && a.domCell === b.domCell)
+      ? withDomCell(merged, a.domCell)
+      : merged;
   }
   // Mixed Opaque + non-Opaque: this is also a per-path-type
   // situation if the non-Opaque side has a known shape. Wrap as
@@ -1709,12 +1743,49 @@ function joinStates(a, b) {
   return joinStatesCore(a, b, join);
 }
 
+// gatherStates / gatherWidenStates — the whole-program
+// fixpoint's merge of a registered callback's exit state into
+// the accumulated persisted state (see src/index.js).
+//
+// This differs from a plain join in one respect: a heap cell
+// the callback constrained SYMBOLICALLY keeps its formula even
+// though the persisted side holds a plain concrete value.
+//
+// The justification is the fixpoint's own premise. The engine
+// walks every registered callback because it assumes the
+// runtime may invoke it; the persisted "callback hasn't run
+// yet" value is therefore not a separate possibility that
+// survives into the merged state, it is the case the
+// callback's own guard already covers. Concretely, for
+//
+//   var g = {ready:false};
+//   onmessage = a => { if (a.data === "flip") g.ready = true; };
+//
+// the callback's exit denotes `g.ready` as `a.data === "flip"`,
+// whose false model IS the "no flip message was sent" world
+// that the persisted `false` represents. Adopting the formula
+// therefore adds no reachability the plain join didn't already
+// have — it only records WHY the cell can be true, which is
+// what a PoC needs in order to deliver the prerequisite input.
+//
+// The lattice element is still the plain join, so soundness and
+// convergence are untouched.
+function gatherStates(a, b) {
+  return joinStatesCore(a, b, join, GATHER_OPTS);
+}
+
+function gatherWidenStates(a, b) {
+  return joinStatesCore(a, b, widen, GATHER_OPTS);
+}
+
+const GATHER_OPTS = Object.freeze({ preferSymbolic: true });
+
 // joinStatesCore — shared implementation of joinStates and
 // widenStates parameterised by the per-value combinator
 // (join or widen). The two differ only in how per-register
 // values are combined; heap-cell and bookkeeping logic is
 // identical.
-function joinStatesCore(a, b, combine) {
+function joinStatesCore(a, b, combine, opts) {
 
   // Fast path: find the nearest common ancestor overlay for regs
   // and heap. Only keys that were written above the shared base
@@ -1746,7 +1817,7 @@ function joinStatesCore(a, b, combine) {
     let joined;
     if (!oa) joined = ob;
     else if (!ob) joined = oa;
-    else joined = joinObject(oa, ob);
+    else joined = joinObject(oa, ob, a.path, b.path, opts);
     newHeapOwn.set(id, joined);
   }
   const newHeap = newHeapOwn.size > 0
@@ -1791,7 +1862,104 @@ function joinPaths(a, b) {
   return _smtModule.mkOr(a, b);
 }
 
-function joinObject(a, b) {
+// --- Symbolic heap values -------------------------------------------------
+//
+// Registers are SSA and the worklist keeps one variant per
+// distinct (regs, heap) shape, so cross-register correlation
+// survives inside a function. The heap is the part that does
+// NOT: when two states merge, a cell written on only one of
+// them joins to a value-set (`{false, true}`) and the causal
+// link to the branch that performed the write is gone.
+//
+// That loss is what made cross-handler state machines
+// unexploitable in practice. Given
+//
+//   var g = {ready:false};
+//   onmessage = a => { if (a.data === "flip") g.ready = true; };
+//   onmessage = b => { if (g.ready) eval(b.data.code); };
+//
+// the fixpoint correctly makes the sink REACHABLE (g.ready
+// joins to {false,true}), but the second handler's guard adds
+// nothing to the path condition, so the synthesised PoC
+// delivers only `b.data.code` and silently omits the `"flip"`
+// message the exploit actually needs.
+//
+// The fix is to keep the merged cell's VALUE symbolic even
+// though its lattice element is imprecise: the joined cell
+// carries the formula `ite(pathOfA, valueOnA, valueOnB)`.
+// Reading it back yields a value whose formula still mentions
+// `a.data`, so the guard in the second handler contributes
+// `(= a.data "flip")` to the path condition and Z3 solves both
+// messages at once.
+//
+// This is purely a precision gain: the lattice element is
+// unchanged (still the sound join), only a formula is attached.
+// `leq` / `equals` ignore formulas, so fixpoint convergence is
+// unaffected.
+//
+// The guard is only built when it can carry information —
+// the two paths must differ and the chosen guard must mention
+// at least one symbol. GUARD_EXPR_LIMIT caps the s-expression
+// size so a long chain of merges can't grow formulas without
+// bound; past the cap the cell keeps the plain join, which is
+// exactly the old behaviour.
+const GUARD_EXPR_LIMIT = 8192;
+
+// The SMT formula denoting a value: its attached formula, or
+// the literal for a concrete primitive. Objects, closures and
+// unconstrained opaques have no denotation and return null.
+function symbolicDenotation(v) {
+  if (!v || v.kind === V.BOTTOM) return null;
+  if (v.formula) return v.formula;
+  if (v.kind === V.CONCRETE) {
+    const t = typeof v.value;
+    if (t === 'string' || t === 'number' || t === 'boolean') {
+      if (!_smtModule) _smtModule = require('./smt.js');
+      return _smtModule.mkConst(v.value);
+    }
+  }
+  return null;
+}
+
+// Build the `ite` formula for a heap field that two merging
+// states disagree on. Returns null when no useful guard exists.
+function guardedFieldFormula(fa, fb, pathA, pathB) {
+  if (!pathA || pathA === pathB || pathA.expr === pathB.expr) return null;
+  if (!_smtModule) _smtModule = require('./smt.js');
+  const SMT = _smtModule;
+  if (!SMT.hasSym(pathA) || pathA.incompatible) return null;
+  const da = symbolicDenotation(fa);
+  const db = symbolicDenotation(fb);
+  if (!da || !db) return null;
+  const ite = SMT.mkIte(pathA, da, db);
+  if (!ite || ite.incompatible) return null;
+  if (ite.expr.length > GUARD_EXPR_LIMIT) return null;
+  return ite;
+}
+
+// preferSymbolicDenotation(fa, fb) — used by the fixpoint
+// gather (see gatherStates). When exactly one of the two merging
+// values denotes a formula that mentions symbols, that formula
+// is the merged cell's denotation.
+function preferSymbolicDenotation(fa, fb) {
+  if (!_smtModule) _smtModule = require('./smt.js');
+  const SMT = _smtModule;
+  const da = symbolicDenotation(fa);
+  const db = symbolicDenotation(fb);
+  const aSym = !!(da && SMT.hasSym(da) && !da.incompatible);
+  const bSym = !!(db && SMT.hasSym(db) && !db.incompatible);
+  if (aSym === bSym) return null;   // neither, or both — no clear pick
+  return aSym ? da : db;
+}
+
+// joinObject(a, b, pathA, pathB, opts) — merge two heap cells.
+// When the merging states carry distinct path conditions, fields
+// the two cells disagree on get a guarded formula (see above).
+// The paths are optional: callers that have no path context (or
+// whose states are unconditionally reachable) get the plain
+// pointwise join. `opts.preferSymbolic` additionally enables the
+// fixpoint gather rule documented on `gatherStates`.
+function joinObject(a, b, pathA, pathB, opts) {
   // Object cells keep fields in plain objects for simplicity —
   // field names are known at parse time and the fan-out is
   // typically small.
@@ -1802,7 +1970,17 @@ function joinObject(a, b) {
   for (const k of fields) {
     const fa = a.fields[k] || bottom();
     const fb = b.fields[k] || bottom();
-    newFields[k] = join(fa, fb);
+    let merged = join(fa, fb);
+    if (!merged.formula && !equals(fa, fb)) {
+      const guard = pathA ? guardedFieldFormula(fa, fb, pathA, pathB) : null;
+      if (guard) {
+        merged = withFormula(merged, guard);
+      } else if (opts && opts.preferSymbolic) {
+        const pick = preferSymbolicDenotation(fa, fb);
+        if (pick) merged = withFormula(merged, pick);
+      }
+    }
+    newFields[k] = merged;
   }
   return Object.freeze({
     kind: a.kind || b.kind,
@@ -1842,11 +2020,12 @@ module.exports = {
   disjunct, disjunctMap, disjunctVariants, variantKey,
   join, widen, leq, equals, truthiness,
   withLabels, unionLabels, freezeLabels, EMPTY_LABELS,
-  withFormula, withAssumptionIds, valueFormula,
+  withFormula, withAssumptionIds, withDomCell, valueFormula,
   refineEq, refineNeq, refineNumericRange, refineByType, refineNotByType,
   refineInstanceof, refineNotInstanceof, typeChainIncludes,
   createState, createStateSharingHeap, withHeap, withPath, pushCallStack, callStackContains,
-  setReg, getReg, joinStates, widenStates, joinPaths, stateLeq, stateEquals,
+  setReg, getReg, joinStates, widenStates, gatherStates, gatherWidenStates,
+  joinPaths, stateLeq, stateEquals,
   unfreezeState, freezeState,
   overlayGet, overlayHas, overlayEntries, overlaySize, overlayFlatten,
   inferTypeName, canonKey, valueFingerprint,

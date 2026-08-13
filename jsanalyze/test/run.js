@@ -48,6 +48,8 @@ const testFiles = [
   'csp-derive.test.js',
   'fetch-trace.test.js',
   'taint-report.test.js',
+  'state-channel.test.js',
+  'construct-coverage.test.js',
   'writes.test.js',
   'legacy-replay.test.js',
 ];

@@ -82,7 +82,31 @@ const EPHEMERAL_SOURCE_LABELS = new Set([
 //
 // Scope is carried by the TypeDB source descriptor's
 // `sourceScope` field and defaulted to `'page'` when absent.
-function allocSourceSym(ctx, label, loc, discriminator, sort, scope) {
+// recordSymbol — note in `ctx._symbolTable` where an SMT symbol
+// came from: which taint source, which delivery mechanism, and
+// which handler was executing when it was minted.
+//
+// Consumers need this because a Z3 witness is a flat map of
+// symbol names, and a witness can name symbols the flow's own
+// sources do NOT cover. A guard on cross-handler state (see
+// domain.gatherStates) puts another handler's input into the
+// path condition, so the solved model tells the attacker to
+// deliver TWO messages — but only the symbol table says which
+// mechanism delivers which one. Recording it here keeps exploit
+// shaping in the consumer (D11.1) while the engine supplies the
+// facts.
+function recordSymbol(ctx, name, meta) {
+  if (!ctx || !name) return;
+  if (!ctx._symbolTable) ctx._symbolTable = Object.create(null);
+  if (ctx._symbolTable[name]) return;
+  ctx._symbolTable[name] = Object.assign({
+    name,
+    fnId: ctx._currentFnId != null ? ctx._currentFnId : null,
+    handlerContext: ctx._currentHandlerContext || null,
+  }, meta || {});
+}
+
+function allocSourceSym(ctx, label, loc, discriminator, sort, scope, meta) {
   if (!ctx._symCache) ctx._symCache = new Map();
   const disc = discriminator || '';
   const s = sort || 'Int';
@@ -106,7 +130,226 @@ function allocSourceSym(ctx, label, loc, discriminator, sort, scope) {
   if (ctx.nextSymId == null) ctx.nextSymId = 1;
   const name = (disc || label) + '_' + (ctx.nextSymId++);
   ctx._symCache.set(key, { name, sort: s });
+  recordSymbol(ctx, name, Object.assign({
+    label, discriminator: disc || label, scope: scope || 'page',
+    location: loc,
+  }, meta || {}));
   return SMT.mkSym(name, s);
+}
+
+// --- DOM as a state channel ----------------------------------------------
+//
+// The DOM is shared mutable state between handlers, exactly like
+// a module global — `el.dataset.token = x` in one handler and
+// `eval(el.dataset.token)` in another is a real flow. Modelling
+// every element as an unwritable Opaque made that flow invisible:
+// the write raised `heap-escape` and the read came back as a
+// content-free `dom-state` value.
+//
+// An element's CONTENT is genuinely unknowable, but its IDENTITY
+// usually is not: `document.getElementById("out")` denotes the
+// same element on every evaluation. So each element reached
+// through an access path the TypeDB marks with `domIdentity`
+// gets a stable heap cell keyed by that path. Writes land in the
+// cell; reads consult it first and fall back to the opaque
+// `dom-state` read for anything analyzed code did not write.
+//
+// Cell keys are strings in their own namespace (`dom:` prefix)
+// so they cannot collide with the numeric object ids
+// `applyAlloc` mints.
+//
+// What this does NOT claim: that the analyzed program is the
+// only writer. A key the program never wrote still reads back
+// opaque with the `dom-state` label, which is the same answer as
+// before. Tracking only ADDS the writes we can prove.
+const DOM_CELL_PREFIX = 'dom:';
+
+// domCellKey — build the cell key for a `domIdentity` descriptor.
+// Returns null when the identity cannot be pinned down (e.g. a
+// computed selector), which leaves the element untracked.
+function domCellKey(kind, typeName, memberName, argStrings, receiverCell) {
+  if (!kind) return null;
+  if (kind === 'singleton') {
+    return DOM_CELL_PREFIX + typeName + '.' + memberName;
+  }
+  if (kind === 'derived') {
+    if (!receiverCell) return null;
+    return receiverCell + '.' + memberName;
+  }
+  if (typeof kind === 'string' && kind.indexOf('arg:') === 0) {
+    const idx = Number(kind.slice(4));
+    if (Number.isNaN(idx)) return null;
+    const key = argStrings && argStrings[idx];
+    if (typeof key !== 'string') return null;
+    return DOM_CELL_PREFIX + memberName + '(' + key + ')';
+  }
+  return null;
+}
+
+// --- Accessor properties (get / set) --------------------------------------
+//
+// The parser stores `get v() {…}` / `set v(x) {…}` on the object
+// (or the class instance) under the mangled keys `__get_v__` /
+// `__set_v__`, so the accessor body survives as a closure in the
+// heap. Nothing ever invoked it, though: a getter is only ever
+// called through a property READ, and property reads went
+// straight to the field table.
+//
+// The consequence was total silence. `o.v` returned `undefined`
+// instead of whatever the getter computes, so taint through an
+// accessor vanished — and worse, a sink written INSIDE a getter
+// body was never walked at all, because the engine only walks
+// functions it sees called. `get v() { el.innerHTML = untrusted }`
+// produced no finding and no assumption.
+//
+// So a property read now looks for the accessor first and calls
+// it, and a property write calls the setter with the assigned
+// value. Both go through `invokeAccessor`, which is the ordinary
+// interprocedural walk minus the parts that only make sense for
+// a syntactic call site (spread/rest expansion, the summary
+// cache, TypeDB descriptor resolution).
+const GETTER_PREFIX = '__get_';
+const SETTER_PREFIX = '__set_';
+const ACCESSOR_SUFFIX = '__';
+
+// Find the accessor closure for `prop` on a receiver, or null.
+// An own data property of the same name wins: a class that
+// assigns `this.v = …` in its constructor has shadowed the
+// prototype accessor, which is what JS does too.
+function accessorClosure(state, obj, prefix, prop) {
+  if (!obj || obj.kind !== D.V.OBJECT || !prop) return null;
+  const cell = D.overlayGet(state.heap, obj.objId);
+  if (!cell || !cell.fields) return null;
+  if (cell.fields[prop] !== undefined) return null;
+  const fn = cell.fields[prefix + prop + ACCESSOR_SUFFIX];
+  if (!fn) return null;
+  if (fn.kind === D.V.CLOSURE && fn.functionId) return fn;
+  if (fn.kind === D.V.DISJUNCT) {
+    for (const v of fn.variants) {
+      if (v && v.kind === D.V.CLOSURE && v.functionId) return v;
+    }
+  }
+  return null;
+}
+
+// invokeAccessor — walk an accessor body and return its value.
+//
+// Returns `{ state, value }`: the state carries any heap writes
+// the accessor performed (a setter's whole purpose), and `value`
+// is the join of the closure's return registers.
+//
+// Recursion is guarded the same way ordinary calls are — a
+// getter that reads its own property would otherwise walk
+// forever. On a guarded re-entry we return an opaque value that
+// keeps the receiver's labels, which is the sound answer.
+async function invokeAccessor(ctx, state, closureValue, thisValue, args, loc) {
+  const fn = ctx.module.functions.find(f => f.id === closureValue.functionId);
+  if (!fn || !fn.cfg) return { state, value: null };
+
+  let init = D.createStateSharingHeap(state);
+  if (ctx.currentPath) init = D.withPath(init, ctx.currentPath);
+
+  // Captures, resolved against the caller's live state first so
+  // the accessor sees current values, then the definition-time
+  // snapshot for closures that have escaped their defining
+  // frame.
+  for (const c of closureValue.captures || []) {
+    if (!c || c.innerReg == null) continue;
+    let val = null;
+    if (c.outerReg != null) {
+      const live = D.getReg(state, c.outerReg);
+      if (live && live.kind !== D.V.BOTTOM) val = live;
+    }
+    if (!val && c.value && c.value.kind !== D.V.BOTTOM) val = c.value;
+    if (val) init = D.setReg(init, c.innerReg, val);
+  }
+
+  const params = fn.params || [];
+  for (let i = 0; i < params.length; i++) {
+    const v = args[i] || D.concrete(undefined, undefined, loc);
+    init = D.setReg(init, params[i], v);
+  }
+
+  const frame = { funcId: fn.id, argsFp: 'accessor' };
+  if (D.callStackContains(init, frame)) {
+    const a = ctx.assumptions.raise(
+      REASONS.UNIMPLEMENTED,
+      'recursive accessor invocation on `' + (fn.name || fn.id) +
+        '` — result conservatively inherits the receiver\'s labels',
+      loc
+    );
+    return {
+      state,
+      value: D.opaque([a.id], null, loc, thisValue && thisValue.labels),
+    };
+  }
+  init = D.pushCallStack(init, frame);
+
+  const savedPath = ctx.currentPath;
+  const savedBlockId = ctx.currentBlockId;
+  const savedThis = ctx._currentThisValue;
+  let result = null;
+  if (thisValue) ctx._currentThisValue = thisValue;
+  try {
+    const analyse = getAnalyseFunction();
+    result = await analyse(ctx.module, fn, init, ctx);
+  } finally {
+    ctx.currentPath = savedPath;
+    ctx.currentBlockId = savedBlockId;
+    ctx._currentThisValue = savedThis;
+  }
+
+  let outState = state;
+  if (result && result.exitState) {
+    const exitHeap = result.exitState.heap;
+    if (!isEmptyOverlayOver(exitHeap, state.heap)) {
+      outState = D.withHeap(state, exitHeap);
+    }
+  }
+
+  let value = null;
+  if (fn.returns && fn.returns.length > 0 && result && result.exitState) {
+    for (const retReg of fn.returns) {
+      const v = D.getReg(result.exitState, retReg);
+      if (v) value = value ? D.join(value, v) : v;
+    }
+  }
+  return { state: outState, value };
+}
+
+// iteratedElementType — the type a typed iterable yields when
+// indexed or iterated, declared as `iteratesType` on the
+// TypeDB's type descriptor (NodeList → HTMLElement,
+// HTMLCollection → HTMLElement, FileList → File). Returns null
+// for anything that doesn't declare one, which leaves the read
+// untyped exactly as before.
+function iteratedElementType(ctx, typeName) {
+  if (!typeName || !ctx.typeDB || !ctx.typeDB.types) return null;
+  const desc = ctx.typeDB.types[typeName];
+  return (desc && desc.iteratesType) || null;
+}
+
+// domStateField — resolve the cell field a `domStateRead` /
+// `domStateWrite` descriptor addresses, e.g. `attr:data-token`
+// for `setAttribute("data-token", v)`. Returns null when the key
+// argument isn't a compile-time string, which leaves the access
+// untracked.
+function domStateField(accessor, argStrings) {
+  if (!accessor) return null;
+  const name = argStrings && argStrings[accessor.nameArg];
+  if (typeof name !== 'string') return null;
+  return (accessor.prefix || '') + name;
+}
+
+// Read a field previously written into a DOM cell by analyzed
+// code. Returns null when the cell or the field is absent, which
+// sends the caller to its normal opaque-read path.
+function domCellRead(state, cellId, field) {
+  if (!cellId) return null;
+  const cell = D.overlayGet(state.heap, cellId);
+  if (!cell || !cell.fields) return null;
+  const v = cell.fields[field];
+  return v || null;
 }
 
 // Map a TypeDB readType string to the SMT sort used for the
@@ -307,6 +550,12 @@ function emitTaintFlow(ctx, sinkInfo, sinkLoc, value, targetType) {
       // to run sink-appropriate exploit solving without any
       // hardcoded knowledge about sink kinds.
       exploit: sinkInfo.exploit || null,
+      // IR function the sink sits in. Paired with
+      // `trace.symbolTable[sym].fnId`, this is how a consumer
+      // tells the flow's OWN inputs from inputs another handler
+      // must receive first for the guard on shared state to
+      // hold (see domain.gatherStates).
+      fnId: ctx._currentFnId != null ? ctx._currentFnId : null,
     },
     severity: sinkInfo.severity,
     pathConditions: [],            // legacy human-readable list — unused in B3
@@ -361,7 +610,7 @@ function sourceDeliveryForLabel(ctx, label) {
 // is itself 'call'-scoped. The compound discriminator keeps
 // MessageEvent.data.action distinct from
 // MessageEvent.data.payload across sites.
-function allocChildSym(ctx, fullName, parentName, prop, scope) {
+function allocChildSym(ctx, fullName, parentName, prop, scope, meta) {
   if (!ctx._symCache) ctx._symCache = new Map();
   const key = 'child:' + parentName + '::' + prop +
     (scope === 'call' ? ':call' : '');
@@ -372,6 +621,16 @@ function allocChildSym(ctx, fullName, parentName, prop, scope) {
   const sort = 'String';
   ctx._symCache.set(key, { name, sort });
   recordSymChild(ctx, parentName, name, prop);
+  const parentMeta = (ctx._symbolTable && ctx._symbolTable[parentName]) || null;
+  recordSymbol(ctx, name, Object.assign({
+    label:      parentMeta ? parentMeta.label : null,
+    delivery:   parentMeta ? parentMeta.delivery : null,
+    discriminator: parentMeta ? parentMeta.discriminator : null,
+    scope:      scope || 'page',
+    parent:     parentName,
+    prop,
+    location:   parentMeta ? parentMeta.location : null,
+  }, meta || {}));
   return SMT.mkSym(name, sort);
 }
 
@@ -913,7 +1172,9 @@ function applyGetGlobal(ctx, state, instr) {
       // Global roots (e.g. `localStorage`) are page-scoped by
       // default — two bare reads observe the same object.
       const scope = typeDesc && typeDesc.sourceScope ? typeDesc.sourceScope : 'page';
-      const sym = allocSourceSym(ctx, selfSource, loc, instr.name, undefined, scope);
+      const sym = allocSourceSym(ctx, selfSource, loc, instr.name, undefined, scope,
+        { delivery: (typeDesc && typeDesc.delivery) || null,
+          typeName, prop: null });
       // Record the delivery declared on the type itself
       // (e.g. selfSource 'storage' → delivery 'localStorage').
       if (typeDesc && typeDesc.delivery) {
@@ -978,11 +1239,40 @@ function applyGetArgs(ctx, state, instr) {
 // downstream `el.src = ...` write sees both the iframe variant
 // (sink) and the anchor variant (no `src` property).
 
-function applyGetProp(ctx, state, instr) {
+async function applyGetProp(ctx, state, instr) {
   const loc = instrLoc(ctx, instr);
   const obj = D.getReg(state, instr.object);
   if (!obj) {
     return D.setReg(state, instr.dest, D.top(loc));
+  }
+  // Accessor path: only taken when some receiver variant
+  // actually has a getter for this name, so the plain
+  // data-property path below is bit-for-bit what it always was.
+  const variants = D.disjunctVariants(obj);
+  let hasAccessor = false;
+  for (const v of variants) {
+    if (accessorClosure(state, v, GETTER_PREFIX, instr.propName)) {
+      hasAccessor = true;
+      break;
+    }
+  }
+  if (hasAccessor) {
+    let joined = null;
+    let newState = state;
+    for (const variant of variants) {
+      const getter = accessorClosure(newState, variant, GETTER_PREFIX, instr.propName);
+      let v;
+      if (getter) {
+        const r = await invokeAccessor(ctx, newState, getter, variant, [], loc);
+        newState = r.state;
+        v = r.value || D.concrete(undefined, undefined, loc);
+      } else {
+        v = propLookupForVariant(ctx, newState, variant, instr, loc);
+      }
+      if (!v || v.kind === D.V.BOTTOM) continue;
+      joined = joined ? D.join(joined, v) : v;
+    }
+    return D.setReg(newState, instr.dest, joined || D.bottom());
   }
   const result = D.disjunctMap(obj, (variant) =>
     propLookupForVariant(ctx, state, variant, instr, loc));
@@ -1002,9 +1292,28 @@ function propLookupForVariant(ctx, state, obj, instr, loc) {
   }
   if (obj.kind === D.V.OPAQUE) {
     const db = ctx.typeDB;
+    // DOM state channel: a value analyzed code wrote through
+    // this same access path wins over the opaque read. The
+    // stored value carries its own labels and formula, so taint
+    // and symbolic reasoning flow through the DOM unbroken.
+    const tracked = domCellRead(state, obj.domCell, instr.propName);
+    if (tracked) return tracked;
     if (db && obj.typeName) {
       const desc = TDB.lookupProp(db, obj.typeName, instr.propName);
       if (desc) {
+        // A sub-object of a tracked element (`el.dataset`) is
+        // itself tracked, keyed by the receiver's cell plus the
+        // property name.
+        const derivedCell = desc.domIdentity
+          ? domCellKey(desc.domIdentity, obj.typeName, instr.propName,
+              null, obj.domCell)
+          : null;
+        if (derivedCell) {
+          return D.withDomCell(
+            D.opaque(obj.assumptionIds || [], desc.readType || null, loc,
+              obj.labels),
+            derivedCell);
+        }
         const resultType = desc.readType || null;
         const existingLabels = obj.labels || D.EMPTY_LABELS;
         let resultLabels = existingLabels;
@@ -1049,7 +1358,9 @@ function propLookupForVariant(ctx, state, obj, instr, loc) {
             (typeDesc && typeDesc.sourceScope != null ? typeDesc.sourceScope : 'page'));
           resultFormula = allocSourceSym(ctx, desc.source, loc,
             obj.typeName + '.' + instr.propName,
-            readTypeToSort(desc.readType), scope);
+            readTypeToSort(desc.readType), scope,
+            { delivery: desc.delivery || null,
+              typeName: obj.typeName, prop: instr.propName });
           // Record the delivery declared on this specific
           // descriptor so flow emission can attribute the
           // correct delivery mechanism to the source. For
@@ -1189,9 +1500,37 @@ function highestNumericKey(fields) {
   return hi;
 }
 
+// applyGetIndex — `obj[key]`. Fans out over Disjunct receivers
+// the same way applyGetProp does, then joins the per-variant
+// results.
+//
+// The fan-out is not cosmetic. An imprecise read over an array
+// joins EVERY field, and an array cell holds `length` alongside
+// its elements — so `arr[k]` with an unknown key yields
+// Disjunct(element, number). Without fanning out, a second read
+// on that value (`arr[j][k]`, or any nested container walked by
+// a for-of) hit the "unresolved target" fallback and dropped the
+// taint entirely.
 function applyGetIndex(ctx, state, instr) {
   const loc = instrLoc(ctx, instr);
   const obj = D.getReg(state, instr.object);
+  if (obj && obj.kind === D.V.DISJUNCT) {
+    let joined = null;
+    let newState = state;
+    for (const variant of obj.variants) {
+      newState = indexLookupForVariant(ctx, newState, variant, instr, loc);
+      const v = D.getReg(newState, instr.dest);
+      joined = joined ? D.join(joined, v) : v;
+    }
+    return D.setReg(newState, instr.dest, joined);
+  }
+  return indexLookupForVariant(ctx, state, obj, instr, loc);
+}
+
+// Resolve a computed index read against a single (non-disjunct)
+// receiver. Writes the result into `instr.dest` and returns the
+// new state, so the caller can join across variants.
+function indexLookupForVariant(ctx, state, obj, instr, loc) {
   const key = D.getReg(state, instr.key);
 
   // Case 1: concrete heap object, concrete scalar key.
@@ -1338,8 +1677,17 @@ function applyGetIndex(ctx, state, instr) {
     // read-out value. The old code built a fresh opaque and
     // dropped labels, which lost taint across `obj[k]` reads
     // when the receiver itself was tainted.
+    //
+    // Typed iterables carry their element type in the TypeDB's
+    // `iteratesType`. Indexing (or iterating, which lowers to
+    // the same read) a NodeList yields an HTMLElement, so
+    // `for (const a of document.querySelectorAll("a")) a.href = x`
+    // classifies the write as a navigation sink. Without the
+    // element type the read produced a type-less opaque and no
+    // sink lookup was possible.
+    const elemType = iteratedElementType(ctx, obj.typeName);
     return D.setReg(state, instr.dest,
-      D.opaque(obj.assumptionIds, null, loc, obj.labels));
+      D.opaque(obj.assumptionIds, elemType, loc, obj.labels));
   }
 
   // Computed index whose target object or key couldn't be
@@ -1357,10 +1705,21 @@ function applyGetIndex(ctx, state, instr) {
 
 // --- SetProp / SetIndex -------------------------------------------------
 
-function applySetProp(ctx, state, instr) {
+async function applySetProp(ctx, state, instr) {
   const loc = instrLoc(ctx, instr);
   const obj = D.getReg(state, instr.object);
   const val = D.getReg(state, instr.value);
+  // Setter path: `o.v = x` where `v` is an accessor runs the
+  // setter body with `x` bound to its parameter, so a sink
+  // inside the setter fires and any `this.…` the setter writes
+  // lands in the heap. As with getters, this only diverges from
+  // the plain field-write path when a setter actually exists.
+  for (const variant of D.disjunctVariants(obj)) {
+    const setter = accessorClosure(state, variant, SETTER_PREFIX, instr.propName);
+    if (!setter) continue;
+    const r = await invokeAccessor(ctx, state, setter, variant, [val], loc);
+    state = r.state;
+  }
   // D11.1 completeness gate: any syntactic innerHTML /
   // outerHTML / insertAdjacentHTML write the walker actually
   // executed — regardless of whether the receiver resolved
@@ -1403,12 +1762,21 @@ function applySetProp(ctx, state, instr) {
       newState = writeHeapField(newState, variant.objId, instr.propName, val);
       any = true;
     } else if (variant && variant.kind === D.V.OPAQUE) {
-      ctx.assumptions.raise(
-        REASONS.HEAP_ESCAPE,
-        'property write on opaque object — mutation not tracked',
-        loc,
-        { affects: instr.propName, chain: variant.assumptionIds }
-      );
+      if (variant.domCell) {
+        // Tracked DOM element: the write goes into its cell, so a
+        // later read through the same access path — in this
+        // handler or another one — observes the written value
+        // instead of an opaque `dom-state` read.
+        newState = writeHeapField(newState, variant.domCell, instr.propName, val);
+        any = true;
+      } else {
+        ctx.assumptions.raise(
+          REASONS.HEAP_ESCAPE,
+          'property write on opaque object — mutation not tracked',
+          loc,
+          { affects: instr.propName, chain: variant.assumptionIds }
+        );
+      }
     }
   }
   return newState;
@@ -1686,6 +2054,42 @@ async function walkCallbackArgs(ctx, state, instr, thisValue, argValues, loc) {
     ? { event: eventName, registrationSite: loc, calleeName: instr.methodName || instr.calleeName || null }
     : null;
 
+  // Promise resolution. `p.then(cb)` hands `cb` the value `p`
+  // settled with, so the callback's first parameter must carry
+  // the receiver's taint rather than being a blank opaque —
+  // otherwise `fetch(u).then(r => …)` walks the handler but
+  // sees nothing flow into it.
+  //
+  // Two shapes, both TypeDB-declared:
+  //
+  //   * The receiver came from an analysed async function, so
+  //     its return value IS the resolution value and we pass it
+  //     through directly.
+  //   * The receiver is a declared Promise with an `innerType`
+  //     (fetch → Promise<Response>), so the parameter takes that
+  //     type and its property reads resolve through the TypeDB.
+  let firstParamValue = null;
+  if (desc.callbackResolvesReceiver && thisValue) {
+    // An analysed async function's promise carries the exact
+    // value its body returned — prefer that over any declared
+    // type, since it is the real thing with its real labels.
+    if (thisValue.resolutionValue) {
+      firstParamValue = thisValue.resolutionValue;
+      if (!firstParamType && firstParamValue.typeName) {
+        firstParamType = firstParamValue.typeName;
+      }
+    }
+    const inner = firstParamValue ? null : (thisValue.innerType || null);
+    if (inner && db.types && db.types[inner]) {
+      firstParamType = inner;
+      firstParamValue = D.opaque(thisValue.assumptionIds || [], inner, loc,
+        thisValue.labels);
+    } else if (!firstParamValue && thisValue.kind !== D.V.BOTTOM) {
+      firstParamValue = thisValue;
+      if (!firstParamType && thisValue.typeName) firstParamType = thisValue.typeName;
+    }
+  }
+
   for (const idx of desc.callbackArgs) {
     if (typeof idx !== 'number') continue;
     const cbValue = argValues[idx];
@@ -1699,13 +2103,15 @@ async function walkCallbackArgs(ctx, state, instr, thisValue, argValues, loc) {
     if (cbValue.kind === D.V.DISJUNCT && Array.isArray(cbValue.variants)) {
       for (const v of cbValue.variants) {
         if (v && v.kind === D.V.CLOSURE && v.functionId) {
-          await walkCallback(ctx, state, v, loc, firstParamType, handlerContext);
+          await walkCallback(ctx, state, v, loc, firstParamType, handlerContext,
+            firstParamValue);
         }
       }
       continue;
     }
     if (fnId == null) continue;
-    await walkCallback(ctx, state, cbValue, loc, firstParamType, handlerContext);
+    await walkCallback(ctx, state, cbValue, loc, firstParamType, handlerContext,
+      firstParamValue);
   }
 }
 
@@ -1731,7 +2137,8 @@ async function walkCallbackArgs(ctx, state, instr, thisValue, argValues, loc) {
 // callback REPEATEDLY until the persisted heap stabilises,
 // modelling the event loop correctly: any ordering, any number
 // of invocations.
-async function walkCallback(ctx, state, closureValue, loc, firstParamType, handlerContext) {
+async function walkCallback(ctx, state, closureValue, loc, firstParamType, handlerContext,
+                            firstParamValue) {
   const calleeFn = ctx.module.functions.find(f => f.id === closureValue.functionId);
   if (!calleeFn || !calleeFn.cfg) return;
 
@@ -1768,6 +2175,7 @@ async function walkCallback(ctx, state, closureValue, loc, firstParamType, handl
     fn: calleeFn,
     resolvedCaptures,
     firstParamType,
+    firstParamValue: firstParamValue || null,
     handlerContext,
     registrationLoc: loc,
     // Carry the outer path so fixpoint re-walks inherit the
@@ -1811,6 +2219,13 @@ function buildCallbackInitState(ctx, cb, persistedState) {
       ctx._calledParamAssumptionIds[paramKey] = aId;
     } else {
       aId = (ctx._calledParamAssumptionIds && ctx._calledParamAssumptionIds[paramKey]) || null;
+    }
+    // A known resolution value (see walkCallbackArgs) replaces
+    // the opaque placeholder for the first parameter, so taint
+    // carried by the promise reaches the handler body.
+    if (pi === 0 && cb.firstParamValue) {
+      init = D.setReg(init, paramReg, cb.firstParamValue);
+      continue;
     }
     init = D.setReg(init, paramReg,
       D.opaque(aId != null ? [aId] : [], typeName, cb.registrationLoc));
@@ -2599,6 +3014,17 @@ async function applyCall(ctx, state, instr) {
         }
       }
     }
+    // An async function returns a Promise, and what `.then(cb)`
+    // hands `cb` is the RESOLUTION value — the thing the body
+    // returned. We keep both: the value is typed `Promise` so
+    // `.then` resolves through the TypeDB, and `resolutionValue`
+    // carries what the body produced so walkCallbackArgs can
+    // bind it to the handler's parameter.
+    if (calleeFn.isAsync && returnValue) {
+      returnValue = Object.freeze(Object.assign({}, D.opaque(
+        returnValue.assumptionIds || [], 'Promise', loc, returnValue.labels),
+        { resolutionValue: returnValue }));
+    }
     if (!returnValue) {
       returnValue = D.concrete(undefined, undefined, loc);
     }
@@ -2649,7 +3075,7 @@ async function applyCall(ctx, state, instr) {
     const perVariantResults = [];
     const perVariantDescs = [];
     for (const thisVariant of thisValue.variants) {
-      const r = resolveCallReturnViaDB(ctx, instr, thisVariant, argValues, loc);
+      const r = resolveCallReturnViaDB(ctx, state, instr, thisVariant, argValues, loc);
       if (r) {
         perVariantResults.push(r.value);
         perVariantDescs.push(r.desc);
@@ -2669,7 +3095,7 @@ async function applyCall(ctx, state, instr) {
       }
     }
   } else {
-    const r = resolveCallReturnViaDB(ctx, instr, thisValue, argValues, loc);
+    const r = resolveCallReturnViaDB(ctx, state, instr, thisValue, argValues, loc);
     if (r) {
       tdbResult = r.value;
       tdbDesc = r.desc;
@@ -2814,7 +3240,7 @@ function applySmtCallOp(op, recv, args) {
 // return type name, any propagated labels, and (when the TypeDB
 // descriptor carries an `smtOp` the engine can translate) an
 // SMT formula derived from the receiver and argument formulas.
-function resolveCallReturnViaDB(ctx, instr, thisValue, argValues, loc) {
+function resolveCallReturnViaDB(ctx, state, instr, thisValue, argValues, loc) {
   const db = ctx.typeDB;
   if (!db) return null;
 
@@ -2837,6 +3263,20 @@ function resolveCallReturnViaDB(ctx, instr, thisValue, argValues, loc) {
     return null;
   });
   const returnType = TDB.resolveReturnType(desc, argStrings);
+
+  // Named DOM-state accessor (`el.getAttribute("data-x")`): when
+  // analyzed code wrote that key through the matching writer, the
+  // call returns exactly what was written — labels, formula and
+  // all — rather than an opaque `dom-state` read.
+  if (desc.domStateRead && thisValue) {
+    const field = domStateField(desc.domStateRead, argStrings);
+    if (field) {
+      for (const variant of D.disjunctVariants(thisValue)) {
+        const tracked = domCellRead(state, variant.domCell, field);
+        if (tracked) return { value: tracked, desc: desc, chainIds: [] };
+      }
+    }
+  }
 
   // Compute the labels that propagate to the return value.
   // Default: no propagation (function call narrows taint).
@@ -2887,6 +3327,28 @@ function resolveCallReturnViaDB(ctx, instr, thisValue, argValues, loc) {
   }
 
   let result = D.opaque(chainIds, returnType, loc, resultLabels);
+
+  // Parametric containers: remember the declared `innerType`
+  // (Promise<Response>, Array<T>) on the value so `.then(cb)`
+  // can type the callback's parameter. Without it the promise
+  // is just an opaque tagged `Promise` and its payload type is
+  // lost at the first call boundary.
+  if (desc.innerType) {
+    result = Object.freeze(Object.assign({}, result, { innerType: desc.innerType }));
+  }
+
+  // DOM identity: a query whose arguments pin down which element
+  // it returns (`getElementById("out")`) yields a value tagged
+  // with that element's stable cell, so writes through it are
+  // visible to later reads through the same path.
+  if (desc.domIdentity) {
+    const cell = domCellKey(desc.domIdentity,
+      (thisValue && thisValue.typeName) || instr.calleeName || '',
+      instr.methodName || instr.calleeName || '',
+      argStrings,
+      thisValue && thisValue.domCell);
+    if (cell) result = D.withDomCell(result, cell);
+  }
 
   // SMT formula propagation. When the TypeDB descriptor names an
   // `smtOp` the engine can translate AND the receiver / args
@@ -2950,7 +3412,24 @@ function resolveCallReturnViaDB(ctx, instr, thisValue, argValues, loc) {
 // updates the target heap cell to reflect the labels that
 // flowed in.
 function applyCallWrites(ctx, state, thisValue, argValues, desc, loc) {
-  if (!desc || !desc.writes || desc.writes.length === 0) return state;
+  if (!desc) return state;
+  // Named DOM-state writer (`el.setAttribute("data-x", v)`).
+  // Stores the written value under the accessor's field so the
+  // matching reader hands it back with its taint intact.
+  if (desc.domStateWrite && thisValue) {
+    const argStrings = argValues.map(v =>
+      (v && v.kind === D.V.CONCRETE && typeof v.value === 'string') ? v.value : null);
+    const field = domStateField(desc.domStateWrite, argStrings);
+    const written = argValues[desc.domStateWrite.valueArg];
+    if (field && written) {
+      for (const variant of D.disjunctVariants(thisValue)) {
+        if (variant.domCell) {
+          state = writeHeapField(state, variant.domCell, field, written);
+        }
+      }
+    }
+  }
+  if (!desc.writes || desc.writes.length === 0) return state;
   for (const w of desc.writes) {
     // Resolve target Value: 'self' → thisValue, 'arg:N' → argValues[N].
     let targetValue = null;
@@ -3012,7 +3491,8 @@ function formulaForValue(ctx, value, loc) {
         // recreate the cross-handler correlation bug at the
         // fallback path.
         const scope = EPHEMERAL_SOURCE_LABELS.has(lab) ? 'call' : 'page';
-        return allocSourceSym(ctx, lab, loc, lab, 'String', scope);
+        return allocSourceSym(ctx, lab, loc, lab, 'String', scope,
+          { delivery: sourceDeliveryForLabel(ctx, lab) });
       }
     }
   }

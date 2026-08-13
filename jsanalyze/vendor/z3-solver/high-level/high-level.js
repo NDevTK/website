@@ -11,7 +11,10 @@ exports.createApi = createApi;
 // TODO(ritave): If a test times out, jest kills it, and the global state of Z3 is left in an unexpected state.
 //               This occurs specifically during longer check(). Afterwards, all next tests will fail to run
 //               thinking the previous call was not finished. Find a way to stop execution and clean up the global state
-const async_mutex_1 = require("async-mutex");
+// Vendoring patch: upstream resolves this through node_modules.
+// The vendored tree carries its own copy under vendor/async-mutex/
+// so jsanalyze needs no npm install to run Z3 in Node.
+const async_mutex_1 = require("../../async-mutex");
 const low_level_1 = require("../low-level");
 const types_1 = require("./types");
 const utils_1 = require("./utils");

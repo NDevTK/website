@@ -25,8 +25,11 @@ The engine runs an abstract-interpretation fixpoint over all entry
 points. Registration (via a TypeDB `callbackArgs` descriptor) records
 the callback; the fixpoint driver re-walks every registered callback
 against the accumulated persisted state until nothing new is learnt.
-Widening kicks in after 4 iterations to guarantee termination; the
-bound is 8 iterations.
+The first pass joins each callback's exit into the persisted state;
+every later pass widens instead. Termination is structural rather
+than capped at a magic iteration count: the domain's widening
+operator gives the chain finite height, so the loop runs until it
+stops growing.
 
 Channels the loop covers:
 
@@ -39,24 +42,33 @@ Channels the loop covers:
 | Class instance state | Method invocations share `this` via the heap. |
 | Exported functions called from outside | Registered when the module exports them. |
 
-Not covered by the loop (needs additional engine work):
-
-- **DOM as a state channel.** The DOM is modelled as opaque with a
-  `dom-state` label; writes via `el.dataset.x = …` followed by reads
-  elsewhere are invisible. Fix would model the DOM as a concrete heap
-  cell in the TypeDB.
+Two channels the loop initially missed, both now covered:
 
 - **Symbolic heap values.** When handler A writes `g.flag = true`
-  under condition `a.data === 'flip'`, the lattice currently joins
-  `g.flag ∈ {false, true}`; the causal link to `a.data` is lost, so
-  a PoC for handler B's sink doesn't include the prerequisite `'flip'`
-  message. Fix would store heap values symbolically (the flag's SMT
-  formula references `a.data`), making B's path condition carry the
-  precondition through.
+  under condition `a.data === 'flip'`, the lattice joins
+  `g.flag ∈ {false, true}` — which makes handler B's sink reachable
+  but says nothing about *why*, so a PoC for B omitted the
+  prerequisite `'flip'` message. The merged cell now also carries
+  the symbolic denotation `ite(pathOfA, valueOnA, valueOnB)`, so B's
+  guard puts `a.data === "flip"` into its path condition and Z3
+  solves both messages at once. The lattice element is unchanged —
+  this is precision, not a change in what is reachable. See
+  `domain.gatherStates`.
 
-Both are meaningful improvements; neither is a soundness bug (the
-current behaviour over-approximates, producing PoCs that may under-
-specify the prerequisite inputs).
+- **DOM as a state channel.** An element's content is unknowable,
+  but its identity usually is not: `document.getElementById("out")`
+  denotes the same element every time. Access paths the TypeDB marks
+  with `domIdentity` now get a stable heap cell, so
+  `el.dataset.x = …` in one handler is visible to a read in another,
+  as is a `setAttribute` / `getAttribute` round-trip. An element
+  reached through a path the engine can't pin down (a computed
+  selector) stays untracked and still raises `heap-escape`, and a key
+  the program never wrote still reads back opaque with the
+  `dom-state` label — tracking only adds the writes we can prove.
+
+A flow that needs another handler's input first reports it in
+`flow.poc.prerequisites`, and the generated reproducer delivers it
+before the payload.
 
 ## Design principles
 
@@ -71,11 +83,22 @@ specify the prerequisite inputs).
    code, large call graphs, and arbitrary expressions never blow the
    JavaScript call stack.
 
-3. **Proper AST parser.** Source is parsed via
-   [acorn](https://github.com/acornjs/acorn) (vendored under
-   `vendor/`). Every construct in the ECMAScript spec is a node
-   kind the analyser can pattern-match on. No ad-hoc tokenizer, no
-   brace-matching heuristic.
+3. **Proper AST parser.** Lexing is
+   [acorn](https://github.com/acornjs/acorn)'s tokenizer (vendored
+   under `vendor/`); the parser on top of it is our own, because
+   acorn's is recursive descent and principle 2 requires an
+   iterative one. The output is an ESTree AST, so every construct
+   is a node kind the analyser pattern-matches on — no ad-hoc
+   tokenizer, no brace-matching heuristic.
+
+   The trade-off is that grammar coverage is ours to maintain, and
+   a gap in it fails SILENTLY: a construct the parser skips takes
+   the sinks inside it along, and a construct it cannot parse at
+   all abandons the whole file. Both look exactly like a clean
+   result. `test/construct-coverage.test.js` is the guard —
+   every construct carries a known flow to a sink, so a
+   regression shows up as a failing test rather than as a missing
+   finding.
 
 4. **SSA intermediate representation.** The AST is lowered to a
    typed SSA form with a control-flow graph of basic blocks. Every
@@ -128,7 +151,7 @@ jsanalyze/
 │   ├── domain.js         abstract domain (Value, State, lattice ops)
 │   ├── transfer.js       transfer functions per IR instruction
 │   ├── worklist.js       iterative fixpoint engine (B4 multi-variant)
-│   ├── reach.js          reachability cascade (layers 1-5)
+│   │                     + the 5-layer reachability cascade
 │   ├── assumptions.js    Assumption record + reason codes + DEFAULT_ACCEPT
 │   ├── query.js          public query.* namespace over a Trace
 │   ├── typedb.js         TypeDB schema + lookup helpers
@@ -159,12 +182,14 @@ jsanalyze/
 │                         trace.stringLiterals + trace.domMutations.
 ├── vendor/
 │   ├── acorn.js          vendored parser
+│   ├── async-mutex/      z3-solver's runtime dependency, vendored
+│   │                     so `node test/run.js` needs no npm install
 │   └── z3-solver/        vendored Z3 WASM (single canonical copy)
 ├── scripts/
 │   └── build-bundle.js   builds jsanalyze/browser-bundle.js
 ├── browser-bundle.js     single-file bundle loaded by analyzer/index.html
 ├── test/
-│   └── *.test.js         635 tests across engine + consumers
+│   └── *.test.js         681 tests across engine + consumers
 ├── docs/
 │   ├── API.md            public API reference
 │   ├── DESIGN-DECISIONS.md  architectural decisions + library/
@@ -274,10 +299,25 @@ SAT wins.
   payload:    string | null;       // value arriving at the sink
   attempt:    string | null;       // name of the exploit shape that matched
   bindings:   { [label]: string }; // what the attacker supplies per source
+  prerequisites: Array<{           // inputs ANOTHER handler needs first
+    label: string;                 // source label, e.g. 'postMessage'
+    delivery: string | null;       // how to deliver it
+    value: string | object;        // what to deliver
+    symbol: string;                // the SMT symbol Z3 solved
+    handlerContext: object | null; // which handler receives it
+  }>;
   reproducer: string | null;       // runnable JavaScript program
   note:       string | null;
 }
 ```
+
+**Prerequisites.** A flow guarded on shared state that another
+handler writes needs two deliveries, not one. Those extra inputs
+are a LIST rather than more `bindings` entries because two of them
+can share a label — two `message` handlers both read `event.data`,
+and collapsing them onto one `postMessage` key would silently drop
+one of the messages the exploit needs. The reproducer emits them
+before the payload.
 
 `reproducer` is a self-contained JavaScript program. Paste into
 a browser console and it opens the victim page at
@@ -356,11 +396,29 @@ Run `node jsanalyze/test/run.js` to see the current pass count
 - `csp-derive.js`   — CSP directive derivation.
 
 **Engine features:** SSA IR, interprocedural worklist fixpoint,
-B4 per-path state correlation, C3 k-CFA summary cache,
-classes / closures / destructuring / arrow functions / template
-literals / switch / try/catch, callbacks via
-`addEventListener` / `setTimeout` / `setInterval`, Z3 Layer 5
-branch refutation, Z3 post-pass refutation, multi-file projects.
+B4 per-path state correlation, C3 k-CFA summary cache, Z3
+Layer 5 branch refutation, Z3 post-pass refutation, multi-file
+projects.
+
+**Language coverage** (each row is a case in
+`test/construct-coverage.test.js`): every loop form including
+for-of / for-in and labelled break; classes with fields, private
+and static members, `extends`, and class expressions; getters and
+setters, invoked on property read and write so a sink inside an
+accessor body is found; destructuring with defaults and
+string keys; async functions, async arrows, `await`, and
+`.then` / `.catch` callbacks with the promise's resolution value
+bound to the handler's parameter; generators (bodies walked —
+values are not tracked through `next()`); tagged templates;
+the comma operator; optional chaining and nullish operators;
+spread and rest; try/catch/finally; switch.
+
+**Known gaps**, all of which fail loudly rather than silently:
+a generator's yielded values are not observable through
+`.next().value`; a `.then` chain does not carry the callback's
+RETURN value into the next link (each callback body is still
+walked); and `for-of` trip counts are widened rather than
+unrolled, like every other loop.
 
 See `docs/DESIGN-DECISIONS.md` for the full architectural
 rationale.

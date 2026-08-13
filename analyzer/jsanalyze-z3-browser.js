@@ -70,6 +70,12 @@
   // runs on first invocation, and only once.
   var _initPromise = null;
 
+  // Per-check wall-clock budget for a single Z3 `async_call`, and
+  // the latch set when one blows through it. See
+  // installInitZ3Wrapper for why the failure has to be terminal.
+  var WATCHDOG_MS = 15000;
+  var wedgedError = null;
+
   function loadClassicScript(src) {
     return new Promise(function (resolve, reject) {
       var s = document.createElement('script');
@@ -86,28 +92,48 @@
   // Wrap window.initZ3 so every invocation gets a Module object
   // carrying `mainScriptUrlOrBlob` (pointing at a Blob of
   // z3-built.js's source) plus a watchdog around async_call.
+  //
+  // Why the Blob is required
+  // ------------------------
   // browser.esm.js calls `await initZ3()` with no arguments, so
   // without this wrapper Emscripten uses `_scriptName`
   // (document.currentScript.src captured at load time) as the
-  // pthread worker's script URL, which re-fetches z3-built.js
-  // through the COI service worker on every pthread spawn.
+  // pthread worker's script URL — an http(s) URL.
   //
-  // SW-intercepted worker-script fetches terminate silently in
-  // Chromium — the worker fires a plain `Event` on `onerror`
-  // with `message` / `filename` / `lineno` / `error` all
-  // undefined, so the pthread looks like it died for no reason
-  // and async_call's capability is never resolved (the await
-  // hangs forever). Passing a pre-built Blob makes emscripten
-  // call `URL.createObjectURL` on it and use the resulting
-  // `blob:` URL for `new Worker`, which never hits the SW.
-  // `worker-src 'self' blob: data:` in the page's CSP covers
-  // the blob-URL worker.
+  // This page is cross-origin isolated, which means it is under
+  // COEP. A dedicated worker booted from an http(s) script URL
+  // must satisfy that policy through the script's own response
+  // headers, and our statically-hosted z3-built.js carries none.
+  // The worker is torn down before it runs: it fires a plain
+  // `Event` on `onerror` with `message` / `filename` / `lineno` /
+  // `error` all undefined, so the pthread looks like it died for
+  // no reason and async_call's capability is never resolved (the
+  // await hangs until the watchdog below fires).
   //
-  // The watchdog around `async_call` is defensive: if a pthread
-  // ever dies silently again (any future SW change, a Z3 wasm
-  // abort, etc.), the main-thread await rejects after the
-  // budget instead of hanging, so the bridge's per-consumer
-  // catch can recover and report an error.
+  // A `blob:` worker inherits the creating document's policies
+  // instead of negotiating its own, which is exactly what we
+  // want. So we hand emscripten a Blob of z3-built.js's source;
+  // it calls `URL.createObjectURL` and boots the pthread from
+  // the resulting `blob:` URL. `worker-src 'self' blob: data:`
+  // in the page's CSP covers it.
+  //
+  // Measured, not assumed: with the Blob suppressed the pthread
+  // dies on the first `solver.check()` whether or not the COI
+  // service worker intercepts subresource requests, so this is
+  // about the worker's own policy negotiation and NOT about the
+  // service worker being in the request path.
+  //
+  // Why the watchdog latches
+  // ------------------------
+  // A timed-out `async_call` cannot be cancelled: the WASM call
+  // is still in flight on a thread we can no longer reach. Z3's
+  // high-level API serialises calls behind a mutex, and rejecting
+  // releases that mutex, so the NEXT call walks straight into
+  // "you can't execute multiple async functions at the same
+  // time" — one real failure turning into a stream of misleading
+  // ones. Once the watchdog fires we therefore latch: Z3 is
+  // wedged for the lifetime of this page, and every later call
+  // rejects immediately with that one honest message.
   //
   // Idempotent via a sentinel flag.
   function installInitZ3Wrapper(z3BuiltBlob) {
@@ -143,10 +169,15 @@
         var origAsyncCall = moduleArg.async_call;
         moduleArg.async_call = function (f) {
           var args = Array.prototype.slice.call(arguments, 1);
+          if (wedgedError) return Promise.reject(wedgedError);
           return new Promise(function (resolve, reject) {
             var watchdog = setTimeout(function () {
-              reject(new Error('z3 async_call watchdog timed out — pthread worker likely died silently'));
-            }, 15000);
+              wedgedError = new Error(
+                'z3 is unavailable: a solver call did not return within ' +
+                (WATCHDOG_MS / 1000) + 's, so its pthread worker died. ' +
+                'Reload the page to retry.');
+              reject(wedgedError);
+            }, WATCHDOG_MS);
             var inner;
             try {
               inner = origAsyncCall.apply(moduleArg, [f].concat(args));

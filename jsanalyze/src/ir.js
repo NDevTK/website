@@ -712,6 +712,8 @@ function lowerStatement(ctx, node) {
     case 'WhileStatement':     return beginWhile(ctx, node, loc);
     case 'DoWhileStatement':   return beginDoWhile(ctx, node, loc);
     case 'ForStatement':       return beginFor(ctx, node, loc);
+    case 'ForOfStatement':
+    case 'ForInStatement':     return beginForInOf(ctx, node, loc);
     case 'BreakStatement':     return lowerBreak(ctx, node, loc);
     case 'ContinueStatement':  return lowerContinue(ctx, node, loc);
     case 'TryStatement':       return beginTry(ctx, node, loc);
@@ -1218,6 +1220,170 @@ function beginWhile(ctx, node, loc) {
   ctx._work.push({ kind: 'lower_stmt', node: node.body });
 }
 
+// beginForInOf — lower `for (LEFT of RIGHT) BODY` and
+// `for (LEFT in RIGHT) BODY`.
+//
+// The parser used to skip both forms entirely, which dropped the
+// loop body — and every sink inside it — with a single
+// `unimplemented` marker standing in for the whole statement.
+// `for (const el of container.children) el.innerHTML = untrusted`
+// simply did not exist as far as the analysis was concerned.
+//
+// The CFG is the same may-execute shape the other loops use:
+//
+//   pred → header (branch on an unknown trip count)
+//   header → body → header        (back edge)
+//   header → exit
+//
+// so the body runs zero-or-more times and the worklist widens at
+// the header exactly as it does for `while`.
+//
+// What LEFT binds to differs:
+//
+//   for-of — the ELEMENT. We emit a GetIndex with an unknown key,
+//            which `applyGetIndex` resolves by joining every field
+//            of the iterable's heap cell. For `[a, b]` that is
+//            `a ⊔ b`: precisely the set of values the loop can
+//            bind, without unrolling.
+//   for-in — the KEY. Property names are strings the analysis
+//            doesn't enumerate, so the binding is opaque. Bodies
+//            that then read `obj[k]` still resolve through the
+//            same join, so the common shape stays precise.
+//
+// The trip count is deliberately unknown rather than derived from
+// the iterable's length: matching the rest of the engine, loops
+// are analysed by widening rather than unrolling.
+function beginForInOf(ctx, node, loc) {
+  const isOf = node.type === 'ForOfStatement';
+  const predBlock = ctx.currentBlock;
+
+  // Evaluate the iterable ONCE, in the pred block.
+  const iterReg = lowerExpression(ctx, node.right);
+
+  // Names assigned in the body need header phis, as do bare
+  // (non-declaring) loop targets — `for (x of xs)` reassigns `x`
+  // on every iteration.
+  const loopDefs = new Set();
+  collectAssignedNames([node.body], loopDefs);
+  const bareTarget = node.left && node.left.type === 'Identifier'
+    ? node.left.name : null;
+  if (bareTarget) loopDefs.add(bareTarget);
+
+  const headerBlock = createBlock(ctx.module);
+  ctx.blocks.set(headerBlock.id, headerBlock);
+  addEdge(ctx.currentBlock, headerBlock);
+
+  const bodyBlock = createBlock(ctx.module);
+  ctx.blocks.set(bodyBlock.id, bodyBlock);
+  addEdge(headerBlock, bodyBlock);
+
+  const exitBlock = createBlock(ctx.module);
+  ctx.blocks.set(exitBlock.id, exitBlock);
+  addEdge(headerBlock, exitBlock);
+
+  emit(ctx.module, ctx.currentBlock, {
+    op: OP.JUMP, target: headerBlock.id,
+  }, loc);
+  const predExitBlock = ctx.currentBlock;
+
+  const phis = [];
+  for (const name of loopDefs) {
+    const currentReg = lookupName(ctx.scope, name);
+    if (currentReg == null) continue;
+    const destReg = newRegister(ctx.module);
+    const phiInstr = {
+      op: OP.PHI,
+      dest: destReg,
+      incoming: [{ pred: predExitBlock.id, value: currentReg }],
+    };
+    emit(ctx.module, headerBlock, phiInstr, loc);
+    updateName(ctx.scope, name, destReg);
+    phis.push({ name, destReg, instr: phiInstr });
+  }
+
+  // Header: branch on whether another element remains.
+  ctx.currentBlock = headerBlock;
+  const condReg = newRegister(ctx.module);
+  emit(ctx.module, headerBlock, {
+    op: OP.OPAQUE,
+    dest: condReg,
+    reason: REASONS.UNIMPLEMENTED,
+    details: 'for-' + (isOf ? 'of' : 'in') +
+      ' trip count is not derived from the iterable; the body is ' +
+      'analysed as may-execute, so the loop is entered and exited ' +
+      'without a bound',
+    affects: null,
+  }, loc);
+  emit(ctx.module, headerBlock, {
+    op: OP.BRANCH,
+    cond: condReg,
+    trueTarget: bodyBlock.id,
+    falseTarget: exitBlock.id,
+  }, loc);
+
+  // Body: bind LEFT, then lower the user's body into the same block.
+  ctx.currentBlock = bodyBlock;
+  const keyReg = newRegister(ctx.module);
+  emit(ctx.module, bodyBlock, {
+    op: OP.OPAQUE,
+    dest: keyReg,
+    reason: REASONS.UNIMPLEMENTED,
+    details: isOf
+      ? 'for-of element position is not tracked per iteration'
+      : 'for-in enumerates property names the analysis does not list',
+    affects: null,
+  }, loc);
+
+  let boundReg;
+  if (isOf) {
+    boundReg = newRegister(ctx.module);
+    emit(ctx.module, bodyBlock, {
+      op: OP.GET_INDEX, dest: boundReg, object: iterReg, key: keyReg,
+    }, loc);
+  } else {
+    boundReg = keyReg;
+  }
+  bindForTarget(ctx, node.left, boundReg, loc);
+
+  if (!ctx._loopStack) ctx._loopStack = [];
+  ctx._loopStack.push({
+    headerBlock,
+    bodyBlock,
+    exitBlock,
+    continueTarget: headerBlock,
+    phis,
+  });
+
+  ctx._work.push({ kind: 'finish_loop_body', loc });
+  ctx._work.push({ kind: 'after_stmt' });
+  ctx._work.push({ kind: 'lower_stmt', node: node.body });
+}
+
+// bindForTarget — bind a for-in / for-of loop target to the
+// register holding this iteration's value. The declaring form
+// (`for (const x of …)`) introduces a binding; the bare form
+// (`for (x of …)`) assigns to whatever `x` already names, and
+// destructuring targets (`for (const {a} of …)`) go through the
+// same path as a variable declarator.
+function bindForTarget(ctx, left, valueReg, loc) {
+  if (!left) return;
+  if (left.type === 'VariableDeclaration') {
+    const declKind = left.kind || 'var';
+    const bindingKind = declKind === 'let' ? BIND.LET
+      : declKind === 'const' ? BIND.CONST
+      : BIND.VAR;
+    const decl = left.declarations && left.declarations[0];
+    if (decl) bindDestructuringTarget(ctx, decl.id, valueReg, bindingKind, loc);
+    return;
+  }
+  if (left.type === 'Identifier') {
+    updateName(ctx.scope, left.name, valueReg);
+    return;
+  }
+  // ObjectPattern / ArrayPattern in the bare form.
+  bindDestructuringTarget(ctx, left, valueReg, BIND.VAR, loc);
+}
+
 function beginDoWhile(ctx, node, loc) {
   const predBlock = ctx.currentBlock;
 
@@ -1542,11 +1708,16 @@ function finishDoWhileCondStep(ctx, task) {
   }, task.loc);
   addEdge(loop.condBlock, loop.bodyBlock);
 
-  // Body-exit phi incomings (via condBlock's back edge).
+  // Body-exit phi incomings (via condBlock's back edge). The
+  // register live at condBlock is also what survives into the
+  // exit block, since a do-while can only leave through the
+  // test — remember it for the rebinding at the bottom.
+  const bodyExitRegs = new Map();
   for (const phi of loop.phis) {
     const finalReg = lookupName(ctx.scope, phi.name);
     if (finalReg != null) {
       phi.instr.incoming.push({ pred: loop.condBlock.id, value: finalReg });
+      bodyExitRegs.set(phi.name, finalReg);
     }
   }
   // `continue` in do-while jumps to condBlock (the continueTarget),
@@ -1593,7 +1764,18 @@ function finishDoWhileCondStep(ctx, task) {
   }
   if (!loop.breakSources || loop.breakSources.length === 0) {
     for (const phi of loop.phis) {
-      updateName(ctx.scope, phi.name, phi.destReg);
+      // A do-while body ALWAYS runs, and the only way out is
+      // through the test — so after the loop a name holds what
+      // the body last assigned, not the loop-entry phi. Binding
+      // to `phi.destReg` here is what made
+      //   var h = ""; do { h = location.hash; } while (c);
+      // read back as "" and silently drop the flow. `while` and
+      // `for` differ: they exit from the header, where the phi
+      // IS the live value.
+      const live = bodyExitRegs.has(phi.name)
+        ? bodyExitRegs.get(phi.name)
+        : phi.destReg;
+      updateName(ctx.scope, phi.name, live);
     }
   }
 
@@ -3357,6 +3539,32 @@ function lowerExpressionIter(ctx, root) {
         results.push(newReg);
         break;
       }
+      case 'emit_yield': {
+        // Drop the operand's register — it has been evaluated —
+        // and produce the opaque resumption value.
+        results.pop();
+        const dest = newRegister(ctx.module);
+        emit(ctx.module, ctx.currentBlock, {
+          op: OP.OPAQUE, dest,
+          reason: REASONS.UNIMPLEMENTED,
+          details: 'value of a `yield` expression is supplied by the ' +
+            'generator\'s consumer via next(), which is not modelled',
+          affects: null,
+        }, task.loc);
+        results.push(dest);
+        break;
+      }
+      case 'emit_sequence': {
+        // Every operand has been lowered and left a register on
+        // the stack. The comma operator's value is the last one;
+        // the earlier registers stay exactly where they are (the
+        // instructions that produced their side effects are
+        // already emitted), we just discard the values.
+        const last = results.pop();
+        for (let i = 1; i < task.count; i++) results.pop();
+        results.push(last);
+        break;
+      }
       case 'emit_unimplemented_expr': {
         const dest = newRegister(ctx.module);
         emit(ctx.module, ctx.currentBlock, {
@@ -3633,6 +3841,45 @@ function visitNode(ctx, node, tasks, results) {
         details: 'UpdateExpression on unrecognised target', loc });
       return;
     }
+    case 'YieldExpression': {
+      // Evaluate the operand for its side effects and sinks;
+      // the yield expression's own value comes from whatever
+      // the consumer passes to `next()`, which is outside the
+      // analysed program.
+      if (node.argument) {
+        tasks.push({ kind: 'emit_yield', loc });
+        tasks.push({ kind: 'visit', node: node.argument });
+      } else {
+        tasks.push({ kind: 'emit_unimplemented_expr',
+          details: 'yield with no operand: resumption value is supplied by the generator\'s consumer',
+          loc });
+      }
+      return;
+    }
+    case 'SequenceExpression': {
+      // The comma operator: evaluate every operand left to right
+      // for its side effects, and take the LAST one's value as
+      // the result. Falling through to `unimplemented` meant
+      // `var h = (0, location.hash)` — and, more importantly,
+      // every minified bundle's comma-chained statements — lost
+      // both the side effects and the value.
+      //
+      // The visit stack pops in reverse, so pushing the operands
+      // back-to-front evaluates them front-to-back. Each visit
+      // leaves its register on the operand stack;
+      // `emit_sequence` drops all but the last.
+      const exprs = node.expressions || [];
+      if (exprs.length === 0) {
+        tasks.push({ kind: 'emit_unimplemented_expr',
+          details: 'empty SequenceExpression', loc });
+        return;
+      }
+      tasks.push({ kind: 'emit_sequence', count: exprs.length, loc });
+      for (let i = exprs.length - 1; i >= 0; i--) {
+        tasks.push({ kind: 'visit', node: exprs[i] });
+      }
+      return;
+    }
     case 'MemberExpression': {
       if (node.computed) {
         tasks.push({ kind: 'emit_member_index', loc });
@@ -3802,6 +4049,33 @@ function visitNode(ctx, node, tasks, results) {
         tasks.push({ kind: 'visit', node: node.arguments[i] });
       }
       tasks.push({ kind: 'visit', node: node.callee });
+      return;
+    }
+    case 'ClassExpression': {
+      // `var C = class { … }`. The class desugaring already
+      // knows how to build the constructor and its members —
+      // it just needed somewhere to hand the resulting register
+      // back to the expression stack. Without this case the
+      // node fell through to `unimplemented` and the class
+      // (methods, fields, accessors and all) evaluated to an
+      // opaque value.
+      const savedSlot = ctx._classExprResult;
+      ctx._classExprResult = -1;          // non-null: "please report"
+      lowerClassDeclaration(ctx, node, loc);
+      const reg = ctx._classExprResult;
+      ctx._classExprResult = savedSlot;
+      if (reg != null && reg !== -1) {
+        results.push(reg);
+      } else {
+        const dest = newRegister(ctx.module);
+        emit(ctx.module, ctx.currentBlock, {
+          op: OP.OPAQUE, dest,
+          reason: REASONS.UNIMPLEMENTED,
+          details: 'class expression produced no constructor register',
+          affects: null,
+        }, loc);
+        results.push(dest);
+      }
       return;
     }
     case 'FunctionExpression':
