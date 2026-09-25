@@ -26,7 +26,7 @@ async function secret(key) {
     
     // The user got here by finding the value of hash or cheated.
     changeSnowflake('🐈');
-    icon.src = 'https://ndev.tk/penguin.webp';
+    icon.src = 'https://ndevtk.github.io/website/penguin.webp';
     about.innerText = 'Still ' + about.innerText;
 }
 
