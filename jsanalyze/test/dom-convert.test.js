@@ -257,7 +257,7 @@ const tests = [
       const input =
         '<div style="position: fixed; z-index: -99; width: 100%; height: 100%">\n' +
         '  <iframe credentialless loading="lazy" id="background" sandbox="allow-scripts" ' +
-        'frameborder="0" height="100%" width="100%" src="https://random.ndev.tk/"></iframe>\n' +
+        'frameborder="0" height="100%" width="100%" src="https://ndevtk.github.io/Dynamic-Random/"></iframe>\n' +
         '</div>\n' +
         '<button onclick="alert(\'hello\')">Greet</button>';
       const files = { 'page.html': input };
