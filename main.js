@@ -165,10 +165,10 @@ typoAbout();
 referrerSnowflake();
 
 icon.onclick = () => {
-    if (icon.src.endsWith('/icon-qr.webp')) {
-        icon.src = '/icon.webp';
+    if (icon.src.endsWith('/website/icon-qr.webp')) {
+        icon.src = '/website/icon.webp';
     } else {
-        icon.src = '/icon-qr.webp';
+        icon.src = '/website/icon-qr.webp';
     }
 }
 
