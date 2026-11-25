@@ -149,14 +149,21 @@ document.addEventListener('keydown', async e => {
 typoAbout();
 referrerSnowflake();
 
+let stillCount = 0;
+
 icon.onclick = () => {
     if (icon.src.endsWith('/website/penguin.webp')) {
         icon.src = '/website/icon.webp';
         changeSnowflake('🐈');
     } else {
-        icon.src = '/website/penguin.webp';        
+        icon.src = '/website/penguin.webp';
         changeSnowflake('🐧');
         about.innerText = 'Still ' + about.innerText;
+        stillCount += 1;
+        if (stillCount === 20) {
+            about.innerText = 'WONTFIX';
+            stillCount = 0;
+        }
     }
 }
 
